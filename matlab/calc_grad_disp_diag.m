@@ -1,0 +1,60 @@
+function [t_grad, cost_0, cost_post, LF_frw]=calc_grad_disp_diag(LF, disp_mask, x_stp_smp, u_x_max, cost_mask, delta, calc_LF_flag)
+% grad = zeros(size(disp_mask), "like", disp_mask); % This is a change
+cost_0 = 0; % initialize zero cost
+LF_frw = zeros(size(LF), "gpuArray");
+cost_post = 0;
+
+% Create the pixel grid for the illumination plane
+g = linspace(-u_x_max, u_x_max, size(LF, 1)); % This is a change
+g = gpuArray(g);
+[g1, g2] = ndgrid(g);
+
+% Iterate through the viewpoints to calculate the original positions of each
+% point in the LF back to the original image using the slopes     
+mask_invalid_0 = ones(size(LF, 1), size(LF, 2), "gpuArray");
+% Calculate the new coordinates in the image
+new_p1_img = g1 + disp_mask(:, :, 1);
+new_p2_img = g2 + disp_mask(:, :, 2);
+new_p1_img_ind = (new_p1_img + u_x_max)/x_stp_smp + 1;
+new_p2_img_ind = (new_p2_img + u_x_max)/x_stp_smp + 1;
+% mask_invalid_0 = (new_p1_img_ind >= 1).*(new_p1_img_ind <= size(LF, 1)).*(new_p2_img_ind >= 1).*(new_p2_img_ind <= size(LF, 2));
+% % new_p1_img_ind = new_p1_img_ind.*mask_invalid_0 + not(mask_invalid_0);
+% new_p2_img_ind = new_p2_img_ind.*mask_invalid_0 + not(mask_invalid_0);
+
+cost_warp_mask0 = interp2D_bkw(cost_mask.*mask_invalid_0, new_p1_img_ind, new_p2_img_ind).*LF;
+
+% cost_warp_mask1 = interp2(cost_mask.*mask_invalid_0, new_p1_img_ind, new_p2_img_ind,'linear').*LF(:, :, i1, i2);
+
+%calculate the score
+cost_0 = cost_0 + sum(sum(cost_warp_mask0));
+mask_invalid_1 = ones(size(LF, 1), size(LF, 2),"gpuArray");
+
+% Implement delta perturbation
+per_disp_mask = zeros(size(disp_mask), "gpuArray");
+per_disp_mask(:, :, 1) = disp_mask(:, :, 1) + delta(1);
+per_disp_mask(:, :, 2) = disp_mask(:, :, 2) + delta(2);
+
+% Repeat calculation to find the original location on the
+% illumination plane
+new_p1_img = g1 + per_disp_mask(:, :, 1);
+new_p2_img = g2 + per_disp_mask(:, :, 2);
+new_p1_img_ind = (new_p1_img + u_x_max)/x_stp_smp + 1;
+new_p2_img_ind = (new_p2_img + u_x_max)/x_stp_smp + 1;
+% mask_invalid_1(:, :, ax) = (new_p1_img_ind >= 1).*(new_p1_img_ind <= size(LF, 1)).*(new_p2_img_ind >= 1).*(new_p2_img_ind <= size(LF, 2));
+% new_p1_img_ind = new_p1_img_ind.*mask_invalid_1(: ,:, ax) + not(mask_invalid_1(:, :, ax));
+% new_p2_img_ind = new_p2_img_ind.*mask_invalid_1(:, :, ax) + not(mask_invalid_1(:, :, ax));
+cost_warp_mask1 = interp2D_bkw(cost_mask.*mask_invalid_1(: ,:), new_p1_img_ind, new_p2_img_ind).*LF;
+
+t_grad = (cost_warp_mask1 - cost_warp_mask0).*min(mask_invalid_0, mask_invalid_1(:, :));
+% grad(:, :, 1) = grad(:, :, 1) + t_grad*delta(1)/max(10^-3, norm(delta));
+% grad(:, :, 2) = grad(:, :, 2) + t_grad*delta(2)/max(10^-3, norm(delta));
+    
+if calc_LF_flag
+    LF_frw = interp2D_frw(LF, new_p1_img_ind, new_p2_img_ind);
+end 
+
+% grad = gpuArray(grad);
+
+
+end
+%grad = grad / delta;

@@ -1,0 +1,270 @@
+% Load an existing result of the simulator or calculate a new one
+if input("Use light field Marina got? (y/n)", "s") == "y"
+    load 2024_03_05_10_18_10_chicken_light_field_BSI_4beads.mat
+else
+    if input("Use pre-computed random abberation layer? (y/n)", "s") == "y"
+        load example_LF.mat
+    else
+        if input("Use pre-computed sinus abberation layer? (y/n)", "s") == "y"
+            load LF_sinus.mat
+        else
+            if input("Use pre-computed parabolic abberation layer? (y/n)", "s") == "y"
+                load LF_parabolic.mat
+            else
+                test_BuildTMat_LF_smp;
+            end
+        end
+    end
+end
+
+% Is this used for testing from simulator
+if exist("mask_s", "var")
+    % Making sure the phase mask matrix is gpuArray
+    if class(mask_s) ~= "gpuArray"
+        mask_s = gpuArray(mask_s);
+    end
+
+    stp_ratio = 1; % ratio between the step_sizes of u_x_max and x_max
+    ind=(ceil(Nl/2)); % index of the central bead
+    
+    % cost mask initilization and 1/9 bead illumination
+    cost_mask = zeros(length(LF1), length(LF1)); %initilization of the cost mask (where are the points)
+    if input("Use 1 bead illumination or 9 point illumination? (1/9)", "s") == "1"
+        cost_mask(ceil(length(LF1)/2), ceil(length(LF1)/2)) = 1; % cost mask measures at the center pixel
+        LF = LF1;
+    else
+        [row, col] = find(reshape(sum(uin,2), sqrt(length(uin)), sqrt(length(uin))));
+        for i = row(:)
+            for j = col(:)
+                cost_mask(ceil(i/smp_stp), ceil(j/smp_stp)) = 1; % cost mask measures at the center pixel
+            end
+        end
+        LF = LF9;
+    end
+    cost_mask = gpuArray(cost_mask); % Some of the indices in [row,col] repeat so cost_mask is initialized on the CPU then transferred to GPU
+    
+    % Smoothing the cost mask
+    g_filt = gpuArray(exp(-0.5/1.5^2*(-5:5).^2)); %1.5 is the variance of the gaussian
+    cost_mask = conv2(g_filt, g_filt', cost_mask, "same");
+else
+    if input("Use precalculated LF and cost_mask? (y/n)", "s") == "n"
+        f1 = 10*10^4; % f of first lens
+        f2 = 20*10^4; % f of second lens
+        f3 = 1*10^4; % f of thrid lens (objective)
+        slm_pix_size = 8; % Size of each pixel in the SLM
+        pos_ctrs = APT.apt_pos_ctrs(1:5, 1);% Relevant coordinates of the centers of the light-field apertures on the SLM (only first column of windows)
+        % pos_ctrs = pos_ctrs - pos_ctrs(ceil(length(pos_ctrs)/2)); % Transforming to displacement from center
+        % lf_ang_grid = (pos_ctrs*slm_pix_size)/(f1) * 20; % Transforming displacements to sin(a) (angles), 20 is the magnification
+        left_pix = 92; % This pixel represents in Fourier space sin(theta)=-0.5, and is the left-most pixel to enter the NA
+        right_pix = 310; % This pixel represents in Fourier space sin(theta)=0.5, and is the right-most pixel to enter the NA
+        ang_res = 9; %resolution of the angle search within [left_pix, right_pix]
+        lf_ang_grid = -0.5:1/ang_res:0.5; % initialize the angle grid for search
+        lf_ang_grid=lf_ang_grid-mean(lf_ang_grid);
+        bin_size = (right_pix-left_pix)/ang_res; % divide the search space to bins acoording to the resolution
+        bin_locs = ceil((pos_ctrs-left_pix)/bin_size); % allocate each center_pos to a bin
+        lf_ang_grid = lf_ang_grid(bin_locs); % Decide which angle goes to each pos_ctr
+        lf_ang_grid = lf_ang_grid - mean(lf_ang_grid); % Centr the choices
+        Na = sqrt(size(Images_apt, 3));
+        lambda = 0.52;
+        x_stp = 0.27;
+        LF = zeros([size(Images_apt, 1), size(Images_apt, 2), sqrt(size(Images_apt, 3)), sqrt(size(Images_apt, 3))], "gpuArray");
+        for i = 1:sqrt(size(Images_apt, 3))
+            for j = 1:sqrt(size(Images_apt, 3))
+                LF(:, :, j, i) = Images_apt(:, :, (i-1)*sqrt(size(Images_apt, 3))+j);
+            end
+        end
+    
+        % Resize validation camera image to fit the sampling camera size\
+        I_val = imresize(I_val, 0.6758, "bilinear");
+        I_val = max(I_val - median(I_val(:))*4, 0);
+    
+        % Find the shift (in pixels) which gives highest correlation between
+        % the center light-field and the validation
+        center_LF = Images_apt(:, :, 13);
+        n1 = size(center_LF, 1);
+        n2 = size(center_LF, 2);
+        offset = (1/3)*length(I_val); % We don't need to measure correlation with the entire cost_mask, only with about 2/3 of it
+        I_val_corr = zeros([size(I_val, 1)+n1*2, size(I_val, 2)+n2*2], "gpuArray");
+        I_val_corr(n1+1:n1+size(I_val, 1),n2+1:n2+size(I_val, 2)) = I_val(:,:);
+        best_corr = 0; %initialize best correlation holder
+        best_corr_inds = [0, 0]; %initialize best correlation indices holder
+        for i = 1:size(I_val, 1)+n1
+            for j = 1:size(I_val, 2)+n2
+                corr = sum(sum(I_val_corr(i:i+n1-1, j:j+n2-1).*center_LF)); % calculate correlation
+                corr_m(i, j) = corr;
+                if corr > best_corr
+                    best_corr_inds = [i, j];
+                    best_corr = corr;
+                end
+            end
+        end
+    
+        I_val_cut = I_val_corr(best_corr_inds(1)+1:best_corr_inds(1)+n1, best_corr_inds(2)+1: best_corr_inds(2)+n2);
+    
+        % cost_mask = zeros(length(LF), length(LF)); %initilization of the cost mask (where are the points)
+        cost_mask = gpuArray(I_val_cut); % Cost mask is the validation image
+        % cost_mask = gpuArray(cost_mask); % Legacy: Some of the indices in [row,col] repeat so cost_mask is initialized on the CPU then transferred to GPU
+        
+        % Smoothing the cost mask
+        g_filt = gpuArray(exp(-0.5/2^2*(-8:8).^2)); 
+        cost_mask = conv2(g_filt, g_filt', cost_mask, "same");
+        cost_mask = max(cost_mask - median(cost_mask(:))*2, 0);
+    else
+        load marina_4_beads_ws.mat
+    end
+    u_x_max = floor(length(cost_mask)/2)*x_stp; % = floor(num of pixels * x_stp/2) num of pixels should be odd
+    
+    % Try GD with different z_abrr values
+    z_abrr = linspace(30, 500, 20);
+
+    x_max = u_x_max + ceil(0.5*max(z_abrr)/x_stp)*x_stp; % add the numerical aperture dilation to the aberration layer
+    Nxw = x_max/x_stp*2+1;
+    stp_ratio = 1; % ratio between the step_sizes of u_x_max and x_max
+    smp_stp = 1;
+    x_
+end
+
+% Use standard x-y steps or diagonal steps
+if input("Use standard x-y steps or diagonal steps? (s/d)", "s") == "d"
+    diag_flag = true;
+else
+    diag_flag = false;
+end
+
+
+% Initialize a  phase mask as a starting point for the
+% G.D
+if ~diag_flag
+    init_mask = initialize_mask([size(LF, 1), size(LF, 2), size(LF, 3), size(LF, 3), 2], "zeros");
+end
+
+% Calculate displacement ground truth if this is a result from the
+% simulator
+if exist("mask_s", "var")
+    [gt_disp, LF_gt] = calc_disp(LF, Na, stp_ratio, -mask_s, z_abrr, x_stp*smp_stp, x_max, lf_ang_grid, u_x_max, true);
+    title("Corrected LF using the simulation output of slope mask");
+    displayLF(squeeze(gt_disp(:, :, :, :, 1)), 1); title("Ground Truth mask ax=1");colorbar;
+    displayLF(squeeze(gt_disp(:, :, :, :, 2)), 1); title("Ground Truth mask ax=2");colorbar;
+end
+
+
+% Perform GD iterations and plot summed difference from the real mask
+gd_iter_num = 12; % number of GD steps
+k_limit = 25; % Range of gradient step_size values
+k_num = 25; % resolution of sampling in the range
+gd_step = 1; % G.D step size
+g_filt_var = 100; %variance of the gaussian filter for the gradients
+thresh_cof = 1; % Parameter deciding the "strength" of the thresholding of the gradient
+
+%initialize mask for diagonal steps
+if diag_flag
+    init_mask = zeros([size(LF, 1), size(LF, 2), size(LF ,3), size(LF, 4), 2], "gpuArray");
+end
+
+
+% for k_num = [7, 9]
+%     for k_limit = [7, 9, 11]
+%         for g_filt_var = [5, 7.5, 10, 12.5, 15]
+%             for thresh_cof = [0.05, 0.2, 0.5, 1]
+%                 init_mask = zeros(size(LF, 1), size(LF, 2), size(LF, 3), size(LF, 3), 2, "gpuArray");
+%                 gd_cost = zeros([gd_iter_num, 1], "gpuArray");
+%                 [init_mask, gd_cost, opt_over_early] = perform_gd_disp(LF, init_mask, gd_iter_num, Na, smp_stp, x_stp, u_x_max, cost_mask, k_num, k_limit, gd_step, g_filt_var, thresh_cof);
+%                 [~, ~, ~, ~] = calc_grad_disp(LF, Na, init_mask, x_stp*smp_stp, u_x_max, cost_mask,0, true); colorbar;
+%                 displayLF(squeeze(init_mask(:, :, :, :, 1)), 1); title("mask ax=1"); colorbar;
+%                 displayLF(squeeze(init_mask(:, :, :, :, 2)), 1); title("mask ax=2"); colorbar;
+%                 figure; hold on; plot(1:gd_iter_num, gd_cost, "r-o");
+%                 [maximum, maxloc] = max(gd_cost);
+%                 xline(maxloc, "Color", "r", "LineWidth", 2)
+%                 textLabel = sprintf("Max at iter=%.0f of %.5e", maxloc, maximum);
+%                 text(3, gd_cost(3), textLabel, "FontSize", 15, "Color", "r")
+%                 xlabel("GD iteration #"); ylabel("score");
+%                 title("k_limit = " + k_limit + " k_num = " + k_num + "g_var = " + g_filt_var + " thresh_cof=" + thresh_cof)
+%                 legend show
+%                 hold off
+%                 % save figues
+%                 folderPath = "/home/itaio/new_sim_backward/images/disp/k_optim_sim_sine";
+%                 resolution = 1000;
+% 
+%                 if ~exist(folderPath, 'dir')
+%                     mkdir(folderPath);
+%                 end
+% 
+%                 figHandles = findall(groot, 'Type', 'figure');
+% 
+%                 for i=1:length(figHandles)
+%                     figHandle = figHandles(i);
+%                     fileName = fullfile(folderPath, ['k_num=' num2str(k_num) '_k_limit=' num2str(k_limit) '_g_var=' num2str(g_filt_var) '_thresh_cof=' num2str(thresh_cof) '_Figure_' num2str(figHandle.Number) '.png']);
+%                     exportgraphics(figHandle, fileName, 'Resolution', resolution)
+%                 end
+%                 close all
+%             end
+%         end
+%     end
+% end
+% keyboard
+
+if size(z_abrr) == 1
+    displayLF(LF, 1);
+    % [~, ~, ~, ~] = calc_grad_disp(LF, Na, init_mask, x_stp*smp_stp, u_x_max, cost_mask,0, true);
+    if diag_flag
+        [init_mask, gd_cost, opt_over_early] = perform_gd_disp_diag(LF, init_mask, gd_iter_num, Na, smp_stp, x_stp, u_x_max, cost_mask, k_num, k_limit, gd_step, g_filt_var, thresh_cof);
+    else
+        [init_mask, gd_cost, opt_over_early] = perform_gd_disp(LF, init_mask, gd_iter_num, Na, smp_stp, x_stp, u_x_max, cost_mask, k_num, k_limit, gd_step, g_filt_var, thresh_cof);
+    end
+    displayLF(squeeze(init_mask(:, :, :, :, 1)), 1); title("mask ax=1");
+    displayLF(squeeze(init_mask(:, :, :, :, 2)), 1); title("mask ax=2");
+    [~, ~, ~, lf] = calc_grad_disp(LF, Na, init_mask, x_stp*smp_stp, u_x_max, cost_mask,0, true);
+    if diag_flag
+        figure; hold on;
+        for i = 1:size(gd_cost, 2)
+            for j = 1:size(gd_cost, 3)
+                plot(1:gd_iter_num, squeeze(gd_cost(:, i, j)), "-o", DisplayName=sprintf("viewpoint: [%.0f, %.0f]", i, j));
+            end
+        end
+        legend;
+    else
+        figure;hold on; plot(1:gd_iter_num, gd_cost, "r-o");
+    end
+    % beta1 = 0.9;
+    % beta2 = 0.999;
+    % epsilon = 1e-8;
+    % [x, cost_history] = adam_optim(LF, Na, init_mask, x_stp, smp_stp, u_x_max, cost_mask, 5, beta1, beta2, epsilon, gd_iter_num);
+    % [~, ~, ~, ~] = calc_grad_disp(LF, Na, init_mask, x_stp*smp_stp, u_x_max, cost_mask,0, true);
+else
+    displayLF(LF, 1);
+    LF = LF.*(LF>1.5*median(LF, "all"));
+    displayLF(LF, 1);
+    if ~diag_flag
+        init_mask = zeros(size(LF, 1), size(LF, 2), size(LF, 3), size(LF, 3), 2, "gpuArray");
+        [init_mask, gd_cost, opt_over_early] = perform_gd_disp(LF, init_mask, gd_iter_num, Na, smp_stp, x_stp, u_x_max, cost_mask, k_num, k_limit, gd_step, g_filt_var, thresh_cof);
+    else
+        [init_mask, gd_cost, opt_over_early] = perform_gd_disp_diag(LF, init_mask, gd_iter_num, Na, smp_stp, x_stp, u_x_max, cost_mask, k_num, k_limit, gd_step, g_filt_var, thresh_cof);
+    end
+    displayLF(squeeze(init_mask(:, :, :, :, 1)), 1); title("mask ax=1");colorbar;
+    displayLF(squeeze(init_mask(:, :, :, :, 2)), 1); title("mask ax=2");colorbar;
+    [~, ~, ~, lf] = calc_grad_disp(LF, Na, init_mask, x_stp*smp_stp, u_x_max, cost_mask, 0, true);
+    if diag_flag
+        figure; hold on;
+        for i = 1:size(gd_cost, 2)
+            for j = 1:size(gd_cost, 3)
+                plot(1:gd_iter_num, squeeze(gd_cost(:, i, j)), "-o", DisplayName=sprintf("viewpoint: [%.0f, %.0f]", i, j));
+            end
+        end
+        legend;
+    else
+        figure;hold on; plot(1:gd_iter_num, gd_cost, "r-o");
+    end
+end
+
+keyboard
+
+if exist("mask_s", "var")
+    [~, ideal_cost, ~, ~] = calc_grad(LF, Na, Nxw, smp_stp, stp_ratio, -mask_s, z_abrr, x_stp*smp_stp, x_max, lf_ang_grid, u_x_max, cost_mask, 0, false); % The so-called ideal cost, score of the mask from the simulation
+end
+init_cost = min(gd_cost, [], "all"); % initial cost of init_mask
+figure; hold on; plot(1:gd_iter_num, (gd_cost-ones(size(gd_cost))*init_cost)/init_cost*100, "r-o", "DisplayName", "w.r.t initial score");
+figure; hold on; plot(1:gd_iter_num, gd_cost, "r-o", "DisplayName", "w.r.t initial score");
+% plot(1:gd_iter_num, gd_cost/ideal_cost*100, "b-o", "DisplayName", "w.r.t score of the simulation mask")
+xlabel("GD iteration #"); ylabel("% improvement");
+legend show
+hold off
