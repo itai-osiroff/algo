@@ -1,0 +1,1 @@
+# This script holds functions which are meant to load data from .mat files, convert them to numpy objects and return them for use
