@@ -17,10 +17,8 @@
 3.  **Basic Utility Translation:**
     *   **Data I/O:**
         *   Python functions to load data from `.mat` files (e.g., `example_LF.mat`, `LF_parabolic.mat`, `LF_sinus.mat`). These will serve as key test inputs.
-        *   Translate `save_figures.m` using `matplotlib.pyplot.savefig`.
     *   **Visualization Wrappers:**
         *   Translate `displayLF.m`, `displayLF_real.m`, and `show_LF_grid.m` to Python/Matplotlib.
-    *   **Simple Helpers:** Translate functions like `smpctr.m`.
 4.  **Initial GPU Setup:**
     *   Test CuPy for basic GPU array operations.
     *   Helper functions for CPU (NumPy) <-> GPU (CuPy) data transfers.
