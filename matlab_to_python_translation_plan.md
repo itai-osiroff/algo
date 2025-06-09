@@ -4,19 +4,19 @@
 
 ## Phase 1: Foundation & Basic Utilities
 
-- [ ] **Environment Setup:**
-    - [ ] Create a Python environment (e.g., using Conda or venv).
-    - [ ] Install core libraries:
-        - [ ] `numpy`: For numerical operations (CPU).
-        - [ ] `scipy`: For `.mat` file I/O (`scipy.io.loadmat`, `scipy.io.savemat`), interpolation (`scipy.interpolate`), signal processing (`scipy.signal`, specifically `convolve2d`).
-        - [ ] `matplotlib`: For 2D plotting.
-        - [ ] `cupy`: For GPU-accelerated array computations (NVIDIA GPUs).
-        - [ ] `scikit-image`: For image processing utilities like `skimage.transform.resize` (for `imresize`).
-- [ ] **Project Structure:**
-    - [ ] Establish a clear Python project directory (e.g., `python_lf_correction`) with subdirectories for source code (`src`), tests (`tests`), data (`data`), and scripts (`scripts`).
+- [-] **Environment Setup:**
+    - [-] Create a Python environment (e.g., using Conda or venv).
+    - [-] Install core libraries:
+        - [-] `numpy`: For numerical operations (CPU).
+        - [-] `scipy`: For `.mat` file I/O (`scipy.io.loadmat`, `scipy.io.savemat`), interpolation (`scipy.interpolate`), signal processing (`scipy.signal`, specifically `convolve2d`).
+        - [-] `matplotlib`: For 2D plotting.
+        - [-] `cupy`: For GPU-accelerated array computations (NVIDIA GPUs).
+        - [-] `scikit-image`: For image processing utilities like `skimage.transform.resize` (for `imresize`).
+- [-] **Project Structure:**
+    - [-] Establish a clear Python project directory (e.g., `python_lf_correction`) with subdirectories for source code (`src`), tests (`tests`), data (`data`), and scripts (`scripts`).
 - [ ] **Basic Utility Translation:**
-    - [ ] **Data I/O:**
-        - [ ] Python functions to load data from `.mat` files (e.g., `example_LF.mat`, `LF_parabolic.mat`, `LF_sinus.mat`). These will serve as key test inputs.
+    - [-] **Data I/O:**
+        - [-] Python functions to load data from `.mat` files (e.g., `example_LF.mat`, `LF_parabolic.mat`, `LF_sinus.mat`). These will serve as key test inputs.
     - [ ] **Visualization Wrappers:**
         - [ ] Translate `displayLF.m`, `displayLF_real.m`, and `show_LF_grid.m` to Python/Matplotlib.
 - [ ] **Initial GPU Setup:**
