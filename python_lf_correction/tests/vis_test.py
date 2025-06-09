@@ -6,4 +6,5 @@ from matlab_data_load import load_mat_file
 from vis_wrappers import displayLF
 
 data = load_mat_file("matlab\example_LF.mat")
-mask = data["mask"]
+mask = data["mask_s"]
+displayLF(mask, border=0)

@@ -4,93 +4,93 @@
 
 ## Phase 1: Foundation & Basic Utilities
 
-1.  **Environment Setup:**
-    *   Create a Python environment (e.g., using Conda or venv).
-    *   Install core libraries:
-        *   `numpy`: For numerical operations (CPU).
-        *   `scipy`: For `.mat` file I/O (`scipy.io.loadmat`, `scipy.io.savemat`), interpolation (`scipy.interpolate`), signal processing (`scipy.signal`, specifically `convolve2d`).
-        *   `matplotlib`: For 2D plotting.
-        *   `cupy`: For GPU-accelerated array computations (NVIDIA GPUs).
-        *   `scikit-image`: For image processing utilities like `skimage.transform.resize` (for `imresize`).
-2.  **Project Structure:**
-    *   Establish a clear Python project directory (e.g., `python_lf_correction`) with subdirectories for source code (`src`), tests (`tests`), data (`data`), and scripts (`scripts`).
-3.  **Basic Utility Translation:**
-    *   **Data I/O:**
-        *   Python functions to load data from `.mat` files (e.g., `example_LF.mat`, `LF_parabolic.mat`, `LF_sinus.mat`). These will serve as key test inputs.
-    *   **Visualization Wrappers:**
-        *   Translate `displayLF.m`, `displayLF_real.m`, and `show_LF_grid.m` to Python/Matplotlib.
-4.  **Initial GPU Setup:**
-    *   Test CuPy for basic GPU array operations.
-    *   Helper functions for CPU (NumPy) <-> GPU (CuPy) data transfers.
-5.  **Checkpoint & Testing Strategy (Phase 1):**
-    *   **Goal:** Load MATLAB data (especially `LF_parabolic.mat`, `LF_sinus.mat`), perform basic manipulations, visualize in Python matching MATLAB plots.
-    *   **Testing:** Visual comparison, test data transfers.
+- [ ] **Environment Setup:**
+    - [ ] Create a Python environment (e.g., using Conda or venv).
+    - [ ] Install core libraries:
+        - [ ] `numpy`: For numerical operations (CPU).
+        - [ ] `scipy`: For `.mat` file I/O (`scipy.io.loadmat`, `scipy.io.savemat`), interpolation (`scipy.interpolate`), signal processing (`scipy.signal`, specifically `convolve2d`).
+        - [ ] `matplotlib`: For 2D plotting.
+        - [ ] `cupy`: For GPU-accelerated array computations (NVIDIA GPUs).
+        - [ ] `scikit-image`: For image processing utilities like `skimage.transform.resize` (for `imresize`).
+- [ ] **Project Structure:**
+    - [ ] Establish a clear Python project directory (e.g., `python_lf_correction`) with subdirectories for source code (`src`), tests (`tests`), data (`data`), and scripts (`scripts`).
+- [ ] **Basic Utility Translation:**
+    - [ ] **Data I/O:**
+        - [ ] Python functions to load data from `.mat` files (e.g., `example_LF.mat`, `LF_parabolic.mat`, `LF_sinus.mat`). These will serve as key test inputs.
+    - [ ] **Visualization Wrappers:**
+        - [ ] Translate `displayLF.m`, `displayLF_real.m`, and `show_LF_grid.m` to Python/Matplotlib.
+- [ ] **Initial GPU Setup:**
+    - [ ] Test CuPy for basic GPU array operations.
+    - [ ] Helper functions for CPU (NumPy) <-> GPU (CuPy) data transfers.
+- [ ] **Checkpoint & Testing Strategy (Phase 1):**
+    - [ ] **Goal:** Load MATLAB data (especially `LF_parabolic.mat`, `LF_sinus.mat`), perform basic manipulations, visualize in Python matching MATLAB plots.
+    - [ ] **Testing:** Visual comparison, test data transfers.
 
 ## Phase 2: Core Signal Processing & Simulation Components
 
-1.  **Convolution & Propagation:**
-    *   Translate `frq_conv.m` using NumPy/SciPy FFTs.
-    *   Translate `getPropConvKerFreq3D_cyc.m`.
-    *   Handle `conv2` calls (from Image Processing Toolbox) using `scipy.signal.convolve2d`, ensuring correct parameter mapping (e.g., `shape`).
-2.  **Interpolation & Resizing:**
-    *   Translate `interp2D_bkw.m` and `interp2D_frw.m` using `scipy.interpolate` functions.
-    *   Handle `imresize` calls (from Image Processing Toolbox) using `skimage.transform.resize` or `scipy.ndimage.zoom`, matching interpolation methods and anti-aliasing.
-3.  **Correlation:** Translate `xcorr2_fft.m`.
-4.  **Simulation/Data Generation Components (as needed for testing):**
-    *   Translate `smpPhaseMask_GaussB.m`.
-    *   Translate `getLayerd_To_LF_and_hr.m`.
-    *   Translate `LFsin.m`.
-5.  **Checkpoint & Testing Strategy (Phase 2):**
-    *   **Goal:** Core signal processing functions numerically validated.
-    *   **Testing:** Unit tests for each function. Compare Python (NumPy/CuPy) outputs against MATLAB outputs using `numpy.testing.assert_allclose` with appropriate tolerance, using data from `LF_parabolic.mat` and `LF_sinus.mat` as inputs where applicable.
+- [ ] **Convolution & Propagation:**
+    - [ ] Translate `frq_conv.m` using NumPy/SciPy FFTs.
+    - [ ] Translate `getPropConvKerFreq3D_cyc.m`.
+    - [ ] Handle `conv2` calls (from Image Processing Toolbox) using `scipy.signal.convolve2d`, ensuring correct parameter mapping (e.g., `shape`).
+- [ ] **Interpolation & Resizing:**
+    - [ ] Translate `interp2D_bkw.m` and `interp2D_frw.m` using `scipy.interpolate` functions.
+    - [ ] Handle `imresize` calls (from Image Processing Toolbox) using `skimage.transform.resize` or `scipy.ndimage.zoom`, matching interpolation methods and anti-aliasing.
+- [ ] **Correlation:** Translate `xcorr2_fft.m`.
+- [ ] **Simulation/Data Generation Components (as needed for testing):**
+    - [ ] Translate `smpPhaseMask_GaussB.m`.
+    - [ ] Translate `getLayerd_To_LF_and_hr.m`.
+    - [ ] Translate `LFsin.m`.
+- [ ] **Checkpoint & Testing Strategy (Phase 2):**
+    - [ ] **Goal:** Core signal processing functions numerically validated.
+    - [ ] **Testing:** Unit tests for each function. Compare Python (NumPy/CuPy) outputs against MATLAB outputs using `numpy.testing.assert_allclose` with appropriate tolerance, using data from `LF_parabolic.mat` and `LF_sinus.mat` as inputs where applicable.
 
 ## Phase 3: Forward & Backward Light-Field Models
 
-1.  **Displacement Calculation:** Translate `calc_disp.m`.
-2.  **Backward Projection/Correction:** Translate `calc_back.m`.
-3.  **Checkpoint & Testing Strategy (Phase 3):**
-    *   **Goal:** Main light-field transformation models validated.
-    *   **Testing:** Compare output arrays (displacement fields, corrected LFs) from Python against MATLAB versions using shared input data (e.g., from `LF_parabolic.mat`). Visualize results.
+- [ ] **Displacement Calculation:** Translate `calc_disp.m`.
+- [ ] **Backward Projection/Correction:** Translate `calc_back.m`.
+- [ ] **Checkpoint & Testing Strategy (Phase 3):**
+    - [ ] **Goal:** Main light-field transformation models validated.
+    - [ ] **Testing:** Compare output arrays (displacement fields, corrected LFs) from Python against MATLAB versions using shared input data (e.g., from `LF_parabolic.mat`). Visualize results.
 
 ## Phase 4: Gradient and Cost Functions
 
-1.  **Gradient Calculations:** Translate `calc_grad.m`, `calc_grad_disp.m`, `calc_grad_disp_diag.m`.
-2.  **Numerical Gradient (for testing):** Translate `calc_num_grad.m`.
-3.  **Cost Functions:** Translate `naive_cost.m` and ensure cost values from gradient functions are consistent.
-4.  **Checkpoint & Testing Strategy (Phase 4):**
-    *   **Goal:** Gradient and cost calculations numerically accurate.
-    *   **Testing:** Compare Python outputs with MATLAB. Use translated `calc_num_grad` (Python) to verify analytical gradients in Python.
+- [ ] **Gradient Calculations:** Translate `calc_grad.m`, `calc_grad_disp.m`, `calc_grad_disp_diag.m`.
+- [ ] **Numerical Gradient (for testing):** Translate `calc_num_grad.m`.
+- [ ] **Cost Functions:** Translate `naive_cost.m` and ensure cost values from gradient functions are consistent.
+- [ ] **Checkpoint & Testing Strategy (Phase 4):**
+    - [ ] **Goal:** Gradient and cost calculations numerically accurate.
+    - [ ] **Testing:** Compare Python outputs with MATLAB. Use translated `calc_num_grad` (Python) to verify analytical gradients in Python.
 
 ## Phase 5: Optimization Algorithms
 
-1.  **Optimization Step Functions:** Translate `perform_g_d_step.m`, `perform_g_d_step_disp.m`, `perform_g_d_step_disp_diag.m`.
-2.  **Main Optimization Loops (Direct Translation Focus):** Translate `perform_gd.m`, `perform_gd_disp.m`, `perform_gd_disp_diag.m`, `adam_optim.m`.
-3.  **Initialization:** Translate `initialize_mask.m`.
-4.  **Checkpoint & Testing Strategy (Phase 5):**
-    *   **Goal:** Optimization routines run and produce comparable results/behavior to MATLAB.
-    *   **Testing:** Use test cases from MATLAB (e.g., from `LF_parabolic.mat`, `LF_sinus.mat` or by saving intermediate MATLAB states). Compare cost histories and final optimized masks.
+- [ ] **Optimization Step Functions:** Translate `perform_g_d_step.m`, `perform_g_d_step_disp.m`, `perform_g_d_step_disp_diag.m`.
+- [ ] **Main Optimization Loops (Direct Translation Focus):** Translate `perform_gd.m`, `perform_gd_disp.m`, `perform_gd_disp_diag.m`, `adam_optim.m`.
+- [ ] **Initialization:** Translate `initialize_mask.m`.
+- [ ] **Checkpoint & Testing Strategy (Phase 5):**
+    - [ ] **Goal:** Optimization routines run and produce comparable results/behavior to MATLAB.
+    - [ ] **Testing:** Use test cases from MATLAB (e.g., from `LF_parabolic.mat`, `LF_sinus.mat` or by saving intermediate MATLAB states). Compare cost histories and final optimized masks.
 
 ## Phase 6: High-Level Scripts, Integration, and Robust Alignment
 
-1.  **Testing/Driver Script Translation:** Translate `Backward.m`, `grad_testing.m`, `g_d_testing.m`, `g_d_testing_disp.m`, etc.
-2.  **Full Workflow Validation:** Run complete workflows. Compare final outputs and scientific outcomes with MATLAB.
-3.  **Robust Alignment:** Focus on ensuring the Python version faithfully replicates the MATLAB algorithm's behavior and outputs (within acceptable numerical tolerances) using the provided test `.mat` files.
-4.  **Checkpoint & Testing Strategy (Phase 6):**
-    *   **Goal:** Achieve robust alignment with MATLAB code. The Python version is a reliable functional equivalent.
-    *   **Testing:** End-to-end tests.
+- [ ] **Testing/Driver Script Translation:** Translate `Backward.m`, `grad_testing.m`, `g_d_testing.m`, `g_d_testing_disp.m`, etc.
+- [ ] **Full Workflow Validation:** Run complete workflows. Compare final outputs and scientific outcomes with MATLAB.
+- [ ] **Robust Alignment:** Focus on ensuring the Python version faithfully replicates the MATLAB algorithm's behavior and outputs (within acceptable numerical tolerances) using the provided test `.mat` files.
+- [ ] **Checkpoint & Testing Strategy (Phase 6):**
+    - [ ] **Goal:** Achieve robust alignment with MATLAB code. The Python version is a reliable functional equivalent.
+    - [ ] **Testing:** End-to-end tests.
 
 ## Phase 7: Further Python Development (Post-Alignment)
 
-1.  **Algorithm Completion & Enhancement:** Proceed with further algorithmic development and completion in Python as planned.
-2.  **Pythonic Refinements (Optional):** Review and refactor code for Python best practices, improved readability, and potentially leveraging more advanced features of Python libraries if beneficial.
+- [ ] **Algorithm Completion & Enhancement:** Proceed with further algorithmic development and completion in Python as planned.
+- [ ] **Pythonic Refinements (Optional):** Review and refactor code for Python best practices, improved readability, and potentially leveraging more advanced features of Python libraries if beneficial.
 
 ## General Considerations (Reiteration):
 
-*   **Version Control (Git).**
-*   **MATLAB vs. Python Idioms:** 1-based vs. 0-based indexing, array operations, slicing, broadcasting, script/function scope.
-*   **GPU Handling (CuPy):** Explicit data movement, use CuPy equivalents for NumPy functions.
-*   **Debugging & Documentation.**
-*   **Testing Rigor:** `numpy.testing.assert_allclose` with appropriate tolerances.
+- [ ] **Version Control (Git).**
+- [ ] **MATLAB vs. Python Idioms:** 1-based vs. 0-based indexing, array operations, slicing, broadcasting, script/function scope.
+- [ ] **GPU Handling (CuPy):** Explicit data movement, use CuPy equivalents for NumPy functions.
+- [ ] **Debugging & Documentation.**
+- [ ] **Testing Rigor:** `numpy.testing.assert_allclose` with appropriate tolerances.
 
 ## Mermaid Diagram: Phased Approach
 
@@ -183,3 +183,4 @@ graph TD
     class Y,L,M,G,P Core_Calculations;
     class H,N,O,Q,R,Z Utilities;
     class S,T,U Data_Generation;
+```
