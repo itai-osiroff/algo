@@ -4,6 +4,8 @@ sys.path.insert(0, './python_lf_correction/lib')
 
 from matlab_data_load import load_mat_file
 from vis_wrappers import displayLF
+import matlab.engine
+
 
 data = load_mat_file("matlab\example_LF.mat")
 mask = data["mask_s"]
