@@ -135,6 +135,7 @@ if __name__ == "__main__":
                     cor = correlate2d(view1, view2, mode="same", boundary="fill")
                     max_cor = np.unravel_index(np.argmax(cor), np.shape(cor))
                     sim_mat[i, j, k, l, :] = max_cor
+    # Display of similarity matrices
     fig_x, ax_x = plt.subplots(nrows=sub_im_num, ncols=sub_im_num, sharex=True, sharey=True)
     fig_y, ax_y = plt.subplots(nrows=sub_im_num, ncols=sub_im_num, sharex=True, sharey=True)
     for idx in range(sub_im_num):    
@@ -147,4 +148,22 @@ if __name__ == "__main__":
             fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
     fig_x.suptitle("X translation similarity")
     fig_y.suptitle("Y translation similarity")
+    plt.show()
+
+    # Show for view (1, 1) the translations and show the average summation
+    rect_images = np.zeros((sub_im_num, sub_im_num, d, d))
+    plt.figure()
+    plt.imshow(views[0, 0], cmap='gray')
+    for idx in range(sub_im_num):
+        for jdx in range(sub_im_num):
+            warp_mat = np.squeeze(np.array([[[1, 0, sim_mat[0, 0, idx, jdx, 1]], [0, 1, sim_mat[0, 0, idx, jdx, 0]]]]))
+            rect_im = cv.warpAffine(views[idx, jdx], warp_mat, (views[idx, jdx].shape[1], views[idx, jdx].shape[0]))
+            rect_images[idx, jdx] = rect_im
+            plt.figure()
+            plt.imshow(rect_im, cmap="gray")
+    plt.show()
+
+    av_rect = np.mean(rect_images, axis=(0, 1))
+    plt.figure()
+    plt.imshow(av_rect, cmap="gray")
     plt.show()
