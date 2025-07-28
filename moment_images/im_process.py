@@ -133,8 +133,8 @@ if __name__ == "__main__":
         for jdx in range(sub_im_num): 
             im_x = ax_x[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 1], cmap="gray")
             im_y = ax_y[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 0], cmap="gray")
-            ax_x[idx, jdx].set_title(f"Views {idx+1}-{jdx+1} X translation similarity")
-            ax_y[idx, jdx].set_title(f"Views {idx+1}-{jdx+1} Y translation similarity")
+            ax_x[idx, jdx].set_title(f"View {idx+1}-{jdx+1} X translation similarity")
+            ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
             fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
             fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
     fig_x.suptitle("X translation similarity")
