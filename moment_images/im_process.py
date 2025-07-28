@@ -73,6 +73,7 @@ if __name__ == "__main__":
         norm_im = min_max_normalize(im).rotate(-5)
         images[i] = norm_im
         # norm_im.show()
+    circles_chosen = None
     for i, im in enumerate(images):
         cimg = cv.cvtColor(np.array(im),cv.COLOR_GRAY2BGR)
         circles = cv.HoughCircles(np.array(im), cv.HOUGH_GRADIENT, dp=1, minDist=20, param1=50, param2=30, minRadius=50, maxRadius=120)
@@ -88,10 +89,17 @@ if __name__ == "__main__":
         # cv.waitKey(0)
         plt.figure()
         plt.imshow(cimg)
-    cv.destroyAllWindows()
+        plt.show()
+        if input("Use this image for further processing? (y/n): ").lower() =="y":
+            circles_chosen = circles
+            break
+        plt.close("all")
+    # cv.destroyAllWindows()
+    if circles_chosen is None:
+        circles_chosen = circles
 
-    # Let's use the first 2 circles found as the basis for the other circles assuming a square grid
-    windows = circles[0, :2]
+    # Let's use the first 2 circles for one of the images found as the basis for the other circles assuming a square grid
+    windows = circles_chosen[0, :2]
     d = int(np.linalg.norm(windows[0][:2] - windows[1][:2])/np.sqrt(2))
     sub_im_num = 3
     d = np.int_(np.floor(1.1*2*np.max(windows[:, 2])))
