@@ -7,6 +7,6 @@ from vis_wrappers import displayLF
 import matlab.engine
 
 
-data = load_mat_file("matlab\example_LF.mat")
+data = load_mat_file("matlab_files\example_LF.mat")
 mask = data["mask_s"]
 displayLF(mask, border=0)
