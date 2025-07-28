@@ -4,6 +4,8 @@ from PIL import Image
 import numpy as np
 import cv2 as cv
 import matplotlib.pyplot as plt
+from scipy.signal import correlate2d
+from matplotlib import cm
 
 def load_image(image_path):
     """
@@ -113,7 +115,7 @@ if __name__ == "__main__":
     #         cv.destroyAllWindows()
     
     # Check similarity of the views in translation
-    sim_mat = np.zeros((sub_im_num, sub_im_num, sub_im_num, sub_im_num))
+    sim_mat = np.zeros((sub_im_num, sub_im_num, sub_im_num, sub_im_num, 2))
     for i in range(0, sub_im_num):
         for j in range(0, sub_im_num):
             for k in range(i, sub_im_num):
@@ -122,8 +124,19 @@ if __name__ == "__main__":
                         continue
                     view1 = views[i, j]
                     view2 = views[k, l]
-                    
-                    if np.array_equal(view1, view2):
-                        print(f"Views {i+1}-{j+1} and {k+1}-{l+1} are identical.")
-                    else:
-                        print(f"Views {i+1}-{j+1} and {k+1}-{l+1} are different.")
+                    cor = correlate2d(view1, view2, mode="same", boundary="fill")
+                    max_cor = np.unravel_index(np.argmax(cor), np.shape(cor))
+                    sim_mat[i, j, k, l, :] = max_cor
+    fig_x, ax_x = plt.subplots(nrows=sub_im_num, ncols=sub_im_num, sharex=True, sharey=True)
+    fig_y, ax_y = plt.subplots(nrows=sub_im_num, ncols=sub_im_num, sharex=True, sharey=True)
+    for idx in range(sub_im_num):    
+        for jdx in range(sub_im_num): 
+            im_x = ax_x[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 1], cmap="gray")
+            im_y = ax_y[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 0], cmap="gray")
+            ax_x[idx, jdx].set_title(f"Views {idx+1}-{jdx+1} X translation similarity")
+            ax_y[idx, jdx].set_title(f"Views {idx+1}-{jdx+1} Y translation similarity")
+            fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+            fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+    fig_x.suptitle("X translation similarity")
+    fig_y.suptitle("Y translation similarity")
+    plt.show()
