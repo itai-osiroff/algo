@@ -78,7 +78,7 @@ if __name__ == "__main__":
     for i, im in enumerate(images):
         cimg = cv.cvtColor(np.array(im),cv.COLOR_GRAY2BGR)
         circles = cv.HoughCircles(np.array(im), cv.HOUGH_GRADIENT, dp=1, minDist=20, param1=50, param2=30, minRadius=50, maxRadius=120)
-        circles = np.int64(np.around(circles))
+        circles = np.around(circles).astype(np.int64)
         for i in circles[0,:2]:
             # draw the outer circle
             cv.circle(cimg,(i[0],i[1]),i[2],(0,255,0),2)
@@ -93,6 +93,7 @@ if __name__ == "__main__":
         plt.show()
         if input("Use this image for further processing? (y/n): ").lower() =="y":
             circles_chosen = circles
+            norm_im = np.array(im)
             break
         plt.close("all")
     # cv.destroyAllWindows()
@@ -105,7 +106,6 @@ if __name__ == "__main__":
     sub_im_num = 3
     d = np.int_(np.floor(1.1*2*np.max(windows[:, 2])))
     views = np.zeros((sub_im_num, sub_im_num, d, d))
-    norm_im = np.array(norm_im)
     for i in range(0, sub_im_num):
         for j in range(0, sub_im_num):
             x = int(windows[0][0] + (i-sub_im_num//2) * d)
@@ -113,16 +113,18 @@ if __name__ == "__main__":
             if x - (d//2) < 0 or y - (d//2) < 0 or x + (d//2) >= np.shape(norm_im)[0] or y + (d//2) >= np.shape(norm_im)[1]:
                 print(f"Skipping view {i+1}-{j+1} due to out of bounds coordinates.")
                 continue
-            views[i, j, :, :] = np.array(norm_im)[y-(d//2):y+(d//2)+1, x-d//2:x+d//2+1]
+            if (d//2)*2 == np.shape(views)[2]:
+                views[i, j, :, :] = np.array(norm_im)[y-(d//2):y+(d//2), x-d//2:x+d//2]
+            else:
+                views[i, j, :, :] = np.array(norm_im)[y-(d//2):y+(d//2)+1, x-d//2:x+d//2+1]
 
-    # for i in range(0, sub_im_num):
-    #     for j in range(0, sub_im_num):    
-    #         cv.namedWindow(f'view {i+1}-{j+1}', cv.WINDOW_NORMAL)
-    #         view_for_imshow = np.array(min_max_normalize(Image.fromarray(views[i, j])))
-    #         cv.imshow(f'view {i+1}-{j+1}', view_for_imshow)
-    #         cv.waitKey(0)
-    #         cv.destroyAllWindows()
-    
+    for i in range(0, sub_im_num):
+        for j in range(0, sub_im_num):    
+            view_for_imshow = np.array(min_max_normalize(Image.fromarray(views[i, j])))
+            plt.figure()
+            plt.imshow(view_for_imshow, cmap="gray")
+    plt.show()
+    plt.close("all")
     # Check similarity of the views in translation
     sim_mat = np.zeros((sub_im_num, sub_im_num, sub_im_num, sub_im_num, 2))
     for i in range(0, sub_im_num):
