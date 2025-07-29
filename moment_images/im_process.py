@@ -61,8 +61,9 @@ def min_max_normalize(image, min=0, max=255):
 
 if __name__ == "__main__":
     images=[]
-    for f in os.listdir('images'):
-        image_path = os.path.join('images', f)
+    ims_dir = 'moment_images/images'
+    for f in os.listdir(ims_dir):
+        image_path = os.path.join(ims_dir, f)
         image = load_image(image_path)
         if image:
             images.append(image)
@@ -148,7 +149,7 @@ if __name__ == "__main__":
             fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
     fig_x.suptitle("X translation similarity")
     fig_y.suptitle("Y translation similarity")
-    plt.show()
+    # plt.show()
 
     # Show for view (1, 1) the translations and show the average summation
     rect_images = np.zeros((sub_im_num, sub_im_num, d, d))
@@ -156,12 +157,12 @@ if __name__ == "__main__":
     plt.imshow(views[0, 0], cmap='gray')
     for idx in range(sub_im_num):
         for jdx in range(sub_im_num):
-            warp_mat = np.squeeze(np.array([[[1, 0, sim_mat[0, 0, idx, jdx, 1]], [0, 1, sim_mat[0, 0, idx, jdx, 0]]]]))
+            warp_mat = np.squeeze(np.array([[[1, 0, sim_mat[0, 0, idx, jdx, 1]-d//2], [0, 1, sim_mat[0, 0, idx, jdx, 0]-d//2]]]))
             rect_im = cv.warpAffine(views[idx, jdx], warp_mat, (views[idx, jdx].shape[1], views[idx, jdx].shape[0]))
             rect_images[idx, jdx] = rect_im
             plt.figure()
             plt.imshow(rect_im, cmap="gray")
-    plt.show()
+    # plt.show()
 
     av_rect = np.mean(rect_images, axis=(0, 1))
     plt.figure()
