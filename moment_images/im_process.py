@@ -158,7 +158,7 @@ if __name__ == "__main__":
     plt.close("all")
     # Check similarity of the views in translation
     sim_mat = np.zeros((sub_im_num, sub_im_num, sub_im_num, sub_im_num, 2))
-    check_all_views = input("Check akk views for similarity? (y/n): ").lower()
+    check_all_views = input("Check all views for similarity? (y/n): ").lower()
     for i in range(0, sub_im_num):
         if check_all_views != "y" and i != 0:
             continue
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     plt.imshow(views[0, 0], cmap='gray')
     for idx in range(sub_im_num):
         for jdx in range(sub_im_num):
-            warp_mat = np.squeeze(np.array([[[1, 0, sim_mat[0, 0, idx, jdx, 1]-d//2], [0, 1, sim_mat[0, 0, idx, jdx, 0]-d//2]]]))
+            warp_mat = np.squeeze(np.array([[[1, 0, sim_mat[0, 0, idx, jdx, 0]-d//2], [0, 1, sim_mat[0, 0, idx, jdx, 1]-d//2]]]))
             rect_im = cv.warpAffine(views[idx, jdx], warp_mat, (views[idx, jdx].shape[1], views[idx, jdx].shape[0]))
             rect_images[idx, jdx] = rect_im
             plt.figure()
