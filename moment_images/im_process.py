@@ -54,8 +54,12 @@ def min_max_normalize(image, min=0, max=255):
     else:
         max_val = image_array.max()
     
-    normalized_array = (image_array - min_val) / (max_val - min_val) * 255
-    normalized_image = Image.fromarray(normalized_array.astype('uint8'))
+    if min_val == max_val:
+        print("Warning: The image has no variation in pixel values. Returning a blank image.")
+        return image.copy()
+    else:
+        normalized_array = (image_array - min_val) / (max_val - min_val) * 255
+        normalized_image = Image.fromarray(normalized_array.astype('uint8'))
     
     return normalized_image
 
@@ -72,14 +76,41 @@ if __name__ == "__main__":
             print(f"Failed to load image: {f}")
     for i, im in enumerate(images):
         norm_im = min_max_normalize(im).rotate(-5)
-        images[i] = norm_im
+        # norm_im = min_max_normalize(im)
+        images[i] = (im, norm_im)
         # norm_im.show()
     circles_chosen = None
+    search_rad_min = 50
+    search_rad_max = 120
     for i, im in enumerate(images):
-        cimg = cv.cvtColor(np.array(im),cv.COLOR_GRAY2BGR)
-        circles = cv.HoughCircles(np.array(im), cv.HOUGH_GRADIENT, dp=1, minDist=20, param1=50, param2=30, minRadius=50, maxRadius=120)
+        cimg = cv.cvtColor(np.array(im[1]),cv.COLOR_GRAY2BGR)
+        im_np = np.array(im[1])
+        roi_choice = input("Enter ROI strategy (1: All of the image, 2: Center of the image, 3: Centered on maximal pixel): ")
+        if roi_choice == "2":
+            # ROI = Center of the image
+            roi = im_np[np.shape(im_np)[0]//2-search_rad_max*2:np.shape(im_np)[0]//2+search_rad_max*2, np.shape(im_np)[1]//2-search_rad_max*2:np.shape(im_np)[1]//2+search_rad_max*2]
+        elif roi_choice == "3":
+            # ROI = centered on the maximal pixel
+            max_search_im = np.array(cv.GaussianBlur(np.array(im[0]), (51, 51), sigmaX=5, sigmaY=5))
+            max_loc = np.unravel_index(np.argmax(max_search_im), np.shape(max_search_im))
+            roi = im_np[max_loc[0]-search_rad_max*2:max_loc[0]+search_rad_max*2, max_loc[1]-search_rad_max*2:max_loc[1]+search_rad_max*2]
+        else:
+            # ROI = all of image
+            roi = im_np
+        circles = cv.HoughCircles(roi, cv.HOUGH_GRADIENT, dp=1, minDist=20, param1=50, param2=30, minRadius=search_rad_min, maxRadius=search_rad_max)
+        if circles is None or len(circles) == 0:
+            print(f"No circles found in image {i+1}.")
+            continue
         circles = np.around(circles).astype(np.int64)
-        for i in circles[0,:2]:
+        if roi_choice == "2":
+            for i in range(len(circles[0])):
+                circles[0, i, 0] += (np.shape(im_np)[0]//2 - search_rad_max*2)
+                circles[0, i, 1] += (np.shape(im_np)[1]//2 - search_rad_max*2)
+        elif roi_choice == "3":
+            for i in range(len(circles[0])):
+                circles[0, i, 0] += (max_loc[0] - search_rad_max*2)
+                circles[0, i, 1] += (max_loc[1] - search_rad_max*2)
+        for i in circles[0,:2]: # only draw most voted 2 circles
             # draw the outer circle
             cv.circle(cimg,(i[0],i[1]),i[2],(0,255,0),2)
             # draw the center of the circle
@@ -93,7 +124,7 @@ if __name__ == "__main__":
         plt.show()
         if input("Use this image for further processing? (y/n): ").lower() =="y":
             circles_chosen = circles
-            norm_im = np.array(im)
+            norm_im = im_np
             break
         plt.close("all")
     # cv.destroyAllWindows()
@@ -102,9 +133,9 @@ if __name__ == "__main__":
 
     # Let's use the first 2 circles for one of the images found as the basis for the other circles assuming a square grid
     windows = circles_chosen[0, :2]
-    d = int(np.linalg.norm(windows[0][:2] - windows[1][:2])/np.sqrt(2))
+    # d = int(np.linalg.norm(windows[0][:2] - windows[1][:2])/np.sqrt(2)) # Use 2 of the first detected circles
+    d = np.int_(np.floor(1.1*2*np.max(windows[:, 2]))) # Use the maximum radius of the circles found
     sub_im_num = 3
-    d = np.int_(np.floor(1.1*2*np.max(windows[:, 2])))
     views = np.zeros((sub_im_num, sub_im_num, d, d))
     for i in range(0, sub_im_num):
         for j in range(0, sub_im_num):
@@ -127,8 +158,13 @@ if __name__ == "__main__":
     plt.close("all")
     # Check similarity of the views in translation
     sim_mat = np.zeros((sub_im_num, sub_im_num, sub_im_num, sub_im_num, 2))
+    check_all_views = input("Check akk views for similarity? (y/n): ").lower()
     for i in range(0, sub_im_num):
+        if check_all_views != "y" and i != 0:
+            continue
         for j in range(0, sub_im_num):
+            if check_all_views != "y" and j != 0:
+                continue
             for k in range(i, sub_im_num):
                 for l in range(j, sub_im_num):
                     if i == k and j == l:
@@ -137,6 +173,9 @@ if __name__ == "__main__":
                     view2 = views[k, l]
                     cor = correlate2d(view1, view2, mode="same", boundary="fill")
                     max_cor = np.unravel_index(np.argmax(cor), np.shape(cor))
+                    max_cor_val = np.max(cor)
+                    if len(np.transpose(np.nonzero(cor==max_cor_val))) > 1:
+                        print(f"Warning: Multiple maxima found in correlation for views {i+1}-{j+1} and {k+1}-{l+1}. Using the first one.")
                     sim_mat[i, j, k, l, :] = max_cor
     # Display of similarity matrices
     fig_x, ax_x = plt.subplots(nrows=sub_im_num, ncols=sub_im_num, sharex=True, sharey=True)
@@ -170,3 +209,4 @@ if __name__ == "__main__":
     plt.figure()
     plt.imshow(av_rect, cmap="gray")
     plt.show()
+    plt.close("all")
