@@ -66,14 +66,22 @@ def min_max_normalize(image, min=0, max=255):
 if __name__ == "__main__":
     images=[]
     ims_dir = 'moment_images/images'
+    image_paths = []
     for f in os.listdir(ims_dir):
         image_path = os.path.join(ims_dir, f)
         image = load_image(image_path)
         if image:
             images.append(image)
+            image_paths.append(image_path)
             print(f"Successfully loaded image: {f}")
         else:
             print(f"Failed to load image: {f}")
+    image_name = input("Enter image name for processing, or None to process all of the images (image_name/Don't enter anything): ")
+    if image_name != None:
+        images = [im for i, im in enumerate(images) if image_name in image_paths[i]]
+    if len(images) == 0:
+        print("No images found for processing/Wrong image name. Exiting.")
+        exit(0)
     for i, im in enumerate(images):
         norm_im = min_max_normalize(im).rotate(-5)
         # norm_im = min_max_normalize(im)
@@ -178,7 +186,7 @@ if __name__ == "__main__":
                     #     continue
                     view1 = views[i, j]
                     view2 = views[k, l]
-                    cor = correlate2d(np.pad(view1, 45, mode="wrap"), view2, mode="valid")
+                    cor = correlate2d(np.pad(view1, 30, mode="wrap"), view2, mode="valid")
                     max_cor = np.unravel_index(np.argmax(cor), np.shape(cor))
                     max_cor_val = np.max(cor)
                     if len(np.transpose(np.nonzero(cor==max_cor_val))) > 1:
