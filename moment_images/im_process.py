@@ -137,14 +137,19 @@ if __name__ == "__main__":
     d = np.int_(np.floor(1.1*2*np.max(windows[:, 2]))) # Use the maximum radius of the circles found
     sub_im_num = 3
     views = np.zeros((sub_im_num, sub_im_num, d, d))
+    if (d//2)*2 == np.shape(views)[2]:
+        views_shape_flag = 1
+    else:
+        views_shape_flag = 0
     for i in range(0, sub_im_num):
         for j in range(0, sub_im_num):
             x = int(windows[0][0] + (i-sub_im_num//2) * d)
             y = int(windows[0][1] + (j-sub_im_num//2) * d)
-            if x - (d//2) < 0 or y - (d//2) < 0 or x + (d//2) >= np.shape(norm_im)[0] or y + (d//2) >= np.shape(norm_im)[1]:
+            norm_im_np = np.array(norm_im) if not isinstance(norm_im, np.ndarray) else norm_im
+            if x - (d//2) < 0 or y - (d//2) < 0 or x + (d//2) >= norm_im_np.shape[0] or y + (d//2) >= norm_im_np.shape[1]:
                 print(f"Skipping view {i+1}-{j+1} due to out of bounds coordinates.")
                 continue
-            if (d//2)*2 == np.shape(views)[2]:
+            if views_shape_flag:
                 views[i, j, :, :] = np.array(norm_im)[y-(d//2):y+(d//2), x-d//2:x+d//2]
             else:
                 views[i, j, :, :] = np.array(norm_im)[y-(d//2):y+(d//2)+1, x-d//2:x+d//2+1]
@@ -167,11 +172,11 @@ if __name__ == "__main__":
                 continue
             for k in range(i, sub_im_num):
                 for l in range(j, sub_im_num):
-                    if i == k and j == l:
-                        continue
+                    # if i == k and j == l:
+                    #     continue
                     view1 = views[i, j]
                     view2 = views[k, l]
-                    cor = correlate2d(view1, view2, mode="same", boundary="fill")
+                    cor = correlate2d(np.pad(view1, 35), view2, mode="valid")
                     max_cor = np.unravel_index(np.argmax(cor), np.shape(cor))
                     max_cor_val = np.max(cor)
                     if len(np.transpose(np.nonzero(cor==max_cor_val))) > 1:
@@ -193,12 +198,12 @@ if __name__ == "__main__":
     # plt.show()
 
     # Show for view (1, 1) the translations and show the average summation
-    rect_images = np.zeros((sub_im_num, sub_im_num, d, d))
+    rect_images = np.zeros((sub_im_num, sub_im_num, np.shape(views)[2], np.shape(views)[3]))
     plt.figure()
     plt.imshow(views[0, 0], cmap='gray')
     for idx in range(sub_im_num):
         for jdx in range(sub_im_num):
-            warp_mat = np.squeeze(np.array([[[1, 0, sim_mat[0, 0, idx, jdx, 0]-d//2], [0, 1, sim_mat[0, 0, idx, jdx, 1]-d//2]]]))
+            warp_mat = np.array([[1, 0, sim_mat[0, 0, idx, jdx, 1]-cor.shape[1]//2], [0, 1, sim_mat[0, 0, idx, jdx, 0]-cor.shape[0]//2]]).astype("float")
             rect_im = cv.warpAffine(views[idx, jdx], warp_mat, (views[idx, jdx].shape[1], views[idx, jdx].shape[0]))
             rect_images[idx, jdx] = rect_im
             plt.figure()
