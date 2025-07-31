@@ -164,11 +164,13 @@ if __name__ == "__main__":
     # Check similarity of the views in translation
     sim_mat = np.zeros((sub_im_num, sub_im_num, sub_im_num, sub_im_num, 2))
     check_all_views = input("Check all views for similarity? (y/n): ").lower()
+    if check_all_views != "y":
+        view_choice = (1, 1)
     for i in range(0, sub_im_num):
-        if check_all_views != "y" and i != 0:
+        if check_all_views != "y" and i != view_choice[0]:
             continue
         for j in range(0, sub_im_num):
-            if check_all_views != "y" and j != 0:
+            if check_all_views != "y" and j != view_choice[1]:
                 continue
             for k in range(i, sub_im_num):
                 for l in range(j, sub_im_num):
@@ -176,7 +178,7 @@ if __name__ == "__main__":
                     #     continue
                     view1 = views[i, j]
                     view2 = views[k, l]
-                    cor = correlate2d(np.pad(view1, 35), view2, mode="valid")
+                    cor = correlate2d(np.pad(view1, 45, mode="wrap"), view2, mode="valid")
                     max_cor = np.unravel_index(np.argmax(cor), np.shape(cor))
                     max_cor_val = np.max(cor)
                     if len(np.transpose(np.nonzero(cor==max_cor_val))) > 1:
@@ -197,13 +199,13 @@ if __name__ == "__main__":
     fig_y.suptitle("Y translation similarity")
     # plt.show()
 
-    # Show for view (1, 1) the translations and show the average summation
+    # Show for chosen view the translations and show the average summation
     rect_images = np.zeros((sub_im_num, sub_im_num, np.shape(views)[2], np.shape(views)[3]))
     plt.figure()
-    plt.imshow(views[0, 0], cmap='gray')
+    plt.imshow(views[view_choice[0], view_choice[1]], cmap='gray')
     for idx in range(sub_im_num):
         for jdx in range(sub_im_num):
-            warp_mat = np.array([[1, 0, sim_mat[0, 0, idx, jdx, 1]-cor.shape[1]//2], [0, 1, sim_mat[0, 0, idx, jdx, 0]-cor.shape[0]//2]]).astype("float")
+            warp_mat = np.array([[1, 0, sim_mat[view_choice[0], view_choice[1], idx, jdx, 1]-cor.shape[1]//2], [0, 1, sim_mat[view_choice[0], view_choice[1], idx, jdx, 0]-cor.shape[0]//2]]).astype("float")
             rect_im = cv.warpAffine(views[idx, jdx], warp_mat, (views[idx, jdx].shape[1], views[idx, jdx].shape[0]))
             rect_images[idx, jdx] = rect_im
             plt.figure()
