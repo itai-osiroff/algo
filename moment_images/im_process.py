@@ -99,7 +99,7 @@ if __name__ == "__main__":
             roi = im_np[np.shape(im_np)[0]//2-search_rad_max*2:np.shape(im_np)[0]//2+search_rad_max*2, np.shape(im_np)[1]//2-search_rad_max*2:np.shape(im_np)[1]//2+search_rad_max*2]
         elif roi_choice == "3":
             # ROI = centered on the maximal pixel
-            max_search_im = np.array(cv.GaussianBlur(np.array(im[0]), (51, 51), sigmaX=5, sigmaY=5))
+            max_search_im = np.array(cv.GaussianBlur(np.array(im[1]), (51, 51), sigmaX=5, sigmaY=5))
             max_loc = np.unravel_index(np.argmax(max_search_im), np.shape(max_search_im))
             roi = im_np[max_loc[0]-search_rad_max*2:max_loc[0]+search_rad_max*2, max_loc[1]-search_rad_max*2:max_loc[1]+search_rad_max*2]
         else:
@@ -116,8 +116,8 @@ if __name__ == "__main__":
                 circles[0, i, 1] += (np.shape(im_np)[1]//2 - search_rad_max*2)
         elif roi_choice == "3":
             for i in range(len(circles[0])):
-                circles[0, i, 0] += (max_loc[0] - search_rad_max*2)
-                circles[0, i, 1] += (max_loc[1] - search_rad_max*2)
+                circles[0, i, 0] += (max_loc[1] - search_rad_max*2)
+                circles[0, i, 1] += (max_loc[0] - search_rad_max*2)
         for i in circles[0,:2]: # only draw most voted 2 circles
             # draw the outer circle
             cv.circle(cimg,(i[0],i[1]),i[2],(0,255,0),2)
