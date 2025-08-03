@@ -91,7 +91,7 @@ if __name__ == "__main__":
     search_rad_min = 50
     search_rad_max = 120
     for i, im in enumerate(images):
-        cimg = cv.cvtColor(np.array(im[1]),cv.COLOR_GRAY2BGR)
+        cimg = cv.cvtColor(np.array(im[1]), cv.COLOR_GRAY2BGR)
         im_np = np.array(im[1])
         roi_choice = input("Enter ROI strategy (1: All of the image, 2: Center of the image, 3: Centered on maximal pixel): ")
         if roi_choice == "2":
@@ -170,23 +170,23 @@ if __name__ == "__main__":
     plt.show()
     plt.close("all")
     # Check similarity of the views in translation
-    sim_mat = np.zeros((sub_im_num, sub_im_num, sub_im_num, sub_im_num, 2))
+    pix_num_cor = 30 # number of pixels to shift to each side in the correlation
+    sim_mat = pix_num_cor * np.ones((sub_im_num, sub_im_num, sub_im_num, sub_im_num, 2)) #intiialize similarity matrix to zero-shift correlation
     check_all_views = input("Check all views for similarity? (y/n): ").lower()
-    if check_all_views != "y":
-        view_choice = (1, 1)
+    view_choice = (1, 1) # Default choice for refrence view - 1-1
     for i in range(0, sub_im_num):
         if check_all_views != "y" and i != view_choice[0]:
             continue
         for j in range(0, sub_im_num):
             if check_all_views != "y" and j != view_choice[1]:
                 continue
-            for k in range(i, sub_im_num):
-                for l in range(j, sub_im_num):
+            for k in range(0, sub_im_num):
+                for l in range(0, sub_im_num):
                     # if i == k and j == l:
                     #     continue
                     view1 = views[i, j]
                     view2 = views[k, l]
-                    cor = correlate2d(np.pad(view1, 30, mode="wrap"), view2, mode="valid")
+                    cor = correlate2d(np.pad(view1, pix_num_cor, mode="wrap"), view2, mode="valid")
                     max_cor = np.unravel_index(np.argmax(cor), np.shape(cor))
                     max_cor_val = np.max(cor)
                     if len(np.transpose(np.nonzero(cor==max_cor_val))) > 1:
@@ -213,6 +213,8 @@ if __name__ == "__main__":
     plt.imshow(views[view_choice[0], view_choice[1]], cmap='gray')
     for idx in range(sub_im_num):
         for jdx in range(sub_im_num):
+            if idx == view_choice[0] and jdx == view_choice[1]:
+                continue
             warp_mat = np.array([[1, 0, sim_mat[view_choice[0], view_choice[1], idx, jdx, 1]-cor.shape[1]//2], [0, 1, sim_mat[view_choice[0], view_choice[1], idx, jdx, 0]-cor.shape[0]//2]]).astype("float")
             rect_im = cv.warpAffine(views[idx, jdx], warp_mat, (views[idx, jdx].shape[1], views[idx, jdx].shape[0]))
             rect_images[idx, jdx] = rect_im
