@@ -5,9 +5,22 @@ import numpy as np
 import cv2 as cv
 import matplotlib.pyplot as plt
 from scipy.signal import correlate2d
-from matplotlib import cm
+from typing import Tuple, List, Optional
 
-def load_image(image_path):
+# --- Constants ---
+DEFAULT_IMAGE_DIR = 'moment_images/images'
+GAUSSIAN_BLUR_KERNEL = (51, 51)
+GAUSSIAN_BLUR_SIGMA = 5
+HOUGH_CIRCLES_PARAM1 = 50
+HOUGH_CIRCLES_PARAM2 = 30
+HOUGH_CIRCLES_MIN_DIST = 20
+VIEW_GRID_SIZE = 3
+VIEW_DISTANCE_SCALE_FACTOR = 1.1
+CORRELATION_PAD_WIDTH = 30
+DEFAULT_SEARCH_RADIUS_MIN = 50
+DEFAULT_SEARCH_RADIUS_MAX = 120
+
+def load_image(image_path: str) -> Optional[Image.Image]:
     """
     Load an image from the specified path.
     
@@ -28,8 +41,7 @@ def load_image(image_path):
         print(f"An unexpected error occurred while loading the image: {e}")
         return None
 
-
-def min_max_normalize(image, min=0, max=255):
+def min_max_normalize(image: Image.Image, min_val: int = 0, max_val: int = 255) -> Image.Image:
     """
     Normalize the image using min-max normalization. 
     
@@ -39,72 +51,72 @@ def min_max_normalize(image, min=0, max=255):
     if not isinstance(image, Image.Image):
         raise ValueError("Input must be a PIL Image object.")
     
-    # Convert image to numpy array
     image_array = np.array(image)
     
-    # Perform min-max normalization
-    min_val = image_array.min()
-    if min > 0:
-        min_val = min
-    else:
-        min_val = image_array.min()
-    max_val = image_array.max()
-    if max < 255:
-        max_val = max
-    else:
-        max_val = image_array.max()
+    img_min = image_array.min()
+    if min_val > 0:
+        img_min = min_val
     
-    if min_val == max_val:
+    img_max = image_array.max()
+    if max_val < 255:
+        img_max = max_val
+
+    if img_min == img_max:
         print("Warning: The image has no variation in pixel values. Returning a blank image.")
         return image.copy()
     else:
-        normalized_array = (image_array - min_val) / (max_val - min_val) * 255
-        normalized_image = Image.fromarray(normalized_array.astype('uint8'))
-    
-    return normalized_image
+        normalized_array = (image_array - img_min) / (img_max - img_min) * 255
+        return Image.fromarray(normalized_array.astype('uint8'))
 
-
-def assemble_HDR(images: list, weights = None) -> Image.Image:
+def assemble_HDR(images: List[Image.Image], weights: Optional[np.ndarray] = None) -> Image.Image:
     """
     Assemble a High Dynamic Range (HDR) image from a list of images.
     
     :param images: List of PIL Image objects.
-    :param weights: Optional weights for each image.
+    :param weights: Optional weights for each image as a NumPy array.
     :return: Assembled HDR image as a PIL Image object.
     """
     if not images:
         raise ValueError("No images provided for HDR assembly.")
     
-    # Convert images to numpy arrays
     image_arrays = [np.array(min_max_normalize(image)) for image in images]
     
-    # If weights not given - give equal weights, Else: ensure valid weights and normalize
     if weights is None:
-        weights = (1/len(images)) * np.ones(len(images))
+        hdr_weights = np.ones(len(images)) / len(images)
     else:
-        weights = np.array(weights)
-        if len(weights) != len(images):
-            raise ValueError("Weights must match the number of images.")
+        if weights.ndim != 1 or len(weights) != len(images):
+            raise ValueError("Weights must be a 1D array matching the number of images.")
         if np.any(weights < 0):
             raise ValueError("Weights must be non-negative.")
-        weights = weights / np.sum(weights)
-    # Stack the arrays along a new dimension
-    stacked_images = np.stack(image_arrays, axis=-1)
-    
-    # Average the stacked images
-    hdr_image = np.mean(stacked_images, axis=-1).astype(np.uint8)
-    
-    return Image.fromarray(hdr_image)
+        hdr_weights = weights / np.sum(weights)
 
-if __name__ == "__main__":
-    images=[]
-    ims_dir = input("Enter path to images or enter 'default' to use the default path: ")
-    if ims_dir == "default":
-        ims_dir = 'moment_images/images'
-    else:
-        HDR_flag = input("Is this an HDR image directory? (y/n): ").lower() == "y"
-    image_paths = []
-    for f in os.listdir(ims_dir):
+    stacked_images = np.stack(image_arrays, axis=-1)
+    hdr_image_array = np.average(stacked_images, axis=-1, weights=hdr_weights).astype(np.uint8)
+    
+    return Image.fromarray(hdr_image_array)
+
+def get_image_paths() -> Tuple[List[Image.Image], List[str], bool]:
+    """
+    Prompt the user for an image directory, load images, and handle HDR assembly.
+
+    Returns:
+        A tuple containing:
+        - A list of loaded PIL Image objects.
+        - A list of corresponding image file paths.
+        - A boolean indicating if the images were from an HDR directory.
+    """
+    ims_dir = input(f"Enter path to images or enter 'default' to use '{DEFAULT_IMAGE_DIR}': ")
+    if ims_dir.lower() == 'default':
+        ims_dir = DEFAULT_IMAGE_DIR
+    
+    hdr_flag = input("Is this an HDR image directory? (y/n): ").lower() == "y"
+    
+    images, image_paths = [], []
+    if not os.path.isdir(ims_dir):
+        print(f"Error: Directory '{ims_dir}' not found.")
+        return [], [], hdr_flag
+
+    for f in sorted(os.listdir(ims_dir)):
         image_path = os.path.join(ims_dir, f)
         image = load_image(image_path)
         if image:
@@ -113,136 +125,262 @@ if __name__ == "__main__":
             print(f"Successfully loaded image: {f}")
         else:
             print(f"Failed to load image: {f}")
-    if HDR_flag:
-        print("Assembling HDR image from the loaded images...")
-        hdr_image = assemble_HDR(images)
-        print("HDR image assembled successfully.")
-        images = [hdr_image]
-    else:
-        image_name = input("Enter image name for processing, or None to process all of the images (image_name/Don't enter anything): ")
-        if image_name != None:
-            images = [im for i, im in enumerate(images) if image_name in image_paths[i]]
-    if len(images) == 0:
-        print("No images found for processing/Wrong image name. Exiting.")
-        exit(0)
-    processed_images = []
-    for i, im in enumerate(images):
-        # norm_im = min_max_normalize(im).rotate(-5)
-        norm_im = min_max_normalize(im)
-        processed_images.append((im, norm_im))
-        # norm_im.show()
-    images = processed_images
-    circles_chosen = None
-    search_rad_min = 50
-    search_rad_max = 120
-    for i, im in enumerate(images):
-        cimg = cv.cvtColor(np.array(im[1]), cv.COLOR_GRAY2BGR)
-        im_np = np.array(im[1])
-        roi_choice = input("Enter ROI strategy (1: All of the image, 2: Center of the image, 3: Centered on maximal pixel): ")
-        if roi_choice == "2":
-            # ROI = Center of the image
-            roi = im_np[np.shape(im_np)[0]//2-search_rad_max*2:np.shape(im_np)[0]//2+search_rad_max*2, np.shape(im_np)[1]//2-search_rad_max*2:np.shape(im_np)[1]//2+search_rad_max*2]
-        elif roi_choice == "3":
-            # ROI = centered on the maximal pixel
-            max_search_im = np.array(cv.GaussianBlur(np.array(im[1]), (51, 51), sigmaX=5, sigmaY=5))
-            max_loc = np.unravel_index(np.argmax(max_search_im), np.shape(max_search_im))
-            roi = im_np[max_loc[0]-search_rad_max*2:max_loc[0]+search_rad_max*2, max_loc[1]-search_rad_max*2:max_loc[1]+search_rad_max*2]
-        else:
-            # ROI = all of image
-            roi = im_np
-        circles = cv.HoughCircles(roi, cv.HOUGH_GRADIENT, dp=1, minDist=20, param1=50, param2=30, minRadius=search_rad_min, maxRadius=search_rad_max)
-        if circles is None or len(circles) == 0:
-            print(f"No circles found in image {i+1}.")
-            continue
-        circles = np.around(circles).astype(np.int64)
-        if roi_choice == "2":
-            for i in range(len(circles[0])):
-                circles[0, i, 0] += (np.shape(im_np)[1]//2 - search_rad_max*2)
-                circles[0, i, 1] += (np.shape(im_np)[0]//2 - search_rad_max*2)
-        elif roi_choice == "3":
-            for i in range(len(circles[0])):
-                circles[0, i, 0] += (max_loc[1] - search_rad_max*2)
-                circles[0, i, 1] += (max_loc[0] - search_rad_max*2)
-        for i in circles[0,:2]: # only draw most voted 2 circles
-            # draw the outer circle
-            cv.circle(cimg,(i[0],i[1]),i[2],(0,255,0),2)
-            # draw the center of the circle
-            cv.circle(cimg,(i[0],i[1]),2,(0,0,255),3)
+            
+    return images, image_paths, hdr_flag
+
+def select_roi(image_np: np.ndarray, strategy: str, search_radius: int) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
+    """
+    Select a Region of Interest (ROI) from the image.
+
+    Args:
+        image_np: The input image as a NumPy array.
+        strategy: The ROI selection strategy ('center', 'max_pixel', or 'full').
+        search_radius: The search radius to define the ROI size.
+
+    Returns:
+        A tuple containing:
+        - The selected ROI as a NumPy array.
+        - The top-left coordinates (row, col) of the ROI in the original image, or None if the full image is used.
+    """
+    h, w = image_np.shape
+    roi_size = search_radius * 2
+    
+    if strategy == 'center':
+        top = h // 2 - roi_size
+        left = w // 2 - roi_size
+        roi = image_np[top:top + roi_size*2, left:left + roi_size*2]
+        return roi, (int(top), int(left))
+    elif strategy == 'max_pixel':
+        blurred = cv.GaussianBlur(image_np, GAUSSIAN_BLUR_KERNEL, sigmaX=GAUSSIAN_BLUR_SIGMA, sigmaY=GAUSSIAN_BLUR_SIGMA)
+        max_loc = np.unravel_index(np.argmax(blurred), blurred.shape)
+        top = max_loc[0] - roi_size
+        left = max_loc[1] - roi_size
+        roi = image_np[top:top + roi_size*2, left:left + roi_size*2]
+        return roi, (int(top), int(left))
+    else: # 'full'
+        return image_np, None
+
+def detect_and_adjust_circles(roi: np.ndarray, roi_offset: Optional[Tuple[int, int]], min_radius: int, max_radius: int) -> Optional[np.ndarray]:
+    """
+    Detect circles in a given ROI and adjust their coordinates to the full image frame.
+
+    Args:
+        roi: The Region of Interest (ROI) to search for circles in.
+        roi_offset: The (row, col) offset of the ROI relative to the full image.
+        min_radius: The minimum radius of circles to detect.
+        max_radius: The maximum radius of circles to detect.
+
+    Returns:
+        A NumPy array of detected circles (x, y, radius), or None if no circles are found.
+    """
+    circles = cv.HoughCircles(roi, cv.HOUGH_GRADIENT, dp=1, minDist=HOUGH_CIRCLES_MIN_DIST, 
+                              param1=HOUGH_CIRCLES_PARAM1, param2=HOUGH_CIRCLES_PARAM2, 
+                              minRadius=min_radius, maxRadius=max_radius)
+    
+    if circles is None:
+        return None
         
-        # cv.namedWindow(f'image {i+1}', cv.WINDOW_NORMAL)
-        # cv.imshow(f'image {i+1}', cimg)
-        # cv.waitKey(0)
-        plt.figure()
-        plt.imshow(cimg)
-        plt.show()
-        if input("Use this image for further processing? (y/n): ").lower() =="y":
-            circles_chosen = circles
-            norm_im = im_np
-            break
-        plt.close("all")
-    # cv.destroyAllWindows()
-    if circles_chosen is None:
-        circles_chosen = circles
+    circles = np.around(circles).astype(np.int64)
+    
+    if roi_offset:
+        circles[0, :, 0] += roi_offset[1]  # Adjust x-coordinates
+        circles[0, :, 1] += roi_offset[0]  # Adjust y-coordinates
+        
+    return circles
 
-    # Let's use the first 2 circles for one of the images found as the basis for the other circles assuming a square grid
-    windows = circles_chosen[0, :2]
-    # d = int(np.linalg.norm(windows[0][:2] - windows[1][:2])/np.sqrt(2)) # Use 2 of the first detected circles
-    d = np.int_(np.floor(1.1*2*np.max(windows[:, 2]))) # Use the maximum radius of the circles found
-    sub_im_num = 3
-    views = np.zeros((sub_im_num, sub_im_num, d, d))
-    if (d//2)*2 == np.shape(views)[2]:
-        views_shape_flag = 1
-    else:
-        views_shape_flag = 0
-    for i in range(0, sub_im_num):
-        for j in range(0, sub_im_num):
-            x = int(windows[0][0] + (i-sub_im_num//2) * d)
-            y = int(windows[0][1] + (j-sub_im_num//2) * d)
-            norm_im_np = np.array(norm_im) if not isinstance(norm_im, np.ndarray) else norm_im
-            if x - (d//2) < 0 or y - (d//2) < 0 or x + (d//2) >= norm_im_np.shape[0] or y + (d//2) >= norm_im_np.shape[1]:
-                print(f"Skipping view {i+1}-{j+1} due to out of bounds coordinates.")
-                continue
-            if views_shape_flag:
-                views[i, j, :, :] = np.array(norm_im)[y-(d//2):y+(d//2), x-d//2:x+d//2]
-            else:
-                views[i, j, :, :] = np.array(norm_im)[y-(d//2):y+(d//2)+1, x-d//2:x+d//2+1]
+def display_circles(image: Image.Image, circles: np.ndarray):
+    """
+    Draw detected circles on an image and display it.
 
-    # Debug print of the all of the cut views
-    for i in range(0, sub_im_num):
-        for j in range(0, sub_im_num):    
-            view_for_imshow = np.array(min_max_normalize(Image.fromarray(views[i, j])))
-            plt.figure()
-            plt.imshow(view_for_imshow, cmap="gray")
+    Args:
+        image: The PIL image to draw on.
+        circles: A NumPy array of circles to display.
+    """
+    cimg = cv.cvtColor(np.array(image), cv.COLOR_GRAY2BGR)
+    for i in circles[0, :2]:  # Draw the top 2 circles
+        cv.circle(cimg, (i[0], i[1]), i[2], (0, 255, 0), 2)  # Outer circle
+        cv.circle(cimg, (i[0], i[1]), 2, (0, 0, 255), 3)    # Center
+    
+    plt.figure()
+    plt.imshow(cimg)
     plt.show()
-    plt.close("all")
-    # Check similarity of the views in translation
-    pix_num_cor = 30 # number of pixels to shift to each side in the correlation
-    sim_mat = pix_num_cor * np.ones((sub_im_num, sub_im_num, sub_im_num, sub_im_num, 2)) #intiialize similarity matrix to zero-shift correlation
-    check_all_views = input("Check all views for similarity? (y/n): ").lower()
-    view_choice = (1, 1) # Default choice for refrence view - 1-1
-    for i in range(0, sub_im_num):
-        if check_all_views != "y" and i != view_choice[0]:
-            continue
-        for j in range(0, sub_im_num):
-            if check_all_views != "y" and j != view_choice[1]:
+
+def extract_views(image_np: np.ndarray, base_circle: np.ndarray, num_views: int, view_dist: int) -> np.ndarray:
+    """
+    Extract a grid of square views from an image based on a reference circle.
+
+    Args:
+        image_np: The input image as a NumPy array.
+        base_circle: The reference circle (x, y, radius) to build the grid around.
+        num_views: The number of views to extract in each dimension (e.g., 3 for a 3x3 grid).
+        view_dist: The distance between the centers of adjacent views.
+
+    Returns:
+        A NumPy array containing the extracted views.
+    """
+    d = view_dist
+    views = np.zeros((num_views, num_views, d, d))
+    
+    for i in range(num_views):
+        for j in range(num_views):
+            x = int(base_circle[0] + (i - num_views // 2) * d)
+            y = int(base_circle[1] + (j - num_views // 2) * d)
+            
+            half_d = d // 2
+            if half_d * 2 != d:
+                even_odd_flag = 1
+            else:
+                even_odd_flag = 0
+            if x - half_d < 0 or y - half_d < 0 or x + half_d >= image_np.shape[1] or y + half_d >= image_np.shape[0]:
+                print(f"Skipping view {i+1}-{j+1} due to out-of-bounds coordinates.")
                 continue
-            for k in range(0, sub_im_num):
-                for l in range(0, sub_im_num):
-                    # if i == k and j == l:
-                    #     continue
+            
+            views[i, j, :, :] = image_np[y - half_d:y + half_d + even_odd_flag, x - half_d:x + half_d + even_odd_flag]
+            
+    return views
+
+def calculate_similarity_matrix(views: np.ndarray, ref_view_idx: Tuple[int, int], pad_width: int) -> np.ndarray:
+    """
+    Calculate the translational similarity between all pairs of views.
+
+    Args:
+        views: A NumPy array of image views.
+        pad_width: The padding to add to each view for correlation.
+
+    Returns:
+        A 5D NumPy array representing the similarity matrix with translation offsets.
+    """
+    num_views = views.shape[0]
+    sim_mat = pad_width * np.ones((num_views, num_views, num_views, num_views, 2))
+    check_all_views = input("Check all views for similarity? (y/n): ").lower()
+    for i in range(num_views):
+        if check_all_views != "y" and i != ref_view_idx[0]:
+            continue
+        for j in range(num_views):
+            if check_all_views != "y" and j != ref_view_idx[1]:
+                continue
+            for k in range(num_views):
+                for l in range(num_views):
                     view1 = views[i, j]
                     view2 = views[k, l]
-                    cor = correlate2d(np.pad(view1, pix_num_cor, mode="wrap"), view2, mode="valid")
-                    max_cor = np.unravel_index(np.argmax(cor), np.shape(cor))
-                    max_cor_val = np.max(cor)
-                    if len(np.transpose(np.nonzero(cor==max_cor_val))) > 1:
-                        print(f"Warning: Multiple maxima found in correlation for views {i+1}-{j+1} and {k+1}-{l+1}. Using the first one.")
-                    sim_mat[i, j, k, l, :] = max_cor
+                    
+                    # Pad view1 for correlation
+                    padded_view1 = np.pad(view1, pad_width, mode='wrap')
+                    
+                    # Calculate correlation
+                    cor = correlate2d(padded_view1, view2, mode='valid')
+                    max_cor_loc = np.unravel_index(np.argmax(cor), cor.shape)
+                    
+                    sim_mat[i, j, k, l, :] = max_cor_loc
+                    
+    return sim_mat
+
+def rectify_and_average_views(views: np.ndarray, sim_mat: np.ndarray, ref_view_idx: Tuple[int, int], cor_shape: Tuple[int, int]) -> Tuple[List[np.ndarray], np.ndarray]:
+    """
+    Align views to a reference view and compute their average.
+
+    Args:
+        views: The array of image views.
+        sim_mat: The similarity matrix containing translation offsets.
+        ref_view_idx: The (row, col) index of the reference view.
+        cor_shape: The shape of the correlation matrix.
+
+    Returns:
+        The averaged image of the aligned views as a NumPy array.
+    """
+    num_views = views.shape[0]
+    rect_images = np.zeros_like(views)
+    
+    ref_i, ref_j = ref_view_idx
+    
+    for i in range(num_views):
+        for j in range(num_views):
+            if i == ref_i and j == ref_j:
+                rect_images[i, j] = views[i, j]
+                continue
+            
+            dx = sim_mat[ref_i, ref_j, i, j, 1] - cor_shape[1] // 2
+            dy = sim_mat[ref_i, ref_j, i, j, 0] - cor_shape[0] // 2
+            
+            warp_mat = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
+            rect_images[i, j] = cv.warpAffine(views[i, j], warp_mat, (views.shape[3], views.shape[2]))
+
+    return (np.mean(rect_images, axis=(0, 1)), rect_images)
+
+def main():
+    """Main function to run the image processing pipeline."""
+    images, image_paths, hdr_flag = get_image_paths()
+
+    if not images:
+        print("No images loaded. Exiting.")
+        return
+
+    if hdr_flag:
+        print("Assembling HDR image...")
+        hdr_image = assemble_HDR(images)
+        images = [hdr_image]
+        print("HDR image assembled successfully.")
+    else:
+        image_name = input("Enter image name for processing (or press Enter for all): ")
+        if image_name:
+            images = [im for i, im in enumerate(images) if image_name in image_paths[i]]
+
+    if not images:
+        print("No images found for processing. Exiting.")
+        return
+
+    processed_images = [(im, min_max_normalize(im)) for im in images]
+    
+    circles_chosen = None
+    norm_im_chosen = None
+
+    for orig_im, norm_im in processed_images:
+        im_np = np.array(norm_im)
+        
+        roi_strategy = input("Enter ROI strategy (full, center, max_pixel): ").lower()
+        roi, roi_offset = select_roi(im_np, roi_strategy, DEFAULT_SEARCH_RADIUS_MAX)
+        
+        circles = detect_and_adjust_circles(roi, roi_offset, DEFAULT_SEARCH_RADIUS_MIN, DEFAULT_SEARCH_RADIUS_MAX)
+        
+        if circles is None:
+            print("No circles found in this image.")
+            continue
+            
+        display_circles(norm_im, circles)
+        
+        if input("Use this image for further processing? (y/n): ").lower() == 'y':
+            circles_chosen = circles
+            norm_im_chosen = im_np
+            break
+        plt.close("all")
+
+    if circles_chosen is None or norm_im_chosen is None:
+        print("No image selected for processing. Exiting.")
+        return
+
+    windows = circles_chosen[0, :2]
+    d = int(np.floor(VIEW_DISTANCE_SCALE_FACTOR * 2 * np.max(windows[:, 2])))
+    
+    views = extract_views(norm_im_chosen, windows[0], VIEW_GRID_SIZE, d)
+    
+    # Display extracted views
+    for i in range(VIEW_GRID_SIZE):
+        for j in range(VIEW_GRID_SIZE):
+            plt.figure()
+            plt.imshow(views[i, j], cmap="gray")
+            plt.title(f"View {i+1}-{j+1}")
+    plt.show()
+    plt.close("all")
+
+    ref_view_choice = (1, 1) # Default to center view as reference
+    sim_mat = calculate_similarity_matrix(views, ref_view_choice, CORRELATION_PAD_WIDTH)
+    
+    # Assemble and dispaly similarity matrix
     # Display of similarity matrices
-    fig_x, ax_x = plt.subplots(nrows=sub_im_num, ncols=sub_im_num, sharex=True, sharey=True)
-    fig_y, ax_y = plt.subplots(nrows=sub_im_num, ncols=sub_im_num, sharex=True, sharey=True)
-    for idx in range(sub_im_num):    
-        for jdx in range(sub_im_num): 
+    fig_x, ax_x = plt.subplots(nrows=VIEW_GRID_SIZE, ncols=VIEW_GRID_SIZE, sharex=True, sharey=True)
+    fig_y, ax_y = plt.subplots(nrows=VIEW_GRID_SIZE, ncols=VIEW_GRID_SIZE, sharex=True, sharey=True)
+    for idx in range(VIEW_GRID_SIZE):    
+        for jdx in range(VIEW_GRID_SIZE): 
             im_x = ax_x[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 1], cmap="gray")
             im_y = ax_y[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 0], cmap="gray")
             ax_x[idx, jdx].set_title(f"View {idx+1}-{jdx+1} X translation similarity")
@@ -253,23 +391,27 @@ if __name__ == "__main__":
     fig_y.suptitle("Y translation similarity")
     # plt.show()
 
-    # Show for chosen view the translations and show the average summation
-    rect_images = np.zeros((sub_im_num, sub_im_num, np.shape(views)[2], np.shape(views)[3]))
-    plt.figure()
-    plt.imshow(views[view_choice[0], view_choice[1]], cmap='gray')
-    for idx in range(sub_im_num):
-        for jdx in range(sub_im_num):
-            if idx == view_choice[0] and jdx == view_choice[1]:
-                continue
-            warp_mat = np.array([[1, 0, sim_mat[view_choice[0], view_choice[1], idx, jdx, 1]-cor.shape[1]//2], [0, 1, sim_mat[view_choice[0], view_choice[1], idx, jdx, 0]-cor.shape[0]//2]]).astype("float")
-            rect_im = cv.warpAffine(views[idx, jdx], warp_mat, (views[idx, jdx].shape[1], views[idx, jdx].shape[0]))
-            rect_images[idx, jdx] = rect_im
-            plt.figure()
-            plt.imshow(rect_im, cmap="gray")
-    # plt.show()
+    # This is needed for the warp affine later
+    padded_view_for_corr_shape = np.pad(views[ref_view_choice], CORRELATION_PAD_WIDTH, mode='wrap')
+    cor_shape = correlate2d(padded_view_for_corr_shape, views[ref_view_choice], mode='valid').shape
 
-    av_rect = np.mean(rect_images, axis=(0, 1))
+    av_rect, rect_images = rectify_and_average_views(views, sim_mat, ref_view_choice, cor_shape)
+    
+    # Display rectified images views
+    for i in range(VIEW_GRID_SIZE):
+        for j in range(VIEW_GRID_SIZE):
+            plt.figure()
+            plt.imshow(rect_images[i, j], cmap="gray")
+            plt.title(f"Rectified View {i+1}-{j+1}")
+    # plt.show()
+    # plt.close("all")
+    
+    # Display the averaged rectified image
     plt.figure()
     plt.imshow(av_rect, cmap="gray")
+    plt.title("Averaged Rectified Image")
     plt.show()
     plt.close("all")
+
+if __name__ == "__main__":
+    main()
