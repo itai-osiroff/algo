@@ -162,6 +162,7 @@ if __name__ == "__main__":
             else:
                 views[i, j, :, :] = np.array(norm_im)[y-(d//2):y+(d//2)+1, x-d//2:x+d//2+1]
 
+    # Debug print of the all of the cut views
     for i in range(0, sub_im_num):
         for j in range(0, sub_im_num):    
             view_for_imshow = np.array(min_max_normalize(Image.fromarray(views[i, j])))
