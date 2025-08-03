@@ -63,9 +63,46 @@ def min_max_normalize(image, min=0, max=255):
     
     return normalized_image
 
+
+def assemble_HDR(images: list, weights = None) -> Image.Image:
+    """
+    Assemble a High Dynamic Range (HDR) image from a list of images.
+    
+    :param images: List of PIL Image objects.
+    :param weights: Optional weights for each image.
+    :return: Assembled HDR image as a PIL Image object.
+    """
+    if not images:
+        raise ValueError("No images provided for HDR assembly.")
+    
+    # Convert images to numpy arrays
+    image_arrays = [np.array(min_max_normalize(image)) for image in images]
+    
+    # If weights not given - give equal weights, Else: ensure valid weights and normalize
+    if weights is None:
+        weights = (1/len(images)) * np.ones(len(images))
+    else:
+        weights = np.array(weights)
+        if len(weights) != len(images):
+            raise ValueError("Weights must match the number of images.")
+        if np.any(weights < 0):
+            raise ValueError("Weights must be non-negative.")
+        weights = weights / np.sum(weights)
+    # Stack the arrays along a new dimension
+    stacked_images = np.stack(image_arrays, axis=-1)
+    
+    # Average the stacked images
+    hdr_image = np.mean(stacked_images, axis=-1).astype(np.uint8)
+    
+    return Image.fromarray(hdr_image)
+
 if __name__ == "__main__":
     images=[]
-    ims_dir = 'moment_images/images'
+    ims_dir = input("Enter path to images or enter 'default' to use the default path: ")
+    if ims_dir == "default":
+        ims_dir = 'moment_images/images'
+    else:
+        HDR_flag = input("Is this an HDR image directory? (y/n): ").lower() == "y"
     image_paths = []
     for f in os.listdir(ims_dir):
         image_path = os.path.join(ims_dir, f)
@@ -76,17 +113,25 @@ if __name__ == "__main__":
             print(f"Successfully loaded image: {f}")
         else:
             print(f"Failed to load image: {f}")
-    image_name = input("Enter image name for processing, or None to process all of the images (image_name/Don't enter anything): ")
-    if image_name != None:
-        images = [im for i, im in enumerate(images) if image_name in image_paths[i]]
+    if HDR_flag:
+        print("Assembling HDR image from the loaded images...")
+        hdr_image = assemble_HDR(images)
+        print("HDR image assembled successfully.")
+        images = [hdr_image]
+    else:
+        image_name = input("Enter image name for processing, or None to process all of the images (image_name/Don't enter anything): ")
+        if image_name != None:
+            images = [im for i, im in enumerate(images) if image_name in image_paths[i]]
     if len(images) == 0:
         print("No images found for processing/Wrong image name. Exiting.")
         exit(0)
+    processed_images = []
     for i, im in enumerate(images):
-        norm_im = min_max_normalize(im).rotate(-5)
-        # norm_im = min_max_normalize(im)
-        images[i] = (im, norm_im)
+        # norm_im = min_max_normalize(im).rotate(-5)
+        norm_im = min_max_normalize(im)
+        processed_images.append((im, norm_im))
         # norm_im.show()
+    images = processed_images
     circles_chosen = None
     search_rad_min = 50
     search_rad_max = 120
@@ -112,8 +157,8 @@ if __name__ == "__main__":
         circles = np.around(circles).astype(np.int64)
         if roi_choice == "2":
             for i in range(len(circles[0])):
-                circles[0, i, 0] += (np.shape(im_np)[0]//2 - search_rad_max*2)
-                circles[0, i, 1] += (np.shape(im_np)[1]//2 - search_rad_max*2)
+                circles[0, i, 0] += (np.shape(im_np)[1]//2 - search_rad_max*2)
+                circles[0, i, 1] += (np.shape(im_np)[0]//2 - search_rad_max*2)
         elif roi_choice == "3":
             for i in range(len(circles[0])):
                 circles[0, i, 0] += (max_loc[1] - search_rad_max*2)
