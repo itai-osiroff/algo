@@ -15,9 +15,9 @@ HOUGH_CIRCLES_PARAM1 = 50
 HOUGH_CIRCLES_PARAM2 = 30
 HOUGH_CIRCLES_MIN_DIST = 20
 VIEW_GRID_SIZE = 3
-VIEW_DISTANCE_SCALE_FACTOR = 1.1
+VIEW_DISTANCE_SCALE_FACTOR = 1.05
 CORRELATION_PAD_WIDTH = 30
-DEFAULT_SEARCH_RADIUS_MIN = 50
+DEFAULT_SEARCH_RADIUS_MIN = 90
 DEFAULT_SEARCH_RADIUS_MAX = 120
 
 def load_image(image_path: str) -> Optional[Image.Image]:
@@ -151,10 +151,27 @@ def select_roi(image_np: np.ndarray, strategy: str, search_radius: int) -> Tuple
         roi = image_np[top:top + roi_size*2, left:left + roi_size*2]
         return roi, (int(top), int(left))
     elif strategy == 'max_pixel':
+        # Find all maximum intensity pixels after Gaussian blur
         blurred = cv.GaussianBlur(image_np, GAUSSIAN_BLUR_KERNEL, sigmaX=GAUSSIAN_BLUR_SIGMA, sigmaY=GAUSSIAN_BLUR_SIGMA)
-        max_loc = np.unravel_index(np.argmax(blurred), blurred.shape)
-        top = max_loc[0] - roi_size
-        left = max_loc[1] - roi_size
+        max_val = blurred.max()
+        max_coords = np.argwhere(blurred == max_val)
+        
+        # Calculate geometric center (handles even/odd dimensions)
+        center_y, center_x = h // 2, w // 2
+        
+        # Find closest maximum to center using Euclidean distance
+        distances = np.sqrt((max_coords[:,0] - center_y)**2 + (max_coords[:,1] - center_x)**2)
+        min_dist_idx = np.argmin(distances)
+        selected_y, selected_x = max_coords[min_dist_idx]
+        
+        # Calculate ROI boundaries centered on selected pixel
+        top = selected_y - roi_size
+        left = selected_x - roi_size
+        
+        # Ensure ROI stays within image bounds
+        top = max(0, min(top, h - roi_size*2))
+        left = max(0, min(left, w - roi_size*2))
+        
         roi = image_np[top:top + roi_size*2, left:left + roi_size*2]
         return roi, (int(top), int(left))
     else: # 'full'
