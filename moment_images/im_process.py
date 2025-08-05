@@ -134,7 +134,7 @@ def select_roi(image_np: np.ndarray, strategy: str, search_radius: int) -> Tuple
 
     Args:
         image_np: The input image as a NumPy array.
-        strategy: The ROI selection strategy ('center', 'max_pixel', or 'full').
+        strategy: The ROI selection strategy ('center', 'max_pixel', 'full', or 'specific').
         search_radius: The search radius to define the ROI size.
 
     Returns:
@@ -174,6 +174,16 @@ def select_roi(image_np: np.ndarray, strategy: str, search_radius: int) -> Tuple
         
         roi = image_np[top:top + roi_size*2, left:left + roi_size*2]
         return roi, (int(top), int(left))
+    elif strategy == 'specific':
+        # Prompt user for specific ROI coordinates
+        center_x = int(input(f"Enter center row (0 to {h - roi_size*2}): "))
+        center_y = int(input(f"Enter center column (0 to {w - roi_size*2}): "))
+        
+        if center_x < roi_size or center_x + roi_size > h or center_y < roi_size or center_y + roi_size > w:
+            raise ValueError("Specified ROI is out of bounds.")
+        
+        roi = image_np[center_x - roi_size:center_x + roi_size, center_y - roi_size:center_y + roi_size]
+        return roi, (int(center_x - roi_size), int(center_y - roi_size))
     else: # 'full'
         return image_np, None
 
@@ -354,7 +364,11 @@ def main():
     for orig_im, norm_im in processed_images:
         im_np = np.array(norm_im)
         
-        roi_strategy = input("Enter ROI strategy (full, center, max_pixel): ").lower()
+        roi_strategy = input("Enter ROI strategy (full, center, max_pixel, specific): ").lower()
+        if roi_strategy == 'specific':
+            plt.figure()
+            plt.imshow(im_np, cmap='gray')
+            plt.show()
         roi, roi_offset = select_roi(im_np, roi_strategy, DEFAULT_SEARCH_RADIUS_MAX)
         
         circles = detect_and_adjust_circles(roi, roi_offset, DEFAULT_SEARCH_RADIUS_MIN, DEFAULT_SEARCH_RADIUS_MAX)
