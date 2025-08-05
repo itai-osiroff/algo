@@ -176,8 +176,8 @@ def select_roi(image_np: np.ndarray, strategy: str, search_radius: int) -> Tuple
         return roi, (int(top), int(left))
     elif strategy == 'specific':
         # Prompt user for specific ROI coordinates
-        center_x = int(input(f"Enter center row (0 to {h - roi_size*2}): "))
-        center_y = int(input(f"Enter center column (0 to {w - roi_size*2}): "))
+        center_y = int(input(f"Enter center row (0 to {h - roi_size*2}): "))
+        center_x = int(input(f"Enter center column (0 to {w - roi_size*2}): "))
         
         if center_x < roi_size or center_x + roi_size > h or center_y < roi_size or center_y + roi_size > w:
             raise ValueError("Specified ROI is out of bounds.")
