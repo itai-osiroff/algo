@@ -15,7 +15,7 @@ HOUGH_CIRCLES_PARAM1 = 50
 HOUGH_CIRCLES_PARAM2 = 30
 HOUGH_CIRCLES_MIN_DIST = 20
 VIEW_GRID_SIZE = 3
-VIEW_DISTANCE_SCALE_FACTOR = 1.05
+VIEW_DISTANCE_SCALE_FACTOR = 1.15
 CORRELATION_PAD_WIDTH = 30
 DEFAULT_SEARCH_RADIUS_MIN = 90
 DEFAULT_SEARCH_RADIUS_MAX = 120
@@ -436,7 +436,11 @@ def main():
     av_rect, rect_images = rectify_and_average_views(views, sim_mat, ref_view_choice, cor_shape)
     
     # Sharpen image (?)
-    av_rect_sharp = unsharp_mask(av_rect, sigma=1.0, strength=1.5)
+    sharpen_sets = [(2.0, 2.0), (3.0, 2.0), (2.0, 3.0), (3.0, 3.0)]
+    av_rect_sharp = []
+    for i in range(len(sharpen_sets)):
+        sigma, strength = sharpen_sets[i]
+        av_rect_sharp.append(unsharp_mask(av_rect, sigma=sigma, strength=strength))
 
     # Display rectified images views
     for i in range(VIEW_GRID_SIZE):
@@ -451,9 +455,10 @@ def main():
     plt.figure()
     plt.imshow(av_rect, cmap="gray")
     plt.title("Averaged Rectified Image")
-    plt.figure()
-    plt.imshow(av_rect_sharp, cmap="gray")
-    plt.title("Averaged Rectified Image (Sharpened)")
+    for i in range(len(sharpen_sets)):
+        plt.figure()
+        plt.imshow(av_rect_sharp[i], cmap="gray")
+        plt.title(f"Averaged Rectified Image (Sharpened) with parameters: sigma={sharpen_sets[i][0]}, strength={sharpen_sets[i][1]}")
     plt.show()
     plt.close("all")
 
