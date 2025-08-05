@@ -68,6 +68,13 @@ def min_max_normalize(image: Image.Image, min_val: int = 0, max_val: int = 255) 
         normalized_array = (image_array - img_min) / (img_max - img_min) * 255
         return Image.fromarray(normalized_array.astype('uint8'))
 
+def unsharp_mask(image, sigma=1.0, strength=1.5):
+    # Apply Gaussian blur
+    blurred = cv.GaussianBlur(image, (0, 0), sigma)
+    # Subtract the blurred image from the original
+    sharpened = cv.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
+    return sharpened
+
 def assemble_HDR(images: List[Image.Image], weights: Optional[np.ndarray] = None) -> Image.Image:
     """
     Assemble a High Dynamic Range (HDR) image from a list of images.
@@ -428,6 +435,9 @@ def main():
 
     av_rect, rect_images = rectify_and_average_views(views, sim_mat, ref_view_choice, cor_shape)
     
+    # Sharpen image (?)
+    av_rect_sharp = unsharp_mask(av_rect, sigma=1.0, strength=1.5)
+
     # Display rectified images views
     for i in range(VIEW_GRID_SIZE):
         for j in range(VIEW_GRID_SIZE):
@@ -441,6 +451,9 @@ def main():
     plt.figure()
     plt.imshow(av_rect, cmap="gray")
     plt.title("Averaged Rectified Image")
+    plt.figure()
+    plt.imshow(av_rect_sharp, cmap="gray")
+    plt.title("Averaged Rectified Image (Sharpened)")
     plt.show()
     plt.close("all")
 
