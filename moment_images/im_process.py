@@ -299,7 +299,7 @@ def calculate_similarity_matrix(views: np.ndarray, ref_view_idx: Tuple[int, int]
                     view2 = views[k, l]
                     
                     # Pad view1 for correlation
-                    padded_view1 = np.pad(view1, pad_width, mode='wrap')
+                    padded_view1 = np.pad(view1, pad_width)
                     
                     # Calculate correlation
                     cor = correlate2d(padded_view1, view2, mode='valid')
@@ -411,6 +411,13 @@ def main():
     plt.close("all")
 
     ref_view_choice = (1, 1) # Default to center view as reference
+
+    # Cleanup of reference view for better correlation
+    view_mask = np.array([val if np.linalg.norm(np.array(np.unravel_index(i, views[ref_view_choice].shape)) - np.array(views[ref_view_choice].shape)//2) < windows[0, 2] else 0 for i, val in enumerate(views[ref_view_choice].flatten())])
+    view_mask = np.reshape(view_mask, views[ref_view_choice].shape)
+    views[ref_view_choice] = view_mask
+
+    #calculate similarity matrix
     sim_mat, cor_shape = calculate_similarity_matrix(views, ref_view_choice, CORRELATION_PAD_WIDTH)
     
     # Assemble and dispaly similarity matrix
