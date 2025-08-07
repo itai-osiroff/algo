@@ -273,7 +273,7 @@ def extract_views(image_np: np.ndarray, base_circle: np.ndarray, num_views: int,
             
     return views
 
-def calculate_similarity_matrix(views: np.ndarray, ref_view_idx: Tuple[int, int], pad_width: int) -> np.ndarray:
+def calculate_similarity_matrix(views: np.ndarray, ref_view_idx: Tuple[int, int], pad_width: int) -> Tuple[np.ndarray, Tuple[int, int]]:
     """
     Calculate the translational similarity between all pairs of views.
 
@@ -307,7 +307,7 @@ def calculate_similarity_matrix(views: np.ndarray, ref_view_idx: Tuple[int, int]
                     
                     sim_mat[i, j, k, l, :] = max_cor_loc
                     
-    return sim_mat
+    return sim_mat, cor.shape
 
 def rectify_and_average_views(views: np.ndarray, sim_mat: np.ndarray, ref_view_idx: Tuple[int, int], cor_shape: Tuple[int, int]) -> Tuple[List[np.ndarray], np.ndarray]:
     """
@@ -411,7 +411,7 @@ def main():
     plt.close("all")
 
     ref_view_choice = (1, 1) # Default to center view as reference
-    sim_mat = calculate_similarity_matrix(views, ref_view_choice, CORRELATION_PAD_WIDTH)
+    sim_mat, cor_shape = calculate_similarity_matrix(views, ref_view_choice, CORRELATION_PAD_WIDTH)
     
     # Assemble and dispaly similarity matrix
     # Display of similarity matrices
@@ -428,10 +428,6 @@ def main():
     fig_x.suptitle("X translation similarity")
     fig_y.suptitle("Y translation similarity")
     # plt.show()
-
-    # This is needed for the warp affine later
-    padded_view_for_corr_shape = np.pad(views[ref_view_choice], CORRELATION_PAD_WIDTH, mode='wrap')
-    cor_shape = correlate2d(padded_view_for_corr_shape, views[ref_view_choice], mode='valid').shape
 
     av_rect, rect_images = rectify_and_average_views(views, sim_mat, ref_view_choice, cor_shape)
     
