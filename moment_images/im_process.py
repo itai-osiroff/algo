@@ -14,7 +14,7 @@ GAUSSIAN_BLUR_SIGMA = 5
 HOUGH_CIRCLES_PARAM1 = 50
 HOUGH_CIRCLES_PARAM2 = 30
 HOUGH_CIRCLES_MIN_DIST = 20
-VIEW_GRID_SIZE = 3
+DEFAULT_VIEW_GRID_SIZE = 3
 VIEW_DISTANCE_SCALE_FACTOR = 1.1
 CORRELATION_PAD_WIDTH = int(125*0.45) # 30% of expected viewpoint size (125 pixels)
 DEFAULT_SEARCH_RADIUS_MIN = 100
@@ -414,18 +414,19 @@ def main():
     windows = circles_chosen[0, :2]
     d = int(np.floor(VIEW_DISTANCE_SCALE_FACTOR * 2 * np.max(windows[:, 2])))
     
-    views = extract_views(norm_im_chosen, windows[0], VIEW_GRID_SIZE, d)
+    view_grid_size = int(input(f"Enter view grid size *default {DEFAULT_VIEW_GRID_SIZE}*: ") or DEFAULT_VIEW_GRID_SIZE)
+    views = extract_views(norm_im_chosen, windows[0], view_grid_size, d)
     
     # Display extracted views
-    for i in range(VIEW_GRID_SIZE):
-        for j in range(VIEW_GRID_SIZE):
+    for i in range(view_grid_size):
+        for j in range(view_grid_size):
             plt.figure()
             plt.imshow(views[i, j], cmap="gray")
             plt.title(f"View {i+1}-{j+1}")
     plt.show()
     plt.close("all")
 
-    ref_view_choice = (1, 1) # Default to center view as reference
+    ref_view_choice = (view_grid_size//2, view_grid_size//2) # Default to center view as reference
 
     # Cleanup of reference view for better correlation
     view_mask = np.array([val if np.linalg.norm(np.array(np.unravel_index(i, views[ref_view_choice].shape)) - np.array(views[ref_view_choice].shape)//2) < windows[0, 2] else 0 for i, val in enumerate(views[ref_view_choice].flatten())])
@@ -437,10 +438,10 @@ def main():
     
     # Assemble and dispaly similarity matrix
     # Display of similarity matrices
-    fig_x, ax_x = plt.subplots(nrows=VIEW_GRID_SIZE, ncols=VIEW_GRID_SIZE, sharex=True, sharey=True)
-    fig_y, ax_y = plt.subplots(nrows=VIEW_GRID_SIZE, ncols=VIEW_GRID_SIZE, sharex=True, sharey=True)
-    for idx in range(VIEW_GRID_SIZE):    
-        for jdx in range(VIEW_GRID_SIZE): 
+    fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+    fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+    for idx in range(view_grid_size):    
+        for jdx in range(view_grid_size): 
             im_x = ax_x[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 1], cmap="gray")
             im_y = ax_y[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 0], cmap="gray")
             ax_x[idx, jdx].set_title(f"View {idx+1}-{jdx+1} X translation similarity")
@@ -461,8 +462,8 @@ def main():
         av_rect_sharp.append(unsharp_mask(av_rect, sigma=sigma, strength=strength))
 
     # Display rectified images views
-    for i in range(VIEW_GRID_SIZE):
-        for j in range(VIEW_GRID_SIZE):
+    for i in range(view_grid_size):
+        for j in range(view_grid_size):
             plt.figure()
             manager = plt.get_current_fig_manager().full_screen_toggle()
             plt.imshow(rect_images[i, j], cmap="gray")
