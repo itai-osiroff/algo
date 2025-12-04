@@ -15,10 +15,10 @@ HOUGH_CIRCLES_PARAM1 = 50
 HOUGH_CIRCLES_PARAM2 = 30
 HOUGH_CIRCLES_MIN_DIST = 20
 VIEW_GRID_SIZE = 3
-VIEW_DISTANCE_SCALE_FACTOR = 1.15
-CORRELATION_PAD_WIDTH = 30
-DEFAULT_SEARCH_RADIUS_MIN = 90
-DEFAULT_SEARCH_RADIUS_MAX = 120
+VIEW_DISTANCE_SCALE_FACTOR = 1.1
+CORRELATION_PAD_WIDTH = int(125*0.45) # 30% of expected viewpoint size (125 pixels)
+DEFAULT_SEARCH_RADIUS_MIN = 100
+DEFAULT_SEARCH_RADIUS_MAX = 130
 
 def load_image(image_path: str) -> Optional[Image.Image]:
     """
@@ -273,7 +273,7 @@ def extract_views(image_np: np.ndarray, base_circle: np.ndarray, num_views: int,
             
     return views
 
-def calculate_similarity_matrix(views: np.ndarray, ref_view_idx: Tuple[int, int], pad_width: int) -> Tuple[np.ndarray, Tuple[int, int]]:
+def calculate_similarity_matrix(views: np.ndarray, ref_view_idx: Tuple[int, int], pad_width: int) -> np.ndarray:
     """
     Calculate the translational similarity between all pairs of views.
 
@@ -304,12 +304,11 @@ def calculate_similarity_matrix(views: np.ndarray, ref_view_idx: Tuple[int, int]
                     # Calculate correlation
                     cor = correlate2d(padded_view1, view2, mode='valid')
                     max_cor_loc = np.unravel_index(np.argmax(cor), cor.shape)
+                    sim_mat[i, j, k, l, :] = np.subtract(max_cor_loc, (cor.shape[0] // 2, cor.shape[1] // 2))
                     
-                    sim_mat[i, j, k, l, :] = max_cor_loc
-                    
-    return sim_mat, cor.shape
+    return sim_mat
 
-def rectify_and_average_views(views: np.ndarray, sim_mat: np.ndarray, ref_view_idx: Tuple[int, int], cor_shape: Tuple[int, int]) -> Tuple[List[np.ndarray], np.ndarray]:
+def rectify_and_average_views(views: np.ndarray, sim_mat: np.ndarray, ref_view_idx: Tuple[int, int]) -> Tuple[List[np.ndarray], np.ndarray]:
     """
     Align views to a reference view and compute their average.
 
@@ -317,7 +316,6 @@ def rectify_and_average_views(views: np.ndarray, sim_mat: np.ndarray, ref_view_i
         views: The array of image views.
         sim_mat: The similarity matrix containing translation offsets.
         ref_view_idx: The (row, col) index of the reference view.
-        cor_shape: The shape of the correlation matrix.
 
     Returns:
         The averaged image of the aligned views as a NumPy array.
@@ -333,8 +331,8 @@ def rectify_and_average_views(views: np.ndarray, sim_mat: np.ndarray, ref_view_i
                 rect_images[i, j] = views[i, j]
                 continue
             
-            dx = sim_mat[ref_i, ref_j, i, j, 1] - cor_shape[1] // 2
-            dy = sim_mat[ref_i, ref_j, i, j, 0] - cor_shape[0] // 2
+            dx = sim_mat[ref_i, ref_j, i, j, 1]
+            dy = sim_mat[ref_i, ref_j, i, j, 0]
             
             warp_mat = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
             rect_images[i, j] = cv.warpAffine(views[i, j], warp_mat, (views.shape[3], views.shape[2]))
@@ -371,31 +369,48 @@ def main():
     for orig_im, norm_im in processed_images:
         im_np = np.array(norm_im)
         
-        roi_strategy = input("Enter ROI strategy (full, center, max_pixel, specific): ").lower()
-        if roi_strategy == 'specific':
+        # give user choice between using circle-detection to find viewpoints, or manually setting the viewpoints
+        viewpoint_method = input("Select viewpoint selection method - circle-detection or manual? (c/m)").lower()
+        if viewpoint_method == 'm':
             plt.figure()
             plt.imshow(im_np, cmap='gray')
             plt.show()
-        roi, roi_offset = select_roi(im_np, roi_strategy, DEFAULT_SEARCH_RADIUS_MAX)
-        
-        circles = detect_and_adjust_circles(roi, roi_offset, DEFAULT_SEARCH_RADIUS_MIN, DEFAULT_SEARCH_RADIUS_MAX)
-        
-        if circles is None:
-            print("No circles found in this image.")
-            continue
+            center_x = int(input(f"Enter center x coordinate of viewpoint: "))
+            center_y = int(input(f"Enter center y coordinate of viewpoint: "))
+            radius = int(input(f"Enter radius of viewpoint: ")) #Expected size of each viewpoint is 250 pixels->radius~125 pixels
+            circles = np.array([[[center_x, center_y, radius]]])
+            display_circles(norm_im, circles)
+            if input("Use this image for further processing? (y/n): ").lower() == 'y':
+                circles_chosen = circles
+                norm_im_chosen = im_np
+                break
+            plt.close("all")
+        else:
+            roi_strategy = input("Enter ROI strategy (full, center, max_pixel, specific): ").lower()
+            if roi_strategy == 'specific':
+                plt.figure()
+                plt.imshow(im_np, cmap='gray')
+                plt.show()
+            roi, roi_offset = select_roi(im_np, roi_strategy, DEFAULT_SEARCH_RADIUS_MAX)
+
+            circles = detect_and_adjust_circles(roi, roi_offset, DEFAULT_SEARCH_RADIUS_MIN, DEFAULT_SEARCH_RADIUS_MAX)
             
-        display_circles(norm_im, circles)
-        
-        if input("Use this image for further processing? (y/n): ").lower() == 'y':
-            circles_chosen = circles
-            norm_im_chosen = im_np
-            break
-        plt.close("all")
+            if circles is None:
+                print("No circles found in this image. ")
+                continue
+                
+            display_circles(norm_im, circles)
+            
+            if input("Use this image for further processing? (y/n): ").lower() == 'y':
+                circles_chosen = circles
+                norm_im_chosen = im_np
+                break
+            plt.close("all")
 
     if circles_chosen is None or norm_im_chosen is None:
-        print("No image selected for processing. Exiting.")
+        print("No image selected for processing/Problem with constructing ROI structure. Exiting.")
         return
-
+    
     windows = circles_chosen[0, :2]
     d = int(np.floor(VIEW_DISTANCE_SCALE_FACTOR * 2 * np.max(windows[:, 2])))
     
@@ -415,10 +430,10 @@ def main():
     # Cleanup of reference view for better correlation
     view_mask = np.array([val if np.linalg.norm(np.array(np.unravel_index(i, views[ref_view_choice].shape)) - np.array(views[ref_view_choice].shape)//2) < windows[0, 2] else 0 for i, val in enumerate(views[ref_view_choice].flatten())])
     view_mask = np.reshape(view_mask, views[ref_view_choice].shape)
-    views[ref_view_choice] = view_mask
+    views[ref_view_choice] = unsharp_mask(view_mask)
 
     #calculate similarity matrix
-    sim_mat, cor_shape = calculate_similarity_matrix(views, ref_view_choice, CORRELATION_PAD_WIDTH)
+    sim_mat = calculate_similarity_matrix(views, ref_view_choice, CORRELATION_PAD_WIDTH)
     
     # Assemble and dispaly similarity matrix
     # Display of similarity matrices
@@ -436,7 +451,7 @@ def main():
     fig_y.suptitle("Y translation similarity")
     # plt.show()
 
-    av_rect, rect_images = rectify_and_average_views(views, sim_mat, ref_view_choice, cor_shape)
+    av_rect, rect_images = rectify_and_average_views(views, sim_mat, ref_view_choice)
     
     # Sharpen image (?)
     sharpen_sets = [(2.0, 2.0), (3.0, 2.0), (2.0, 3.0), (3.0, 3.0)]
@@ -449,6 +464,7 @@ def main():
     for i in range(VIEW_GRID_SIZE):
         for j in range(VIEW_GRID_SIZE):
             plt.figure()
+            manager = plt.get_current_fig_manager().full_screen_toggle()
             plt.imshow(rect_images[i, j], cmap="gray")
             plt.title(f"Rectified View {i+1}-{j+1}")
     # plt.show()
@@ -457,10 +473,12 @@ def main():
     # Display the averaged rectified image
     plt.figure()
     plt.imshow(av_rect, cmap="gray")
+    manager = plt.get_current_fig_manager().full_screen_toggle()
     plt.title("Averaged Rectified Image")
     for i in range(len(sharpen_sets)):
         plt.figure()
         plt.imshow(av_rect_sharp[i], cmap="gray")
+        manager = plt.get_current_fig_manager().full_screen_toggle()
         plt.title(f"Averaged Rectified Image (Sharpened) with parameters: sigma={sharpen_sets[i][0]}, strength={sharpen_sets[i][1]}")
     plt.show()
     plt.close("all")
