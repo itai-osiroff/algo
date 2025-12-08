@@ -4,6 +4,7 @@ from PIL import Image
 import numpy as np
 import cv2 as cv
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from scipy.signal import correlate2d
 from typing import Tuple, List, Optional
 
@@ -339,6 +340,22 @@ def rectify_and_average_views(views: np.ndarray, sim_mat: np.ndarray, ref_view_i
 
     return (np.mean(rect_images, axis=(0, 1)), rect_images)
 
+def save_figures(figures: List[Figure], save_dir: str, dpi: int = 600):
+	"""
+	Save a list of matplotlib Figure objects as high-resolution JPG files.
+	"""
+	if not figures:
+		print("No figures to save.")
+		return
+	os.makedirs(save_dir, exist_ok=True)
+	for idx, fig in enumerate(figures, start=1):
+		filename = os.path.join(save_dir, f"figure_{idx}.jpg")
+		try:
+			fig.savefig(filename, format='jpg', dpi=dpi, bbox_inches='tight')
+			print(f"Saved: {filename}")
+		except Exception as e:
+			print(f"Failed to save {filename}: {e}")
+
 def main():
     """Main function to run the image processing pipeline."""
     images, image_paths, hdr_flag = get_image_paths()
@@ -363,6 +380,9 @@ def main():
 
     processed_images = [(im, min_max_normalize(im)) for im in images]
     
+    # New: collect created matplotlib figures so we can optionally save them later
+    created_figures: List[Figure] = []
+    
     circles_chosen = None
     norm_im_chosen = None
 
@@ -372,7 +392,8 @@ def main():
         # give user choice between using circle-detection to find viewpoints, or manually setting the viewpoints
         viewpoint_method = input("Select viewpoint selection method - circle-detection or manual? (c/m)").lower()
         if viewpoint_method == 'm':
-            plt.figure()
+            fig = plt.figure()
+            created_figures.append(fig)
             plt.imshow(im_np, cmap='gray')
             plt.show()
             center_x = int(input(f"Enter center x coordinate of viewpoint: "))
@@ -388,7 +409,8 @@ def main():
         else:
             roi_strategy = input("Enter ROI strategy (full, center, max_pixel, specific): ").lower()
             if roi_strategy == 'specific':
-                plt.figure()
+                fig = plt.figure()
+                created_figures.append(fig)
                 plt.imshow(im_np, cmap='gray')
                 plt.show()
             roi, roi_offset = select_roi(im_np, roi_strategy, DEFAULT_SEARCH_RADIUS_MAX)
@@ -420,7 +442,8 @@ def main():
     # Display extracted views
     for i in range(view_grid_size):
         for j in range(view_grid_size):
-            plt.figure()
+            fig = plt.figure()
+            created_figures.append(fig)
             plt.imshow(views[i, j], cmap="gray")
             plt.title(f"View {i+1}-{j+1}")
     plt.show()
@@ -439,7 +462,9 @@ def main():
     # Assemble and dispaly similarity matrix
     # Display of similarity matrices
     fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+    created_figures.append(fig_x)
     fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+    created_figures.append(fig_y)
     for idx in range(view_grid_size):    
         for jdx in range(view_grid_size): 
             im_x = ax_x[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 1], cmap="gray")
@@ -464,7 +489,8 @@ def main():
     # Display rectified images views
     for i in range(view_grid_size):
         for j in range(view_grid_size):
-            plt.figure()
+            fig = plt.figure()
+            created_figures.append(fig)
             manager = plt.get_current_fig_manager().full_screen_toggle()
             plt.imshow(rect_images[i, j], cmap="gray")
             plt.title(f"Rectified View {i+1}-{j+1}")
@@ -472,17 +498,30 @@ def main():
     # plt.close("all")
     
     # Display the averaged rectified image
-    plt.figure()
+    fig = plt.figure()
+    created_figures.append(fig)
     plt.imshow(av_rect, cmap="gray")
     manager = plt.get_current_fig_manager().full_screen_toggle()
     plt.title("Averaged Rectified Image")
     for i in range(len(sharpen_sets)):
-        plt.figure()
+        fig = plt.figure()
+        created_figures.append(fig)
         plt.imshow(av_rect_sharp[i], cmap="gray")
         manager = plt.get_current_fig_manager().full_screen_toggle()
         plt.title(f"Averaged Rectified Image (Sharpened) with parameters: sigma={sharpen_sets[i][0]}, strength={sharpen_sets[i][1]}")
     plt.show()
+
+    # New: Ask user whether to save displayed figures
+    if created_figures:
+        save_opt = input("Do you want to save the displayed figures as high-resolution JPG files? (y/n): ").lower()
+        if save_opt == 'y':
+            save_dir = input("Enter directory path to save figures (will be created if not exists): ").strip()
+            if save_dir:
+                save_figures(created_figures, save_dir, dpi=600)
+            else:
+                print("No directory entered. Skipping save.")
+    # Close all figures afterwards
     plt.close("all")
 
 if __name__ == "__main__":
-    main()
+	main()
