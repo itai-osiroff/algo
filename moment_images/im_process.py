@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from scipy.signal import correlate2d
 from typing import Tuple, List, Optional
+from django.utils.text import slugify
 
 # --- Constants ---
 DEFAULT_IMAGE_DIR = 'moment_images/images'
@@ -351,7 +352,7 @@ def save_figures(figures: List[Figure], save_dir: str, dpi: int = 600):
     os.makedirs(save_dir, exist_ok=True)
     for idx, fig in enumerate(figures, start=1):
         # Get the figure title
-        title = fig._suptitle.get_text() if fig._suptitle else None
+        title = slugify(fig._suptitle.get_text()) if fig._suptitle else None
         if not title:
             # Try to get title from axes
             if fig.axes and fig.axes[0].get_title():
