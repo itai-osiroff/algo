@@ -341,20 +341,33 @@ def rectify_and_average_views(views: np.ndarray, sim_mat: np.ndarray, ref_view_i
     return (np.mean(rect_images, axis=(0, 1)), rect_images)
 
 def save_figures(figures: List[Figure], save_dir: str, dpi: int = 600):
-	"""
-	Save a list of matplotlib Figure objects as high-resolution JPG files.
-	"""
-	if not figures:
-		print("No figures to save.")
-		return
-	os.makedirs(save_dir, exist_ok=True)
-	for idx, fig in enumerate(figures, start=1):
-		filename = os.path.join(save_dir, f"figure_{idx}.jpg")
-		try:
-			fig.savefig(filename, format='jpg', dpi=dpi, bbox_inches='tight')
-			print(f"Saved: {filename}")
-		except Exception as e:
-			print(f"Failed to save {filename}: {e}")
+    """
+    Save a list of matplotlib Figure objects as high-resolution JPG files.
+    The filename is based on the figure's title.
+    """
+    if not figures:
+        print("No figures to save.")
+        return
+    os.makedirs(save_dir, exist_ok=True)
+    for idx, fig in enumerate(figures, start=1):
+        # Get the figure title
+        title = fig._suptitle.get_text() if fig._suptitle else None
+        if not title:
+            # Try to get title from axes
+            if fig.axes and fig.axes[0].get_title():
+                title = fig.axes[0].get_title()
+        
+        # Use title if available, otherwise use default naming
+        if title:
+            filename = os.path.join(save_dir, f"{title}.jpg")
+        else:
+            filename = os.path.join(save_dir, f"figure_{idx}.jpg")
+        
+        try:
+            fig.savefig(filename, format='jpg', dpi=dpi, bbox_inches='tight')
+            print(f"Saved: {filename}")
+        except Exception as e:
+            print(f"Failed to save {filename}: {e}")
 
 def main():
     """Main function to run the image processing pipeline."""
