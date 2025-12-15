@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from scipy.signal import correlate2d
 from typing import Tuple, List, Optional
+from itertools import combinations
 from django.utils.text import slugify
 
 # --- Constants ---
@@ -357,6 +358,51 @@ def rectify_and_average_views(views: np.ndarray, sim_mat: np.ndarray, ref_view_i
 
     return (np.mean(rect_images, axis=(0, 1)), rect_images)
 
+
+def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]]:
+    """
+    Create RGB overlays comparing each pair of extreme rectified views.
+
+    The red channel is populated by the first view in the pair and the green
+    channel by the second, enabling pixel-by-pixel inspection of differences.
+    Values are normalized to [0, 1] to ensure consistent display regardless of
+    the original image scale.
+
+    Args:
+        rect_images: Rectified grayscale views arranged in a square grid of
+            shape (N, N, H, W).
+
+    Returns:
+        A list of tuples containing the overlay image and the paired indices.
+    """
+    grid_size = rect_images.shape[0]
+    if grid_size < 2:
+        return []
+
+    extreme_indices = [
+        (0, 0),
+        (0, grid_size - 1),
+        (grid_size - 1, 0),
+        (grid_size - 1, grid_size - 1),
+    ]
+
+    overlays: List[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]] = []
+    for (i1, j1), (i2, j2) in combinations(extreme_indices, 2):
+        view_1 = rect_images[i1, j1].astype(np.float32)
+        view_2 = rect_images[i2, j2].astype(np.float32)
+
+        max_val = float(max(np.max(view_1), np.max(view_2), 1e-8))
+        view_1_norm = view_1 / max_val
+        view_2_norm = view_2 / max_val
+
+        overlay = np.zeros((*view_1.shape, 3), dtype=np.float32)
+        overlay[..., 0] = view_1_norm
+        overlay[..., 1] = view_2_norm
+
+        overlays.append((overlay, (i1, j1), (i2, j2)))
+
+    return overlays
+
 def save_figures(figures: List[Figure], save_dir: str, dpi: int = 600):
     """
     Save a list of matplotlib Figure objects as high-resolution JPG files.
@@ -533,6 +579,17 @@ def main():
             plt.title(f"Rectified View {i+1}-{j+1}")
     # plt.show()
     # plt.close("all")
+
+    # Build and display RGB overlays for the most extreme rectified views
+    extreme_overlays = build_extreme_view_overlays(rect_images)
+    for overlay, (i1, j1), (i2, j2) in extreme_overlays:
+        fig = plt.figure()
+        created_figures.append(fig)
+        plt.imshow(overlay)
+        plt.title(
+            "Extreme View Overlay "
+            f"({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})"
+        )
     
     # Display the averaged rectified image
     fig = plt.figure()
