@@ -89,17 +89,23 @@ def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray]
         raise ValueError("No images provided for HDR assembly.")
 
     # Convert PIL Images to OpenCV BGR format and ensure consistent normalization
-    cv_images = [cv.cvtColor(np.array(min_max_normalize(image).convert("RGB")), cv.COLOR_RGB2BGR) for image in images]
+    cv_images = [cv.cvtColor(np.array(image), cv.COLOR_GRAY2BGR).astype('uint8') for image in images]
 
+    # Normalize/validate exposure_times and make sure it's a 1D numpy array of float32
     if exposure_times is None:
         # Generate synthetic exposure times if none are provided (in seconds)
         exposure_times = np.array([1.0 / (2 ** i) for i in range(len(cv_images))], dtype=np.float32)
     else:
+        exposure_times = np.array(exposure_times, dtype=np.float32)
         if exposure_times.ndim != 1 or len(exposure_times) != len(cv_images):
             raise ValueError("Exposure times must be a 1D array matching the number of images.")
         if np.any(exposure_times <= 0):
             raise ValueError("Exposure times must be positive.")
-        exposure_times = exposure_times.astype(np.float32)
+
+    # Order images and exposure times by exposure time descending (higher -> lower)
+    sort_idx = np.argsort(-exposure_times)  # descending order
+    exposure_times = exposure_times[sort_idx]
+    cv_images = [cv_images[i] for i in sort_idx]
 
     calibrate = cv.createCalibrateDebevec()
     response = calibrate.process(cv_images, exposure_times)
@@ -108,11 +114,11 @@ def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray]
     hdr = merge_debevec.process(cv_images, exposure_times, response)
 
     # Tone map the HDR image to 8-bit for display and saving
-    tonemap = cv.createTonemapDurand(gamma=2.2)
-    ldr = tonemap.process(hdr)
-    ldr_8bit = np.clip(ldr * 255, 0, 255).astype(np.uint8)
+    tonemap = cv.createTonemap(gamma=2.2)
+    ldr = np.nan_to_num(tonemap.process(hdr.copy()))
+    ldr_clipped = np.clip(ldr * 255, 0, 255).astype('uint8')
 
-    return Image.fromarray(cv.cvtColor(ldr_8bit, cv.COLOR_BGR2RGB))
+    return Image.fromarray(cv.cvtColor(ldr_clipped, cv.COLOR_BGR2GRAY))
 
 def get_image_paths() -> Tuple[List[Image.Image], List[str], bool]:
     """
@@ -389,8 +395,15 @@ def main():
         return
 
     if hdr_flag:
+        exp_time = input("Do you want to enter exposure times for the images or generate them automatically? (manual/auto): ").lower()
+        if exp_time == 'auto':
+            exp_times = None
+        else:
+            exp_times = np.zeros(len(images))
+            for i in range(len(images)):
+                exp_times[i] = float(input(f"Enter exposure time (in seconds) for image {image_paths[i]}: "))
         print("Assembling HDR image...")
-        hdr_image = assemble_HDR(images)
+        hdr_image = assemble_HDR(images, exp_times)
         images = [hdr_image]
         print("HDR image assembled successfully.")
     else:
