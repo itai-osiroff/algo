@@ -148,10 +148,15 @@ def get_image_paths() -> Tuple[List[Image.Image], List[str], bool]:
         if image:
             images.append(image)
             image_paths.append(image_path)
-            print(f"Successfully loaded image: {f}")
+            print(f"[{len(image_paths)}] Successfully loaded image: {f}")
         else:
             print(f"Failed to load image: {f}")
-            
+
+    if image_paths:
+        print("\nLoaded images:")
+        for idx, path in enumerate(image_paths, start=1):
+            print(f"  {idx}: {os.path.basename(path)}")
+
     return images, image_paths, hdr_flag
 
 def select_roi(image_np: np.ndarray, strategy: str, search_radius: int) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
@@ -453,9 +458,17 @@ def main():
         images = [hdr_image]
         print("HDR image assembled successfully.")
     else:
-        image_name = input("Enter image name for processing (or press Enter for all): ")
-        if image_name:
-            images = [im for i, im in enumerate(images) if image_name in image_paths[i]]
+        image_choice = input("Enter image number or name for processing (or press Enter for all): ").strip()
+        if image_choice:
+            if image_choice.isdigit():
+                chosen_idx = int(image_choice)
+                if 1 <= chosen_idx <= len(images):
+                    images = [images[chosen_idx - 1]]
+                else:
+                    print(f"Invalid selection. Number must be between 1 and {len(images)}.")
+                    images = []
+            else:
+                images = [im for i, im in enumerate(images) if image_choice in image_paths[i]]
 
     if not images:
         print("No images found for processing. Exiting.")
