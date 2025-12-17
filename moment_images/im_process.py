@@ -488,9 +488,12 @@ def main():
         # give user choice between using circle-detection to find viewpoints, or manually setting the viewpoints
         viewpoint_method = input("Select viewpoint selection method - circle-detection or manual? (c/m)").lower()
         if viewpoint_method == 'm':
-            fig = plt.figure()
+            fig = plt.figure(1)
             created_figures.append(fig)
             plt.imshow(im_np, cmap='gray')
+            fig = plt.figure(2)
+            created_figures.append(fig)
+            plt.imshow(cv.equalizeHist(im_np), cmap='gray')
             plt.show()
             center_x = int(input(f"Enter center x coordinate of viewpoint: "))
             center_y = int(input(f"Enter center y coordinate of viewpoint: "))
@@ -610,12 +613,17 @@ def main():
     plt.imshow(av_rect, cmap="gray")
     manager = plt.get_current_fig_manager().full_screen_toggle()
     plt.title("Averaged Rectified Image")
+    fig = plt.figure()
+    created_figures.append(fig)
+    plt.imshow(cv.equalizeHist(av_rect.astype('uint8')), cmap="gray")
+    manager = plt.get_current_fig_manager().full_screen_toggle()
+    plt.title("Averaged Rectified Image - Equalized for contrast")
     for i in range(len(sharpen_sets)):
         fig = plt.figure()
         created_figures.append(fig)
         plt.imshow(av_rect_sharp[i], cmap="gray")
         manager = plt.get_current_fig_manager().full_screen_toggle()
-        plt.title(f"Averaged Rectified Image (Sharpened) with parameters: sigma={sharpen_sets[i][0]}, strength={sharpen_sets[i][1]}")
+        plt.title(f"Averaged Rectified Image (Sharpened) with parameters - sigma={sharpen_sets[i][0]}, strength={sharpen_sets[i][1]}")
     plt.show()
 
     # New: Ask user whether to save displayed figures
