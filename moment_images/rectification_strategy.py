@@ -120,13 +120,18 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
 
         num_views = views_arr.shape[0]
         sim_mat = self.pad_width * np.ones((num_views, num_views, num_views, num_views, 2))
+        check_all_views = input("Check all views for similarity? (y/n): ").lower()
 
         ref_i, ref_j = ref_view_idx
         if not (0 <= ref_i < num_views and 0 <= ref_j < num_views):
             raise ValueError("ref_view_idx must point to a valid view inside views")
 
         for i in range(num_views):
+            if check_all_views != "y" and i != ref_view_idx[0]:
+                continue
             for j in range(num_views):
+                if check_all_views != "y" and j != ref_view_idx[1]:
+                    continue
                 for k in range(num_views):
                     for l in range(num_views):
                         view1 = views_arr[i, j]
