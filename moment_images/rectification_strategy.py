@@ -25,6 +25,7 @@ from typing import Optional, Tuple
 import cv2 as cv
 import numpy as np
 from scipy.signal import correlate2d
+from scipy.ndimage import gaussian_filter
 
 
 DEFAULT_CORRELATION_PAD_WIDTH = int(125 * 0.45)
@@ -240,9 +241,17 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         return grid_rows // 2, grid_cols // 2
 
     def compute_similarity_matrix(
-        self, views: np.ndarray, ref_view_idx: Tuple[int, int]
+        self, views: np.ndarray, ref_view_idx: Tuple[int, int], max_disp: Optional[int] = None,
+        gauss_sigma: Optional[float] = None, gauss_size: Optional[int] = None,
     ) -> PixelwiseSimilarityResult:
         views_arr = np.asarray(views, dtype=np.float64)
+
+        if max_disp is None:
+            max_disp = self.window_size * 2
+        if gauss_sigma is None:
+            gauss_sigma = 1.0
+        if gauss_size is None:
+            gauss_size = self.window_size * 2 + 1
 
         if views_arr.ndim != 4:
             raise ValueError("views must have shape (N, N, H, W)")
@@ -258,30 +267,22 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             raise ValueError("ref_view_idx must point to a valid view inside views")
 
         ref_view = views_arr[ref_i, ref_j].astype(np.float32, copy=False)
-        padded_views = np.pad(
-            views_arr,
-            ((0, 0), (0, 0), (self.window_radius, self.window_radius), (self.window_radius, self.window_radius)),
-            mode="reflect",
-        )
-
+        corr_mats = np.zeros((height, width, max_disp *2 + 1, max_disp *2 + 1), dtype=np.float32)
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.int32)
         scores = np.full((height, width, grid_rows, grid_cols), -np.inf, dtype=np.float64)
-
         for i in range(grid_rows):
             for j in range(grid_cols):
-                view = padded_views[i, j].astype(np.float32, copy=False)
-                for y in range(height):
-                    for x in range(width):
-                        patch = view[y : y + self.window_size, x : x + self.window_size]
-                        corr = cv.matchTemplate(ref_view, patch, method=cv.TM_CCORR_NORMED)
-                        max_idx = np.unravel_index(np.argmax(corr), corr.shape)
-                        max_score = float(corr[max_idx])
-
-                        target_y = max_idx[0] + self.window_radius
-                        target_x = max_idx[1] + self.window_radius
-
-                        coordinates[y, x, i, j] = (target_y, target_x)
-                        scores[y, x, i, j] = max_score
+                if i == ref_i and j == ref_j:
+                    continue
+                view = views_arr[i, j].astype(np.float32, copy=False)
+                for s_y in range(-max_disp, max_disp):
+                    for s_x in range(-max_disp, max_disp):
+                        shifted_view = np.roll(view, shift=(s_y, s_x), axis=(0,1))
+                        corr_mats[:, :, s_y, s_x] = gaussian_filter(np.multiply(ref_view, shifted_view), sigma=gauss_sigma,
+                                                truncate=(((gauss_size-1)/2)/gauss_sigma), mode="constant")
+                max_val = np.max(corr_mats, axis=(2,3))
+                scores[:, :, i, j] = max_val
+                coordinates[:, :, i, j] = np.unravel_index(np.nonzero(corr_mats==max_val), corr_mats.shape[:2])
 
         return PixelwiseSimilarityResult(coordinates=coordinates, scores=scores)
 
