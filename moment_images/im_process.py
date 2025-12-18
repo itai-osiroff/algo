@@ -5,10 +5,10 @@ import numpy as np
 import cv2 as cv
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
-from scipy.signal import correlate2d
 from typing import Tuple, List, Optional
 from itertools import combinations
 from django.utils.text import slugify
+from moment_images.rectification_strategy import GlobalTranslationRectificationStrategy
 
 # --- Constants ---
 DEFAULT_IMAGE_DIR = 'moment_images/images'
@@ -297,72 +297,6 @@ def extract_views(image_np: np.ndarray, base_circle: np.ndarray, num_views: int,
             
     return views
 
-def calculate_similarity_matrix(views: np.ndarray, ref_view_idx: Tuple[int, int], pad_width: int) -> np.ndarray:
-    """
-    Calculate the translational similarity between all pairs of views.
-
-    Args:
-        views: A NumPy array of image views.
-        pad_width: The padding to add to each view for correlation.
-
-    Returns:
-        A 5D NumPy array representing the similarity matrix with translation offsets.
-    """
-    num_views = views.shape[0]
-    sim_mat = pad_width * np.ones((num_views, num_views, num_views, num_views, 2))
-    check_all_views = input("Check all views for similarity? (y/n): ").lower()
-    for i in range(num_views):
-        if check_all_views != "y" and i != ref_view_idx[0]:
-            continue
-        for j in range(num_views):
-            if check_all_views != "y" and j != ref_view_idx[1]:
-                continue
-            for k in range(num_views):
-                for l in range(num_views):
-                    view1 = views[i, j]
-                    view2 = views[k, l]
-                    
-                    # Pad view1 for correlation
-                    padded_view1 = np.pad(view1, pad_width)
-                    
-                    # Calculate correlation
-                    cor = correlate2d(padded_view1, view2, mode='valid')
-                    max_cor_loc = np.unravel_index(np.argmax(cor), cor.shape)
-                    sim_mat[i, j, k, l, :] = np.subtract(max_cor_loc, (cor.shape[0] // 2, cor.shape[1] // 2))
-                    
-    return sim_mat
-
-def rectify_and_average_views(views: np.ndarray, sim_mat: np.ndarray, ref_view_idx: Tuple[int, int]) -> Tuple[List[np.ndarray], np.ndarray]:
-    """
-    Align views to a reference view and compute their average.
-
-    Args:
-        views: The array of image views.
-        sim_mat: The similarity matrix containing translation offsets.
-        ref_view_idx: The (row, col) index of the reference view.
-
-    Returns:
-        The averaged image of the aligned views as a NumPy array.
-    """
-    num_views = views.shape[0]
-    rect_images = np.zeros_like(views)
-    
-    ref_i, ref_j = ref_view_idx
-    
-    for i in range(num_views):
-        for j in range(num_views):
-            if i == ref_i and j == ref_j:
-                rect_images[i, j] = views[i, j]
-                continue
-            
-            dx = sim_mat[ref_i, ref_j, i, j, 1]
-            dy = sim_mat[ref_i, ref_j, i, j, 0]
-            
-            warp_mat = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
-            rect_images[i, j] = cv.warpAffine(views[i, j], warp_mat, (views.shape[3], views.shape[2]))
-
-    return (np.mean(rect_images, axis=(0, 1)), rect_images)
-
 
 def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]]:
     """
@@ -548,7 +482,8 @@ def main():
     plt.show()
     plt.close("all")
 
-    ref_view_choice = (view_grid_size//2, view_grid_size//2) # Default to center view as reference
+    rectification_strategy = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
+    ref_view_choice = rectification_strategy.select_reference_view(views)
 
     # Cleanup of reference view for better correlation
     view_mask = np.array([val if np.linalg.norm(np.array(np.unravel_index(i, views[ref_view_choice].shape)) - np.array(views[ref_view_choice].shape)//2) < windows[0, 2] else 0 for i, val in enumerate(views[ref_view_choice].flatten())])
@@ -556,7 +491,7 @@ def main():
     views[ref_view_choice] = unsharp_mask(view_mask)
 
     #calculate similarity matrix
-    sim_mat = calculate_similarity_matrix(views, ref_view_choice, CORRELATION_PAD_WIDTH)
+    sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice)
     
     # Assemble and dispaly similarity matrix
     # Display of similarity matrices
@@ -576,7 +511,7 @@ def main():
     fig_y.suptitle("Y translation similarity")
     # plt.show()
 
-    av_rect, rect_images = rectify_and_average_views(views, sim_mat, ref_view_choice)
+    av_rect, rect_images = rectification_strategy.rectify(views, sim_mat, ref_view_choice)
     
     # Sharpen image (?)
     sharpen_sets = [(2.0, 2.0), (3.0, 2.0), (2.0, 3.0), (3.0, 3.0)]
