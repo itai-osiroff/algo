@@ -8,7 +8,7 @@ from matplotlib.figure import Figure
 from typing import Tuple, List, Optional
 from itertools import combinations
 from django.utils.text import slugify
-from moment_images.rectification_strategy import GlobalTranslationRectificationStrategy
+from rectification_strategy import GlobalTranslationRectificationStrategy
 
 # --- Constants ---
 DEFAULT_IMAGE_DIR = 'moment_images/images'
