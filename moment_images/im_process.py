@@ -492,7 +492,7 @@ def main():
     if rect_strat == 1:
         rectification_strategy = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
     else:
-        sim_window_size = int(input("Enter similarity window size (odd integer, default 5): ") or 5)
+        sim_window_size = int(input("Enter similarity window size (odd integer, default 31): ") or 31)
         rectification_strategy = PixelwisePatchRectificationStrategy(sim_window_size)
     
     ref_view_choice = rectification_strategy.select_reference_view(views)
@@ -532,7 +532,8 @@ def main():
         av_rect, rect_images = rectification_strategy.rectify(views, sim_mat, ref_view_choice)
     else:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
-        sim_mat_coords = sim_mat_pixelwise.coordinates
+        disps_y = sim_mat_pixelwise.disps_y
+        disps_x = sim_mat_pixelwise.disps_x
         # sim_mat_scores = sim_mat_pixelwise.scores
         fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
         created_figures.append(fig_x)
@@ -540,8 +541,8 @@ def main():
         created_figures.append(fig_y)
         for idx in range(view_grid_size):    
             for jdx in range(view_grid_size): 
-                im_x = ax_x[idx,jdx].imshow(sim_mat_coords[idx, jdx, :, :, 1], cmap="gray")
-                im_y = ax_y[idx,jdx].imshow(sim_mat_coords[idx, jdx, :, :, 0], cmap="gray")
+                im_x = ax_x[idx,jdx].imshow(disps_x[:,:,idx, jdx], cmap="gray")
+                im_y = ax_y[idx,jdx].imshow(disps_y[:,:,idx, jdx], cmap="gray")
                 ax_x[idx, jdx].set_title(f"View {idx+1}-{jdx+1} X translation similarity")
                 ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
                 fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)

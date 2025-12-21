@@ -37,6 +37,8 @@ class PixelwiseSimilarityResult:
 
     coordinates: np.ndarray
     scores: np.ndarray
+    disps_y: np.ndarray
+    disps_x: np.ndarray
 
 
 class RectificationStrategy(ABC):
@@ -216,9 +218,12 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
     views to the reference grid.
     """
 
-    def __init__(self, window_size: int = 5) -> None:
-        if window_size % 2 == 0 or window_size < 1:
+    def __init__(self, window_size: int = 31) -> None:
+        if window_size < 1:
             raise ValueError("window_size must be a positive odd integer")
+        elif window_size % 2 == 0:
+            print("Warning: window_size should be odd, incrementing by 1")
+            window_size += 1
         self.window_size = int(window_size)
         self.window_radius = self.window_size // 2
 
@@ -241,11 +246,11 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         views_arr = np.asarray(views, dtype=np.float64)
 
         if max_disp is None:
-            max_disp = self.window_size * 2
+            max_disp = self.window_radius
         if gauss_sigma is None:
             gauss_sigma = 1.0
         if gauss_size is None:
-            gauss_size = self.window_size * 2 + 1
+            gauss_size = self.window_radius * 2 + 1
 
         D = max_disp * 2 + 1
         disp_arr = np.arange(-max_disp, max_disp + 1)
@@ -267,7 +272,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         corr_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.int32)
         scores = np.full((height, width, grid_rows, grid_cols), 0, dtype=np.float64)
-
+        disps_y = np.zeros((height, width, grid_rows, grid_cols), dtype=np.int32)
+        disps_x = np.zeros((height, width, grid_rows, grid_cols), dtype=np.int32)
         base_coords = np.stack(np.meshgrid(np.arange(height), np.arange(width), indexing="ij"), -1)
 
         for i in range(grid_rows):
@@ -275,8 +281,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 if i == ref_i and j == ref_j:
                     continue
                 view = views_arr[i, j].astype(np.float32, copy=False)
-                for s_y_ind in range(D-1):
-                    for s_x_ind in range(D-1):
+                for s_y_ind in range(D):
+                    for s_x_ind in range(D):
                         s_y = s_y_ind - max_disp
                         s_x = s_x_ind - max_disp
                         shifted_view = np.roll(view, shift=(s_y, s_x), axis=(0, 1))
@@ -304,10 +310,12 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                     idx_x[zero_mask] = max_disp
 
                 # compute coordinates: base + displacement
+                disps_y[:, :, i, j] = disp_arr[idx_y]
+                disps_x[:, :, i, j] = disp_arr[idx_x]
                 coordinates[:, :, i, j, 0] = base_coords[:, :, 0] + disp_arr[idx_y]
                 coordinates[:, :, i, j, 1] = base_coords[:, :, 1] + disp_arr[idx_x]
 
-        return PixelwiseSimilarityResult(coordinates=coordinates, scores=scores)
+        return PixelwiseSimilarityResult(coordinates=coordinates, scores=scores, disps_y = disps_y, disps_x = disps_x)
 
     def rectify(
         self,
