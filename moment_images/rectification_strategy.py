@@ -218,7 +218,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
     views to the reference grid.
     """
 
-    def __init__(self, window_size: int = 31) -> None:
+    def __init__(self, window_size: int = 61, step_size: Optional[int] = None) -> None:
         if window_size < 1:
             raise ValueError("window_size must be a positive odd integer")
         elif window_size % 2 == 0:
@@ -226,6 +226,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             window_size += 1
         self.window_size = int(window_size)
         self.window_radius = self.window_size // 2
+        self.step_size = step_size if step_size is not None else self.window_size // 10
 
     def select_reference_view(self, views: np.ndarray) -> Tuple[int, int]:
         views_arr = np.asarray(views)
@@ -281,8 +282,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 if i == ref_i and j == ref_j:
                     continue
                 view = views_arr[i, j].astype(np.float32, copy=False)
-                for s_y_ind in range(D):
-                    for s_x_ind in range(D):
+                for s_y_ind in range(0, D, self.step_size):
+                    for s_x_ind in range(0, D, self.step_size):
                         s_y = s_y_ind - max_disp
                         s_x = s_x_ind - max_disp
                         shifted_view = np.roll(view, shift=(s_y, s_x), axis=(0, 1))

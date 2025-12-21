@@ -492,7 +492,7 @@ def main():
     if rect_strat == 1:
         rectification_strategy = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
     else:
-        sim_window_size = int(input("Enter similarity window size (odd integer, default 31): ") or 31)
+        sim_window_size = int(input("Enter similarity window size (odd integer, default 61): ") or 61)
         rectification_strategy = PixelwisePatchRectificationStrategy(sim_window_size)
     
     ref_view_choice = rectification_strategy.select_reference_view(views)
