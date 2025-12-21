@@ -83,7 +83,7 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
     def test_compute_similarity_matrix_produces_expected_shapes(self) -> None:
         views = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
 
-        result = self.strategy.compute_similarity_matrix(views, (0, 0))
+        result = self.strategy.compute_similarity_matrices(views, (0, 0))
 
         self.assertIsInstance(result, PixelwiseSimilarityResult)
         self.assertEqual(result.coordinates.shape, (2, 2, 1, 1, 2))
@@ -104,8 +104,16 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
         coords[:, :, 0, 1, :] = np.stack([yy, np.clip(xx + 1, 0, 2)], axis=-1)
         coords[:, :, 1, 0, :] = identity_coords
         coords[:, :, 1, 1, :] = identity_coords
+        disps_y = np.zeros((3, 3, 2, 2), dtype=int)
+        disps_x = np.zeros((3, 3, 2, 2), dtype=int)
+        disps_x[:, :, 0, 1] = 1
 
-        sim_result = PixelwiseSimilarityResult(coordinates=coords, scores=scores)
+        sim_result = PixelwiseSimilarityResult(
+            coordinates=coords,
+            scores=scores,
+            disps_y=disps_y,
+            disps_x=disps_x,
+        )
 
         avg_image, rectified_views = self.strategy.rectify(views, sim_result, (0, 0))
 
