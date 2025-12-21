@@ -247,6 +247,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if gauss_size is None:
             gauss_size = self.window_size * 2 + 1
 
+        D = max_disp * 2 + 1
+        disp_arr = np.arange(-max_disp, max_disp + 1)
+
         if views_arr.ndim != 4:
             raise ValueError("views must have shape (N, N, H, W)")
 
@@ -261,23 +264,48 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             raise ValueError("ref_view_idx must point to a valid view inside views")
 
         ref_view = views_arr[ref_i, ref_j].astype(np.float32, copy=False)
-        corr_mats = np.zeros((height, width, grid_rows, grid_cols, max_disp *2 + 1, max_disp *2 + 1), dtype=np.float32)
+        corr_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.int32)
-        scores = np.full((height, width, grid_rows, grid_cols), -np.inf, dtype=np.float64)
+        scores = np.full((height, width, grid_rows, grid_cols), 0, dtype=np.float64)
+
+        base_coords = np.stack(np.meshgrid(np.arange(height), np.arange(width), indexing="ij"), -1)
+
         for i in range(grid_rows):
             for j in range(grid_cols):
                 if i == ref_i and j == ref_j:
                     continue
                 view = views_arr[i, j].astype(np.float32, copy=False)
-                for s_y in range(-max_disp, max_disp):
-                    for s_x in range(-max_disp, max_disp):
-                        shifted_view = np.roll(view, shift=(s_y, s_x), axis=(0,1))
-                        corr_mats[:, :, i, j, s_y, s_x] = gaussian_filter(np.multiply(ref_view, shifted_view), sigma=gauss_sigma,
-                                                truncate=(((gauss_size-1)/2)/gauss_sigma), mode="constant")
-                max_val = np.max(np.squeeze(corr_mats[:, :, i, j, :, :]), axis=(2,3))
-                # max_val_comp = np.repeat(max_val, repeats=corr_mats.shape[2]*corr_mats.shape[3], axis=-1).reshape(corr_mats.shape)
+                for s_y_ind in range(D-1):
+                    for s_x_ind in range(D-1):
+                        s_y = s_y_ind - max_disp
+                        s_x = s_x_ind - max_disp
+                        shifted_view = np.roll(view, shift=(s_y, s_x), axis=(0, 1))
+                        corr_mats[:, :, i, j, s_y_ind, s_x_ind] = gaussian_filter(
+                            ref_view * shifted_view,
+                            sigma=gauss_sigma,
+                            truncate=(((gauss_size - 1) / 2) / gauss_sigma),
+                            mode="constant",
+                        )
+
+                corr_stack = corr_mats[:, :, i, j, :, :]  # shape (H, W, D, D)
+                max_val = np.max(corr_stack, axis=(2, 3))
                 scores[:, :, i, j] = max_val
-                coordinates[:, :, i, j, :] = np.stack(np.unravel_index(np.argmax(np.reshape(np.squeeze(corr_mats[:, :, i,j, :,:]), (height, width, (max_disp *2 + 1)**2)), axis=2), (max_disp *2 + 1, max_disp *2 + 1)), -1)
+
+                flat = corr_stack.reshape((height, width, D * D))
+                argmax_flat = np.argmax(flat, axis=2)
+                idx_y, idx_x = np.unravel_index(argmax_flat, (D, D))
+
+                # ensure pixels with zero max score keep zero displacement (center index)
+                zero_mask = (max_val == 0)
+                if np.any(zero_mask):
+                    idx_y = idx_y.copy()
+                    idx_x = idx_x.copy()
+                    idx_y[zero_mask] = max_disp
+                    idx_x[zero_mask] = max_disp
+
+                # compute coordinates: base + displacement
+                coordinates[:, :, i, j, 0] = base_coords[:, :, 0] + disp_arr[idx_y]
+                coordinates[:, :, i, j, 1] = base_coords[:, :, 1] + disp_arr[idx_x]
 
         return PixelwiseSimilarityResult(coordinates=coordinates, scores=scores)
 
