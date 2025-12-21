@@ -243,6 +243,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
     def compute_similarity_matrices(
         self, views: np.ndarray, ref_view_idx: Tuple[int, int], max_disp: Optional[int] = None,
         gauss_sigma: Optional[float] = None, gauss_size: Optional[int] = None,
+        disp_gauss_sigma: Optional[float] = None, disp_gauss_size: Optional[int] = None,
     ) -> PixelwiseSimilarityResult:
         views_arr = np.asarray(views, dtype=np.float64)
 
@@ -252,7 +253,11 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             gauss_sigma = 1.0
         if gauss_size is None:
             gauss_size = self.window_radius * 2 + 1
-
+        if disp_gauss_sigma is None:
+            disp_gauss_sigma = 1.0
+        if disp_gauss_size is None:
+            disp_gauss_size = self.window_radius * 2 + 1
+        
         D = max_disp * 2 + 1
         disp_arr = np.arange(-max_disp, max_disp + 1)
 
@@ -311,8 +316,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                     idx_x[zero_mask] = max_disp
 
                 # compute coordinates: base + displacement
-                disps_y[:, :, i, j] = disp_arr[idx_y]
-                disps_x[:, :, i, j] = disp_arr[idx_x]
+                disps_y[:, :, i, j] = gaussian_filter(disp_arr[idx_y], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_y]
+                disps_x[:, :, i, j] = gaussian_filter(disp_arr[idx_x], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_x]
                 coordinates[:, :, i, j, 0] = base_coords[:, :, 0] + disp_arr[idx_y]
                 coordinates[:, :, i, j, 1] = base_coords[:, :, 1] + disp_arr[idx_x]
 
