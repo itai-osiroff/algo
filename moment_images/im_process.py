@@ -8,7 +8,7 @@ from matplotlib.figure import Figure
 from typing import Tuple, List, Optional
 from itertools import combinations
 from django.utils.text import slugify
-from rectification_strategy import GlobalTranslationRectificationStrategy
+from rectification_strategy import GlobalTranslationRectificationStrategy, PixelwisePatchRectificationStrategy
 
 # --- Constants ---
 DEFAULT_IMAGE_DIR = 'moment_images/images'
@@ -482,7 +482,13 @@ def main():
     plt.show()
     plt.close("all")
 
-    rectification_strategy = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
+    rect_strat = int(input("Start rectification process. Choose the rectification strategy:\n1: Global Translation Rectification\n2: Pixel-wise Patch Rectification\nEnter your choice:"))
+    if rect_strat == 1:
+        rectification_strategy = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
+    else:
+        sim_window_size = int(input("Enter similarity window size (odd integer, default 5): ") or 5)
+        rectification_strategy = PixelwisePatchRectificationStrategy(sim_window_size)
+    
     ref_view_choice = rectification_strategy.select_reference_view(views)
 
     # Cleanup of reference view for better correlation
@@ -491,28 +497,55 @@ def main():
     views[ref_view_choice] = unsharp_mask(view_mask)
 
     #calculate similarity matrix
-    sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice)
+    if rect_strat == 1:
+        assert isinstance(rectification_strategy, GlobalTranslationRectificationStrategy)
+        sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice)
+    else:
+        assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
+        sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice)
     
-    # Assemble and dispaly similarity matrix
+    # Assemble and display similarity matrix
     # Display of similarity matrices
-    fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
-    created_figures.append(fig_x)
-    fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
-    created_figures.append(fig_y)
-    for idx in range(view_grid_size):    
-        for jdx in range(view_grid_size): 
-            im_x = ax_x[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 1], cmap="gray")
-            im_y = ax_y[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 0], cmap="gray")
-            ax_x[idx, jdx].set_title(f"View {idx+1}-{jdx+1} X translation similarity")
-            ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
-            fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
-            fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
-    fig_x.suptitle("X translation similarity")
-    fig_y.suptitle("Y translation similarity")
-    # plt.show()
+    if rect_strat == 1:
+        assert isinstance(rectification_strategy, GlobalTranslationRectificationStrategy)
+        fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+        created_figures.append(fig_x)
+        fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+        created_figures.append(fig_y)
+        for idx in range(view_grid_size):    
+            for jdx in range(view_grid_size): 
+                im_x = ax_x[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 1], cmap="gray")
+                im_y = ax_y[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 0], cmap="gray")
+                ax_x[idx, jdx].set_title(f"View {idx+1}-{jdx+1} X translation similarity")
+                ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
+                fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+                fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+        fig_x.suptitle("X translation similarity")
+        fig_y.suptitle("Y translation similarity")
 
-    av_rect, rect_images = rectification_strategy.rectify(views, sim_mat, ref_view_choice)
+        av_rect, rect_images = rectification_strategy.rectify(views, sim_mat, ref_view_choice)
+    else:
+        assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
+        sim_mat_coords = sim_mat_pixelwise.coordinates
+        # sim_mat_scores = sim_mat_pixelwise.scores
+        fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+        created_figures.append(fig_x)
+        fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+        created_figures.append(fig_y)
+        for idx in range(view_grid_size):    
+            for jdx in range(view_grid_size): 
+                im_x = ax_x[idx,jdx].imshow(sim_mat_coords[idx, jdx, :, :, 1], cmap="gray")
+                im_y = ax_y[idx,jdx].imshow(sim_mat_coords[idx, jdx, :, :, 0], cmap="gray")
+                ax_x[idx, jdx].set_title(f"View {idx+1}-{jdx+1} X translation similarity")
+                ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
+                fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+                fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+        fig_x.suptitle("X translation similarity")
+        fig_y.suptitle("Y translation similarity")
+
+        av_rect, rect_images = rectification_strategy.rectify(views, sim_mat_pixelwise, ref_view_choice)
     
+    # plt.show()    
     # Sharpen image (?)
     sharpen_sets = [(2.0, 2.0), (3.0, 2.0), (2.0, 3.0), (3.0, 3.0)]
     av_rect_sharp = []
