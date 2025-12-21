@@ -65,12 +65,6 @@ class RectificationStrategy(ABC):
         """Pick a reference view index from a grid of views."""
 
     @abstractmethod
-    def compute_similarity_matrix(
-        self, views: np.ndarray, ref_view_idx: Tuple[int, int]
-    ) -> np.ndarray:
-        """Calculate translation offsets between all view pairs."""
-
-    @abstractmethod
     def rectify(
         self,
         views: np.ndarray,
@@ -240,7 +234,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
         return grid_rows // 2, grid_cols // 2
 
-    def compute_similarity_matrix(
+    def compute_similarity_matrices(
         self, views: np.ndarray, ref_view_idx: Tuple[int, int], max_disp: Optional[int] = None,
         gauss_sigma: Optional[float] = None, gauss_size: Optional[int] = None,
     ) -> PixelwiseSimilarityResult:
@@ -267,7 +261,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             raise ValueError("ref_view_idx must point to a valid view inside views")
 
         ref_view = views_arr[ref_i, ref_j].astype(np.float32, copy=False)
-        corr_mats = np.zeros((height, width, max_disp *2 + 1, max_disp *2 + 1), dtype=np.float32)
+        corr_mats = np.zeros((height, width, grid_rows, grid_cols, max_disp *2 + 1, max_disp *2 + 1), dtype=np.float32)
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.int32)
         scores = np.full((height, width, grid_rows, grid_cols), -np.inf, dtype=np.float64)
         for i in range(grid_rows):
@@ -278,11 +272,12 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 for s_y in range(-max_disp, max_disp):
                     for s_x in range(-max_disp, max_disp):
                         shifted_view = np.roll(view, shift=(s_y, s_x), axis=(0,1))
-                        corr_mats[:, :, s_y, s_x] = gaussian_filter(np.multiply(ref_view, shifted_view), sigma=gauss_sigma,
+                        corr_mats[:, :, i, j, s_y, s_x] = gaussian_filter(np.multiply(ref_view, shifted_view), sigma=gauss_sigma,
                                                 truncate=(((gauss_size-1)/2)/gauss_sigma), mode="constant")
-                max_val = np.max(corr_mats, axis=(2,3))
+                max_val = np.max(np.squeeze(corr_mats[:, :, i, j, :, :]), axis=(2,3))
+                # max_val_comp = np.repeat(max_val, repeats=corr_mats.shape[2]*corr_mats.shape[3], axis=-1).reshape(corr_mats.shape)
                 scores[:, :, i, j] = max_val
-                coordinates[:, :, i, j] = np.unravel_index(np.nonzero(corr_mats==max_val), corr_mats.shape[:2])
+                coordinates[:, :, i, j, :] = np.stack(np.unravel_index(np.argmax(np.reshape(np.squeeze(corr_mats[:, :, i,j, :,:]), (height, width, (max_disp *2 + 1)**2)), axis=2), (max_disp *2 + 1, max_disp *2 + 1)), -1)
 
         return PixelwiseSimilarityResult(coordinates=coordinates, scores=scores)
 
@@ -306,7 +301,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         sim_result = (
             sim_mat
             if sim_mat is not None
-            else self.compute_similarity_matrix(views_arr, (ref_i, ref_j))
+            else self.compute_similarity_matrices(views_arr, (ref_i, ref_j))
         )
         if not isinstance(sim_result, PixelwiseSimilarityResult):
             raise TypeError("sim_mat must be a PixelwiseSimilarityResult for pixelwise rectification")
