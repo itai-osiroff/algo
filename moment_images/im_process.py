@@ -5,10 +5,15 @@ import numpy as np
 import cv2 as cv
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Any, cast
 from itertools import combinations
 from django.utils.text import slugify
-from rectification_strategy import GlobalTranslationRectificationStrategy, PixelwisePatchRectificationStrategy
+try:
+    # Prefer absolute import when running as a script
+    from rectification_strategy import GlobalTranslationRectificationStrategy, PixelwisePatchRectificationStrategy
+except Exception:
+    # When imported as a package, use relative import
+    from .rectification_strategy import GlobalTranslationRectificationStrategy, PixelwisePatchRectificationStrategy
 
 # --- Constants ---
 DEFAULT_IMAGE_DIR = 'moment_images/images'
@@ -352,8 +357,9 @@ def save_figures(figures: List[Figure], save_dir: str, dpi: int = 600):
         return
     os.makedirs(save_dir, exist_ok=True)
     for idx, fig in enumerate(figures, start=1):
-        # Get the figure title
-        title = slugify(fig._suptitle.get_text()) if fig._suptitle else None
+        # Get the figure title in a type-safe way (avoid accessing private attributes directly)
+        title_obj = getattr(cast(Any, fig), "_suptitle", None)
+        title = slugify(title_obj.get_text()) if title_obj is not None else None
         if not title:
             # Try to get title from axes
             if fig.axes and fig.axes[0].get_title():
@@ -558,7 +564,10 @@ def main():
         for j in range(view_grid_size):
             fig = plt.figure()
             created_figures.append(fig)
-            manager = plt.get_current_fig_manager().full_screen_toggle()
+            manager = plt.get_current_fig_manager()
+            _fullscreen = getattr(manager, "full_screen_toggle", None)
+            if callable(_fullscreen):
+                _fullscreen()
             plt.imshow(rect_images[i, j], cmap="gray")
             plt.title(f"Rectified View {i+1}-{j+1}")
     # plt.show()
@@ -579,18 +588,27 @@ def main():
     fig = plt.figure()
     created_figures.append(fig)
     plt.imshow(av_rect, cmap="gray")
-    manager = plt.get_current_fig_manager().full_screen_toggle()
+    manager = plt.get_current_fig_manager()
+    _fullscreen = getattr(manager, "full_screen_toggle", None)
+    if callable(_fullscreen):
+        _fullscreen()
     plt.title("Averaged Rectified Image")
     fig = plt.figure()
     created_figures.append(fig)
     plt.imshow(np.clip(cv.equalizeHist(av_rect.astype('uint8')), 0.85*255, 255), cmap="gray")
-    manager = plt.get_current_fig_manager().full_screen_toggle()
+    manager = plt.get_current_fig_manager()
+    _fullscreen = getattr(manager, "full_screen_toggle", None)
+    if callable(_fullscreen):
+        _fullscreen()
     plt.title("Averaged Rectified Image - Equalized (clipped, 85%) for contrast")
     for i in range(len(sharpen_sets)):
         fig = plt.figure()
         created_figures.append(fig)
         plt.imshow(av_rect_sharp[i], cmap="gray")
-        manager = plt.get_current_fig_manager().full_screen_toggle()
+        manager = plt.get_current_fig_manager()
+        _fullscreen = getattr(manager, "full_screen_toggle", None)
+        if callable(_fullscreen):
+            _fullscreen()
         plt.title(f"Averaged Rectified Image (Sharpened) with parameters - sigma={sharpen_sets[i][0]}, strength={sharpen_sets[i][1]}")
     plt.show()
 
