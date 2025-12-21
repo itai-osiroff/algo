@@ -350,6 +350,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
         coordinates = np.asarray(sim_result.coordinates)
         scores = np.asarray(sim_result.scores)
+        disps_y = np.asarray(sim_result.disps_y)
+        disps_x = np.asarray(sim_result.disps_x)
 
         if coordinates.shape != (height, width, grid_rows, grid_cols, 2):
             raise ValueError(
@@ -357,21 +359,24 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             )
         if scores.shape != (height, width, grid_rows, grid_cols):
             raise ValueError("scores must have shape (H, W, N, N) matching views dimensions")
+        if disps_y.shape != (height, width, grid_rows, grid_cols):
+            raise ValueError("disps_y must have shape (H, W, N, N) matching views dimensions")
+        if disps_x.shape != (height, width, grid_rows, grid_cols):
+            raise ValueError("disps_x must have shape (H, W, N, N) matching views dimensions")
 
         rectified_views = np.zeros((grid_rows, grid_cols, height, width), dtype=np.float64)
 
         base_mapping = self._identity_mapping(height, width)
+        base_y = base_mapping[:, :, 0]
+        base_x = base_mapping[:, :, 1]
         for i in range(grid_rows):
             for j in range(grid_cols):
                 if i == ref_i and j == ref_j:
                     rectified_views[i, j] = views_arr[i, j]
                     continue
 
-                mapping = self._build_backward_map(
-                    coordinates[:, :, i, j], scores[:, :, i, j], base_mapping
-                )
-                map_x = mapping[:, :, 1].astype(np.float32)
-                map_y = mapping[:, :, 0].astype(np.float32)
+                map_y = (base_y - disps_y[:, :, i, j]).astype(np.float32)
+                map_x = (base_x - disps_x[:, :, i, j]).astype(np.float32)
                 rectified_views[i, j] = cv.remap(
                     views_arr[i, j],
                     map_x,
