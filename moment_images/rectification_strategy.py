@@ -244,6 +244,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         self, views: np.ndarray, ref_view_idx: Tuple[int, int], max_disp: Optional[int] = None,
         gauss_sigma: Optional[float] = None, gauss_size: Optional[int] = None,
         disp_gauss_sigma: Optional[float] = None, disp_gauss_size: Optional[int] = None,
+        thresh: Optional[float] = None,
     ) -> PixelwiseSimilarityResult:
         views_arr = np.asarray(views, dtype=np.float64)
 
@@ -257,7 +258,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             disp_gauss_sigma = 0.0
         if disp_gauss_size is None:
             disp_gauss_size = self.window_radius * 2 + 1
-        
+
         D = max_disp * 2 + 1
         disp_arr = np.arange(-max_disp, max_disp + 1)
 
@@ -274,7 +275,11 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if not (0 <= ref_i < grid_rows and 0 <= ref_j < grid_cols):
             raise ValueError("ref_view_idx must point to a valid view inside views")
 
-        ref_view = views_arr[ref_i, ref_j].astype(np.float32, copy=False)
+        # Setting up and thresholding the reference view according to percentages from maximal value
+        ref_view = views_arr[ref_i, ref_j].astype(np.float32, copy=True)
+        if thresh is not None:
+            ref_view[ref_view < np.max(ref_view)*thresh] = 0.0
+
         corr_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.int32)
         scores = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)

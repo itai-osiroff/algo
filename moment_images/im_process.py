@@ -520,7 +520,9 @@ def main():
         sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice)
     else:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
-        sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice)
+        #sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice,
+        #  ref_view_idx, max_disp, gauss_sigma, gauss_size, disp_gauss_sigma, disp_gauss_size, thresh)
+        sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice, disp_gauss_sigma=10.0, thresh=0.25)
     
     # Assemble and display similarity matrix
     # Display of similarity matrices
