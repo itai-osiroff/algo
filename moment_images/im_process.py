@@ -76,12 +76,24 @@ def min_max_normalize(image: Image.Image, min_val: int = 0, max_val: int = 255) 
         normalized_array = (image_array - img_min) / (img_max - img_min) * 255
         return Image.fromarray(normalized_array.astype('uint8'))
 
-def unsharp_mask(image, sigma=1.0, strength=1.5):
-    # Apply Gaussian blur
-    blurred = cv.GaussianBlur(image, (0, 0), sigma)
-    # Subtract the blurred image from the original
-    sharpened = cv.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
-    return sharpened
+def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 1.5) -> np.ndarray:
+    """
+    Apply unsharp masking while keeping the output normalized to the same
+    range as the other views (0-255).
+    """
+    image_float = image.astype(np.float32)
+
+    blurred = cv.GaussianBlur(image_float, (0, 0), sigma)
+    sharpened = cv.addWeighted(image_float, 1.0 + strength, blurred, -strength, 0)
+
+    min_val = float(sharpened.min())
+    max_val = float(sharpened.max())
+    if np.isclose(min_val, max_val):
+        normalized = np.zeros_like(sharpened)
+    else:
+        normalized = (sharpened - min_val) / (max_val - min_val) * 255.0
+
+    return normalized.astype(image.dtype, copy=False)
 
 def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray] = None) -> Image.Image:
     """
