@@ -277,7 +277,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         ref_view = views_arr[ref_i, ref_j].astype(np.float32, copy=False)
         corr_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.int32)
-        scores = np.full((height, width, grid_rows, grid_cols), 0, dtype=np.float64)
+        scores = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
         disps_y = np.zeros((height, width, grid_rows, grid_cols), dtype=np.int32)
         disps_x = np.zeros((height, width, grid_rows, grid_cols), dtype=np.int32)
         base_coords = np.stack(np.meshgrid(np.arange(height), np.arange(width), indexing="ij"), -1)
