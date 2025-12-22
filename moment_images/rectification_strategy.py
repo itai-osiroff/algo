@@ -251,7 +251,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if max_disp is None:
             max_disp = self.window_radius
         if gauss_sigma is None:
-            gauss_sigma = 1.0
+            gauss_sigma = max_disp / 5.0
         if gauss_size is None:
             gauss_size = self.window_radius * 2 + 1
         if disp_gauss_sigma is None:
