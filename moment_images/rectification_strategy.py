@@ -254,7 +254,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if gauss_size is None:
             gauss_size = self.window_radius * 2 + 1
         if disp_gauss_sigma is None:
-            disp_gauss_sigma = 1.0
+            disp_gauss_sigma = 0.0
         if disp_gauss_size is None:
             disp_gauss_size = self.window_radius * 2 + 1
         
@@ -315,9 +315,13 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                     idx_y[zero_mask] = max_disp
                     idx_x[zero_mask] = max_disp
 
-                # compute coordinates: base + displacement
-                disps_y[:, :, i, j] = gaussian_filter(disp_arr[idx_y], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_y]
-                disps_x[:, :, i, j] = gaussian_filter(disp_arr[idx_x], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_x]
+                # compute coordinates: base + displacement, apply gaussian filter if sigma is legal
+                if disp_gauss_sigma is None or disp_gauss_sigma <= 0.0:
+                    disps_y[:, :, i, j] = disp_arr[idx_y]
+                    disps_x[:, :, i, j] = disp_arr[idx_x]
+                else:
+                    disps_y[:, :, i, j] = gaussian_filter(disp_arr[idx_y], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_y]
+                    disps_x[:, :, i, j] = gaussian_filter(disp_arr[idx_x], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_x]
                 coordinates[:, :, i, j, 0] = base_coords[:, :, 0] + disp_arr[idx_y]
                 coordinates[:, :, i, j, 1] = base_coords[:, :, 1] + disp_arr[idx_x]
 
