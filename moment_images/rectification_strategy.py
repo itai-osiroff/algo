@@ -379,14 +379,16 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                     rectified_views[i, j] = views_arr[i, j]
                     continue
 
-                map_y = (base_y - disps_y[:, :, i, j]).astype(np.float32)
-                map_x = (base_x - disps_x[:, :, i, j]).astype(np.float32)
+                # map_y = (base_y - disps_y[:, :, i, j]).astype(np.float32)
+                # map_x = (base_x - disps_x[:, :, i, j]).astype(np.float32)
+                map_y = coordinates[:, :, i, j, 0].astype(np.float32)
+                map_x = coordinates[:, :, i, j, 1].astype(np.float32)
                 rectified_views[i, j] = cv.remap(
                     views_arr[i, j],
                     map_x,
                     map_y,
                     interpolation=cv.INTER_LINEAR,
-                    borderMode=cv.BORDER_REFLECT,
+                    borderMode=cv.BORDER_CONSTANT,
                 )
 
         avg_image = np.mean(rectified_views, axis=(0, 1))
