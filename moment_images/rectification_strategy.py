@@ -218,7 +218,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
     views to the reference grid.
     """
 
-    def __init__(self, window_size: int = 61, step_size: Optional[int] = None) -> None:
+    def __init__(self, window_size: int = 41, step_size: Optional[int] = None) -> None:
         if window_size < 1:
             raise ValueError("window_size must be a positive odd integer")
         elif window_size % 2 == 0:
