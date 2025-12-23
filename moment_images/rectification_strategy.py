@@ -275,7 +275,11 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             displacement maps, and target coordinates for each view.
         """
         views_arr = np.asarray(views, dtype=np.float64)
-
+        if thresh is not None:
+            for i in range(views_arr.shape[0]):
+                for j in range(views_arr.shape[1]):
+                    views_arr[i, j, :, :][views_arr[i, j, :, :] < np.max(views_arr[i, j, :, :]) * thresh] = 0.0
+        
         if max_disp is None:
             max_disp = self.window_radius
         if gauss_sigma is None:
