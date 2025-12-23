@@ -1,19 +1,12 @@
 """
 Interfaces for rectifying view grids extracted from light-field captures.
 
-The default pipeline works with view stacks shaped as ``(N, N, H, W)`` where:
-
-* ``N`` is the view grid size along each axis (e.g., 3 for a 3x3 grid).
-* ``H``/``W`` are the per-view height and width, typically matching the
-  extracted patch size ``d`` described in ``im_process.extract_views``.
-* Values are expected to be floating-point grayscale intensities (``float64``)
-  produced by the ROI/circle-based extraction step.
-
-Similarity matrices are stored as ``np.ndarray`` of shape ``(N, N, N, N, 2)``,
-where the last axis contains ``(dy, dx)`` integer translations from
-``calculate_similarity_matrix``. Both arrays are consumed by rectification
-strategies to align every view to the chosen reference and produce standardized
-outputs.
+View stacks are expected as ``(N, N, H, W)`` arrays of floating-point grayscale
+intensities. Global rectification strategies operate on translation similarity
+matrices shaped ``(N, N, N, N, 2)``, while the pixelwise variant relies on a
+``PixelwiseSimilarityResult`` containing dense coordinate and score maps. Both
+approaches ultimately align every view to a selected reference and average the
+results.
 """
 
 from __future__ import annotations
@@ -33,7 +26,14 @@ DEFAULT_CORRELATION_PAD_WIDTH = int(125 * 0.45)
 
 @dataclass
 class PixelwiseSimilarityResult:
-    """Container for pixelwise similarity outputs."""
+    """
+    Container for pixelwise patch-matching outputs.
+
+    Attributes mirror ``compute_similarity_matrices``: ``coordinates`` holds the
+    best-match destination per pixel, ``scores`` stores the corresponding
+    correlation values, and ``disps_y``/``disps_x`` cache the raw displacements
+    selected for each view relative to the reference.
+    """
 
     coordinates: np.ndarray
     scores: np.ndarray
@@ -43,23 +43,12 @@ class PixelwiseSimilarityResult:
 
 class RectificationStrategy(ABC):
     """
-    Rectify a grid of extracted views against a reference and produce
-    rectified outputs in a standardized format.
+    Abstract interface for aligning a grid of extracted views to a reference.
 
-    Implementations should assume:
-
-    * ``views`` has shape ``(N, N, H, W)`` with floating-point grayscale values.
-    * ``sim_mat`` has shape ``(N, N, N, N, 2)`` containing translation offsets
-      ``(dy, dx)`` relative to the correlation center.
-    * ``ref_view_idx`` is a 2-tuple ``(row, col)`` pointing to the reference
-      view inside ``views``.
-
-    Returns:
-        A tuple of:
-        * ``avg_image``: ``np.ndarray`` with shape ``(H, W)`` representing the
-          mean (or otherwise aggregated) rectified reference frame.
-        * ``rectified_views``: ``np.ndarray`` with shape ``(N, N, H, W)``,
-          aligned to the reference view using ``sim_mat`` semantics.
+    Implementations accept a square view stack ``(N, N, H, W)`` and return both
+    the averaged rectified image and the fully aligned stack. The similarity
+    representation (global translations vs. per-pixel flows) is left to
+    subclasses.
     """
 
     @abstractmethod
@@ -74,15 +63,15 @@ class RectificationStrategy(ABC):
         ref_view_idx: Optional[Tuple[int, int]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Align ``views`` using ``sim_mat`` offsets and return the averaged image
-        plus the full rectified stack.
+        Align ``views`` using a strategy-specific similarity description.
 
         Args:
             views: Grid of extracted grayscale patches with shape
                 ``(N, N, H, W)``.
-            sim_mat: Translation field of shape ``(N, N, N, N, 2)`` produced by
-                correlation, where the last axis stores ``(dy, dx)`` offsets.
-            ref_view_idx: Indices of the reference view inside ``views``.
+            sim_mat: Pre-computed similarity data for the strategy (shape/type
+                defined by the implementation).
+            ref_view_idx: Indices of the reference view inside ``views``. When
+                omitted, the strategy chooses a default reference.
 
         Returns:
             A tuple ``(avg_image, rectified_views)`` where ``avg_image`` has
@@ -122,6 +111,14 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
     def compute_similarity_matrix(
         self, views: np.ndarray, ref_view_idx: Tuple[int, int]
     ) -> np.ndarray:
+        """
+        Correlate every view against every other to estimate global translations.
+
+        The reference view indices control which correlations are computed when
+        ``prompt_for_all_views`` is ``False``; otherwise all pairwise matches are
+        evaluated. The result contains ``(dy, dx)`` offsets in pixels for each
+        view pair, padded by ``pad_width`` to avoid edge effects.
+        """
         views_arr = np.asarray(views, dtype=np.float64)
 
         if views_arr.ndim != 4:
@@ -164,6 +161,13 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
         sim_mat: Optional[np.ndarray] = None,
         ref_view_idx: Optional[Tuple[int, int]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Warp each view by its global translation and average the aligned stack.
+
+        If ``sim_mat`` is omitted the method computes pairwise translations on
+        the fly using ``compute_similarity_matrix``. Warping is done with
+        OpenCV's affine transform and the outputs retain the input dimensions.
+        """
         views_arr = np.asarray(views, dtype=np.float64)
 
         if views_arr.ndim != 4:
@@ -246,6 +250,30 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         disp_gauss_sigma: Optional[float] = None, disp_gauss_size: Optional[int] = None,
         thresh: Optional[float] = None,
     ) -> PixelwiseSimilarityResult:
+        """
+        Perform per-pixel patch correlation between each view and the reference.
+
+        For every non-reference view, the function rolls the image across a
+        displacement grid and computes Gaussian-filtered correlation scores
+        against the (optionally thresholded) reference. The best displacement
+        per pixel is recorded along with raw scores and derived flow fields.
+
+        Args:
+            views: Square grid of grayscale patches with shape ``(N, N, H, W)``.
+            ref_view_idx: ``(row, col)`` index of the reference view.
+            max_disp: Maximum pixel displacement searched in each direction.
+            gauss_sigma: Sigma for blurring the per-pixel correlation product.
+            gauss_size: Kernel size used for the Gaussian blur.
+            disp_gauss_sigma: Optional smoothing applied to the displacement
+                fields.
+            disp_gauss_size: Kernel size for displacement smoothing.
+            thresh: Relative intensity threshold (0–1) below which reference
+                pixels are ignored.
+
+        Returns:
+            ``PixelwiseSimilarityResult`` containing correlation scores,
+            displacement maps, and target coordinates for each view.
+        """
         views_arr = np.asarray(views, dtype=np.float64)
 
         if max_disp is None:
@@ -338,6 +366,14 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         sim_mat: Optional[PixelwiseSimilarityResult] = None,
         ref_view_idx: Optional[Tuple[int, int]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Backward-warp each view using per-pixel displacement fields.
+
+        The provided ``PixelwiseSimilarityResult`` supplies absolute coordinates
+        for ``cv.remap``; when omitted, similarities are recomputed first. The
+        reference view is copied directly into the rectified stack before the
+        averaged image is calculated.
+        """
         views_arr = np.asarray(views, dtype=np.float64)
 
         if views_arr.ndim != 4:
@@ -405,6 +441,13 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         scores: np.ndarray,
         base_mapping: np.ndarray,
     ) -> np.ndarray:
+        """
+        Construct a reverse lookup map from destination coordinates and scores.
+
+        For each candidate coordinate, the mapping keeps only the source pixel
+        that achieved the highest score at that destination, falling back to the
+        identity map when no valid mapping exists.
+        """
         mapping = base_mapping.copy()
         height, width, _ = coordinates.shape
         best_scores = np.full((height, width), -np.inf, dtype=np.float64)
@@ -423,5 +466,6 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
     @staticmethod
     def _identity_mapping(height: int, width: int) -> np.ndarray:
+        """Return an ``(H, W, 2)`` array of pixel indices for identity remapping."""
         yy, xx = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
         return np.stack([yy, xx], axis=-1).astype(np.float32)

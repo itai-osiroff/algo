@@ -30,10 +30,17 @@ DEFAULT_SEARCH_RADIUS_MAX = 130
 
 def load_image(image_path: str) -> Optional[Image.Image]:
     """
-    Load an image from the specified path.
-    
-    :param image_path: Path to the image file.
-    :return: PIL Image object or None if the image cannot be loaded.
+    Load a single image from disk, printing informative errors on failure.
+
+    The function never raises when the file is missing or unreadable; it simply
+    logs the reason and returns ``None`` so callers can skip the bad entry.
+
+    Args:
+        image_path: Path to the image file.
+
+    Returns:
+        The opened ``PIL.Image`` or ``None`` when the file does not exist or is
+        not a recognizable image.
     """
     if not os.path.exists(image_path):
         print(f"Error: The file {image_path} does not exist.")
@@ -51,10 +58,19 @@ def load_image(image_path: str) -> Optional[Image.Image]:
 
 def min_max_normalize(image: Image.Image, min_val: int = 0, max_val: int = 255) -> Image.Image:
     """
-    Normalize the image using min-max normalization. 
-    
-    :param image: PIL Image object.
-    :return: Normalized PIL Image object.
+    Scale pixel values to the 0–255 range while optionally clamping extremes.
+
+    ``min_val`` and ``max_val`` override the computed extrema when provided,
+    allowing quick clipping of dark/bright outliers. A flat input image returns
+    an unmodified copy to avoid division by zero.
+
+    Args:
+        image: Source ``PIL.Image``.
+        min_val: Optional lower bound to use instead of the image minimum.
+        max_val: Optional upper bound to use instead of the image maximum.
+
+    Returns:
+        A new ``PIL.Image`` normalized to ``uint8`` intensities.
     """
     if not isinstance(image, Image.Image):
         raise ValueError("Input must be a PIL Image object.")
@@ -78,8 +94,20 @@ def min_max_normalize(image: Image.Image, min_val: int = 0, max_val: int = 255) 
 
 def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 1.5) -> np.ndarray:
     """
-    Apply unsharp masking while keeping the output normalized to the same
-    range as the other views (0-255).
+    Sharpen an image with Gaussian blur subtraction and re-normalize to 0–255.
+
+    The operation mirrors OpenCV's unsharp masking approach: blur the input,
+    subtract a scaled version of the blur, and scale the result back to the
+    original dtype range. Completely flat inputs return zeros to preserve
+    downstream expectations.
+
+    Args:
+        image: Input ``numpy`` image array.
+        sigma: Standard deviation for Gaussian blur.
+        strength: Scaling factor applied to the high-frequency component.
+
+    Returns:
+        Sharpened image with the same dtype as ``image``.
     """
     image_float = image.astype(np.float32)
 
@@ -97,11 +125,19 @@ def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 1.5) -
 
 def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray] = None) -> Image.Image:
     """
-    Assemble a High Dynamic Range (HDR) image from a list of images using Debevec's method.
+    Build and tone-map an HDR image using Debevec calibration and merging.
 
-    :param images: List of PIL Image objects.
-    :param exposure_times: Optional array of exposure times corresponding to the images.
-    :return: Tone-mapped HDR image as a PIL Image object.
+    Images are converted to BGR, ordered by exposure time (descending), and
+    processed via OpenCV's Debevec calibrate/merge pipeline. The final HDR is
+    tone-mapped to an 8-bit grayscale image using gamma 2.2.
+
+    Args:
+        images: List of ``PIL.Image`` instances (grayscale expected).
+        exposure_times: Optional exposure times in seconds. When omitted,
+            synthetic 1, 1/2, 1/4, ... values are generated.
+
+    Returns:
+        Tone-mapped HDR output as a ``PIL.Image``.
     """
     if not images:
         raise ValueError("No images provided for HDR assembly.")
@@ -140,13 +176,17 @@ def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray]
 
 def get_image_paths() -> Tuple[List[Image.Image], List[str], bool]:
     """
-    Prompt the user for an image directory, load images, and handle HDR assembly.
+    Interactively collect images from a directory and report HDR intent.
+
+    Users can choose the default image folder, supply a custom path, and mark
+    the directory as HDR-capable. Invalid entries are skipped with console
+    feedback rather than raising.
 
     Returns:
-        A tuple containing:
-        - A list of loaded PIL Image objects.
-        - A list of corresponding image file paths.
-        - A boolean indicating if the images were from an HDR directory.
+        ``(images, image_paths, hdr_flag)`` where ``images`` are loaded
+        ``PIL.Image`` objects, ``image_paths`` are their file paths, and
+        ``hdr_flag`` indicates whether the caller identified the directory as
+        HDR content.
     """
     ims_dir = input(f"Enter path to images or enter 'default' to use '{DEFAULT_IMAGE_DIR}': ")
     if ims_dir.lower() == 'default':
@@ -178,17 +218,22 @@ def get_image_paths() -> Tuple[List[Image.Image], List[str], bool]:
 
 def select_roi(image_np: np.ndarray, strategy: str, search_radius: int) -> Tuple[np.ndarray, Optional[Tuple[int, int]]]:
     """
-    Select a Region of Interest (ROI) from the image.
+    Extract a square ROI using one of several heuristic or manual strategies.
+
+    The ROI is always ``(2*search_radius)**2`` pixels. Strategies include using
+    the image center, the brightest Gaussian-smoothed pixel nearest the center,
+    explicit coordinates provided by the user, or the full image without
+    cropping.
 
     Args:
-        image_np: The input image as a NumPy array.
-        strategy: The ROI selection strategy ('center', 'max_pixel', 'full', or 'specific').
-        search_radius: The search radius to define the ROI size.
+        image_np: Input grayscale image array.
+        strategy: One of ``center``, ``max_pixel``, ``full``, or ``specific``.
+        search_radius: Radius used to size the ROI square.
 
     Returns:
-        A tuple containing:
-        - The selected ROI as a NumPy array.
-        - The top-left coordinates (row, col) of the ROI in the original image, or None if the full image is used.
+        ``(roi, offset)`` where ``roi`` is the extracted array and ``offset``
+        is the ``(row, col)`` origin relative to the original image (``None``
+        when ``strategy == "full"``).
     """
     h, w = image_np.shape
     roi_size = search_radius * 2
@@ -237,16 +282,18 @@ def select_roi(image_np: np.ndarray, strategy: str, search_radius: int) -> Tuple
 
 def detect_and_adjust_circles(roi: np.ndarray, roi_offset: Optional[Tuple[int, int]], min_radius: int, max_radius: int) -> Optional[np.ndarray]:
     """
-    Detect circles in a given ROI and adjust their coordinates to the full image frame.
+    Run Hough circle detection inside an ROI and rebase results to the full image.
 
     Args:
-        roi: The Region of Interest (ROI) to search for circles in.
-        roi_offset: The (row, col) offset of the ROI relative to the full image.
-        min_radius: The minimum radius of circles to detect.
-        max_radius: The maximum radius of circles to detect.
+        roi: Grayscale ROI used for detection.
+        roi_offset: ``(row, col)`` offset locating the ROI within the original
+            image; ``None`` when the ROI is the full image.
+        min_radius: Minimum circle radius in pixels.
+        max_radius: Maximum circle radius in pixels.
 
     Returns:
-        A NumPy array of detected circles (x, y, radius), or None if no circles are found.
+        ``np.ndarray`` of detected ``(x, y, r)`` circles or ``None`` when no
+        detections are produced.
     """
     circles = cv.HoughCircles(roi, cv.HOUGH_GRADIENT, dp=1, minDist=HOUGH_CIRCLES_MIN_DIST, 
                               param1=HOUGH_CIRCLES_PARAM1, param2=HOUGH_CIRCLES_PARAM2, 
@@ -265,7 +312,7 @@ def detect_and_adjust_circles(roi: np.ndarray, roi_offset: Optional[Tuple[int, i
 
 def display_circles(image: Image.Image, circles: np.ndarray):
     """
-    Draw detected circles on an image and display it.
+    Visualize up to the first two detected circles on top of an image.
 
     Args:
         image: The PIL image to draw on.
@@ -282,16 +329,20 @@ def display_circles(image: Image.Image, circles: np.ndarray):
 
 def extract_views(image_np: np.ndarray, base_circle: np.ndarray, num_views: int, view_dist: int) -> np.ndarray:
     """
-    Extract a grid of square views from an image based on a reference circle.
+    Slice a square grid of equally sized patches centered around a base circle.
+
+    Each grid element is centered ``view_dist`` pixels apart; patches that would
+    exceed image bounds are left as zeroed arrays and logged to stdout.
 
     Args:
-        image_np: The input image as a NumPy array.
-        base_circle: The reference circle (x, y, radius) to build the grid around.
-        num_views: The number of views to extract in each dimension (e.g., 3 for a 3x3 grid).
-        view_dist: The distance between the centers of adjacent views.
+        image_np: Grayscale source image.
+        base_circle: Reference ``(x, y, radius)`` used as the grid origin.
+        num_views: Grid dimension (e.g., ``3`` for ``3x3``).
+        view_dist: Pixel distance between adjacent view centers.
 
     Returns:
-        A NumPy array containing the extracted views.
+        Array of shape ``(num_views, num_views, view_dist, view_dist)`` with
+        extracted (or zero-filled) patches.
     """
     d = view_dist
     views = np.zeros((num_views, num_views, d, d))
@@ -317,19 +368,17 @@ def extract_views(image_np: np.ndarray, base_circle: np.ndarray, num_views: int,
 
 def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]]:
     """
-    Create RGB overlays comparing each pair of extreme rectified views.
+    Create normalized RGB overlays comparing each pair of corner rectified views.
 
-    The red channel is populated by the first view in the pair and the green
-    channel by the second, enabling pixel-by-pixel inspection of differences.
-    Values are normalized to [0, 1] to ensure consistent display regardless of
-    the original image scale.
+    The four extreme grid positions are paired in all combinations; each overlay
+    stores one view in the red channel and the other in green to highlight
+    misalignments. Inputs are scaled to [0, 1] to avoid brightness imbalance.
 
     Args:
-        rect_images: Rectified grayscale views arranged in a square grid of
-            shape (N, N, H, W).
+        rect_images: Rectified grayscale view grid with shape ``(N, N, H, W)``.
 
     Returns:
-        A list of tuples containing the overlay image and the paired indices.
+        List of ``(overlay, idx1, idx2)`` tuples for each extreme-view pair.
     """
     grid_size = rect_images.shape[0]
     if grid_size < 2:
@@ -361,8 +410,10 @@ def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarra
 
 def save_figures(figures: List[Figure], save_dir: str, dpi: int = 600):
     """
-    Save a list of matplotlib Figure objects as high-resolution JPG files.
-    The filename is based on the figure's title.
+    Persist matplotlib figures to disk with sanitized titles as filenames.
+
+    Figures without titles fall back to ``figure_<index>.jpg``. Non-fatal save
+    errors are reported to stdout so the rest of the batch can continue.
     """
     if not figures:
         print("No figures to save.")
@@ -390,7 +441,7 @@ def save_figures(figures: List[Figure], save_dir: str, dpi: int = 600):
             print(f"Failed to save {filename}: {e}")
 
 def main():
-    """Main function to run the image processing pipeline."""
+    """Run the interactive light-field rectification workflow."""
     images, image_paths, hdr_flag = get_image_paths()
 
     if not images:
