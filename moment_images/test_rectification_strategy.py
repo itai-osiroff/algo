@@ -2,12 +2,16 @@ import unittest
 
 import numpy as np
 
-from moment_images.rectification_strategy import GlobalTranslationRectificationStrategy
+from moment_images.rectification_strategy import (
+    GlobalTranslationRectificationStrategy,
+    PixelwisePatchRectificationStrategy,
+    PixelwiseSimilarityResult,
+)
 
 
 class GlobalTranslationRectificationStrategyTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.strategy = GlobalTranslationRectificationStrategy()
+        self.strategy = GlobalTranslationRectificationStrategy(prompt_for_all_views=False)
 
     def test_rectify_aligns_and_averages_views(self) -> None:
         views = np.arange(16, dtype=np.float32).reshape(2, 2, 2, 2)
@@ -56,7 +60,7 @@ class GlobalTranslationRectificationStrategyTests(unittest.TestCase):
 
     def test_compute_similarity_matrix_matches_dimensions(self) -> None:
         views = np.zeros((2, 2, 2, 2), dtype=np.float32)
-        strategy = GlobalTranslationRectificationStrategy(pad_width=1)
+        strategy = GlobalTranslationRectificationStrategy(pad_width=1, prompt_for_all_views=False)
 
         sim_mat = strategy.compute_similarity_matrix(views, (0, 0))
 
@@ -64,12 +68,57 @@ class GlobalTranslationRectificationStrategyTests(unittest.TestCase):
 
     def test_rectify_with_internal_computation(self) -> None:
         views = np.arange(9, dtype=np.float32).reshape(1, 1, 3, 3)
-        strategy = GlobalTranslationRectificationStrategy(pad_width=1)
+        strategy = GlobalTranslationRectificationStrategy(pad_width=1, prompt_for_all_views=False)
 
         avg_image, rectified_views = strategy.rectify(views)
 
         np.testing.assert_allclose(avg_image, views[0, 0])
         np.testing.assert_allclose(rectified_views[0, 0], views[0, 0])
+
+
+class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.strategy = PixelwisePatchRectificationStrategy(window_size=1)
+
+    def test_compute_similarity_matrix_produces_expected_shapes(self) -> None:
+        views = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+
+        result = self.strategy.compute_similarity_matrices(views, (0, 0))
+
+        self.assertIsInstance(result, PixelwiseSimilarityResult)
+        self.assertEqual(result.coordinates.shape, (2, 2, 1, 1, 2))
+        self.assertEqual(result.scores.shape, (2, 2, 1, 1))
+
+    def test_rectify_uses_backward_mapping(self) -> None:
+        views = np.zeros((2, 2, 3, 3), dtype=np.float32)
+        views[0, 0, 1, 1] = 1.0  # reference bright pixel at center
+        views[0, 1, 1, 0] = 1.0  # shifted left by one
+
+        coords = np.zeros((3, 3, 2, 2, 2), dtype=int)
+        scores = np.ones((3, 3, 2, 2), dtype=float)
+
+        yy, xx = np.meshgrid(np.arange(3), np.arange(3), indexing="ij")
+        identity_coords = np.stack([yy, xx], axis=-1)
+
+        coords[:, :, 0, 0, :] = identity_coords
+        coords[:, :, 0, 1, :] = np.stack([yy, np.clip(xx + 1, 0, 2)], axis=-1)
+        coords[:, :, 1, 0, :] = identity_coords
+        coords[:, :, 1, 1, :] = identity_coords
+        disps_y = np.zeros((3, 3, 2, 2), dtype=int)
+        disps_x = np.zeros((3, 3, 2, 2), dtype=int)
+        disps_x[:, :, 0, 1] = 1
+
+        sim_result = PixelwiseSimilarityResult(
+            coordinates=coords,
+            scores=scores,
+            disps_y=disps_y,
+            disps_x=disps_x,
+        )
+
+        avg_image, rectified_views = self.strategy.rectify(views, sim_result, (0, 0))
+
+        self.assertAlmostEqual(rectified_views[0, 1, 1, 1], 1.0)
+        np.testing.assert_allclose(avg_image[1, 1], (rectified_views[:, :, 1, 1].sum()) / 4)
 
 
 if __name__ == "__main__":
