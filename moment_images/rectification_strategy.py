@@ -24,6 +24,31 @@ from scipy.ndimage import gaussian_filter
 DEFAULT_CORRELATION_PAD_WIDTH = int(125 * 0.45)
 
 
+def resolve_reference_view(
+    views: np.ndarray, ref_view_idx: Optional[Tuple[int, int]] = None
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """
+    Validate ``views`` and resolve the effective reference view indices.
+
+    This helper centralizes shape validation and defaulting to the center view
+    so multi-stage rectification pipelines can share reference selection logic
+    without re-prompting the user. Existing strategies retain their behavior by
+    calling ``select_reference_view`` when desired.
+    """
+
+    views_arr, grid_rows, grid_cols, center_i, center_j = RectificationStrategy._default_reference_view(
+        views
+    )
+    if ref_view_idx is None:
+        return views_arr, (center_i, center_j)
+
+    ref_i, ref_j = ref_view_idx
+    if not (0 <= ref_i < grid_rows and 0 <= ref_j < grid_cols):
+        raise ValueError("ref_view_idx must point to a valid view inside views")
+
+    return views_arr, (ref_i, ref_j)
+
+
 @dataclass
 class PixelwiseSimilarityResult:
     """
@@ -54,6 +79,26 @@ class RectificationStrategy(ABC):
     @abstractmethod
     def select_reference_view(self, views: np.ndarray) -> Tuple[int, int]:
         """Pick a reference view index from a grid of views."""
+
+    @staticmethod
+    def _default_reference_view(views: np.ndarray) -> Tuple[np.ndarray, int, int, int, int]:
+        """
+        Validate ``views`` and return its normalized array form with center indices.
+
+        This helper centralizes the shape/type checks shared by all rectification
+        strategies without altering the existing default behavior (center view
+        selection).
+        """
+        views_arr = np.asarray(views)
+
+        if views_arr.ndim != 4:
+            raise ValueError("views must have shape (N, N, H, W)")
+
+        grid_rows, grid_cols = views_arr.shape[:2]
+        if grid_rows != grid_cols:
+            raise ValueError("views must represent a square grid of views")
+
+        return views_arr, grid_rows, grid_cols, grid_rows // 2, grid_cols // 2
 
     @abstractmethod
     def rectify(
@@ -97,16 +142,8 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
         self.prompt_for_all_views = prompt_for_all_views
 
     def select_reference_view(self, views: np.ndarray) -> Tuple[int, int]:
-        views_arr = np.asarray(views)
-
-        if views_arr.ndim != 4:
-            raise ValueError("views must have shape (N, N, H, W)")
-
-        grid_rows, grid_cols = views_arr.shape[:2]
-        if grid_rows != grid_cols:
-            raise ValueError("views must represent a square grid of views")
-
-        return grid_rows // 2, grid_cols // 2
+        _, _, _, center_i, center_j = self._default_reference_view(views)
+        return center_i, center_j
 
     def compute_similarity_matrix(
         self, views: np.ndarray, ref_view_idx: Tuple[int, int]
@@ -233,16 +270,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         self.step_size = step_size if step_size is not None else self.window_size // 10
 
     def select_reference_view(self, views: np.ndarray) -> Tuple[int, int]:
-        views_arr = np.asarray(views)
-
-        if views_arr.ndim != 4:
-            raise ValueError("views must have shape (N, N, H, W)")
-
-        grid_rows, grid_cols = views_arr.shape[:2]
-        if grid_rows != grid_cols:
-            raise ValueError("views must represent a square grid of views")
-
-        return grid_rows // 2, grid_cols // 2
+        _, _, _, center_i, center_j = self._default_reference_view(views)
+        return center_i, center_j
 
     def compute_similarity_matrices(
         self, views: np.ndarray, ref_view_idx: Tuple[int, int], max_disp: Optional[int] = None,
