@@ -564,34 +564,39 @@ def main():
     else:
         rectification_strategy = None
         rectification_strategy_global = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
-        refinement_window_size = int(input("Enter similarity window size for pixel-wise refinement (odd integer, default 15): ") or 15)
+        refinement_window_size = int(input("Enter similarity window size for pixel-wise refinement (odd integer, default 7): ") or 7)
         rectification_strategy_pixel = PixelwisePatchRectificationStrategy(refinement_window_size)
     
     views_for_rect = np.asarray(views)
     _, ref_view_choice = resolve_reference_view(views_for_rect)
 
     # Cleanup of reference view for better correlation
-    view_mask = np.array([val if np.linalg.norm(np.array(np.unravel_index(i, views[ref_view_choice].shape)) - np.array(views[ref_view_choice].shape)//2) < windows[0, 2] else 0 for i, val in enumerate(views[ref_view_choice].flatten())])
-    view_mask = np.reshape(view_mask, views[ref_view_choice].shape)
-    views[ref_view_choice] = unsharp_mask(view_mask)
+    # view_mask = np.array([val if np.linalg.norm(np.array(np.unravel_index(i, views[ref_view_choice].shape)) - np.array(views[ref_view_choice].shape)//2) < windows[0, 2] else 0 for i, val in enumerate(views[ref_view_choice].flatten())])
+    # view_mask = np.reshape(view_mask, views[ref_view_choice].shape)
+    # views[ref_view_choice] = unsharp_mask(view_mask)
 
     #calculate similarity matrix
     if rect_strat == 1:
         assert isinstance(rectification_strategy, GlobalTranslationRectificationStrategy)
-        sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice)
+        sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
     elif rect_strat == 2:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
-        # Leave this comment in, It's for clarification of use.
         sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice, disp_gauss_sigma=10.0, thresh=0.25)
     else:
         assert rectification_strategy is None
         assert isinstance(rectification_strategy_global, GlobalTranslationRectificationStrategy)
         assert isinstance(rectification_strategy_pixel, PixelwisePatchRectificationStrategy)
-        sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice)
+
+        # Compute global similarity and perform global rectification ONCE.
+        sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
         av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(views, sim_mat, ref_view_choice)
+        
+        # Prepare pixel-wise similarity on the global-rectified views (refinement)
         refined_ref_view_choice = ref_view_choice
-        sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(rect_views_after_global, refined_ref_view_choice, disp_gauss_sigma=10.0, thresh=0.25)
-    
+        sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
+            rect_views_after_global, refined_ref_view_choice, disp_gauss_sigma=10.0, thresh=0.25
+        )
+
     # Assemble and display similarity matrix
     # Display of similarity matrices
     if rect_strat == 1:
@@ -634,6 +639,7 @@ def main():
 
         av_rect, rect_images = rectification_strategy.rectify(views, sim_mat_pixelwise, ref_view_choice)
     else:
+        # --- Global similarity visualisation (uses sim_mat computed earlier) ---
         disps_y_global = sim_mat[:, :, :, :, 0]
         disps_x_global = sim_mat[:, :, :, :, 1]
         fig_x_global, ax_x_global = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
@@ -642,8 +648,8 @@ def main():
         created_figures.append(fig_y_global)
         for idx in range(view_grid_size):
             for jdx in range(view_grid_size):
-                im_x = ax_x_global[idx,jdx].imshow(disps_x_global[idx, jdx, :, :,], cmap="gray")
-                im_y = ax_y_global[idx,jdx].imshow(disps_y_global[idx, jdx, :, :,], cmap="gray")
+                im_x = ax_x_global[idx, jdx].imshow(disps_x_global[idx, jdx, :, :,], cmap="gray")
+                im_y = ax_y_global[idx, jdx].imshow(disps_y_global[idx, jdx, :, :,], cmap="gray")
                 ax_x_global[idx, jdx].set_title(f"Global: View {idx+1}-{jdx+1} X translation similarity")
                 ax_y_global[idx, jdx].set_title(f"Global: View {idx+1}-{jdx+1} Y translation similarity")
                 fig_x_global.colorbar(im_x, ax=ax_x_global[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
@@ -651,26 +657,62 @@ def main():
         fig_x_global.suptitle("Global X translation similarity")
         fig_y_global.suptitle("Global Y translation similarity")
 
-        assert isinstance(rectification_strategy_global, GlobalTranslationRectificationStrategy)
-        av_rect_global, rect_images_global = rectification_strategy_global.rectify(views, sim_mat, ref_view_choice)
+        # --- Display global-rectified views and overlays (collected for saving) ---
+        for i in range(view_grid_size):
+            for j in range(view_grid_size):
+                fig = plt.figure()
+                created_figures.append(fig)
+                manager = plt.get_current_fig_manager()
+                _fullscreen = getattr(manager, "full_screen_toggle", None)
+                if callable(_fullscreen):
+                    _fullscreen()
+                plt.imshow(rect_views_after_global[i, j], cmap="gray")
+                plt.title(f"Global Rectified View {i+1}-{j+1}")
 
+        extreme_overlays_global = build_extreme_view_overlays(rect_views_after_global)
+        for overlay, (i1, j1), (i2, j2) in extreme_overlays_global:
+            fig = plt.figure()
+            created_figures.append(fig)
+            plt.imshow(overlay)
+            plt.title(f"Global Extreme View Overlay ({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})")
+
+        fig = plt.figure()
+        created_figures.append(fig)
+        plt.imshow(av_rect_global, cmap="gray")
+        manager = plt.get_current_fig_manager()
+        _fullscreen = getattr(manager, "full_screen_toggle", None)
+        if callable(_fullscreen):
+            _fullscreen()
+        plt.title("Averaged Global Rectified Image")
+
+        fig = plt.figure()
+        created_figures.append(fig)
+        plt.imshow(np.clip(cv.equalizeHist(av_rect_global.astype('uint8')), 0.85*255, 255), cmap="gray")
+        manager = plt.get_current_fig_manager()
+        _fullscreen = getattr(manager, "full_screen_toggle", None)
+        if callable(_fullscreen):
+            _fullscreen()
+        plt.title("Averaged Global Rectified Image - Equalized (clipped, 85%) for contrast")
+
+        # --- Pixel-wise similarity visualisation (refinement stage) ---
         disps_y = sim_mat_pixelwise.disps_y
         disps_x = sim_mat_pixelwise.disps_x
         fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
         created_figures.append(fig_x)
         fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
         created_figures.append(fig_y)
-        for idx in range(view_grid_size):    
-            for jdx in range(view_grid_size): 
-                im_x = ax_x[idx,jdx].imshow(disps_x[:,:,idx, jdx], cmap="gray")
-                im_y = ax_y[idx,jdx].imshow(disps_y[:,:,idx, jdx], cmap="gray")
-                ax_x[idx, jdx].set_title(f"Pixel-wise: View {idx+1}-{jdx+1} X translation similarity")
-                ax_y[idx, jdx].set_title(f"Pixel-wise: View {idx+1}-{jdx+1} Y translation similarity")
+        for idx in range(view_grid_size):
+            for jdx in range(view_grid_size):
+                im_x = ax_x[idx, jdx].imshow(disps_x[:, :, idx, jdx], cmap="gray")
+                im_y = ax_y[idx, jdx].imshow(disps_y[:, :, idx, jdx], cmap="gray")
+                ax_x[idx, jdx].set_title(f"View {idx+1}-{jdx+1} X translation similarity")
+                ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
                 fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
                 fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
-        fig_x.suptitle("Pixel-wise X translation similarity")
-        fig_y.suptitle("Pixel-wise Y translation similarity")
+        fig_x.suptitle("Pixel-Wise X translation similarity")
+        fig_y.suptitle("Pixel-Wise Y translation similarity")
 
+        # Perform pixel-wise rectification ONCE on the global-rectified views
         assert isinstance(rectification_strategy_pixel, PixelwisePatchRectificationStrategy)
         av_rect, rect_images = rectification_strategy_pixel.rectify(rect_views_after_global, sim_mat_pixelwise, refined_ref_view_choice)
     
