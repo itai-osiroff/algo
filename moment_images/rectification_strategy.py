@@ -146,7 +146,8 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
         return center_i, center_j
 
     def compute_similarity_matrix(
-        self, views: np.ndarray, ref_view_idx: Tuple[int, int]
+        self, views: np.ndarray, ref_view_idx: Tuple[int, int],
+        thresh: Optional[float] = None,
     ) -> np.ndarray:
         """
         Correlate every view against every other to estimate global translations.
@@ -156,7 +157,11 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
         evaluated. The result contains ``(dy, dx)`` offsets in pixels for each
         view pair, padded by ``pad_width`` to avoid edge effects.
         """
-        views_arr = np.asarray(views, dtype=np.float64)
+        views_arr = np.asarray(views, dtype=np.float64, copy=True)
+        if thresh is not None:
+            for i in range(views_arr.shape[0]):
+                for j in range(views_arr.shape[1]):
+                    views_arr[i, j, :, :][views_arr[i, j, :, :] < np.max(views_arr[i, j, :, :]) * thresh] = 0.0
 
         if views_arr.ndim != 4:
             raise ValueError("views must have shape (N, N, H, W)")
@@ -268,6 +273,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         self.window_size = int(window_size)
         self.window_radius = self.window_size // 2
         self.step_size = step_size if step_size is not None else self.window_size // 10
+        if self.step_size < 1:
+            self.step_size = 1
 
     def select_reference_view(self, views: np.ndarray) -> Tuple[int, int]:
         _, _, _, center_i, center_j = self._default_reference_view(views)
@@ -303,7 +310,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             ``PixelwiseSimilarityResult`` containing correlation scores,
             displacement maps, and target coordinates for each view.
         """
-        views_arr = np.asarray(views, dtype=np.float64)
+        views_arr = np.asarray(views, dtype=np.float64, copy=True)
         if thresh is not None:
             for i in range(views_arr.shape[0]):
                 for j in range(views_arr.shape[1]):
