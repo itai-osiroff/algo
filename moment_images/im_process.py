@@ -10,10 +10,10 @@ from itertools import combinations
 from django.utils.text import slugify
 try:
     # Prefer absolute import when running as a script
-    from rectification_strategy import GlobalTranslationRectificationStrategy, PixelwisePatchRectificationStrategy
+    from rectification_strategy import GlobalTranslationRectificationStrategy, PixelwisePatchRectificationStrategy, resolve_reference_view
 except Exception:
     # When imported as a package, use relative import
-    from .rectification_strategy import GlobalTranslationRectificationStrategy, PixelwisePatchRectificationStrategy
+    from .rectification_strategy import GlobalTranslationRectificationStrategy, PixelwisePatchRectificationStrategy, resolve_reference_view
 
 # --- Constants ---
 DEFAULT_IMAGE_DIR = 'moment_images/images'
@@ -366,7 +366,7 @@ def extract_views(image_np: np.ndarray, base_circle: np.ndarray, num_views: int,
     return views
 
 
-def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]]:
+def build_extreme_view_overlays(rect_images: np.ndarray, ref_index: Optional[Tuple[int, int]] = None) -> List[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]]:
     """
     Create normalized RGB overlays comparing each pair of corner rectified views.
 
@@ -374,11 +374,8 @@ def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarra
     stores one view in the red channel and the other in green to highlight
     misalignments. Inputs are scaled to [0, 1] to avoid brightness imbalance.
 
-    Args:
-        rect_images: Rectified grayscale view grid with shape ``(N, N, H, W)``.
-
-    Returns:
-        List of ``(overlay, idx1, idx2)`` tuples for each extreme-view pair.
+    If ``ref_index`` is provided, also add overlays comparing each extreme
+    view with the reference view (one overlay per extreme).
     """
     grid_size = rect_images.shape[0]
     if grid_size < 2:
@@ -392,6 +389,7 @@ def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarra
     ]
 
     overlays: List[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]] = []
+    pairs_added = set()
     for (i1, j1), (i2, j2) in combinations(extreme_indices, 2):
         view_1 = rect_images[i1, j1].astype(np.float32)
         view_2 = rect_images[i2, j2].astype(np.float32)
@@ -405,6 +403,29 @@ def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarra
         overlay[..., 1] = view_2_norm
 
         overlays.append((overlay, (i1, j1), (i2, j2)))
+        pairs_added.add(frozenset({(i1, j1), (i2, j2)}))
+
+    # Add overlays that compare each extreme view with the reference view (if provided)
+    if ref_index is not None:
+        for (ei, ej) in extreme_indices:
+            ref_pair = frozenset({(ei, ej), ref_index})
+            # Skip if same view or already added above
+            if ref_pair in pairs_added or (ei, ej) == ref_index:
+                continue
+
+            view_ext = rect_images[ei, ej].astype(np.float32)
+            view_ref = rect_images[ref_index].astype(np.float32)
+
+            max_val = float(max(np.max(view_ext), np.max(view_ref), 1e-8))
+            view_ext_norm = view_ext / max_val
+            view_ref_norm = view_ref / max_val
+
+            overlay = np.zeros((*view_ext.shape, 3), dtype=np.float32)
+            overlay[..., 0] = view_ext_norm
+            overlay[..., 1] = view_ref_norm
+
+            overlays.append((overlay, (ei, ej), ref_index))
+            pairs_added.add(ref_pair)
 
     return overlays
 
@@ -551,30 +572,52 @@ def main():
     plt.show()
     plt.close("all")
 
-    rect_strat = int(input("Start rectification process. Choose the rectification strategy:\n1: Global Translation Rectification\n2: Pixel-wise Patch Rectification\nEnter your choice:"))
+    rect_strat = int(input("Start rectification process. Choose the rectification strategy:\n1: Global Translation Rectification\n2: Pixel-wise Patch Rectification\n3: Combined (Global followed by Pixel-wise refinement)\nEnter your choice:"))
     if rect_strat == 1:
         rectification_strategy = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
-    else:
+        rectification_strategy_global = None
+        rectification_strategy_pixel = None
+    elif rect_strat == 2:
         sim_window_size = int(input("Enter similarity window size (odd integer, default 41): ") or 41)
         rectification_strategy = PixelwisePatchRectificationStrategy(sim_window_size)
+        rectification_strategy_global = None
+        rectification_strategy_pixel = None
+    else:
+        rectification_strategy = None
+        rectification_strategy_global = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
+        refinement_window_size = int(input("Enter similarity window size for pixel-wise refinement (odd integer, default 7): ") or 14)
+        rectification_strategy_pixel = PixelwisePatchRectificationStrategy(refinement_window_size, zero_fill_roll=True)
     
-    ref_view_choice = rectification_strategy.select_reference_view(views)
+    views_for_rect = np.asarray(views)
+    _, ref_view_choice = resolve_reference_view(views_for_rect)
 
     # Cleanup of reference view for better correlation
-    view_mask = np.array([val if np.linalg.norm(np.array(np.unravel_index(i, views[ref_view_choice].shape)) - np.array(views[ref_view_choice].shape)//2) < windows[0, 2] else 0 for i, val in enumerate(views[ref_view_choice].flatten())])
-    view_mask = np.reshape(view_mask, views[ref_view_choice].shape)
-    views[ref_view_choice] = unsharp_mask(view_mask)
+    # view_mask = np.array([val if np.linalg.norm(np.array(np.unravel_index(i, views[ref_view_choice].shape)) - np.array(views[ref_view_choice].shape)//2) < windows[0, 2] else 0 for i, val in enumerate(views[ref_view_choice].flatten())])
+    # view_mask = np.reshape(view_mask, views[ref_view_choice].shape)
+    # views[ref_view_choice] = unsharp_mask(view_mask)
 
     #calculate similarity matrix
     if rect_strat == 1:
         assert isinstance(rectification_strategy, GlobalTranslationRectificationStrategy)
-        sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice)
-    else:
+        sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
+    elif rect_strat == 2:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
-        #sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice,
-        #  ref_view_idx, max_disp, gauss_sigma, gauss_size, disp_gauss_sigma, disp_gauss_size, thresh)
-        sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice, disp_gauss_sigma=10.0, thresh=0.25)
-    
+        sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice, thresh=0.05)
+    else:
+        assert rectification_strategy is None
+        assert isinstance(rectification_strategy_global, GlobalTranslationRectificationStrategy)
+        assert isinstance(rectification_strategy_pixel, PixelwisePatchRectificationStrategy)
+
+        # Compute global similarity and perform global rectification ONCE.
+        sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
+        av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(views, sim_mat, ref_view_choice)
+        
+        # Prepare pixel-wise similarity on the global-rectified views (refinement)
+        refined_ref_view_choice = ref_view_choice
+        sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
+            rect_views_after_global, refined_ref_view_choice, thresh=0.05
+        )
+
     # Assemble and display similarity matrix
     # Display of similarity matrices
     if rect_strat == 1:
@@ -595,7 +638,7 @@ def main():
         fig_y.suptitle("Y translation similarity")
 
         av_rect, rect_images = rectification_strategy.rectify(views, sim_mat, ref_view_choice)
-    else:
+    elif rect_strat == 2:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
         disps_y = sim_mat_pixelwise.disps_y
         disps_x = sim_mat_pixelwise.disps_x
@@ -616,6 +659,84 @@ def main():
         fig_y.suptitle("Y translation similarity")
 
         av_rect, rect_images = rectification_strategy.rectify(views, sim_mat_pixelwise, ref_view_choice)
+    else:
+        # --- Global similarity visualisation (uses sim_mat computed earlier) ---
+        disps_y_global = sim_mat[:, :, :, :, 0]
+        disps_x_global = sim_mat[:, :, :, :, 1]
+        fig_x_global, ax_x_global = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+        created_figures.append(fig_x_global)
+        fig_y_global, ax_y_global = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+        created_figures.append(fig_y_global)
+        for idx in range(view_grid_size):
+            for jdx in range(view_grid_size):
+                im_x = ax_x_global[idx, jdx].imshow(disps_x_global[idx, jdx, :, :,], cmap="gray")
+                im_y = ax_y_global[idx, jdx].imshow(disps_y_global[idx, jdx, :, :,], cmap="gray")
+                ax_x_global[idx, jdx].set_title(f"Global: View {idx+1}-{jdx+1} X translation similarity")
+                ax_y_global[idx, jdx].set_title(f"Global: View {idx+1}-{jdx+1} Y translation similarity")
+                fig_x_global.colorbar(im_x, ax=ax_x_global[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+                fig_y_global.colorbar(im_y, ax=ax_y_global[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+        fig_x_global.suptitle("Global X translation similarity")
+        fig_y_global.suptitle("Global Y translation similarity")
+
+        # --- Display global-rectified views and overlays (collected for saving) ---
+        for i in range(view_grid_size):
+            for j in range(view_grid_size):
+                fig = plt.figure()
+                created_figures.append(fig)
+                manager = plt.get_current_fig_manager()
+                _fullscreen = getattr(manager, "full_screen_toggle", None)
+                if callable(_fullscreen):
+                    _fullscreen()
+                plt.imshow(rect_views_after_global[i, j], cmap="gray")
+                plt.title(f"Global Rectified View {i+1}-{j+1}")
+
+        # Pass reference view to include reference comparisons
+        extreme_overlays_global = build_extreme_view_overlays(rect_views_after_global, ref_index=ref_view_choice)
+        for overlay, (i1, j1), (i2, j2) in extreme_overlays_global:
+            fig = plt.figure()
+            created_figures.append(fig)
+            plt.imshow(overlay)
+            plt.title(f"Global Extreme View Overlay ({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})")
+
+        fig = plt.figure()
+        created_figures.append(fig)
+        plt.imshow(av_rect_global, cmap="gray")
+        manager = plt.get_current_fig_manager()
+        _fullscreen = getattr(manager, "full_screen_toggle", None)
+        if callable(_fullscreen):
+            _fullscreen()
+        plt.title("Averaged Global Rectified Image")
+
+        fig = plt.figure()
+        created_figures.append(fig)
+        plt.imshow(np.clip(cv.equalizeHist(av_rect_global.astype('uint8')), 0.85*255, 255), cmap="gray")
+        manager = plt.get_current_fig_manager()
+        _fullscreen = getattr(manager, "full_screen_toggle", None)
+        if callable(_fullscreen):
+            _fullscreen()
+        plt.title("Averaged Global Rectified Image - Equalized (clipped, 85%) for contrast")
+
+        # --- Pixel-wise similarity visualisation (refinement stage) ---
+        disps_y = sim_mat_pixelwise.disps_y
+        disps_x = sim_mat_pixelwise.disps_x
+        fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+        created_figures.append(fig_x)
+        fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
+        created_figures.append(fig_y)
+        for idx in range(view_grid_size):
+            for jdx in range(view_grid_size):
+                im_x = ax_x[idx, jdx].imshow(disps_x[:, :, idx, jdx], cmap="gray")
+                im_y = ax_y[idx, jdx].imshow(disps_y[:, :, idx, jdx], cmap="gray")
+                ax_x[idx, jdx].set_title(f"View {idx+1}-{jdx+1} X translation similarity")
+                ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
+                fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+                fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+        fig_x.suptitle("Pixel-Wise X translation similarity")
+        fig_y.suptitle("Pixel-Wise Y translation similarity")
+
+        # Perform pixel-wise rectification ONCE on the global-rectified views
+        assert isinstance(rectification_strategy_pixel, PixelwisePatchRectificationStrategy)
+        av_rect, rect_images = rectification_strategy_pixel.rectify(rect_views_after_global, sim_mat_pixelwise, refined_ref_view_choice)
     
     # plt.show()    
     # Sharpen image (?)
@@ -640,7 +761,9 @@ def main():
     # plt.close("all")
 
     # Build and display RGB overlays for the most extreme rectified views
-    extreme_overlays = build_extreme_view_overlays(rect_images)
+    # + comparison to displacement maps (flag)
+    disp_comp_flag = input("Do you want to see displacement comparison overlays for extreme views? (y/n): ").lower() == 'y'
+    extreme_overlays = build_extreme_view_overlays(rect_images, ref_index=ref_view_choice)
     for overlay, (i1, j1), (i2, j2) in extreme_overlays:
         fig = plt.figure()
         created_figures.append(fig)
@@ -649,7 +772,64 @@ def main():
             "Extreme View Overlay "
             f"({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})"
         )
-    
+        if disp_comp_flag:
+            # Ensure displacement maps exist in this run; skip gracefully otherwise
+            if 'disps_x' not in locals() or 'disps_y' not in locals():
+                print("Displacement maps unavailable for this run — skipping displacement comparison overlays.")
+                continue
+
+            # Extract views and build boolean masks for X/Y displacements
+            view1 = rect_views_after_global[i1, j1, :, :].astype(np.float32)
+            view2 = rect_views_after_global[i2, j2, :, :].astype(np.float32)
+
+            mask_x1 = np.abs(disps_x[:, :, i1, j1]) > 0
+            mask_y1 = np.abs(disps_y[:, :, i1, j1]) > 0
+            mask_x2 = np.abs(disps_x[:, :, i2, j2]) > 0
+            mask_y2 = np.abs(disps_y[:, :, i2, j2]) > 0
+
+            masked_x_view1 = mask_x1 * view1
+            masked_y_view1 = mask_y1 * view1
+            masked_x_view2 = mask_x2 * view2
+            masked_y_view2 = mask_y2 * view2
+
+            # Single, organized figure: two rows (view1 / view2), three columns (original, masked X, masked Y),
+            # and a full-width overlay below.
+            fig_all = plt.figure(constrained_layout=True, figsize=(12, 10))
+            gs = fig_all.add_gridspec(3, 3)
+            ax0 = fig_all.add_subplot(gs[0, 0])
+            ax1 = fig_all.add_subplot(gs[0, 1])
+            ax2 = fig_all.add_subplot(gs[0, 2])
+            ax3 = fig_all.add_subplot(gs[1, 0])
+            ax4 = fig_all.add_subplot(gs[1, 1])
+            ax5 = fig_all.add_subplot(gs[1, 2])
+            ax_overlay = fig_all.add_subplot(gs[2, :])
+
+            im0 = ax0.imshow(view1, cmap="gray")
+            ax0.set_title(f"View {i1+1}-{j1+1} — Original")
+            im1 = ax1.imshow(masked_x_view1, cmap="gray")
+            ax1.set_title("Masked X × Original")
+            im2 = ax2.imshow(masked_y_view1, cmap="gray")
+            ax2.set_title("Masked Y × Original")
+
+            im3 = ax3.imshow(view2, cmap="gray")
+            ax3.set_title(f"View {i2+1}-{j2+1} — Original")
+            im4 = ax4.imshow(masked_x_view2, cmap="gray")
+            ax4.set_title("Masked X × Original")
+            im5 = ax5.imshow(masked_y_view2, cmap="gray")
+            ax5.set_title("Masked Y × Original")
+
+            ax_overlay.imshow(overlay)
+            ax_overlay.set_title(f"Overlay (Red=({i1+1}-{j1+1}), Green=({i2+1}-{j2+1}))")
+
+            # Add colorbars for the masked maps to emphasise displacement regions
+            fig_all.colorbar(im1, ax=ax1, orientation='vertical', fraction=0.035, pad=0.02)
+            fig_all.colorbar(im2, ax=ax2, orientation='vertical', fraction=0.035, pad=0.02)
+            fig_all.colorbar(im4, ax=ax4, orientation='vertical', fraction=0.035, pad=0.02)
+            fig_all.colorbar(im5, ax=ax5, orientation='vertical', fraction=0.035, pad=0.02)
+
+            fig_all.suptitle(f"Displacement masks and original views: ({i1+1}-{j1+1}) vs ({i2+1}-{j2+1})")
+            created_figures.append(fig_all)
+
     # Display the averaged rectified image
     fig = plt.figure()
     created_figures.append(fig)

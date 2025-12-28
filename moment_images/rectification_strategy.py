@@ -24,6 +24,31 @@ from scipy.ndimage import gaussian_filter
 DEFAULT_CORRELATION_PAD_WIDTH = int(125 * 0.45)
 
 
+def resolve_reference_view(
+    views: np.ndarray, ref_view_idx: Optional[Tuple[int, int]] = None
+) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """
+    Validate ``views`` and resolve the effective reference view indices.
+
+    This helper centralizes shape validation and defaulting to the center view
+    so multi-stage rectification pipelines can share reference selection logic
+    without re-prompting the user. Existing strategies retain their behavior by
+    calling ``select_reference_view`` when desired.
+    """
+
+    views_arr, grid_rows, grid_cols, center_i, center_j = RectificationStrategy._default_reference_view(
+        views
+    )
+    if ref_view_idx is None:
+        return views_arr, (center_i, center_j)
+
+    ref_i, ref_j = ref_view_idx
+    if not (0 <= ref_i < grid_rows and 0 <= ref_j < grid_cols):
+        raise ValueError("ref_view_idx must point to a valid view inside views")
+
+    return views_arr, (ref_i, ref_j)
+
+
 @dataclass
 class PixelwiseSimilarityResult:
     """
@@ -54,6 +79,26 @@ class RectificationStrategy(ABC):
     @abstractmethod
     def select_reference_view(self, views: np.ndarray) -> Tuple[int, int]:
         """Pick a reference view index from a grid of views."""
+
+    @staticmethod
+    def _default_reference_view(views: np.ndarray) -> Tuple[np.ndarray, int, int, int, int]:
+        """
+        Validate ``views`` and return its normalized array form with center indices.
+
+        This helper centralizes the shape/type checks shared by all rectification
+        strategies without altering the existing default behavior (center view
+        selection).
+        """
+        views_arr = np.asarray(views)
+
+        if views_arr.ndim != 4:
+            raise ValueError("views must have shape (N, N, H, W)")
+
+        grid_rows, grid_cols = views_arr.shape[:2]
+        if grid_rows != grid_cols:
+            raise ValueError("views must represent a square grid of views")
+
+        return views_arr, grid_rows, grid_cols, grid_rows // 2, grid_cols // 2
 
     @abstractmethod
     def rectify(
@@ -91,25 +136,20 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
     """
 
     def __init__(
-        self, pad_width: int = DEFAULT_CORRELATION_PAD_WIDTH, prompt_for_all_views: bool = True
+        self,
+        pad_width: int = DEFAULT_CORRELATION_PAD_WIDTH,
+        prompt_for_all_views: bool = True,
     ) -> None:
         self.pad_width = int(pad_width)
         self.prompt_for_all_views = prompt_for_all_views
 
     def select_reference_view(self, views: np.ndarray) -> Tuple[int, int]:
-        views_arr = np.asarray(views)
-
-        if views_arr.ndim != 4:
-            raise ValueError("views must have shape (N, N, H, W)")
-
-        grid_rows, grid_cols = views_arr.shape[:2]
-        if grid_rows != grid_cols:
-            raise ValueError("views must represent a square grid of views")
-
-        return grid_rows // 2, grid_cols // 2
+        _, _, _, center_i, center_j = self._default_reference_view(views)
+        return center_i, center_j
 
     def compute_similarity_matrix(
-        self, views: np.ndarray, ref_view_idx: Tuple[int, int]
+        self, views: np.ndarray, ref_view_idx: Tuple[int, int],
+        thresh: Optional[float] = None,
     ) -> np.ndarray:
         """
         Correlate every view against every other to estimate global translations.
@@ -119,7 +159,11 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
         evaluated. The result contains ``(dy, dx)`` offsets in pixels for each
         view pair, padded by ``pad_width`` to avoid edge effects.
         """
-        views_arr = np.asarray(views, dtype=np.float64)
+        views_arr = np.asarray(views, dtype=np.float64, copy=True)
+        if thresh is not None:
+            for i in range(views_arr.shape[0]):
+                for j in range(views_arr.shape[1]):
+                    views_arr[i, j, :, :][views_arr[i, j, :, :] < np.max(views_arr[i, j, :, :]) * thresh] = 0.0
 
         if views_arr.ndim != 4:
             raise ValueError("views must have shape (N, N, H, W)")
@@ -203,7 +247,7 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
                 dy, dx = sim_arr[ref_i, ref_j, i, j]
                 warp_mat = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
                 rectified_views[i, j] = cv.warpAffine(
-                    views_arr[i, j], warp_mat, (width, height)
+                    views_arr[i, j], warp_mat, (width, height), borderMode=cv.BORDER_CONSTANT
                 )
 
         avg_image = np.mean(rectified_views, axis=(0, 1))
@@ -222,7 +266,12 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
     views to the reference grid.
     """
 
-    def __init__(self, window_size: int = 41, step_size: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        window_size: int = 41,
+        step_size: Optional[int] = None,
+        zero_fill_roll: bool = False,
+    ) -> None:
         if window_size < 1:
             raise ValueError("window_size must be a positive odd integer")
         elif window_size % 2 == 0:
@@ -231,18 +280,13 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         self.window_size = int(window_size)
         self.window_radius = self.window_size // 2
         self.step_size = step_size if step_size is not None else self.window_size // 10
+        if self.step_size < 1:
+            self.step_size = 1
+        self.zero_fill_roll = zero_fill_roll
 
     def select_reference_view(self, views: np.ndarray) -> Tuple[int, int]:
-        views_arr = np.asarray(views)
-
-        if views_arr.ndim != 4:
-            raise ValueError("views must have shape (N, N, H, W)")
-
-        grid_rows, grid_cols = views_arr.shape[:2]
-        if grid_rows != grid_cols:
-            raise ValueError("views must represent a square grid of views")
-
-        return grid_rows // 2, grid_cols // 2
+        _, _, _, center_i, center_j = self._default_reference_view(views)
+        return center_i, center_j
 
     def compute_similarity_matrices(
         self, views: np.ndarray, ref_view_idx: Tuple[int, int], max_disp: Optional[int] = None,
@@ -274,7 +318,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             ``PixelwiseSimilarityResult`` containing correlation scores,
             displacement maps, and target coordinates for each view.
         """
-        views_arr = np.asarray(views, dtype=np.float64)
+        views_arr = np.asarray(views, dtype=np.float64, copy=True)
         if thresh is not None:
             for i in range(views_arr.shape[0]):
                 for j in range(views_arr.shape[1]):
@@ -283,9 +327,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if max_disp is None:
             max_disp = self.window_radius
         if gauss_sigma is None:
-            gauss_sigma = max_disp / 5.0
+            gauss_sigma = 7
         if gauss_size is None:
-            gauss_size = self.window_radius * 2 + 1
+            gauss_size = int(gauss_sigma * 6)
         if disp_gauss_sigma is None:
             disp_gauss_sigma = 0.0
         if disp_gauss_size is None:
@@ -328,11 +372,13 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                     for s_x_ind in range(0, D, self.step_size):
                         s_y = s_y_ind - max_disp
                         s_x = s_x_ind - max_disp
-                        shifted_view = np.roll(view, shift=(s_y, s_x), axis=(0, 1))
+                        shifted_view = self._roll_with_fill(
+                            view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
+                        )
                         corr_mats[:, :, i, j, s_y_ind, s_x_ind] = gaussian_filter(
                             ref_view * shifted_view,
                             sigma=gauss_sigma,
-                            truncate=(((gauss_size - 1) / 2) / gauss_sigma),
+                            truncate=(gauss_size/ gauss_sigma),
                             mode="constant",
                         )
 
@@ -359,8 +405,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 else:
                     disps_y[:, :, i, j] = gaussian_filter(disp_arr[idx_y], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_y]
                     disps_x[:, :, i, j] = gaussian_filter(disp_arr[idx_x], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_x]
-                coordinates[:, :, i, j, 0] = base_coords[:, :, 0] + disp_arr[idx_y]
-                coordinates[:, :, i, j, 1] = base_coords[:, :, 1] + disp_arr[idx_x]
+                coordinates[:, :, i, j, 0] = base_coords[:, :, 0] - disp_arr[idx_y]
+                coordinates[:, :, i, j, 1] = base_coords[:, :, 1] - disp_arr[idx_x]
 
         return PixelwiseSimilarityResult(coordinates=coordinates, scores=scores, disps_y = disps_y, disps_x = disps_x)
 
@@ -473,3 +519,34 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         """Return an ``(H, W, 2)`` array of pixel indices for identity remapping."""
         yy, xx = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
         return np.stack([yy, xx], axis=-1).astype(np.float32)
+
+    @staticmethod
+    def _roll_with_fill(
+        array: np.ndarray, shift_y: int, shift_x: int, zero_fill: bool
+    ) -> np.ndarray:
+        """
+        Shift ``array`` by ``(shift_y, shift_x)`` using ``np.roll`` with optional zero fill.
+
+        When ``zero_fill`` is ``True``, regions that would wrap around the image edges
+        are explicitly set to zero to avoid reflected artifacts from the roll
+        operation.
+        """
+
+        shifted = np.roll(array, shift=(shift_y, shift_x), axis=(0, 1))
+        if not zero_fill:
+            return shifted
+
+        rows_to_zero = min(abs(shift_y), shifted.shape[0])
+        cols_to_zero = min(abs(shift_x), shifted.shape[1])
+
+        if shift_y > 0:
+            shifted[:rows_to_zero, :] = 0
+        elif shift_y < 0:
+            shifted[-rows_to_zero:, :] = 0
+
+        if shift_x > 0:
+            shifted[:, :cols_to_zero] = 0
+        elif shift_x < 0:
+            shifted[:, -cols_to_zero:] = 0
+
+        return shifted
