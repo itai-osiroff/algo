@@ -395,8 +395,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 else:
                     disps_y[:, :, i, j] = gaussian_filter(disp_arr[idx_y], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_y]
                     disps_x[:, :, i, j] = gaussian_filter(disp_arr[idx_x], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_x]
-                coordinates[:, :, i, j, 0] = base_coords[:, :, 0] + disp_arr[idx_y]
-                coordinates[:, :, i, j, 1] = base_coords[:, :, 1] + disp_arr[idx_x]
+                coordinates[:, :, i, j, 0] = base_coords[:, :, 0] - disp_arr[idx_y]
+                coordinates[:, :, i, j, 1] = base_coords[:, :, 1] - disp_arr[idx_x]
 
         return PixelwiseSimilarityResult(coordinates=coordinates, scores=scores, disps_y = disps_y, disps_x = disps_x)
 
