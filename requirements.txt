@@ -1,0 +1,8 @@
+Django
+h5py
+matlabengine
+matplotlib
+numpy
+opencv-python
+Pillow
+scipy
