@@ -319,9 +319,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if max_disp is None:
             max_disp = self.window_radius
         if gauss_sigma is None:
-            gauss_sigma = max_disp / 5.0
+            gauss_sigma = 7
         if gauss_size is None:
-            gauss_size = self.window_radius * 2 + 1
+            gauss_size = int(gauss_sigma * 6)
         if disp_gauss_sigma is None:
             disp_gauss_sigma = 0.0
         if disp_gauss_size is None:
@@ -368,7 +368,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         corr_mats[:, :, i, j, s_y_ind, s_x_ind] = gaussian_filter(
                             ref_view * shifted_view,
                             sigma=gauss_sigma,
-                            truncate=(((gauss_size - 1) / 2) / gauss_sigma),
+                            truncate=(gauss_size/ gauss_sigma),
                             mode="constant",
                         )
 
