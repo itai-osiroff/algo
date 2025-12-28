@@ -136,7 +136,9 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
     """
 
     def __init__(
-        self, pad_width: int = DEFAULT_CORRELATION_PAD_WIDTH, prompt_for_all_views: bool = True
+        self,
+        pad_width: int = DEFAULT_CORRELATION_PAD_WIDTH,
+        prompt_for_all_views: bool = True,
     ) -> None:
         self.pad_width = int(pad_width)
         self.prompt_for_all_views = prompt_for_all_views
@@ -245,7 +247,7 @@ class GlobalTranslationRectificationStrategy(RectificationStrategy):
                 dy, dx = sim_arr[ref_i, ref_j, i, j]
                 warp_mat = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
                 rectified_views[i, j] = cv.warpAffine(
-                    views_arr[i, j], warp_mat, (width, height)
+                    views_arr[i, j], warp_mat, (width, height), borderMode=cv.BORDER_CONSTANT
                 )
 
         avg_image = np.mean(rectified_views, axis=(0, 1))
@@ -264,7 +266,12 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
     views to the reference grid.
     """
 
-    def __init__(self, window_size: int = 41, step_size: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        window_size: int = 41,
+        step_size: Optional[int] = None,
+        zero_fill_roll: bool = False,
+    ) -> None:
         if window_size < 1:
             raise ValueError("window_size must be a positive odd integer")
         elif window_size % 2 == 0:
@@ -275,6 +282,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         self.step_size = step_size if step_size is not None else self.window_size // 10
         if self.step_size < 1:
             self.step_size = 1
+        self.zero_fill_roll = zero_fill_roll
 
     def select_reference_view(self, views: np.ndarray) -> Tuple[int, int]:
         _, _, _, center_i, center_j = self._default_reference_view(views)
@@ -364,7 +372,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                     for s_x_ind in range(0, D, self.step_size):
                         s_y = s_y_ind - max_disp
                         s_x = s_x_ind - max_disp
-                        shifted_view = np.roll(view, shift=(s_y, s_x), axis=(0, 1))
+                        shifted_view = self._roll_with_fill(
+                            view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
+                        )
                         corr_mats[:, :, i, j, s_y_ind, s_x_ind] = gaussian_filter(
                             ref_view * shifted_view,
                             sigma=gauss_sigma,
@@ -509,3 +519,34 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         """Return an ``(H, W, 2)`` array of pixel indices for identity remapping."""
         yy, xx = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
         return np.stack([yy, xx], axis=-1).astype(np.float32)
+
+    @staticmethod
+    def _roll_with_fill(
+        array: np.ndarray, shift_y: int, shift_x: int, zero_fill: bool
+    ) -> np.ndarray:
+        """
+        Shift ``array`` by ``(shift_y, shift_x)`` using ``np.roll`` with optional zero fill.
+
+        When ``zero_fill`` is ``True``, regions that would wrap around the image edges
+        are explicitly set to zero to avoid reflected artifacts from the roll
+        operation.
+        """
+
+        shifted = np.roll(array, shift=(shift_y, shift_x), axis=(0, 1))
+        if not zero_fill:
+            return shifted
+
+        rows_to_zero = min(abs(shift_y), shifted.shape[0])
+        cols_to_zero = min(abs(shift_x), shifted.shape[1])
+
+        if shift_y > 0:
+            shifted[:rows_to_zero, :] = 0
+        elif shift_y < 0:
+            shifted[-rows_to_zero:, :] = 0
+
+        if shift_x > 0:
+            shifted[:, :cols_to_zero] = 0
+        elif shift_x < 0:
+            shifted[:, -cols_to_zero:] = 0
+
+        return shifted
