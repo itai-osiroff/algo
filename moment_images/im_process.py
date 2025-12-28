@@ -366,7 +366,7 @@ def extract_views(image_np: np.ndarray, base_circle: np.ndarray, num_views: int,
     return views
 
 
-def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]]:
+def build_extreme_view_overlays(rect_images: np.ndarray, ref_index: Optional[Tuple[int, int]] = None) -> List[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]]:
     """
     Create normalized RGB overlays comparing each pair of corner rectified views.
 
@@ -374,11 +374,8 @@ def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarra
     stores one view in the red channel and the other in green to highlight
     misalignments. Inputs are scaled to [0, 1] to avoid brightness imbalance.
 
-    Args:
-        rect_images: Rectified grayscale view grid with shape ``(N, N, H, W)``.
-
-    Returns:
-        List of ``(overlay, idx1, idx2)`` tuples for each extreme-view pair.
+    If ``ref_index`` is provided, also add overlays comparing each extreme
+    view with the reference view (one overlay per extreme).
     """
     grid_size = rect_images.shape[0]
     if grid_size < 2:
@@ -392,6 +389,7 @@ def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarra
     ]
 
     overlays: List[Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]] = []
+    pairs_added = set()
     for (i1, j1), (i2, j2) in combinations(extreme_indices, 2):
         view_1 = rect_images[i1, j1].astype(np.float32)
         view_2 = rect_images[i2, j2].astype(np.float32)
@@ -405,6 +403,29 @@ def build_extreme_view_overlays(rect_images: np.ndarray) -> List[Tuple[np.ndarra
         overlay[..., 1] = view_2_norm
 
         overlays.append((overlay, (i1, j1), (i2, j2)))
+        pairs_added.add(frozenset({(i1, j1), (i2, j2)}))
+
+    # Add overlays that compare each extreme view with the reference view (if provided)
+    if ref_index is not None:
+        for (ei, ej) in extreme_indices:
+            ref_pair = frozenset({(ei, ej), ref_index})
+            # Skip if same view or already added above
+            if ref_pair in pairs_added or (ei, ej) == ref_index:
+                continue
+
+            view_ext = rect_images[ei, ej].astype(np.float32)
+            view_ref = rect_images[ref_index].astype(np.float32)
+
+            max_val = float(max(np.max(view_ext), np.max(view_ref), 1e-8))
+            view_ext_norm = view_ext / max_val
+            view_ref_norm = view_ref / max_val
+
+            overlay = np.zeros((*view_ext.shape, 3), dtype=np.float32)
+            overlay[..., 0] = view_ext_norm
+            overlay[..., 1] = view_ref_norm
+
+            overlays.append((overlay, (ei, ej), ref_index))
+            pairs_added.add(ref_pair)
 
     return overlays
 
@@ -669,7 +690,8 @@ def main():
                 plt.imshow(rect_views_after_global[i, j], cmap="gray")
                 plt.title(f"Global Rectified View {i+1}-{j+1}")
 
-        extreme_overlays_global = build_extreme_view_overlays(rect_views_after_global)
+        # Pass reference view to include reference comparisons
+        extreme_overlays_global = build_extreme_view_overlays(rect_views_after_global, ref_index=ref_view_choice)
         for overlay, (i1, j1), (i2, j2) in extreme_overlays_global:
             fig = plt.figure()
             created_figures.append(fig)
@@ -741,7 +763,7 @@ def main():
     # Build and display RGB overlays for the most extreme rectified views
     # + comparison to displacement maps (flag)
     disp_comp_flag = input("Do you want to see displacement comparison overlays for extreme views? (y/n): ").lower() == 'y'
-    extreme_overlays = build_extreme_view_overlays(rect_images)
+    extreme_overlays = build_extreme_view_overlays(rect_images, ref_index=ref_view_choice)
     for overlay, (i1, j1), (i2, j2) in extreme_overlays:
         fig = plt.figure()
         created_figures.append(fig)
