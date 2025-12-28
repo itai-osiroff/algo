@@ -586,7 +586,7 @@ def main():
         rectification_strategy = None
         rectification_strategy_global = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
         refinement_window_size = int(input("Enter similarity window size for pixel-wise refinement (odd integer, default 7): ") or 14)
-        rectification_strategy_pixel = PixelwisePatchRectificationStrategy(refinement_window_size)
+        rectification_strategy_pixel = PixelwisePatchRectificationStrategy(refinement_window_size, zero_fill_roll=True)
     
     views_for_rect = np.asarray(views)
     _, ref_view_choice = resolve_reference_view(views_for_rect)
