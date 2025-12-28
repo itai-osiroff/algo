@@ -564,7 +564,7 @@ def main():
     else:
         rectification_strategy = None
         rectification_strategy_global = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
-        refinement_window_size = int(input("Enter similarity window size for pixel-wise refinement (odd integer, default 7): ") or 7)
+        refinement_window_size = int(input("Enter similarity window size for pixel-wise refinement (odd integer, default 7): ") or 14)
         rectification_strategy_pixel = PixelwisePatchRectificationStrategy(refinement_window_size)
     
     views_for_rect = np.asarray(views)
@@ -581,7 +581,7 @@ def main():
         sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
     elif rect_strat == 2:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
-        sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice, disp_gauss_sigma=10.0, thresh=0.25)
+        sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice, thresh=0.05)
     else:
         assert rectification_strategy is None
         assert isinstance(rectification_strategy_global, GlobalTranslationRectificationStrategy)
@@ -594,7 +594,7 @@ def main():
         # Prepare pixel-wise similarity on the global-rectified views (refinement)
         refined_ref_view_choice = ref_view_choice
         sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
-            rect_views_after_global, refined_ref_view_choice, disp_gauss_sigma=10.0, thresh=0.25
+            rect_views_after_global, refined_ref_view_choice, thresh=0.05
         )
 
     # Assemble and display similarity matrix
@@ -739,6 +739,8 @@ def main():
     # plt.close("all")
 
     # Build and display RGB overlays for the most extreme rectified views
+    # + comparison to displacement maps (flag)
+    disp_comp_flag = input("Do you want to see displacement comparison overlays for extreme views? (y/n): ").lower() == 'y'
     extreme_overlays = build_extreme_view_overlays(rect_images)
     for overlay, (i1, j1), (i2, j2) in extreme_overlays:
         fig = plt.figure()
@@ -748,7 +750,64 @@ def main():
             "Extreme View Overlay "
             f"({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})"
         )
-    
+        if disp_comp_flag:
+            # Ensure displacement maps exist in this run; skip gracefully otherwise
+            if 'disps_x' not in locals() or 'disps_y' not in locals():
+                print("Displacement maps unavailable for this run — skipping displacement comparison overlays.")
+                continue
+
+            # Extract views and build boolean masks for X/Y displacements
+            view1 = rect_views_after_global[i1, j1, :, :].astype(np.float32)
+            view2 = rect_views_after_global[i2, j2, :, :].astype(np.float32)
+
+            mask_x1 = np.abs(disps_x[:, :, i1, j1]) > 0
+            mask_y1 = np.abs(disps_y[:, :, i1, j1]) > 0
+            mask_x2 = np.abs(disps_x[:, :, i2, j2]) > 0
+            mask_y2 = np.abs(disps_y[:, :, i2, j2]) > 0
+
+            masked_x_view1 = mask_x1 * view1
+            masked_y_view1 = mask_y1 * view1
+            masked_x_view2 = mask_x2 * view2
+            masked_y_view2 = mask_y2 * view2
+
+            # Single, organized figure: two rows (view1 / view2), three columns (original, masked X, masked Y),
+            # and a full-width overlay below.
+            fig_all = plt.figure(constrained_layout=True, figsize=(12, 10))
+            gs = fig_all.add_gridspec(3, 3)
+            ax0 = fig_all.add_subplot(gs[0, 0])
+            ax1 = fig_all.add_subplot(gs[0, 1])
+            ax2 = fig_all.add_subplot(gs[0, 2])
+            ax3 = fig_all.add_subplot(gs[1, 0])
+            ax4 = fig_all.add_subplot(gs[1, 1])
+            ax5 = fig_all.add_subplot(gs[1, 2])
+            ax_overlay = fig_all.add_subplot(gs[2, :])
+
+            im0 = ax0.imshow(view1, cmap="gray")
+            ax0.set_title(f"View {i1+1}-{j1+1} — Original")
+            im1 = ax1.imshow(masked_x_view1, cmap="gray")
+            ax1.set_title("Masked X × Original")
+            im2 = ax2.imshow(masked_y_view1, cmap="gray")
+            ax2.set_title("Masked Y × Original")
+
+            im3 = ax3.imshow(view2, cmap="gray")
+            ax3.set_title(f"View {i2+1}-{j2+1} — Original")
+            im4 = ax4.imshow(masked_x_view2, cmap="gray")
+            ax4.set_title("Masked X × Original")
+            im5 = ax5.imshow(masked_y_view2, cmap="gray")
+            ax5.set_title("Masked Y × Original")
+
+            ax_overlay.imshow(overlay)
+            ax_overlay.set_title(f"Overlay (Red=({i1+1}-{j1+1}), Green=({i2+1}-{j2+1}))")
+
+            # Add colorbars for the masked maps to emphasise displacement regions
+            fig_all.colorbar(im1, ax=ax1, orientation='vertical', fraction=0.035, pad=0.02)
+            fig_all.colorbar(im2, ax=ax2, orientation='vertical', fraction=0.035, pad=0.02)
+            fig_all.colorbar(im4, ax=ax4, orientation='vertical', fraction=0.035, pad=0.02)
+            fig_all.colorbar(im5, ax=ax5, orientation='vertical', fraction=0.035, pad=0.02)
+
+            fig_all.suptitle(f"Displacement masks and original views: ({i1+1}-{j1+1}) vs ({i2+1}-{j2+1})")
+            created_figures.append(fig_all)
+
     # Display the averaged rectified image
     fig = plt.figure()
     created_figures.append(fig)
