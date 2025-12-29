@@ -1,19 +1,31 @@
 import os
+import sys
 import PIL
+from dataclasses import dataclass
 from PIL import Image
 import numpy as np
 import cv2 as cv
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
-from typing import Tuple, List, Optional, Any, cast
+from typing import Dict, List, Optional, Tuple, Any, cast
 from itertools import combinations
 from django.utils.text import slugify
-try:
-    # Prefer absolute import when running as a script
-    from rectification_strategy import GlobalTranslationRectificationStrategy, PixelwisePatchRectificationStrategy, resolve_reference_view
-except Exception:
-    # When imported as a package, use relative import
-    from .rectification_strategy import GlobalTranslationRectificationStrategy, PixelwisePatchRectificationStrategy, resolve_reference_view
+
+if __package__ is None or __package__ == "":
+    # Running as a script: make local package modules importable
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from rectification_strategy import (
+        GlobalTranslationRectificationStrategy,
+        PixelwisePatchRectificationStrategy,
+        resolve_reference_view,
+    )
+else:
+    # Imported as a module within the package
+    from .rectification_strategy import (
+        GlobalTranslationRectificationStrategy,
+        PixelwisePatchRectificationStrategy,
+        resolve_reference_view,
+    )
 
 # --- Constants ---
 DEFAULT_IMAGE_DIR = 'moment_images/images'
@@ -27,6 +39,39 @@ VIEW_DISTANCE_SCALE_FACTOR = 1.1
 CORRELATION_PAD_WIDTH = int(125*0.45) # 30% of expected viewpoint size (125 pixels)
 DEFAULT_SEARCH_RADIUS_MIN = 100
 DEFAULT_SEARCH_RADIUS_MAX = 130
+
+
+@dataclass
+class RectificationRunConfig:
+    """Configuration for running the rectification pipeline non-interactively.
+
+    Attributes mirror the choices made during the interactive ``main`` flow so
+    that external scripts can inject deterministic values when sweeping
+    parameters.
+    """
+
+    strategy: str = "pixel"
+    similarity_window_size: int = 41
+    refinement_window_size: int = 14
+    correlation_pad_width: int = CORRELATION_PAD_WIDTH
+    max_displacement: Optional[int] = None
+    gauss_sigma: Optional[float] = None
+    gauss_size: Optional[int] = None
+    disp_gauss_sigma: Optional[float] = None
+    disp_gauss_size: Optional[int] = None
+    global_threshold: float = 0.25
+    pixel_threshold: float = 0.05
+
+
+@dataclass
+class RectificationResult:
+    """Container for automated rectification results."""
+
+    avg_image: np.ndarray
+    rectified_views: np.ndarray
+    similarity_data: Any
+    config: RectificationRunConfig
+    ref_view_index: Tuple[int, int]
 
 def load_image(image_path: str) -> Optional[Image.Image]:
     """
@@ -55,6 +100,141 @@ def load_image(image_path: str) -> Optional[Image.Image]:
     except Exception as e:
         print(f"An unexpected error occurred while loading the image: {e}")
         return None
+
+
+def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig) -> RectificationResult:
+    """Run rectification with injected parameters instead of interactive prompts.
+
+    Args:
+        views: Square grid of grayscale patches shaped ``(N, N, H, W)``.
+        config: Rectification options to sweep over.
+
+    Returns:
+        ``RectificationResult`` containing the averaged rectified image, the
+        rectified stack, and the similarity information produced by the chosen
+        strategy.
+    """
+
+    views_arr, ref_view_idx = resolve_reference_view(views)
+
+    strategy = config.strategy.lower()
+    if strategy not in {"global", "pixel", "combined"}:
+        raise ValueError("strategy must be one of 'global', 'pixel', or 'combined'")
+
+    if strategy == "global":
+        rectification_strategy = GlobalTranslationRectificationStrategy(
+            pad_width=config.correlation_pad_width, prompt_for_all_views=False
+        )
+        similarity_data = rectification_strategy.compute_similarity_matrix(
+            views_arr, ref_view_idx, thresh=config.global_threshold
+        )
+        avg_image, rectified_views = rectification_strategy.rectify(
+            views_arr, similarity_data, ref_view_idx
+        )
+    elif strategy == "pixel":
+        rectification_strategy = PixelwisePatchRectificationStrategy(
+            config.similarity_window_size
+        )
+        similarity_data = rectification_strategy.compute_similarity_matrices(
+            views_arr,
+            ref_view_idx,
+            max_disp=config.max_displacement,
+            gauss_sigma=config.gauss_sigma,
+            gauss_size=config.gauss_size,
+            disp_gauss_sigma=config.disp_gauss_sigma,
+            disp_gauss_size=config.disp_gauss_size,
+            thresh=config.pixel_threshold,
+        )
+        avg_image, rectified_views = rectification_strategy.rectify(
+            views_arr, similarity_data, ref_view_idx
+        )
+    else:
+        rectification_strategy_global = GlobalTranslationRectificationStrategy(
+            pad_width=config.correlation_pad_width, prompt_for_all_views=False
+        )
+        global_similarity = rectification_strategy_global.compute_similarity_matrix(
+            views_arr, ref_view_idx, thresh=config.global_threshold
+        )
+        av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(
+            views_arr, global_similarity, ref_view_idx
+        )
+
+        rectification_strategy_pixel = PixelwisePatchRectificationStrategy(
+            config.refinement_window_size, zero_fill_roll=True
+        )
+        similarity_data = rectification_strategy_pixel.compute_similarity_matrices(
+            rect_views_after_global,
+            ref_view_idx,
+            max_disp=config.max_displacement,
+            gauss_sigma=config.gauss_sigma,
+            gauss_size=config.gauss_size,
+            disp_gauss_sigma=config.disp_gauss_sigma,
+            disp_gauss_size=config.disp_gauss_size,
+            thresh=config.pixel_threshold,
+        )
+        avg_image, rectified_views = rectification_strategy_pixel.rectify(
+            rect_views_after_global, similarity_data, ref_view_idx
+        )
+
+    return RectificationResult(
+        avg_image=avg_image,
+        rectified_views=rectified_views,
+        similarity_data=similarity_data,
+        config=config,
+        ref_view_index=ref_view_idx,
+    )
+
+
+def generate_rectification_figures(
+    rectified_views: np.ndarray,
+    avg_image: np.ndarray,
+    ref_index: Optional[Tuple[int, int]] = None,
+) -> Dict[str, List[Figure]]:
+    """
+    Build matplotlib figures that mirror the interactive workflow's outputs.
+
+    The figures are created without calling ``plt.show`` so they can be saved
+    non-interactively (e.g., during parameter sweeps).
+    """
+
+    figures: Dict[str, List[Figure]] = {
+        "rectified_views": [],
+        "overlays": [],
+        "averages": [],
+    }
+
+    view_grid_size = rectified_views.shape[0]
+
+    # Individual rectified view figures
+    for i in range(view_grid_size):
+        for j in range(view_grid_size):
+            fig = plt.figure()
+            plt.imshow(rectified_views[i, j], cmap="gray")
+            plt.title(f"Rectified View {i+1}-{j+1}")
+            figures["rectified_views"].append(fig)
+
+    # Overlays for extreme views (and optional reference view)
+    extreme_overlays = build_extreme_view_overlays(rectified_views, ref_index=ref_index)
+    for overlay, (i1, j1), (i2, j2) in extreme_overlays:
+        fig = plt.figure()
+        plt.imshow(overlay)
+        plt.title(f"Overlay ({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})")
+        figures["overlays"].append(fig)
+
+    # Averaged rectified image and an equalized variant
+    fig_avg = plt.figure()
+    plt.imshow(avg_image, cmap="gray")
+    plt.title("Averaged Rectified Image")
+    figures["averages"].append(fig_avg)
+
+    fig_eq = plt.figure()
+    base_img = np.clip(avg_image, 0, 255).astype("uint8")
+    eq_img = np.clip(cv.equalizeHist(base_img), 0.85 * 255, 255)
+    plt.imshow(eq_img, cmap="gray")
+    plt.title("Averaged Rectified Image - Equalized (clipped, 85%) for contrast")
+    figures["averages"].append(fig_eq)
+
+    return figures
 
 def min_max_normalize(image: Image.Image, min_val: int = 0, max_val: int = 255) -> Image.Image:
     """
@@ -871,4 +1051,4 @@ def main():
     plt.close("all")
 
 if __name__ == "__main__":
-	main()
+    main()
