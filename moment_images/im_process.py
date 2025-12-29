@@ -609,7 +609,7 @@ def build_extreme_view_overlays(rect_images: np.ndarray, ref_index: Optional[Tup
 
     return overlays
 
-def save_figures(figures: List[Figure], save_dir: str, dpi: int = 600):
+def save_figures(figures: List[Figure], save_dir: str, dpi: int = 1000):
     """
     Persist matplotlib figures to disk with sanitized titles as filenames.
 
@@ -1044,7 +1044,7 @@ def main():
         if save_opt == 'y':
             save_dir = input("Enter directory path to save figures (will be created if not exists): ").strip()
             if save_dir:
-                save_figures(created_figures, save_dir, dpi=600)
+                save_figures(created_figures, save_dir, dpi=1000)
             else:
                 print("No directory entered. Skipping save.")
     # Close all figures afterwards
