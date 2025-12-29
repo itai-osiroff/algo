@@ -16,7 +16,13 @@ The script will prompt you for image selection and viewpoint choices. Figures ar
 
 ## Sweeping rectification parameters
 
-Use `parameter_sweep.py` to iterate over window sizes, displacement limits, and Gaussian smoothing values while saving results for each combination. The CLI now builds the view grid for you from a source image before sweeping so every iteration rectifies the same cached stack:
+Use `parameter_sweep.py` to iterate over window sizes, displacement limits, and Gaussian smoothing values while saving results for each combination. You can launch a minimal GUI for configuring the sweep (no CLI flags required) with:
+
+```bash
+python -m moment_images.parameter_sweep --gui
+```
+
+The GUI collects the same inputs as the CLI with friendly defaults. If you prefer the command line, the sweep still builds the view grid for you from a source image before iterating so every combination rectifies the same cached stack:
 
 ```bash
 python -m moment_images.parameter_sweep \
