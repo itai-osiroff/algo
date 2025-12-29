@@ -148,7 +148,7 @@ def sweep_parameters(
         json.dump(summary, fp, indent=2)
 
 
-def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep im_process rectification parameters")
     parser.add_argument("--views", required=True, help="Path to a (N, N, H, W) numpy array of views")
     parser.add_argument(
@@ -177,7 +177,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Iterable[str] | None = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     if args.save_figures:
         plt.switch_backend("Agg")
