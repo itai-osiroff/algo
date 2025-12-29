@@ -1,0 +1,45 @@
+import numpy as np
+
+from moment_images.im_process import RectificationRunConfig, rectify_views_from_config
+from moment_images.parameter_sweep import sweep_parameters
+
+
+def test_parameter_sweep_matches_direct_rectification(tmp_path):
+    views = np.arange(16, dtype=np.float32).reshape(2, 2, 2, 2)
+
+    window_sizes = [1]
+    max_displacements = [0]
+    gauss_sigmas = [1.0]
+    disp_gauss_sigmas = [0.0]
+
+    output_dir = tmp_path / "runs"
+
+    sweep_parameters(
+        views=views,
+        output_dir=output_dir,
+        window_sizes=window_sizes,
+        max_displacements=max_displacements,
+        gauss_sigmas=gauss_sigmas,
+        disp_gauss_sigmas=disp_gauss_sigmas,
+        strategy="pixel",
+        save_figures_flag=False,
+    )
+
+    run_dir = output_dir / "win1_disp0_g1.0_dg0.0"
+    sweep_rectified = np.load(run_dir / "rectified_views.npy")
+
+    direct_config = RectificationRunConfig(
+        strategy="pixel",
+        similarity_window_size=1,
+        refinement_window_size=1,
+        max_displacement=0,
+        gauss_sigma=1.0,
+        gauss_size=6,
+        disp_gauss_sigma=0.0,
+        disp_gauss_size=1,
+    )
+
+    direct_result = rectify_views_from_config(views, direct_config)
+
+    np.testing.assert_allclose(sweep_rectified, direct_result.rectified_views)
+    np.testing.assert_allclose(sweep_rectified.mean(axis=(0, 1)), direct_result.avg_image)
