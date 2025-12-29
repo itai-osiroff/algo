@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -210,11 +211,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Save rectification figures (non-interactive) for each run",
     )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Launch a minimal GUI for configuring the sweep instead of using CLI flags",
+    )
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    args = parse_args(argv)
+def _run_from_namespace(args: argparse.Namespace) -> Path:
     if args.save_figures:
         plt.switch_backend("Agg")
     output_dir = (
@@ -272,6 +277,133 @@ def main(argv: Sequence[str] | None = None) -> None:
         strategy=args.strategy,
         save_figures_flag=args.save_figures,
     )
+    return output_dir
+
+
+def _parse_optional_int(value: str) -> int | None:
+    value = value.strip()
+    if not value:
+        return None
+    return int(value)
+
+
+def _launch_gui() -> None:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+
+    root = tk.Tk()
+    root.title("Moment Images Sweep Setup")
+
+    labels = [
+        ("Views (.npy)", "views", ""),
+        ("Source image", "source_image", ""),
+        ("Center X", "center_x", ""),
+        ("Center Y", "center_y", ""),
+        ("View radius", "view_radius", ""),
+        ("View grid size", "view_grid_size", "3"),
+        ("View distance (optional)", "view_distance", ""),
+        ("Output directory", "output_dir", ""),
+        ("Window start", "window_start", "15"),
+        ("Window stop", "window_stop", "45"),
+        ("Window step", "window_step", "10"),
+        ("Max disp start", "max_disp_start", "5"),
+        ("Max disp stop", "max_disp_stop", "25"),
+        ("Max disp step", "max_disp_step", "10"),
+        ("Gauss sigma start", "gauss_sigma_start", "3.0"),
+        ("Gauss sigma stop", "gauss_sigma_stop", "7.0"),
+        ("Gauss sigma step", "gauss_sigma_step", "2.0"),
+        ("Disp gauss start", "disp_gauss_start", "0.0"),
+        ("Disp gauss stop", "disp_gauss_stop", "1.0"),
+        ("Disp gauss step", "disp_gauss_step", "1.0"),
+    ]
+
+    entries: dict[str, tk.Entry] = {}
+
+    def choose_file(target: str, filetypes: list[tuple[str, str]] | None = None) -> None:
+        selection = filedialog.askopenfilename(filetypes=filetypes)
+        if selection:
+            entries[target].delete(0, tk.END)
+            entries[target].insert(0, selection)
+
+    for row, (label, key, default) in enumerate(labels):
+        tk.Label(root, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=2)
+        entry = tk.Entry(root, width=32)
+        entry.insert(0, default)
+        entry.grid(row=row, column=1, padx=6, pady=2)
+        entries[key] = entry
+        if key in {"views", "source_image"}:
+            button_text = "Browse"
+            filetypes = [("NumPy arrays", "*.npy")] if key == "views" else [("Images", "*.png *.jpg *.jpeg *.bmp")]
+            tk.Button(root, text=button_text, command=lambda k=key, ft=filetypes: choose_file(k, ft)).grid(
+                row=row, column=2, padx=6, pady=2
+            )
+
+    tk.Label(root, text="Strategy").grid(row=len(labels), column=0, sticky="w", padx=6, pady=2)
+    strategy_var = tk.StringVar(value="pixel")
+    tk.OptionMenu(root, strategy_var, "pixel", "global", "combined").grid(row=len(labels), column=1, padx=6, pady=2, sticky="we")
+
+    save_figures_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(root, text="Save figures", variable=save_figures_var).grid(
+        row=len(labels) + 1, column=1, sticky="w", padx=6, pady=2
+    )
+
+    def start_sweep() -> None:
+        try:
+            args = argparse.Namespace(
+                views=entries["views"].get().strip() or None,
+                source_image=entries["source_image"].get().strip() or None,
+                center_x=int(entries["center_x"].get()) if entries["center_x"].get().strip() else None,
+                center_y=int(entries["center_y"].get()) if entries["center_y"].get().strip() else None,
+                view_radius=int(entries["view_radius"].get()) if entries["view_radius"].get().strip() else None,
+                view_grid_size=int(entries["view_grid_size"].get()),
+                view_distance=_parse_optional_int(entries["view_distance"].get()),
+                output_dir=entries["output_dir"].get().strip() or None,
+                strategy=strategy_var.get(),
+                window_start=int(entries["window_start"].get()),
+                window_stop=int(entries["window_stop"].get()),
+                window_step=int(entries["window_step"].get()),
+                max_disp_start=int(entries["max_disp_start"].get()),
+                max_disp_stop=int(entries["max_disp_stop"].get()),
+                max_disp_step=int(entries["max_disp_step"].get()),
+                gauss_sigma_start=float(entries["gauss_sigma_start"].get()),
+                gauss_sigma_stop=float(entries["gauss_sigma_stop"].get()),
+                gauss_sigma_step=float(entries["gauss_sigma_step"].get()),
+                disp_gauss_start=float(entries["disp_gauss_start"].get()),
+                disp_gauss_stop=float(entries["disp_gauss_stop"].get()),
+                disp_gauss_step=float(entries["disp_gauss_step"].get()),
+                save_figures=save_figures_var.get(),
+            )
+        except ValueError as exc:
+            messagebox.showerror("Invalid input", str(exc))
+            return
+
+        root.withdraw()
+        try:
+            output_dir = _run_from_namespace(args)
+        except Exception as exc:  # noqa: BLE001 - bubble UI errors to user
+            root.deiconify()
+            messagebox.showerror("Sweep failed", str(exc))
+            return
+
+        messagebox.showinfo("Sweep complete", f"Artifacts written to {output_dir}")
+        root.destroy()
+
+    tk.Button(root, text="Start sweep", command=start_sweep).grid(
+        row=len(labels) + 2, column=1, pady=8
+    )
+
+    root.mainloop()
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+
+    should_launch_gui = args.gui or (argv is None and len(sys.argv) == 1)
+    if should_launch_gui:
+        _launch_gui()
+        return
+
+    _run_from_namespace(args)
 
 
 if __name__ == "__main__":
