@@ -16,11 +16,14 @@ The script will prompt you for image selection and viewpoint choices. Figures ar
 
 ## Sweeping rectification parameters
 
-Use `parameter_sweep.py` to iterate over window sizes, displacement limits, and Gaussian smoothing values while saving results for each combination:
+Use `parameter_sweep.py` to iterate over window sizes, displacement limits, and Gaussian smoothing values while saving results for each combination. The CLI now builds the view grid for you from a source image before sweeping so every iteration rectifies the same cached stack:
 
 ```bash
 python -m moment_images.parameter_sweep \
-  --views path/to/views.npy \
+  --source-image path/to/source.png \
+  --center-x 640 --center-y 360 \
+  --view-radius 125 \
+  --view-grid-size 3 \
   --output-dir sweep_runs/experiment1 \
   --strategy pixel \
   --window-start 21 --window-stop 41 --window-step 10 \
@@ -30,10 +33,12 @@ python -m moment_images.parameter_sweep \
 ```
 
 ### Required inputs
-- **`--views`** must point to a NumPy array shaped `(N, N, H, W)` containing the grayscale viewpoint patches you want to rectify.
+- Provide either **`--views`** (a NumPy array shaped `(N, N, H, W)`) or the combination of **`--source-image`**, **`--center-x`**, **`--center-y`**, and **`--view-radius`** so the sweep can extract views once before iterating.
+- Use **`--view-grid-size`** to control how many views per dimension are extracted. Add **`--view-distance`** to override the computed distance between adjacent view centers.
 - **`--strategy`** accepts `global`, `pixel`, or `combined` to match the strategies available in the interactive flow.
 
 ### Outputs
+- The sweep caches the generated view grid to `generated_views.npy` inside `--output-dir` before running any rectification iterations.
 - Each parameter combination writes a folder under `--output-dir` with the averaged rectified image (`avg_rectified.png`), rectified stack (`rectified_views.npy`), and the exact configuration (`config.json`).
 - A top-level `summary.json` collects per-run metrics (e.g., average and maximum intensities) for quick comparison.
 - Add `--save-figures` to capture the same figures produced in the interactive workflow. Figures are written under each run folder in a logical hierarchy: `figures/rectified_views`, `figures/overlays`, and `figures/averages`.
