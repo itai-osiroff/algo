@@ -26,8 +26,11 @@ from matplotlib.figure import Figure
 from moment_images.im_process import (
     RectificationRunConfig,
     generate_rectification_figures,
+    min_max_normalize,
     rectify_views_from_config,
     save_figures,
+    extract_views,
+    VIEW_DISTANCE_SCALE_FACTOR,
 )
 
 
@@ -87,8 +90,37 @@ def _load_views(path: Path) -> np.ndarray:
     return views
 
 
+def _generate_views(
+    image_path: Path,
+    center_x: int,
+    center_y: int,
+    radius: int,
+    grid_size: int,
+    view_distance: int | None,
+    cache_dir: Path,
+) -> tuple[np.ndarray, Path]:
+    if not image_path.exists():
+        raise FileNotFoundError(f"Source image not found: {image_path}")
+
+    image = Image.open(image_path).convert("L")
+    normalized = min_max_normalize(image)
+    image_np = np.array(normalized)
+
+    distance = view_distance
+    if distance is None:
+        distance = int(np.floor(VIEW_DISTANCE_SCALE_FACTOR * 2 * radius))
+
+    base_circle = np.array([center_x, center_y, radius])
+    views = extract_views(image_np, base_circle, grid_size, distance)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "generated_views.npy"
+    np.save(cache_path, views)
+    return views, cache_path
+
+
 def sweep_parameters(
-    views_path: Path,
+    views: np.ndarray,
     output_dir: Path,
     window_sizes: Sequence[int],
     max_displacements: Sequence[int],
@@ -97,8 +129,6 @@ def sweep_parameters(
     strategy: str = "pixel",
     save_figures_flag: bool = False,
 ) -> None:
-    views = _load_views(views_path)
-
     combos = [
         (win, max_disp, gauss, disp_gauss)
         for win in window_sizes
@@ -150,7 +180,13 @@ def sweep_parameters(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep im_process rectification parameters")
-    parser.add_argument("--views", required=True, help="Path to a (N, N, H, W) numpy array of views")
+    parser.add_argument("--views", help="Path to a precomputed (N, N, H, W) numpy array of views")
+    parser.add_argument("--source-image", help="Path to the source image to extract views from")
+    parser.add_argument("--center-x", type=int, help="X coordinate of the central view")
+    parser.add_argument("--center-y", type=int, help="Y coordinate of the central view")
+    parser.add_argument("--view-radius", type=int, help="Radius of a single view in pixels")
+    parser.add_argument("--view-grid-size", type=int, default=3, help="Number of views per dimension to extract")
+    parser.add_argument("--view-distance", type=int, help="Override the distance between adjacent view centers")
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -187,13 +223,47 @@ def main(argv: Sequence[str] | None = None) -> None:
         else Path("sweep_runs") / datetime.now().strftime("%Y%m%d_%H%M%S")
     )
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.views is None:
+        missing = [
+            name
+            for name, present in [
+                ("--source-image", args.source_image),
+                ("--center-x", args.center_x),
+                ("--center-y", args.center_y),
+                ("--view-radius", args.view_radius),
+            ]
+            if present is None
+        ]
+        if missing:
+            missing_str = ", ".join(missing)
+            raise SystemExit(
+                "When --views is not provided, the following arguments are required: "
+                f"{missing_str}."
+            )
+
+        views, cached_views_path = _generate_views(
+            image_path=Path(args.source_image),
+            center_x=args.center_x,
+            center_y=args.center_y,
+            radius=args.view_radius,
+            grid_size=args.view_grid_size,
+            view_distance=args.view_distance,
+            cache_dir=output_dir,
+        )
+        print(f"Generated views once and cached to {cached_views_path}")
+    else:
+        cached_views_path = Path(args.views)
+        views = _load_views(cached_views_path)
+
     window_sizes = _build_int_range(args.window_start, args.window_stop, args.window_step)
     max_displacements = _build_int_range(args.max_disp_start, args.max_disp_stop, args.max_disp_step)
     gauss_sigmas = _build_float_range(args.gauss_sigma_start, args.gauss_sigma_stop, args.gauss_sigma_step)
     disp_gauss_sigmas = _build_float_range(args.disp_gauss_start, args.disp_gauss_stop, args.disp_gauss_step)
 
     sweep_parameters(
-        views_path=Path(args.views),
+        views=views,
         output_dir=output_dir,
         window_sizes=window_sizes,
         max_displacements=max_displacements,
