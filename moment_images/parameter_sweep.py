@@ -103,7 +103,7 @@ def _generate_views(
     if not image_path.exists():
         raise FileNotFoundError(f"Source image not found: {image_path}")
 
-    image = Image.open(image_path).convert("L")
+    image = Image.open(image_path)
     normalized = min_max_normalize(image)
     image_np = np.array(normalized)
 
