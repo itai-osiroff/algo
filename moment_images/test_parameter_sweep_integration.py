@@ -11,6 +11,7 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
     max_displacements = [0]
     gauss_sigmas = [1.0]
     disp_gauss_sigmas = [0.0]
+    pixel_thresholds = [0.05]
 
     output_dir = tmp_path / "runs"
 
@@ -21,11 +22,12 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
         max_displacements=max_displacements,
         gauss_sigmas=gauss_sigmas,
         disp_gauss_sigmas=disp_gauss_sigmas,
+        pixel_thresholds=pixel_thresholds,
         strategy="pixel",
         save_figures_flag=False,
     )
 
-    run_dir = output_dir / "win1_disp0_g1.0_dg0.0"
+    run_dir = output_dir / "win1_disp0_g1.0_dg0.0_pt0.05"
     sweep_rectified = np.load(run_dir / "rectified_views.npy")
 
     direct_config = RectificationRunConfig(
@@ -37,6 +39,7 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
         gauss_size=6,
         disp_gauss_sigma=0.0,
         disp_gauss_size=1,
+        pixel_threshold=0.05,
     )
 
     direct_result = rectify_views_from_config(views, direct_config)

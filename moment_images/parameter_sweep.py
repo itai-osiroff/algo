@@ -127,22 +127,57 @@ def sweep_parameters(
     max_displacements: Sequence[int],
     gauss_sigmas: Sequence[float],
     disp_gauss_sigmas: Sequence[float],
+    global_thresholds: Sequence[float] | None = None,
+    pixel_thresholds: Sequence[float] | None = None,
     strategy: str = "pixel",
     save_figures_flag: bool = False,
     zero_fill_roll: bool = True,
 ) -> None:
-    combos = [
-        (win, max_disp, gauss, disp_gauss)
-        for win in window_sizes
-        for max_disp in max_displacements
-        for gauss in gauss_sigmas
-        for disp_gauss in disp_gauss_sigmas
-    ]
+    default_config = RectificationRunConfig()
+    global_thresholds = list(global_thresholds or [default_config.global_threshold])
+    pixel_thresholds = list(pixel_thresholds or [default_config.pixel_threshold])
+
+    if strategy == "global":
+        combos = [
+            (win, max_disp, gauss, disp_gauss, global_thresh)
+            for win in window_sizes
+            for max_disp in max_displacements
+            for gauss in gauss_sigmas
+            for disp_gauss in disp_gauss_sigmas
+            for global_thresh in global_thresholds
+        ]
+    elif strategy == "pixel":
+        combos = [
+            (win, max_disp, gauss, disp_gauss, pixel_thresh)
+            for win in window_sizes
+            for max_disp in max_displacements
+            for gauss in gauss_sigmas
+            for disp_gauss in disp_gauss_sigmas
+            for pixel_thresh in pixel_thresholds
+        ]
+    else:
+        combos = [
+            (win, max_disp, gauss, disp_gauss, global_thresh, pixel_thresh)
+            for win in window_sizes
+            for max_disp in max_displacements
+            for gauss in gauss_sigmas
+            for disp_gauss in disp_gauss_sigmas
+            for global_thresh in global_thresholds
+            for pixel_thresh in pixel_thresholds
+        ]
 
     output_dir.mkdir(parents=True, exist_ok=True)
     summary: List[dict] = []
 
-    for win, max_disp, gauss, disp_gauss in tqdm(combos, desc="Sweeping parameters", unit="combo"):
+    for combo in tqdm(combos, desc="Sweeping parameters", unit="combo"):
+        if strategy == "global":
+            win, max_disp, gauss, disp_gauss, global_thresh = combo
+            pixel_thresh = default_config.pixel_threshold
+        elif strategy == "pixel":
+            win, max_disp, gauss, disp_gauss, pixel_thresh = combo
+            global_thresh = default_config.global_threshold
+        else:
+            win, max_disp, gauss, disp_gauss, global_thresh, pixel_thresh = combo
         config = RectificationRunConfig(
             strategy=strategy,
             similarity_window_size=win,
@@ -153,10 +188,22 @@ def sweep_parameters(
             disp_gauss_sigma=disp_gauss,
             disp_gauss_size=win,
             zero_fill_roll=zero_fill_roll,
+            global_threshold=global_thresh,
+            pixel_threshold=pixel_thresh,
         )
 
         result = rectify_views_from_config(views, config)
-        run_name = f"win{win}_disp{max_disp}_g{gauss}_dg{disp_gauss}"
+        run_name_parts = [
+            f"win{win}",
+            f"disp{max_disp}",
+            f"g{gauss}",
+            f"dg{disp_gauss}",
+        ]
+        if strategy in {"global", "combined"}:
+            run_name_parts.append(f"gt{global_thresh}")
+        if strategy in {"pixel", "combined"}:
+            run_name_parts.append(f"pt{pixel_thresh}")
+        run_name = "_".join(run_name_parts)
         _save_run_artifacts(output_dir, run_name, result.avg_image, result.rectified_views, config)
 
         if save_figures_flag:
@@ -204,8 +251,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--disp-gauss-start", type=float, default=0.0)
     parser.add_argument("--disp-gauss-stop", type=float, default=1.0)
     parser.add_argument("--disp-gauss-step", type=float, default=1.0)
+    parser.add_argument("--global-thresh-start", type=float, default=0.25)
+    parser.add_argument("--global-thresh-stop", type=float, default=0.25)
+    parser.add_argument("--global-thresh-step", type=float, default=0.05)
+    parser.add_argument("--pixel-thresh-start", type=float, default=0.05)
+    parser.add_argument("--pixel-thresh-stop", type=float, default=0.05)
+    parser.add_argument("--pixel-thresh-step", type=float, default=0.05)
     parser.add_argument("--zero-fill-roll",
-                         action="store_true", 
+                         action="store_true",
                          help="Use zero-filled rolling window in pixelwise rectification")
     parser.add_argument(
         "--save-figures",
@@ -267,6 +320,12 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
     max_displacements = _build_int_range(args.max_disp_start, args.max_disp_stop, args.max_disp_step)
     gauss_sigmas = _build_float_range(args.gauss_sigma_start, args.gauss_sigma_stop, args.gauss_sigma_step)
     disp_gauss_sigmas = _build_float_range(args.disp_gauss_start, args.disp_gauss_stop, args.disp_gauss_step)
+    global_thresholds = _build_float_range(
+        args.global_thresh_start, args.global_thresh_stop, args.global_thresh_step
+    )
+    pixel_thresholds = _build_float_range(
+        args.pixel_thresh_start, args.pixel_thresh_stop, args.pixel_thresh_step
+    )
 
     sweep_parameters(
         views=views,
@@ -275,6 +334,8 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         max_displacements=max_displacements,
         gauss_sigmas=gauss_sigmas,
         disp_gauss_sigmas=disp_gauss_sigmas,
+        global_thresholds=global_thresholds,
+        pixel_thresholds=pixel_thresholds,
         strategy=args.strategy,
         save_figures_flag=args.save_figures,
         zero_fill_roll=args.zero_fill_roll,
@@ -317,6 +378,12 @@ def _launch_gui() -> None:
         ("Disp gauss start", "disp_gauss_start", "0.0"),
         ("Disp gauss stop", "disp_gauss_stop", "1.0"),
         ("Disp gauss step", "disp_gauss_step", "1.0"),
+        ("Global thresh start", "global_thresh_start", "0.25"),
+        ("Global thresh stop", "global_thresh_stop", "0.25"),
+        ("Global thresh step", "global_thresh_step", "0.05"),
+        ("Pixel thresh start", "pixel_thresh_start", "0.05"),
+        ("Pixel thresh stop", "pixel_thresh_stop", "0.05"),
+        ("Pixel thresh step", "pixel_thresh_step", "0.05"),
         ("Zero fill roll", "zero_fill_roll", "True"),
     ]
 
@@ -374,6 +441,12 @@ def _launch_gui() -> None:
                 disp_gauss_start=float(entries["disp_gauss_start"].get()),
                 disp_gauss_stop=float(entries["disp_gauss_stop"].get()),
                 disp_gauss_step=float(entries["disp_gauss_step"].get()),
+                global_thresh_start=float(entries["global_thresh_start"].get()),
+                global_thresh_stop=float(entries["global_thresh_stop"].get()),
+                global_thresh_step=float(entries["global_thresh_step"].get()),
+                pixel_thresh_start=float(entries["pixel_thresh_start"].get()),
+                pixel_thresh_stop=float(entries["pixel_thresh_stop"].get()),
+                pixel_thresh_step=float(entries["pixel_thresh_step"].get()),
                 zero_fill_roll=bool(entries["zero_fill_roll"].get().strip().lower() in {"true", "1", "yes"}),
                 save_figures=save_figures_var.get(),
             )
