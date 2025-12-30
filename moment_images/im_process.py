@@ -74,6 +74,15 @@ class RectificationResult:
     config: RectificationRunConfig
     ref_view_index: Tuple[int, int]
 
+    # New: retain input views and stage-specific data so downstream tools can
+    # create the same figures as the interactive run.
+    input_views: Optional[np.ndarray] = None
+    global_similarity: Optional[np.ndarray] = None
+    global_rectified_views: Optional[np.ndarray] = None
+    global_avg_image: Optional[np.ndarray] = None
+    pixel_similarity: Optional[Any] = None
+
+
 def load_image(image_path: str) -> Optional[Image.Image]:
     """
     Load a single image from disk, printing informative errors on failure.
@@ -118,6 +127,12 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
 
     views_arr, ref_view_idx = resolve_reference_view(views)
 
+    # Initialize new-stage holders
+    global_similarity = None
+    global_rectified_views = None
+    global_avg_image = None
+    pixel_similarity = None
+
     strategy = config.strategy.lower()
     if strategy not in {"global", "pixel", "combined"}:
         raise ValueError("strategy must be one of 'global', 'pixel', or 'combined'")
@@ -126,17 +141,19 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         rectification_strategy = GlobalTranslationRectificationStrategy(
             pad_width=config.correlation_pad_width, prompt_for_all_views=False
         )
-        similarity_data = rectification_strategy.compute_similarity_matrix(
+        global_similarity = rectification_strategy.compute_similarity_matrix(
             views_arr, ref_view_idx, thresh=config.global_threshold
         )
-        avg_image, rectified_views = rectification_strategy.rectify(
-            views_arr, similarity_data, ref_view_idx
+        global_avg_image, global_rectified_views = rectification_strategy.rectify(
+            views_arr, global_similarity, ref_view_idx
         )
+        # final outputs are the global results
+        avg_image, rectified_views = global_avg_image, global_rectified_views
     elif strategy == "pixel":
         rectification_strategy = PixelwisePatchRectificationStrategy(
             config.similarity_window_size, zero_fill_roll=config.zero_fill_roll
         )
-        similarity_data = rectification_strategy.compute_similarity_matrices(
+        pixel_similarity = rectification_strategy.compute_similarity_matrices(
             views_arr,
             ref_view_idx,
             max_disp=config.max_displacement,
@@ -147,24 +164,25 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             thresh=config.pixel_threshold,
         )
         avg_image, rectified_views = rectification_strategy.rectify(
-            views_arr, similarity_data, ref_view_idx
+            views_arr, pixel_similarity, ref_view_idx
         )
     else:
+        # Combined: perform global once, then pixel refinement on global-rectified views
         rectification_strategy_global = GlobalTranslationRectificationStrategy(
             pad_width=config.correlation_pad_width, prompt_for_all_views=False
         )
         global_similarity = rectification_strategy_global.compute_similarity_matrix(
             views_arr, ref_view_idx, thresh=config.global_threshold
         )
-        av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(
+        global_avg_image, global_rectified_views = rectification_strategy_global.rectify(
             views_arr, global_similarity, ref_view_idx
         )
 
         rectification_strategy_pixel = PixelwisePatchRectificationStrategy(
             config.refinement_window_size, zero_fill_roll=config.zero_fill_roll
         )
-        similarity_data = rectification_strategy_pixel.compute_similarity_matrices(
-            rect_views_after_global,
+        pixel_similarity = rectification_strategy_pixel.compute_similarity_matrices(
+            global_rectified_views,
             ref_view_idx,
             max_disp=config.max_displacement,
             gauss_sigma=config.gauss_sigma,
@@ -174,66 +192,153 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             thresh=config.pixel_threshold,
         )
         avg_image, rectified_views = rectification_strategy_pixel.rectify(
-            rect_views_after_global, similarity_data, ref_view_idx
+            global_rectified_views, pixel_similarity, ref_view_idx
         )
 
     return RectificationResult(
         avg_image=avg_image,
         rectified_views=rectified_views,
-        similarity_data=similarity_data,
+        similarity_data=pixel_similarity if pixel_similarity is not None else global_similarity,
         config=config,
         ref_view_index=ref_view_idx,
+        input_views=views_arr,
+        global_similarity=global_similarity,
+        global_rectified_views=global_rectified_views,
+        global_avg_image=global_avg_image,
+        pixel_similarity=pixel_similarity,
     )
 
 
 def generate_rectification_figures(
-    rectified_views: np.ndarray,
-    avg_image: np.ndarray,
-    ref_index: Optional[Tuple[int, int]] = None,
+    result: RectificationResult,
 ) -> Dict[str, List[Figure]]:
     """
     Build matplotlib figures that mirror the interactive workflow's outputs.
 
-    The figures are created without calling ``plt.show`` so they can be saved
-    non-interactively (e.g., during parameter sweeps).
+    Accepts a RectificationResult and creates sections:
+    - original_views, global_maps, global_rectified_views, pixel_maps,
+      rectified_views, overlays, averages
     """
-
     figures: Dict[str, List[Figure]] = {
+        "original_views": [],
+        "global_maps": [],
+        "global_rectified_views": [],
+        "pixel_maps": [],
         "rectified_views": [],
         "overlays": [],
         "averages": [],
     }
 
-    view_grid_size = rectified_views.shape[0]
+    # Original (non-rectified) views
+    if result.input_views is not None:
+        VG = result.input_views.shape[0]
+        for i in range(VG):
+            for j in range(VG):
+                fig = plt.figure()
+                plt.imshow(result.input_views[i, j], cmap="gray")
+                plt.title(f"Original View {i+1}-{j+1}")
+                figures["original_views"].append(fig)
 
-    # Individual rectified view figures
-    for i in range(view_grid_size):
-        for j in range(view_grid_size):
+    # Global similarity maps (X/Y) if present
+    if result.global_similarity is not None:
+        sim = result.global_similarity  # expected shape (N,N,H,W,2) -> [...,1]=X, [...,0]=Y
+        VG = sim.shape[0]
+        fig_x, ax_x = plt.subplots(nrows=VG, ncols=VG, squeeze=False, sharex=True, sharey=True)
+        fig_y, ax_y = plt.subplots(nrows=VG, ncols=VG, squeeze=False, sharex=True, sharey=True)
+        for idx in range(VG):
+            for jdx in range(VG):
+                im_x = ax_x[idx, jdx].imshow(sim[idx, jdx, :, :, 1], cmap="gray")
+                im_y = ax_y[idx, jdx].imshow(sim[idx, jdx, :, :, 0], cmap="gray")
+                ax_x[idx, jdx].set_title(f"Global: View {idx+1}-{jdx+1} X similarity")
+                ax_y[idx, jdx].set_title(f"Global: View {idx+1}-{jdx+1} Y similarity")
+                fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+                fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+        fig_x.suptitle("Global X translation similarity")
+        fig_y.suptitle("Global Y translation similarity")
+        figures["global_maps"].extend([fig_x, fig_y])
+
+    # Global rectified views (if present)
+    if result.global_rectified_views is not None:
+        VG = result.global_rectified_views.shape[0]
+        for i in range(VG):
+            for j in range(VG):
+                fig = plt.figure()
+                plt.imshow(result.global_rectified_views[i, j], cmap="gray")
+                plt.title(f"Global Rectified View {i+1}-{j+1}")
+                figures["global_rectified_views"].append(fig)
+
+        # Overlays for global extremes (include ref if available)
+        if result.ref_view_index is not None:
+            extreme_overlays_global = build_extreme_view_overlays(result.global_rectified_views, ref_index=result.ref_view_index)
+            for overlay, (i1, j1), (i2, j2) in extreme_overlays_global:
+                fig = plt.figure()
+                plt.imshow(overlay)
+                plt.title(f"Global Extreme Overlay ({i1+1}-{j1+1}) vs ({i2+1}-{j2+1})")
+                figures["overlays"].append(fig)
+
+    # Pixel-wise maps (if present)
+    if result.pixel_similarity is not None:
+        # Expect pixel_similarity to expose disps_x and disps_y shaped (H, W, N, N)
+        disps_x = getattr(result.pixel_similarity, "disps_x", None)
+        disps_y = getattr(result.pixel_similarity, "disps_y", None)
+        if disps_x is not None and disps_y is not None:
+            VG = disps_x.shape[2]  # shape (H, W, N, N)
+            fig_x, ax_x = plt.subplots(nrows=VG, ncols=VG, squeeze=False, sharex=True, sharey=True)
+            fig_y, ax_y = plt.subplots(nrows=VG, ncols=VG, squeeze=False, sharex=True, sharey=True)
+            for idx in range(VG):
+                for jdx in range(VG):
+                    im_x = ax_x[idx, jdx].imshow(disps_x[:, :, idx, jdx], cmap="gray")
+                    im_y = ax_y[idx, jdx].imshow(disps_y[:, :, idx, jdx], cmap="gray")
+                    ax_x[idx, jdx].set_title(f"View {idx+1}-{jdx+1} X translation similarity")
+                    ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
+                    fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+                    fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
+            fig_x.suptitle("Pixel-Wise X translation similarity")
+            fig_y.suptitle("Pixel-Wise Y translation similarity")
+            figures["pixel_maps"].extend([fig_x, fig_y])
+
+    # Final rectified views
+    VG = result.rectified_views.shape[0]
+    for i in range(VG):
+        for j in range(VG):
             fig = plt.figure()
-            plt.imshow(rectified_views[i, j], cmap="gray")
+            plt.imshow(result.rectified_views[i, j], cmap="gray")
             plt.title(f"Rectified View {i+1}-{j+1}")
             figures["rectified_views"].append(fig)
 
-    # Overlays for extreme views (and optional reference view)
-    extreme_overlays = build_extreme_view_overlays(rectified_views, ref_index=ref_index)
+    # Overlays for final rectified views (include ref if available)
+    extreme_overlays = build_extreme_view_overlays(result.rectified_views, ref_index=result.ref_view_index)
     for overlay, (i1, j1), (i2, j2) in extreme_overlays:
         fig = plt.figure()
         plt.imshow(overlay)
         plt.title(f"Overlay ({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})")
         figures["overlays"].append(fig)
 
-    # Averaged rectified image and an equalized variant
+    # Averages: final and histogram-equalized + clipped, plus global average if available
     fig_avg = plt.figure()
-    plt.imshow(avg_image, cmap="gray")
+    plt.imshow(result.avg_image, cmap="gray")
     plt.title("Averaged Rectified Image")
     figures["averages"].append(fig_avg)
 
     fig_eq = plt.figure()
-    base_img = np.clip(avg_image, 0, 255).astype("uint8")
+    base_img = np.clip(result.avg_image, 0, 255).astype("uint8")
     eq_img = np.clip(cv.equalizeHist(base_img), 0.85 * 255, 255)
     plt.imshow(eq_img, cmap="gray")
     plt.title("Averaged Rectified Image - Equalized (clipped, 85%) for contrast")
     figures["averages"].append(fig_eq)
+
+    if result.global_avg_image is not None:
+        fig_gavg = plt.figure()
+        plt.imshow(result.global_avg_image, cmap="gray")
+        plt.title("Global Averaged Rectified Image")
+        figures["averages"].append(fig_gavg)
+
+        fig_gavg_eq = plt.figure()
+        g_base = np.clip(result.global_avg_image, 0, 255).astype("uint8")
+        g_eq = np.clip(cv.equalizeHist(g_base), 0.85 * 255, 255)
+        plt.imshow(g_eq, cmap="gray")
+        plt.title("Global Averaged Rectified Image - Equalized (clipped, 85%) for contrast")
+        figures["averages"].append(fig_gavg_eq)
 
     return figures
 
@@ -766,7 +871,7 @@ def main():
     else:
         rectification_strategy = None
         rectification_strategy_global = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
-        refinement_window_size = int(input("Enter similarity window size for pixel-wise refinement (odd integer, default 7): ") or 14)
+        refinement_window_size = int(input("Enter maximum displacement for pixel-wise refinement (odd integer, default 7): ") or 14)
         rectification_strategy_pixel = PixelwisePatchRectificationStrategy(refinement_window_size, zero_fill_roll=True)
     
     views_for_rect = np.asarray(views)
@@ -796,7 +901,7 @@ def main():
         # Prepare pixel-wise similarity on the global-rectified views (refinement)
         refined_ref_view_choice = ref_view_choice
         sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
-            rect_views_after_global, refined_ref_view_choice, thresh=0.05
+            rect_views_after_global, refined_ref_view_choice, max_disp=refinement_window_size//2,thresh=0.05
         )
 
     # Assemble and display similarity matrix
