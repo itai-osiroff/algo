@@ -101,12 +101,16 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
         identity_coords = np.stack([yy, xx], axis=-1)
 
         coords[:, :, 0, 0, :] = identity_coords
-        coords[:, :, 0, 1, :] = np.stack([yy, np.clip(xx + 1, 0, 2)], axis=-1)
+        # destination (y,x) should sample source shifted left by 1 (x-1) to bring pixel at x=0 -> x=1
+        coords[:, :, 0, 1, :] = np.stack([yy, np.clip(xx - 1, 0, 2)], axis=-1)
         coords[:, :, 1, 0, :] = identity_coords
         coords[:, :, 1, 1, :] = identity_coords
         disps_y = np.zeros((3, 3, 2, 2), dtype=int)
         disps_x = np.zeros((3, 3, 2, 2), dtype=int)
-        disps_x[:, :, 0, 1] = 1
+        # displacement is negative in x because the source pixel is left of center
+        disps_x[:, :, 0, 1] = -1
+        # sanity check: mapping for central pixel points to source (1,0)
+        assert tuple(coords[1, 1, 0, 1]) == (1, 0)
 
         sim_result = PixelwiseSimilarityResult(
             coordinates=coords,

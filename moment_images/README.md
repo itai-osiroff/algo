@@ -35,13 +35,15 @@ python -m moment_images.parameter_sweep \
   --window-start 21 --window-stop 41 --window-step 10 \
   --max-disp-start 5 --max-disp-stop 25 --max-disp-step 10 \
   --gauss-sigma-start 3.0 --gauss-sigma-stop 7.0 --gauss-sigma-step 2.0 \
-  --disp-gauss-start 0.0 --disp-gauss-stop 1.0 --disp-gauss-step 1.0
+  --disp-gauss-start 0.0 --disp-gauss-stop 1.0 --disp-gauss-step 1.0 \
+  --pixel-thresh-start 0.05 --pixel-thresh-stop 0.15 --pixel-thresh-step 0.05
 ```
 
 ### Required inputs
 - Provide either **`--views`** (a NumPy array shaped `(N, N, H, W)`) or the combination of **`--source-image`**, **`--center-x`**, **`--center-y`**, and **`--view-radius`** so the sweep can extract views once before iterating.
 - Use **`--view-grid-size`** to control how many views per dimension are extracted. Add **`--view-distance`** to override the computed distance between adjacent view centers.
 - **`--strategy`** accepts `global`, `pixel`, or `combined` to match the strategies available in the interactive flow.
+- Threshold sweeps: **`--global-thresh-*`** control the correlation mask used in the global strategy, while **`--pixel-thresh-*`** affect pixel-wise patch similarity calculations.
 
 ### Outputs
 - The sweep caches the generated view grid to `generated_views.npy` inside `--output-dir` before running any rectification iterations.
