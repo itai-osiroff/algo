@@ -160,11 +160,7 @@ def sweep_parameters(
         _save_run_artifacts(output_dir, run_name, result.avg_image, result.rectified_views, config)
 
         if save_figures_flag:
-            figures = generate_rectification_figures(
-                rectified_views=result.rectified_views,
-                avg_image=result.avg_image,
-                ref_index=result.ref_view_index,
-            )
+            figures = generate_rectification_figures(result)  # pass full result so we can save global/pixel maps, originals, overlays, averages
             figures_dir = output_dir / run_name / "figures"
             _persist_figures(figures, figures_dir)
 
