@@ -61,6 +61,7 @@ class RectificationRunConfig:
     disp_gauss_size: Optional[int] = None
     global_threshold: float = 0.25
     pixel_threshold: float = 0.05
+    zero_fill_roll: bool = True
 
 
 @dataclass
@@ -133,7 +134,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         )
     elif strategy == "pixel":
         rectification_strategy = PixelwisePatchRectificationStrategy(
-            config.similarity_window_size
+            config.similarity_window_size, zero_fill_roll=config.zero_fill_roll
         )
         similarity_data = rectification_strategy.compute_similarity_matrices(
             views_arr,
@@ -160,7 +161,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         )
 
         rectification_strategy_pixel = PixelwisePatchRectificationStrategy(
-            config.refinement_window_size, zero_fill_roll=True
+            config.refinement_window_size, zero_fill_roll=config.zero_fill_roll
         )
         similarity_data = rectification_strategy_pixel.compute_similarity_matrices(
             rect_views_after_global,

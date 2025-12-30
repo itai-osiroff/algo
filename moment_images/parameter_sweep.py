@@ -129,6 +129,7 @@ def sweep_parameters(
     disp_gauss_sigmas: Sequence[float],
     strategy: str = "pixel",
     save_figures_flag: bool = False,
+    zero_fill_roll: bool = True,
 ) -> None:
     combos = [
         (win, max_disp, gauss, disp_gauss)
@@ -151,6 +152,7 @@ def sweep_parameters(
             gauss_size=int(gauss * 6),
             disp_gauss_sigma=disp_gauss,
             disp_gauss_size=win,
+            zero_fill_roll=zero_fill_roll,
         )
 
         result = rectify_views_from_config(views, config)
@@ -206,6 +208,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--disp-gauss-start", type=float, default=0.0)
     parser.add_argument("--disp-gauss-stop", type=float, default=1.0)
     parser.add_argument("--disp-gauss-step", type=float, default=1.0)
+    parser.add_argument("--zero-fill-roll",
+                         action="store_true", 
+                         help="Use zero-filled rolling window in pixelwise rectification")
     parser.add_argument(
         "--save-figures",
         action="store_true",
@@ -276,6 +281,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         disp_gauss_sigmas=disp_gauss_sigmas,
         strategy=args.strategy,
         save_figures_flag=args.save_figures,
+        zero_fill_roll=args.zero_fill_roll,
     )
     return output_dir
 
@@ -315,6 +321,7 @@ def _launch_gui() -> None:
         ("Disp gauss start", "disp_gauss_start", "0.0"),
         ("Disp gauss stop", "disp_gauss_stop", "1.0"),
         ("Disp gauss step", "disp_gauss_step", "1.0"),
+        ("Zero fill roll", "zero_fill_roll", "True"),
     ]
 
     entries: dict[str, tk.Entry] = {}
@@ -333,7 +340,7 @@ def _launch_gui() -> None:
         entries[key] = entry
         if key in {"views", "source_image"}:
             button_text = "Browse"
-            filetypes = [("NumPy arrays", "*.npy")] if key == "views" else [("Images", "*.png *.jpg *.jpeg *.bmp")]
+            filetypes = [("NumPy arrays", "*.npy")] if key == "views" else [("Images", "*.png *.jpg *.jpeg *.bmp *.tiff")]
             tk.Button(root, text=button_text, command=lambda k=key, ft=filetypes: choose_file(k, ft)).grid(
                 row=row, column=2, padx=6, pady=2
             )
@@ -371,6 +378,7 @@ def _launch_gui() -> None:
                 disp_gauss_start=float(entries["disp_gauss_start"].get()),
                 disp_gauss_stop=float(entries["disp_gauss_stop"].get()),
                 disp_gauss_step=float(entries["disp_gauss_step"].get()),
+                zero_fill_roll=bool(entries["zero_fill_roll"].get().strip().lower() in {"true", "1", "yes"}),
                 save_figures=save_figures_var.get(),
             )
         except ValueError as exc:
