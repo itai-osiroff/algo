@@ -35,8 +35,8 @@ HOUGH_CIRCLES_PARAM1 = 50
 HOUGH_CIRCLES_PARAM2 = 30
 HOUGH_CIRCLES_MIN_DIST = 20
 DEFAULT_VIEW_GRID_SIZE = 3
-VIEW_DISTANCE_SCALE_FACTOR = 1.1
-CORRELATION_PAD_WIDTH = int(125*0.45) # 30% of expected viewpoint size (125 pixels)
+VIEW_DISTANCE_SCALE_FACTOR = 1
+CORRELATION_PAD_WIDTH = int(120*0.45) # 45% of expected viewpoint size (120 pixels)
 DEFAULT_SEARCH_RADIUS_MIN = 100
 DEFAULT_SEARCH_RADIUS_MAX = 130
 
@@ -680,9 +680,10 @@ def build_extreme_view_overlays(rect_images: np.ndarray, ref_index: Optional[Tup
         view_1 = rect_images[i1, j1].astype(np.float32)
         view_2 = rect_images[i2, j2].astype(np.float32)
 
-        max_val = float(max(np.max(view_1), np.max(view_2), 1e-8))
-        view_1_norm = view_1 / max_val
-        view_2_norm = view_2 / max_val
+        max_val_1 = float(max(np.max(view_1), 1e-8))
+        max_val_2 = float(max(np.max(view_2), 1e-8))
+        view_1_norm = view_1 / max_val_1
+        view_2_norm = view_2 / max_val_2
 
         overlay = np.zeros((*view_1.shape, 3), dtype=np.float32)
         overlay[..., 0] = view_1_norm
@@ -702,9 +703,10 @@ def build_extreme_view_overlays(rect_images: np.ndarray, ref_index: Optional[Tup
             view_ext = rect_images[ei, ej].astype(np.float32)
             view_ref = rect_images[ref_index].astype(np.float32)
 
-            max_val = float(max(np.max(view_ext), np.max(view_ref), 1e-8))
-            view_ext_norm = view_ext / max_val
-            view_ref_norm = view_ref / max_val
+            max_val_ext = float(max(np.max(view_ext), 1e-8))
+            max_val_ref = float(max(np.max(view_ref), 1e-8))
+            view_ext_norm = view_ext / max_val_ext
+            view_ref_norm = view_ref / max_val_ref
 
             overlay = np.zeros((*view_ext.shape, 3), dtype=np.float32)
             overlay[..., 0] = view_ext_norm
