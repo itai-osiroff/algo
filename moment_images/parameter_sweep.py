@@ -33,6 +33,11 @@ from moment_images.im_process import (
     extract_views,
     VIEW_DISTANCE_SCALE_FACTOR,
 )
+from moment_images.sweep_analysis import (
+    analyze_summary_data,
+    build_metric_record,
+    save_analysis,
+)
 
 
 def _build_int_range(start: int, stop: int, step: int) -> List[int]:
@@ -132,6 +137,7 @@ def sweep_parameters(
     strategy: str = "pixel",
     save_figures_flag: bool = False,
     zero_fill_roll: bool = True,
+    analyze: bool = False,
 ) -> None:
     default_config = RectificationRunConfig()
     global_thresholds = list(global_thresholds or [default_config.global_threshold])
@@ -211,17 +217,14 @@ def sweep_parameters(
             figures_dir = output_dir / run_name / "figures"
             _persist_figures(figures, figures_dir)
 
-        summary.append(
-            {
-                "run": run_name,
-                "config": asdict(config),
-                "avg_intensity": float(np.mean(result.avg_image)),
-                "max_intensity": float(np.max(result.avg_image)),
-            }
-        )
+        summary.append(build_metric_record(run_name, config, result))
 
     with (output_dir / "summary.json").open("w", encoding="utf-8") as fp:
         json.dump(summary, fp, indent=2)
+
+    if analyze:
+        analysis = analyze_summary_data(summary)
+        save_analysis(analysis, output_dir / "analysis.json")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -264,6 +267,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--save-figures",
         action="store_true",
         help="Save rectification figures (non-interactive) for each run",
+    )
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="Compute aggregate statistics for sweep metrics after the run",
     )
     parser.add_argument(
         "--gui",
@@ -339,6 +347,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         strategy=args.strategy,
         save_figures_flag=args.save_figures,
         zero_fill_roll=args.zero_fill_roll,
+        analyze=args.analyze,
     )
     return output_dir
 
@@ -417,6 +426,11 @@ def _launch_gui() -> None:
         row=len(labels) + 1, column=1, sticky="w", padx=6, pady=2
     )
 
+    analyze_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(root, text="Analyze metrics after sweep", variable=analyze_var).grid(
+        row=len(labels) + 2, column=1, sticky="w", padx=6, pady=2
+    )
+
     def start_sweep() -> None:
         try:
             args = argparse.Namespace(
@@ -449,6 +463,7 @@ def _launch_gui() -> None:
                 pixel_thresh_step=float(entries["pixel_thresh_step"].get()),
                 zero_fill_roll=bool(entries["zero_fill_roll"].get().strip().lower() in {"true", "1", "yes"}),
                 save_figures=save_figures_var.get(),
+                analyze=analyze_var.get(),
             )
         except ValueError as exc:
             messagebox.showerror("Invalid input", str(exc))
@@ -466,7 +481,7 @@ def _launch_gui() -> None:
         root.destroy()
 
     tk.Button(root, text="Start sweep", command=start_sweep).grid(
-        row=len(labels) + 2, column=1, pady=8
+        row=len(labels) + 3, column=1, pady=8
     )
 
     root.mainloop()

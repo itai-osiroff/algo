@@ -48,7 +48,7 @@ python -m moment_images.parameter_sweep \
 ### Outputs
 - The sweep caches the generated view grid to `generated_views.npy` inside `--output-dir` before running any rectification iterations.
 - Each parameter combination writes a folder under `--output-dir` with the averaged rectified image (`avg_rectified.png`), rectified stack (`rectified_views.npy`), and the exact configuration (`config.json`).
-- A top-level `summary.json` collects per-run metrics (e.g., average and maximum intensities) for quick comparison.
+- A top-level `summary.json` collects per-run metrics for both the globally averaged image and the globally+locally refined average (intensity, gradients, and Laplacian energy/variance). Add `--analyze` to also write aggregated extrema and means: the detailed structure remains in `analysis.json`, and a compact `analysis.csv` provides a quick, filterable table with the same min/max/mean data per metric and alignment scope.
 - Add `--save-figures` to capture the same figures produced in the interactive workflow. Figures are written under each run folder in a logical hierarchy: `figures/rectified_views`, `figures/overlays`, and `figures/averages`.
 
 The CLI uses sensible defaults so you can start a sweep with minimal arguments:
