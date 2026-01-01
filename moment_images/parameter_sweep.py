@@ -33,6 +33,67 @@ from moment_images.im_process import (
     extract_views,
     VIEW_DISTANCE_SCALE_FACTOR,
 )
+from moment_images.sweep_analysis import (
+    analyze_summary_data,
+    build_metric_record,
+    save_analysis,
+)
+
+
+class LiveMetricsPlotter:
+    """Render sweep metrics as they are recorded for at-a-glance comparisons."""
+
+    def __init__(self, metric_keys: Sequence[str]):
+        self.metric_keys = list(metric_keys)
+        self.scopes = [
+            ("global_only_metrics", "Global only"),
+            ("global_and_local_metrics", "Global + local"),
+        ]
+        self.run_labels: list[str] = []
+        self.data: Dict[str, Dict[str, List[float]]] = {
+            scope: {metric: [] for metric in self.metric_keys} for scope, _ in self.scopes
+        }
+
+        plt.ion()
+        self.fig, axes = plt.subplots(
+            len(self.metric_keys), 1, figsize=(10, 3 * len(self.metric_keys)), sharex=True
+        )
+        self.axes = axes if isinstance(axes, np.ndarray) else np.array([axes])
+        self.fig.suptitle("Live sweep metrics", fontsize=14)
+
+    def update(self, run_name: str, record: Dict[str, object]) -> None:
+        self.run_labels.append(run_name)
+
+        for scope, _ in self.scopes:
+            metrics = record.get(scope)
+            for metric in self.metric_keys:
+                value = float(metrics.get(metric)) if metrics and metric in metrics else np.nan
+                self.data[scope][metric].append(value)
+
+        self._redraw()
+
+    def _redraw(self) -> None:
+        x_values = range(len(self.run_labels))
+
+        for axis, metric in zip(self.axes, self.metric_keys):
+            axis.clear()
+            for scope, label in self.scopes:
+                values = self.data[scope][metric]
+                if not values or np.all(np.isnan(values)):
+                    continue
+                axis.plot(x_values, values, marker="o", label=label)
+            axis.set_ylabel(metric.replace("_", " ").title())
+            axis.grid(True, linestyle=":", alpha=0.5)
+            axis.legend()
+
+        self.axes[-1].set_xticks(list(x_values))
+        self.axes[-1].set_xticklabels(self.run_labels, rotation=45, ha="right")
+        self.axes[-1].set_xlabel("Run")
+
+        self.fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.001)
 
 
 def _build_int_range(start: int, stop: int, step: int) -> List[int]:
@@ -132,6 +193,8 @@ def sweep_parameters(
     strategy: str = "pixel",
     save_figures_flag: bool = False,
     zero_fill_roll: bool = True,
+    analyze: bool = False,
+    live_plot: bool = False,
 ) -> None:
     default_config = RectificationRunConfig()
     global_thresholds = list(global_thresholds or [default_config.global_threshold])
@@ -168,6 +231,7 @@ def sweep_parameters(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     summary: List[dict] = []
+    plotter: LiveMetricsPlotter | None = None
 
     for combo in tqdm(combos, desc="Sweeping parameters", unit="combo"):
         if strategy == "global":
@@ -211,17 +275,21 @@ def sweep_parameters(
             figures_dir = output_dir / run_name / "figures"
             _persist_figures(figures, figures_dir)
 
-        summary.append(
-            {
-                "run": run_name,
-                "config": asdict(config),
-                "avg_intensity": float(np.mean(result.avg_image)),
-                "max_intensity": float(np.max(result.avg_image)),
-            }
-        )
+        record = build_metric_record(run_name, config, result)
+        summary.append(record)
+
+        if live_plot:
+            if plotter is None:
+                metric_keys = list(record["global_and_local_metrics"].keys())
+                plotter = LiveMetricsPlotter(metric_keys)
+            plotter.update(run_name, record)
 
     with (output_dir / "summary.json").open("w", encoding="utf-8") as fp:
         json.dump(summary, fp, indent=2)
+
+    if analyze:
+        analysis = analyze_summary_data(summary)
+        save_analysis(analysis, output_dir / "analysis.json")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -266,6 +334,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Save rectification figures (non-interactive) for each run",
     )
     parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="Compute aggregate statistics for sweep metrics after the run",
+    )
+    parser.add_argument(
+        "--live-plot",
+        action="store_true",
+        help="Display a live graph of tracked metrics while the sweep runs",
+    )
+    parser.add_argument(
         "--gui",
         action="store_true",
         help="Launch a minimal GUI for configuring the sweep instead of using CLI flags",
@@ -274,7 +352,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _run_from_namespace(args: argparse.Namespace) -> Path:
-    if args.save_figures:
+    if args.save_figures and not args.live_plot:
         plt.switch_backend("Agg")
     output_dir = (
         Path(args.output_dir)
@@ -339,6 +417,8 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         strategy=args.strategy,
         save_figures_flag=args.save_figures,
         zero_fill_roll=args.zero_fill_roll,
+        analyze=args.analyze,
+        live_plot=args.live_plot,
     )
     return output_dir
 
@@ -417,6 +497,16 @@ def _launch_gui() -> None:
         row=len(labels) + 1, column=1, sticky="w", padx=6, pady=2
     )
 
+    analyze_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(root, text="Analyze metrics after sweep", variable=analyze_var).grid(
+        row=len(labels) + 2, column=1, sticky="w", padx=6, pady=2
+    )
+
+    live_plot_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(root, text="Show live metrics plot", variable=live_plot_var).grid(
+        row=len(labels) + 3, column=1, sticky="w", padx=6, pady=2
+    )
+
     def start_sweep() -> None:
         try:
             args = argparse.Namespace(
@@ -449,6 +539,8 @@ def _launch_gui() -> None:
                 pixel_thresh_step=float(entries["pixel_thresh_step"].get()),
                 zero_fill_roll=bool(entries["zero_fill_roll"].get().strip().lower() in {"true", "1", "yes"}),
                 save_figures=save_figures_var.get(),
+                analyze=analyze_var.get(),
+                live_plot=live_plot_var.get(),
             )
         except ValueError as exc:
             messagebox.showerror("Invalid input", str(exc))
@@ -466,7 +558,7 @@ def _launch_gui() -> None:
         root.destroy()
 
     tk.Button(root, text="Start sweep", command=start_sweep).grid(
-        row=len(labels) + 2, column=1, pady=8
+        row=len(labels) + 4, column=1, pady=8
     )
 
     root.mainloop()
