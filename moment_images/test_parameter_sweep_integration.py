@@ -1,7 +1,8 @@
 import numpy as np
+from matplotlib import pyplot as plt
 
 from moment_images.im_process import RectificationRunConfig, rectify_views_from_config
-from moment_images.parameter_sweep import sweep_parameters
+from moment_images.parameter_sweep import LiveMetricsPlotter, sweep_parameters
 
 
 def test_parameter_sweep_matches_direct_rectification(tmp_path):
@@ -46,3 +47,27 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
 
     np.testing.assert_allclose(sweep_rectified, direct_result.rectified_views)
     np.testing.assert_allclose(sweep_rectified.mean(axis=(0, 1)), direct_result.avg_image)
+
+
+def test_live_metrics_plotter_tracks_metrics():
+    plt.switch_backend("Agg")
+    plotter = LiveMetricsPlotter(["average_intensity", "maximum_intensity"])
+    record = {
+        "run": "run1",
+        "config": {},
+        "global_only_metrics": {
+            "average_intensity": 1.0,
+            "maximum_intensity": 2.0,
+        },
+        "global_and_local_metrics": {
+            "average_intensity": 0.5,
+            "maximum_intensity": 1.5,
+        },
+    }
+
+    plotter.update("run1", record)
+
+    assert plotter.run_labels == ["run1"]
+    assert plotter.data["global_only_metrics"]["average_intensity"] == [1.0]
+    assert plotter.data["global_and_local_metrics"]["maximum_intensity"] == [1.5]
+    plt.close(plotter.fig)
