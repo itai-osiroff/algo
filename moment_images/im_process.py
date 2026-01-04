@@ -850,6 +850,25 @@ def main():
     view_grid_size = int(input(f"Enter view grid size *default {DEFAULT_VIEW_GRID_SIZE}*: ") or DEFAULT_VIEW_GRID_SIZE)
     views = extract_views(norm_im_chosen, windows[0], view_grid_size, d)
     
+    # Debug mode
+    debug_views = np.zeros_like(views)
+    debug_views[3, 3] = views[3, 3]
+
+    for i in range(view_grid_size):
+        for j in range(view_grid_size):
+            for i_im in range(views[0, 0].shape[0]):
+                for j_im in range(views[0, 0].shape[0]):
+                    if i_im > 93 and i_im < 104 and j_im > 117 and j_im < 144 and i != 3 and j != 3:
+                        debug_views[i, j, i_im-4, j_im-4] = views[3, 3, i_im, j_im]
+                    elif i_im > 93+4 and i_im < 104+4 and j_im > 117+4 and j_im < 144+4 and i != 3 and j != 3:
+                        debug_views[i, j, i_im, j_im] = 0
+                    else:
+                        debug_views[i, j, i_im, j_im] = views[3, 3, i_im, j_im]
+
+    views = debug_views
+
+# End debug mode
+
     # Display extracted views
     for i in range(view_grid_size):
         for j in range(view_grid_size):
@@ -866,8 +885,8 @@ def main():
         rectification_strategy_global = None
         rectification_strategy_pixel = None
     elif rect_strat == 2:
-        sim_window_size = int(input("Enter similarity window size (odd integer, default 41): ") or 41)
-        rectification_strategy = PixelwisePatchRectificationStrategy(sim_window_size)
+        sim_window_size = int(input("Enter similarity window size (odd integer, default 7): ") or 14)
+        rectification_strategy = PixelwisePatchRectificationStrategy(sim_window_size, zero_fill_roll=True)
         rectification_strategy_global = None
         rectification_strategy_pixel = None
     else:
@@ -1050,7 +1069,10 @@ def main():
 
     # Build and display RGB overlays for the most extreme rectified views
     # + comparison to displacement maps (flag)
-    disp_comp_flag = input("Do you want to see displacement comparison overlays for extreme views? (y/n): ").lower() == 'y'
+    if rect_strat == 3:
+        disp_comp_flag = input("Do you want to see displacement comparison overlays for extreme views? (y/n): ").lower() == 'y'
+    else:
+        disp_comp_flag = False
     extreme_overlays = build_extreme_view_overlays(rect_images, ref_index=ref_view_choice)
     for overlay, (i1, j1), (i2, j2) in extreme_overlays:
         fig = plt.figure()

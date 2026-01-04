@@ -67,7 +67,7 @@ class LiveMetricsPlotter:
         for scope, _ in self.scopes:
             metrics = record.get(scope)
             for metric in self.metric_keys:
-                value = float(metrics.get(metric)) if metrics and metric in metrics else np.nan
+                value = float(metrics[metric]) if isinstance(metrics, dict) and metric in metrics else np.nan
                 self.data[scope][metric].append(value)
 
         self._redraw()
@@ -90,7 +90,7 @@ class LiveMetricsPlotter:
         self.axes[-1].set_xticklabels(self.run_labels, rotation=45, ha="right")
         self.axes[-1].set_xlabel("Run")
 
-        self.fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+        self.fig.tight_layout(rect=(0, 0.03, 1, 0.95))
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
         plt.pause(0.001)
@@ -235,13 +235,13 @@ def sweep_parameters(
 
     for combo in tqdm(combos, desc="Sweeping parameters", unit="combo"):
         if strategy == "global":
-            win, max_disp, gauss, disp_gauss, global_thresh = combo
+            win, max_disp, gauss, disp_gauss, global_thresh = combo  # type: ignore[misc]
             pixel_thresh = default_config.pixel_threshold
         elif strategy == "pixel":
-            win, max_disp, gauss, disp_gauss, pixel_thresh = combo
+            win, max_disp, gauss, disp_gauss, pixel_thresh = combo  # type: ignore[misc]
             global_thresh = default_config.global_threshold
         else:
-            win, max_disp, gauss, disp_gauss, global_thresh, pixel_thresh = combo
+            win, max_disp, gauss, disp_gauss, global_thresh, pixel_thresh = combo  # type: ignore[misc]
         config = RectificationRunConfig(
             strategy=strategy,
             similarity_window_size=win,
@@ -280,7 +280,8 @@ def sweep_parameters(
 
         if live_plot:
             if plotter is None:
-                metric_keys = list(record["global_and_local_metrics"].keys())
+                metrics_dict = record["global_and_local_metrics"]
+                metric_keys = list(metrics_dict.keys()) if isinstance(metrics_dict, dict) else []
                 plotter = LiveMetricsPlotter(metric_keys)
             plotter.update(run_name, record)
 
