@@ -866,8 +866,8 @@ def main():
         rectification_strategy_global = None
         rectification_strategy_pixel = None
     elif rect_strat == 2:
-        sim_window_size = int(input("Enter similarity window size (odd integer, default 41): ") or 41)
-        rectification_strategy = PixelwisePatchRectificationStrategy(sim_window_size)
+        sim_window_size = int(input("Enter similarity window size (odd integer, default 7): ") or 14)
+        rectification_strategy = PixelwisePatchRectificationStrategy(sim_window_size, zero_fill_roll=True)
         rectification_strategy_global = None
         rectification_strategy_pixel = None
     else:
@@ -1050,7 +1050,10 @@ def main():
 
     # Build and display RGB overlays for the most extreme rectified views
     # + comparison to displacement maps (flag)
-    disp_comp_flag = input("Do you want to see displacement comparison overlays for extreme views? (y/n): ").lower() == 'y'
+    if rect_strat == 3:
+        disp_comp_flag = input("Do you want to see displacement comparison overlays for extreme views? (y/n): ").lower() == 'y'
+    else:
+        disp_comp_flag = False
     extreme_overlays = build_extreme_view_overlays(rect_images, ref_index=ref_view_choice)
     for overlay, (i1, j1), (i2, j2) in extreme_overlays:
         fig = plt.figure()
