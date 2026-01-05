@@ -852,18 +852,21 @@ def main():
     
     # Debug mode
     debug_views = np.zeros_like(views)
-    debug_views[3, 3] = views[3, 3]
+    _, (center_i, center_j) = resolve_reference_view(views)
+    debug_views[center_i, center_j] = views[center_i, center_j]
 
     for i in range(view_grid_size):
         for j in range(view_grid_size):
             for i_im in range(views[0, 0].shape[0]):
                 for j_im in range(views[0, 0].shape[0]):
-                    if i_im > 93 and i_im < 104 and j_im > 117 and j_im < 144 and i != 3 and j != 3:
-                        debug_views[i, j, i_im-4, j_im-4] = views[3, 3, i_im, j_im]
-                    elif i_im > 93+4 and i_im < 104+4 and j_im > 117+4 and j_im < 144+4 and i != 3 and j != 3:
+                    if i == center_i and j == center_j:
+                         continue
+                    if i_im > 93 and i_im < 104 and j_im > 117 and j_im < 144:
+                        debug_views[i, j, i_im-4, j_im-4] = views[center_i, center_j, i_im, j_im]
+                    elif i_im > 93+4 and i_im < 104+4 and j_im > 117+4 and j_im < 144+4:
                         debug_views[i, j, i_im, j_im] = 0
                     else:
-                        debug_views[i, j, i_im, j_im] = views[3, 3, i_im, j_im]
+                        debug_views[i, j, i_im, j_im] = views[center_i, center_j, i_im, j_im]
 
     views = debug_views
 
