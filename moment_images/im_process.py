@@ -850,25 +850,25 @@ def main():
     view_grid_size = int(input(f"Enter view grid size *default {DEFAULT_VIEW_GRID_SIZE}*: ") or DEFAULT_VIEW_GRID_SIZE)
     views = extract_views(norm_im_chosen, windows[0], view_grid_size, d)
     
-    # Debug mode
-    debug_views = np.zeros_like(views)
-    _, (center_i, center_j) = resolve_reference_view(views)
-    debug_views[center_i, center_j] = views[center_i, center_j]
+# Debug mode
+    # debug_views = np.zeros_like(views)
+    # _, (center_i, center_j) = resolve_reference_view(views)
+    # debug_views[center_i, center_j] = views[center_i, center_j]
 
-    for i in range(view_grid_size):
-        for j in range(view_grid_size):
-            for i_im in range(views[0, 0].shape[0]):
-                for j_im in range(views[0, 0].shape[0]):
-                    if i == center_i and j == center_j:
-                         continue
-                    if i_im > 93 and i_im < 104 and j_im > 117 and j_im < 144:
-                        debug_views[i, j, i_im-4, j_im-4] = views[center_i, center_j, i_im, j_im]
-                    elif i_im > 93+4 and i_im < 104+4 and j_im > 117+4 and j_im < 144+4:
-                        debug_views[i, j, i_im, j_im] = 0
-                    else:
-                        debug_views[i, j, i_im, j_im] = views[center_i, center_j, i_im, j_im]
+    # for i in range(view_grid_size):
+    #     for j in range(view_grid_size):
+    #         for i_im in range(views[0, 0].shape[0]):
+    #             for j_im in range(views[0, 0].shape[0]):
+    #                 if i == center_i and j == center_j:
+    #                      continue
+    #                 if i_im > 93 and i_im < 104 and j_im > 117 and j_im < 144:
+    #                     debug_views[i, j, i_im-4, j_im-4] = views[center_i, center_j, i_im, j_im]
+    #                 elif i_im > 93+4 and i_im < 104+4 and j_im > 117+4 and j_im < 144+4:
+    #                     debug_views[i, j, i_im, j_im] = 0
+    #                 else:
+    #                     debug_views[i, j, i_im, j_im] = views[center_i, center_j, i_im, j_im]
 
-    views = debug_views
+    # views = debug_views
 
 # End debug mode
 
