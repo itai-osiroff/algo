@@ -443,9 +443,13 @@ def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray]
             raise ValueError("Exposure times must be positive.")
 
     # Assemble weight vector
-    weights = np.array([np.power(np_images[i]/np.power(exposure_times[i], 1), len(exposure_times))*(np_images[i] < 255) for i in range(len(np_images))])
+    exposure_exponent = 0.5
+    cutoff_thresh = [0.5, 1]
+    weights = np.array([np.power(np_images[i]/np.power(exposure_times[i], exposure_exponent), len(exposure_times))*
+                        (np_images[i] < np.fmin(np.max(np_images[i])*cutoff_thresh[i], np.ones_like(np_images[i])*255))
+                          for i in range(len(np_images))])
     weights_norm = np.array([np.divide(weights[i, :, :],np.fmax(np.sum(weights, axis=0), np.ones_like(weights[i, :, :])*1e-8)) for i in range(weights.shape[0])])
-    hdr_im = np.sum([weights_norm[i, :, :] * np_images[i]/exposure_times[i] for i in range(len(np_images))], axis=0)
+    hdr_im = np.sum([weights_norm[i, :, :] * np_images[i] for i in range(len(np_images))], axis=0)
     return Image.fromarray(hdr_im)
 
 def get_image_paths() -> Tuple[List[Image.Image], List[str], bool]:
