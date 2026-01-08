@@ -411,11 +411,11 @@ def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 1.5) -
 
 def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray] = None) -> Image.Image:
     """
-    Build and tone-map an HDR image using Debevec calibration and merging.
+    Build and tone-map an HDR image using weighted HDR.
 
-    Images are converted to BGR, ordered by exposure time (descending), and
-    processed via OpenCV's Debevec calibrate/merge pipeline. The final HDR is
-    tone-mapped to an 8-bit grayscale image using gamma 2.2.
+    Images are converted to numpy arrays, and a weights vector is constructed per pixel by
+    normalizing each pixel by exposure times and clipped where image is saturated.
+    The final HDR image is assembled by averaging the weighted pixel values across all image.
 
     Args:
         images: List of ``PIL.Image`` instances (grayscale expected).
@@ -423,42 +423,30 @@ def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray]
             synthetic 1, 1/2, 1/4, ... values are generated.
 
     Returns:
-        Tone-mapped HDR output as a ``PIL.Image``.
+        HDR output as a ``PIL.Image``.
     """
     if not images:
         raise ValueError("No images provided for HDR assembly.")
 
-    # Convert PIL Images to OpenCV BGR format and ensure consistent normalization
-    cv_images = [cv.cvtColor(np.array(image), cv.COLOR_GRAY2BGR).astype('uint8') for image in images]
+    # Convert PIL Images to numpy arrays
+    np_images = [np.array(min_max_normalize(image)) for image in images]
 
     # Normalize/validate exposure_times and make sure it's a 1D numpy array of float32
     if exposure_times is None:
         # Generate synthetic exposure times if none are provided (in seconds)
-        exposure_times = np.array([1.0 / (2 ** i) for i in range(len(cv_images))], dtype=np.float32)
+        exposure_times = np.array([1.0 / (2 ** i) for i in range(len(np_images))], dtype=np.float32)
     else:
         exposure_times = np.array(exposure_times, dtype=np.float32)
-        if exposure_times.ndim != 1 or len(exposure_times) != len(cv_images):
+        if exposure_times.ndim != 1 or len(exposure_times) != len(np_images):
             raise ValueError("Exposure times must be a 1D array matching the number of images.")
         if np.any(exposure_times <= 0):
             raise ValueError("Exposure times must be positive.")
 
-    # Order images and exposure times by exposure time descending (higher -> lower)
-    sort_idx = np.argsort(-exposure_times)  # descending order
-    exposure_times = exposure_times[sort_idx]
-    cv_images = [cv_images[i] for i in sort_idx]
-
-    calibrate = cv.createCalibrateDebevec()
-    response = calibrate.process(cv_images, exposure_times)
-
-    merge_debevec = cv.createMergeDebevec()
-    hdr = merge_debevec.process(cv_images, exposure_times, response)
-
-    # Tone map the HDR image to 8-bit for display and saving
-    tonemap = cv.createTonemap(gamma=2.2)
-    ldr = np.nan_to_num(tonemap.process(hdr.copy()))
-    ldr_clipped = np.clip(ldr * 255, 0, 255).astype('uint8')
-
-    return Image.fromarray(cv.cvtColor(ldr_clipped, cv.COLOR_BGR2GRAY))
+    # Assemble weight vector
+    weights = np.array([np.power(np_images[i]/np.power(exposure_times[i], 1), len(exposure_times))*(np_images[i] < 255) for i in range(len(np_images))])
+    weights_norm = np.array([np.divide(weights[i, :, :],np.fmax(np.sum(weights, axis=0), np.ones_like(weights[i, :, :])*1e-8)) for i in range(weights.shape[0])])
+    hdr_im = np.sum([weights_norm[i, :, :] * np_images[i]/exposure_times[i] for i in range(len(np_images))], axis=0)
+    return Image.fromarray(hdr_im)
 
 def get_image_paths() -> Tuple[List[Image.Image], List[str], bool]:
     """
