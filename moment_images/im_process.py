@@ -409,7 +409,8 @@ def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 1.5) -
 
     return normalized.astype(image.dtype, copy=False)
 
-def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray] = None) -> Image.Image:
+def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray] = None,
+                  views: Optional[np.ndarray] = None) -> Image.Image:
     """
     Build and tone-map an HDR image using weighted HDR.
 
@@ -441,6 +442,17 @@ def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray]
             raise ValueError("Exposure times must be a 1D array matching the number of images.")
         if np.any(exposure_times <= 0):
             raise ValueError("Exposure times must be positive.")
+
+    if views is not None:
+        # Apply an inverse gaussian filter
+        gx, gy = np.meshgrid(np.linspace(0, views[0, 0].shape[1]-1, views[0, 0].shape[1]), np.linspace(0, views[0, 0].shape[0]-1, views[0, 0].shape[0]))
+        cn1 = np.ceil(views[0, 0].shape[1]/2)
+        cn2 = np.ceil(views[0, 0].shape[0]/2)
+        gauss = np.exp((((gx - cn1)**2 + (gy - cn2)**2)/(2*(0.2*cn1)**2)))
+        for i in range(views.shape[0]):
+            for j in range(views.shape[0]):
+                views[i, j] = views[i,j]*gauss
+
 
     # Assemble weight vector
     exposure_exponent = 0.5
@@ -757,10 +769,15 @@ def main():
             exp_times = np.zeros(len(images))
             for i in range(len(images)):
                 exp_times[i] = float(input(f"Enter exposure time (in seconds) for image {image_paths[i]}: "))
-        print("Assembling HDR image...")
-        hdr_image = assemble_HDR(images, exp_times)
-        images = [hdr_image]
-        print("HDR image assembled successfully.")
+        # apply center-inverse gaussian?
+        gauss_flag = input("Apply center-inverse gaussian (y/n)? ").lower()
+        if gauss_flag != 'y':
+            print("Assembling HDR image...")
+            hdr_image = assemble_HDR(images, exp_times)
+            images = [hdr_image]
+            print("HDR image assembled successfully.")
+        else:
+            print("HDR image will be assembled after global rectification.")
     else:
         image_choice = input("Enter image number or name for processing (or press Enter for all): ").strip()
         if image_choice:
@@ -784,7 +801,7 @@ def main():
     created_figures: List[Figure] = []
     
     circles_chosen = None
-    norm_im_chosen = None
+    norm_im_chosen = np.array([])
 
     for orig_im, norm_im in processed_images:
         im_np = np.array(norm_im)
@@ -806,8 +823,8 @@ def main():
             display_circles(norm_im, circles)
             if input("Use this image for further processing? (y/n): ").lower() == 'y':
                 circles_chosen = circles
-                norm_im_chosen = im_np
-                break
+                norm_im_chosen = np.append(norm_im_chosen, im_np)
+                continue
             plt.close("all")
         else:
             roi_strategy = input("Enter ROI strategy (full, center, max_pixel, specific): ").lower()
@@ -828,11 +845,11 @@ def main():
             
             if input("Use this image for further processing? (y/n): ").lower() == 'y':
                 circles_chosen = circles
-                norm_im_chosen = im_np
-                break
+                norm_im_chosen = np.append(norm_im_chosen, im_np)
+                continue
             plt.close("all")
 
-    if circles_chosen is None or norm_im_chosen is None:
+    if circles_chosen is None or norm_im_chosen.size == 0:
         print("No image selected for processing/Problem with constructing ROI structure. Exiting.")
         return
     
@@ -840,7 +857,10 @@ def main():
     d = int(np.floor(VIEW_DISTANCE_SCALE_FACTOR * 2 * np.max(windows[:, 2])))
     
     view_grid_size = int(input(f"Enter view grid size *default {DEFAULT_VIEW_GRID_SIZE}*: ") or DEFAULT_VIEW_GRID_SIZE)
-    views = extract_views(norm_im_chosen, windows[0], view_grid_size, d)
+    if norm_im_chosen.size != 0:
+        views = np.array([])
+        for i in range(norm_im_chosen.shape[0]):
+            views = np.append(views, extract_views(norm_im_chosen[i], windows[0], view_grid_size, d))
     
 # Debug mode
     # debug_views = np.zeros_like(views)
@@ -911,14 +931,27 @@ def main():
         assert isinstance(rectification_strategy_pixel, PixelwisePatchRectificationStrategy)
 
         # Compute global similarity and perform global rectification ONCE.
-        sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
-        av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(views, sim_mat, ref_view_choice)
+        
+        if gauss_flag == 'y':
+            sim_mat = rectification_strategy_global.compute_similarity_matrix(views[0, :, : ,: ,:], ref_view_choice, thresh=0.25)
+            for i in range(views.shape[0]):
+                av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(views[i, :, :, :, :], sim_mat, ref_view_choice)
+            hdr_views = assemble_HDR(images, exp_times, views)
+        else:
+            sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
+            av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(views, sim_mat, ref_view_choice)
         
         # Prepare pixel-wise similarity on the global-rectified views (refinement)
-        refined_ref_view_choice = ref_view_choice
-        sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
-            rect_views_after_global, refined_ref_view_choice, max_disp=refinement_window_size//2,thresh=0.05
-        )
+        if gauss_flag == 'y':
+            refined_ref_view_choice = ref_view_choice
+            sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
+                hdr_views, refined_ref_view_choice, max_disp=refinement_window_size//2,thresh=0.05
+            )
+        else:
+            refined_ref_view_choice = ref_view_choice
+            sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
+                rect_views_after_global, refined_ref_view_choice, max_disp=refinement_window_size//2,thresh=0.05
+            )
 
     # Assemble and display similarity matrix
     # Display of similarity matrices
