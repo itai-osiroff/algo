@@ -342,41 +342,47 @@ def generate_rectification_figures(
 
     return figures
 
-def min_max_normalize(image: Image.Image, min_val: int = 0, max_val: int = 255) -> Image.Image:
+def min_max_normalize(image: Image.Image | np.ndarray, min_val: int = 0, max_val: int = 255) -> Image.Image | np.ndarray:
     """
     Scale pixel values to the 0–255 range while optionally clamping extremes.
 
-    ``min_val`` and ``max_val`` override the computed extrema when provided,
-    allowing quick clipping of dark/bright outliers. A flat input image returns
-    an unmodified copy to avoid division by zero.
+    Accepts either a PIL.Image or a numpy.ndarray. ``min_val`` and ``max_val``
+    override the computed extrema when provided. A flat input (min == max)
+    returns a copy of the original input (same type) to avoid division by zero.
 
     Args:
-        image: Source ``PIL.Image``.
+        image: Source ``PIL.Image`` or ``numpy.ndarray``.
         min_val: Optional lower bound to use instead of the image minimum.
         max_val: Optional upper bound to use instead of the image maximum.
 
     Returns:
-        A new ``PIL.Image`` normalized to ``uint8`` intensities.
+        A normalized image of the same type as the input (PIL.Image or numpy.ndarray),
+        with dtype uint8 in the range [0, 255].
     """
-    if not isinstance(image, Image.Image):
-        raise ValueError("Input must be a PIL Image object.")
-    
-    image_array = np.array(image)
-    
+    is_pil = isinstance(image, Image.Image)
+    is_np = isinstance(image, np.ndarray)
+    if not (is_pil or is_np):
+        raise ValueError("Input must be a PIL Image or a numpy ndarray.")
+
+    # Operate on a float copy for numerical safety
+    image_array = np.asarray(image).astype(np.float32)
+
     img_min = image_array.min()
     if min_val > 0:
         img_min = min_val
-    
+
     img_max = image_array.max()
     if max_val < 255:
         img_max = max_val
 
-    if img_min == img_max:
-        print("Warning: The image has no variation in pixel values. Returning a blank image.")
-        return image.copy()
-    else:
-        normalized_array = (image_array - img_min) / (img_max - img_min) * 255
-        return Image.fromarray(normalized_array.astype('uint8'))
+    if np.isclose(img_min, img_max):
+        print("Warning: The image has no variation in pixel values. Returning a copy of the original input.")
+        return image.copy() if is_pil else image_array.copy().astype(np.uint8)
+
+    normalized_array = (image_array - img_min) / (img_max - img_min) * 255.0
+    normalized_uint8 = normalized_array.astype(np.uint8)
+
+    return Image.fromarray(normalized_uint8) if is_pil else normalized_uint8
 
 def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 1.5) -> np.ndarray:
     """
@@ -461,6 +467,10 @@ def assemble_HDR(
         cn2 = np.ceil(height / 2)
         gauss = np.exp(((gx - cn1) ** 2 + (gy - cn2) ** 2) / (2 * (0.2 * cn1) ** 2))
         views_weighted = views_arr * gauss[None, None, None, :, :]
+        for i in range(views_weighted.shape[0]):
+            for j in range(views_weighted.shape[1]):
+                for k in range(views_weighted.shape[2]):
+                    views_weighted[i, j, k] = min_max_normalize(views_weighted[i, j, k])
 
         exposure_exponent = 0.5
         cutoff_thresh = [0.5, 1]
@@ -513,7 +523,7 @@ def assemble_HDR(
                           for i in range(len(np_images))])
     weights_norm = np.array([np.divide(weights[i, :, :],np.fmax(np.sum(weights, axis=0), np.ones_like(weights[i, :, :])*1e-8)) for i in range(weights.shape[0])])
     hdr_im = np.sum([weights_norm[i, :, :] * np_images[i] for i in range(len(np_images))], axis=0)
-    return Image.fromarray(hdr_im)
+    return min_max_normalize(Image.fromarray(hdr_im))
 
 def get_image_paths() -> Tuple[List[Image.Image], List[str], bool]:
     """
@@ -825,6 +835,9 @@ def main():
         if gauss_flag != 'y':
             print("Assembling HDR image...")
             hdr_image = assemble_HDR(images, exp_times)
+            # Convert numpy array back to PIL Image if needed
+            if isinstance(hdr_image, np.ndarray):
+                hdr_image = Image.fromarray(np.clip(hdr_image, 0, 255).astype('uint8'))
             images = [hdr_image]
             print("HDR image assembled successfully.")
         else:
@@ -845,7 +858,7 @@ def main():
     if not images:
         print("No images found for processing. Exiting.")
         return
-
+    
     processed_images = [(im, min_max_normalize(im)) for im in images]
     
     # New: collect created matplotlib figures so we can optionally save them later
@@ -871,6 +884,7 @@ def main():
             center_y = int(input(f"Enter center y coordinate of viewpoint: "))
             radius = int(input(f"Enter radius of viewpoint: ")) #Expected size of each viewpoint is 250 pixels->radius~125 pixels
             circles = np.array([[[center_x, center_y, radius]]])
+            assert norm_im is Image.Image
             display_circles(norm_im, circles)
             if input("Use this image for further processing? (y/n): ").lower() == 'y':
                 circles_chosen = circles
@@ -891,7 +905,8 @@ def main():
             if circles is None:
                 print("No circles found in this image. ")
                 continue
-                
+            
+            assert norm_im is Image.Image
             display_circles(norm_im, circles)
             
             if input("Use this image for further processing? (y/n): ").lower() == 'y':
@@ -899,6 +914,8 @@ def main():
                 norm_im_chosen = np.append(norm_im_chosen, im_np)
                 continue
             plt.close("all")
+
+    norm_im_chosen = np.reshape(norm_im_chosen, (-1, im_np.shape[0], im_np.shape[1]))
 
     if circles_chosen is None or norm_im_chosen.size == 0:
         print("No image selected for processing/Problem with constructing ROI structure. Exiting.")
@@ -912,6 +929,7 @@ def main():
         views = np.array([])
         for i in range(norm_im_chosen.shape[0]):
             views = np.append(views, extract_views(norm_im_chosen[i], windows[0], view_grid_size, d))
+        views = np.reshape(views, (norm_im_chosen.shape[0], view_grid_size, view_grid_size, d, d))
     
 # Debug mode
     # debug_views = np.zeros_like(views)
@@ -940,7 +958,10 @@ def main():
         for j in range(view_grid_size):
             fig = plt.figure()
             created_figures.append(fig)
-            plt.imshow(views[i, j], cmap="gray")
+            if len(views.shape) == 4:
+                plt.imshow(views[i, j], cmap="gray")
+            else:
+                plt.imshow(views[0, i, j], cmap="gray")
             plt.title(f"View {i+1}-{j+1}")
     plt.show()
     plt.close("all")
@@ -992,8 +1013,10 @@ def main():
                 )
                 rectified_view_stack.append(rect_views_after_global)
             rectified_view_stack = np.asarray(rectified_view_stack)
+            assert all([isinstance(im, Image.Image) for im in images])
             hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
             rect_views_after_global = hdr_views
+            assert hdr_views is np.ndarray
             av_rect_global = np.mean(hdr_views, axis=(0, 1))
         else:
             sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
@@ -1007,6 +1030,7 @@ def main():
             )
         else:
             refined_ref_view_choice = ref_view_choice
+            assert rect_views_after_global is np.ndarray
             sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
                 rect_views_after_global, refined_ref_view_choice, max_disp=refinement_window_size//2,thresh=0.05
             )
