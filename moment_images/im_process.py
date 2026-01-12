@@ -409,49 +409,100 @@ def unsharp_mask(image: np.ndarray, sigma: float = 1.0, strength: float = 1.5) -
 
     return normalized.astype(image.dtype, copy=False)
 
-def assemble_HDR(images: List[Image.Image], exposure_times: Optional[np.ndarray] = None,
-                  views: Optional[np.ndarray] = None) -> Image.Image:
+def assemble_HDR(
+    images: List[Image.Image],
+    exposure_times: Optional[np.ndarray] = None,
+    views: Optional[np.ndarray] = None,
+) -> Image.Image | np.ndarray:
     """
     Build and tone-map an HDR image using weighted HDR.
 
-    Images are converted to numpy arrays, and a weights vector is constructed per pixel by
-    normalizing each pixel by exposure times and clipped where image is saturated.
-    The final HDR image is assembled by averaging the weighted pixel values across all image.
+    Images (or rectified view stacks) are converted to numpy arrays, and a
+    weights vector is constructed per pixel by normalizing each pixel by
+    exposure times and clipped where the source is saturated. The final HDR
+    image is assembled by averaging the weighted pixel values across all
+    images/exposures.
 
     Args:
         images: List of ``PIL.Image`` instances (grayscale expected).
         exposure_times: Optional exposure times in seconds. When omitted,
             synthetic 1, 1/2, 1/4, ... values are generated.
+        views: Optional stack shaped ``(E, N, N, H, W)`` of rectified views for
+            each exposure. When provided, HDR is assembled per view and the
+            resulting view grid is returned as a NumPy array.
 
     Returns:
-        HDR output as a ``PIL.Image``.
+        HDR output as a ``PIL.Image`` when ``views`` is ``None``; otherwise a
+        NumPy array of HDR views shaped ``(N, N, H, W)``.
     """
+    def normalize_exposure_times(
+        times: Optional[np.ndarray], num_items: int
+    ) -> np.ndarray:
+        if times is None:
+            return np.array([1.0 / (2 ** i) for i in range(num_items)], dtype=np.float32)
+        times_arr = np.array(times, dtype=np.float32)
+        if times_arr.ndim != 1 or len(times_arr) != num_items:
+            raise ValueError("Exposure times must be a 1D array matching the number of images.")
+        if np.any(times_arr <= 0):
+            raise ValueError("Exposure times must be positive.")
+        return times_arr
+
+    if views is not None:
+        views_arr = np.asarray(views, dtype=np.float64)
+        if views_arr.ndim != 5:
+            raise ValueError("views must have shape (E, N, N, H, W) when provided.")
+        exposure_times = normalize_exposure_times(exposure_times, views_arr.shape[0])
+
+        height, width = views_arr.shape[-2:]
+        gx, gy = np.meshgrid(
+            np.linspace(0, width - 1, width), np.linspace(0, height - 1, height)
+        )
+        cn1 = np.ceil(width / 2)
+        cn2 = np.ceil(height / 2)
+        gauss = np.exp(((gx - cn1) ** 2 + (gy - cn2) ** 2) / (2 * (0.2 * cn1) ** 2))
+        views_weighted = views_arr * gauss[None, None, None, :, :]
+
+        exposure_exponent = 0.5
+        cutoff_thresh = [0.5, 1]
+        weights = np.array(
+            [
+                np.power(
+                    views_weighted[i] / np.power(exposure_times[i], exposure_exponent),
+                    len(exposure_times),
+                )
+                * (
+                    views_weighted[i]
+                    < np.fmin(
+                        np.max(views_weighted[i]) * cutoff_thresh[i],
+                        np.ones_like(views_weighted[i]) * 255,
+                    )
+                )
+                for i in range(len(exposure_times))
+            ]
+        )
+        weights_norm = np.array(
+            [
+                np.divide(
+                    weights[i],
+                    np.fmax(np.sum(weights, axis=0), np.ones_like(weights[i]) * 1e-8),
+                )
+                for i in range(weights.shape[0])
+            ]
+        )
+        hdr_views = np.sum(
+            [weights_norm[i] * views_weighted[i] for i in range(len(exposure_times))],
+            axis=0,
+        )
+        return hdr_views
+
     if not images:
         raise ValueError("No images provided for HDR assembly.")
 
+    # Normalize/validate exposure_times and make sure it's a 1D numpy array of float32
     # Convert PIL Images to numpy arrays
     np_images = [np.array(min_max_normalize(image)) for image in images]
 
-    # Normalize/validate exposure_times and make sure it's a 1D numpy array of float32
-    if exposure_times is None:
-        # Generate synthetic exposure times if none are provided (in seconds)
-        exposure_times = np.array([1.0 / (2 ** i) for i in range(len(np_images))], dtype=np.float32)
-    else:
-        exposure_times = np.array(exposure_times, dtype=np.float32)
-        if exposure_times.ndim != 1 or len(exposure_times) != len(np_images):
-            raise ValueError("Exposure times must be a 1D array matching the number of images.")
-        if np.any(exposure_times <= 0):
-            raise ValueError("Exposure times must be positive.")
-
-    if views is not None:
-        # Apply an inverse gaussian filter
-        gx, gy = np.meshgrid(np.linspace(0, views[0, 0].shape[1]-1, views[0, 0].shape[1]), np.linspace(0, views[0, 0].shape[0]-1, views[0, 0].shape[0]))
-        cn1 = np.ceil(views[0, 0].shape[1]/2)
-        cn2 = np.ceil(views[0, 0].shape[0]/2)
-        gauss = np.exp((((gx - cn1)**2 + (gy - cn2)**2)/(2*(0.2*cn1)**2)))
-        for i in range(views.shape[0]):
-            for j in range(views.shape[0]):
-                views[i, j] = views[i,j]*gauss
+    exposure_times = normalize_exposure_times(exposure_times, len(np_images))
 
 
     # Assemble weight vector
@@ -934,9 +985,16 @@ def main():
         
         if gauss_flag == 'y':
             sim_mat = rectification_strategy_global.compute_similarity_matrix(views[0, :, : ,: ,:], ref_view_choice, thresh=0.25)
+            rectified_view_stack = []
             for i in range(views.shape[0]):
-                av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(views[i, :, :, :, :], sim_mat, ref_view_choice)
-            hdr_views = assemble_HDR(images, exp_times, views)
+                av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(
+                    views[i, :, :, :, :], sim_mat, ref_view_choice
+                )
+                rectified_view_stack.append(rect_views_after_global)
+            rectified_view_stack = np.asarray(rectified_view_stack)
+            hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
+            rect_views_after_global = hdr_views
+            av_rect_global = np.mean(hdr_views, axis=(0, 1))
         else:
             sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
             av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(views, sim_mat, ref_view_choice)
