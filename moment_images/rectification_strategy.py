@@ -85,14 +85,23 @@ class RectificationStrategy(ABC):
         """
         Validate ``views`` and return its normalized array form with center indices.
 
+        Accept either:
+          - (N, N, H, W) : single view grid, or
+          - (E, N, N, H, W): multiple exposures of a view grid (will be averaged
+            across the exposure axis to produce a single (N, N, H, W) grid).
+
         This helper centralizes the shape/type checks shared by all rectification
         strategies without altering the existing default behavior (center view
         selection).
         """
         views_arr = np.asarray(views)
 
+        # Accept either a 4D view grid or a 5D stack of exposures (E, N, N, H, W).
+        if views_arr.ndim == 5:
+            # Collapse exposures by averaging to produce a single (N, N, H, W) grid.
+            views_arr = np.mean(views_arr, axis=0)
         if views_arr.ndim != 4:
-            raise ValueError("views must have shape (N, N, H, W)")
+            raise ValueError("views must have shape (N, N, H, W) or (E, N, N, H, W)")
 
         grid_rows, grid_cols = views_arr.shape[:2]
         if grid_rows != grid_cols:
