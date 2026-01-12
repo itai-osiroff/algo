@@ -473,7 +473,7 @@ def assemble_HDR(
                     views_weighted[i, j, k] = min_max_normalize(views_weighted[i, j, k])
 
         exposure_exponent = 0.5
-        cutoff_thresh = [0.5, 1]
+        cutoff_thresh = np.linspace(0.5, 1, len(exposure_times))
         weights = np.array(
             [
                 np.power(
@@ -930,7 +930,9 @@ def main():
         for i in range(norm_im_chosen.shape[0]):
             views = np.append(views, extract_views(norm_im_chosen[i], windows[0], view_grid_size, d))
         views = np.reshape(views, (norm_im_chosen.shape[0], view_grid_size, view_grid_size, d, d))
-    
+
+    views = np.squeeze(views)
+
 # Debug mode
     # debug_views = np.zeros_like(views)
     # _, (center_i, center_j) = resolve_reference_view(views)
@@ -942,9 +944,9 @@ def main():
     #             for j_im in range(views[0, 0].shape[0]):
     #                 if i == center_i and j == center_j:
     #                      continue
-    #                 if i_im > 93 and i_im < 104 and j_im > 117 and j_im < 144:
+    #                 if i_im > 78 and i_im < 91 and j_im > 137 and j_im < 147:
     #                     debug_views[i, j, i_im-4, j_im-4] = views[center_i, center_j, i_im, j_im]
-    #                 elif i_im > 93+4 and i_im < 104+4 and j_im > 117+4 and j_im < 144+4:
+    #                 elif i_im > 78+4 and i_im < 91+4 and j_im > 137+4 and j_im < 147+4:
     #                     debug_views[i, j, i_im, j_im] = 0
     #                 else:
     #                     debug_views[i, j, i_im, j_im] = views[center_i, center_j, i_im, j_im]
