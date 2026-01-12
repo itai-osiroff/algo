@@ -843,6 +843,7 @@ def main():
         else:
             print("HDR image will be assembled after global rectification.")
     else:
+        gauss_flag = 'n'
         image_choice = input("Enter image number or name for processing (or press Enter for all): ").strip()
         if image_choice:
             if image_choice.isdigit():
