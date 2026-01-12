@@ -465,7 +465,7 @@ def assemble_HDR(
         )
         cn1 = np.ceil(width / 2)
         cn2 = np.ceil(height / 2)
-        gauss = np.exp(((gx - cn1) ** 2 + (gy - cn2) ** 2) / (2 * (0.2 * cn1) ** 2))
+        gauss = np.exp(((gx - cn1) ** 2 + (gy - cn2) ** 2) / (2 * (0.6 * cn1) ** 2))
         views_weighted = views_arr * gauss[None, None, None, :, :]
         for i in range(views_weighted.shape[0]):
             for j in range(views_weighted.shape[1]):
@@ -884,7 +884,7 @@ def main():
             center_y = int(input(f"Enter center y coordinate of viewpoint: "))
             radius = int(input(f"Enter radius of viewpoint: ")) #Expected size of each viewpoint is 250 pixels->radius~125 pixels
             circles = np.array([[[center_x, center_y, radius]]])
-            assert norm_im is Image.Image
+            assert isinstance(norm_im, Image.Image)
             display_circles(norm_im, circles)
             if input("Use this image for further processing? (y/n): ").lower() == 'y':
                 circles_chosen = circles
@@ -1016,7 +1016,7 @@ def main():
             assert all([isinstance(im, Image.Image) for im in images])
             hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
             rect_views_after_global = hdr_views
-            assert hdr_views is np.ndarray
+            assert isinstance(hdr_views, np.ndarray)
             av_rect_global = np.mean(hdr_views, axis=(0, 1))
         else:
             sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
