@@ -187,6 +187,50 @@ def _generate_views(
     return views, cache_path
 
 
+def _generate_exposure_views(
+    image_dir: Path,
+    center_x: int,
+    center_y: int,
+    radius: int,
+    grid_size: int,
+    view_distance: int | None,
+    cache_dir: Path,
+) -> tuple[np.ndarray, Path]:
+    if not image_dir.exists():
+        raise FileNotFoundError(f"Source image directory not found: {image_dir}")
+    if not image_dir.is_dir():
+        raise ValueError(f"Source image directory is not a folder: {image_dir}")
+
+    image_paths = sorted(
+        [
+            path
+            for path in image_dir.iterdir()
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}
+        ]
+    )
+    if not image_paths:
+        raise ValueError(f"No images found in {image_dir}")
+
+    distance = view_distance
+    if distance is None:
+        distance = int(np.floor(VIEW_DISTANCE_SCALE_FACTOR * 2 * radius))
+
+    base_circle = np.array([center_x, center_y, radius])
+    exposure_views: list[np.ndarray] = []
+    for image_path in image_paths:
+        image = Image.open(image_path)
+        normalized = min_max_normalize(image)
+        image_np = np.array(normalized)
+        views = extract_views(image_np, base_circle, grid_size, distance)
+        exposure_views.append(views)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / "generated_exposure_views.npy"
+    exposure_views_arr = np.asarray(exposure_views)
+    np.save(cache_path, exposure_views_arr)
+    return exposure_views_arr, cache_path
+
+
 def sweep_parameters(
     views: np.ndarray,
     output_dir: Path,
@@ -305,8 +349,15 @@ def sweep_parameters(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep im_process rectification parameters")
-    parser.add_argument("--views", help="Path to a precomputed (N, N, H, W) numpy array of views")
+    parser.add_argument(
+        "--views",
+        help="Path to a precomputed (N, N, H, W) or (E, N, N, H, W) numpy array of views",
+    )
     parser.add_argument("--source-image", help="Path to the source image to extract views from")
+    parser.add_argument(
+        "--source-image-dir",
+        help="Directory of exposure images to extract HDR views from (used with --hdr-assemble)",
+    )
     parser.add_argument("--center-x", type=int, help="X coordinate of the central view")
     parser.add_argument("--center-y", type=int, help="Y coordinate of the central view")
     parser.add_argument("--view-radius", type=int, help="Radius of a single view in pixels")
@@ -382,37 +433,68 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.hdr_assemble and args.views is None:
-        raise SystemExit("HDR assembly requires --views with shape (E, N, N, H, W).")
+    if args.hdr_assemble and args.views is None and args.source_image_dir is None:
+        raise SystemExit(
+            "HDR assembly requires --views with shape (E, N, N, H, W) or --source-image-dir."
+        )
+    if not args.hdr_assemble and args.source_image_dir is not None:
+        raise SystemExit("--source-image-dir is only supported with --hdr-assemble.")
 
     if args.views is None:
-        missing = [
-            name
-            for name, present in [
-                ("--source-image", args.source_image),
-                ("--center-x", args.center_x),
-                ("--center-y", args.center_y),
-                ("--view-radius", args.view_radius),
+        if args.hdr_assemble:
+            missing = [
+                name
+                for name, present in [
+                    ("--center-x", args.center_x),
+                    ("--center-y", args.center_y),
+                    ("--view-radius", args.view_radius),
+                ]
+                if present is None
             ]
-            if present is None
-        ]
-        if missing:
-            missing_str = ", ".join(missing)
-            raise SystemExit(
-                "When --views is not provided, the following arguments are required: "
-                f"{missing_str}."
+            if missing:
+                missing_str = ", ".join(missing)
+                raise SystemExit(
+                    "When --views is not provided, the following arguments are required: "
+                    f"{missing_str}."
+                )
+            views, cached_views_path = _generate_exposure_views(
+                image_dir=Path(args.source_image_dir),
+                center_x=args.center_x,
+                center_y=args.center_y,
+                radius=args.view_radius,
+                grid_size=args.view_grid_size,
+                view_distance=args.view_distance,
+                cache_dir=output_dir,
             )
+            print(f"Generated exposure views once and cached to {cached_views_path}")
+        else:
+            missing = [
+                name
+                for name, present in [
+                    ("--source-image", args.source_image),
+                    ("--center-x", args.center_x),
+                    ("--center-y", args.center_y),
+                    ("--view-radius", args.view_radius),
+                ]
+                if present is None
+            ]
+            if missing:
+                missing_str = ", ".join(missing)
+                raise SystemExit(
+                    "When --views is not provided, the following arguments are required: "
+                    f"{missing_str}."
+                )
 
-        views, cached_views_path = _generate_views(
-            image_path=Path(args.source_image),
-            center_x=args.center_x,
-            center_y=args.center_y,
-            radius=args.view_radius,
-            grid_size=args.view_grid_size,
-            view_distance=args.view_distance,
-            cache_dir=output_dir,
-        )
-        print(f"Generated views once and cached to {cached_views_path}")
+            views, cached_views_path = _generate_views(
+                image_path=Path(args.source_image),
+                center_x=args.center_x,
+                center_y=args.center_y,
+                radius=args.view_radius,
+                grid_size=args.view_grid_size,
+                view_distance=args.view_distance,
+                cache_dir=output_dir,
+            )
+            print(f"Generated views once and cached to {cached_views_path}")
     else:
         cached_views_path = Path(args.views)
         views = _load_views(cached_views_path)
@@ -421,6 +503,12 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         raise SystemExit("HDR assembly requires views shaped (E, N, N, H, W).")
     if not args.hdr_assemble and views.ndim == 5:
         raise SystemExit("Views include multiple exposures; enable --hdr-assemble to use HDR assembly.")
+    exposure_times = _parse_float_list(args.hdr_exposure_times)
+    if exposure_times is not None and views.ndim == 5:
+        if len(exposure_times) != views.shape[0]:
+            raise SystemExit(
+                "HDR exposure times must match the number of exposures in --views or --source-image-dir."
+            )
 
     window_sizes = _build_int_range(args.window_start, args.window_stop, args.window_step)
     max_displacements = _build_int_range(args.max_disp_start, args.max_disp_stop, args.max_disp_step)
@@ -448,7 +536,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         analyze=args.analyze,
         live_plot=args.live_plot,
         hdr_enabled=args.hdr_assemble,
-        hdr_exposure_times=_parse_float_list(args.hdr_exposure_times),
+        hdr_exposure_times=exposure_times,
     )
     return output_dir
 
@@ -479,6 +567,7 @@ def _launch_gui() -> None:
     labels = [
         ("Views (.npy)", "views", ""),
         ("Source image", "source_image", ""),
+        ("Source image directory (HDR)", "source_image_dir", ""),
         ("Center X", "center_x", ""),
         ("Center Y", "center_y", ""),
         ("View radius", "view_radius", ""),
@@ -515,18 +604,36 @@ def _launch_gui() -> None:
             entries[target].delete(0, tk.END)
             entries[target].insert(0, selection)
 
+    def choose_directory(target: str) -> None:
+        selection = filedialog.askdirectory()
+        if selection:
+            entries[target].delete(0, tk.END)
+            entries[target].insert(0, selection)
+
     for row, (label, key, default) in enumerate(labels):
         tk.Label(root, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=2)
         entry = tk.Entry(root, width=32)
         entry.insert(0, default)
         entry.grid(row=row, column=1, padx=6, pady=2)
         entries[key] = entry
-        if key in {"views", "source_image"}:
+        if key in {"views", "source_image", "source_image_dir"}:
             button_text = "Browse"
-            filetypes = [("NumPy arrays", "*.npy")] if key == "views" else [("Images", "*.png *.jpg *.jpeg *.bmp *.tiff")]
-            tk.Button(root, text=button_text, command=lambda k=key, ft=filetypes: choose_file(k, ft)).grid(
-                row=row, column=2, padx=6, pady=2
-            )
+            if key == "views":
+                filetypes = [("NumPy arrays", "*.npy")]
+                tk.Button(root, text=button_text, command=lambda k=key, ft=filetypes: choose_file(k, ft)).grid(
+                    row=row, column=2, padx=6, pady=2
+                )
+            elif key == "source_image":
+                filetypes = [("Images", "*.png *.jpg *.jpeg *.bmp *.tiff")]
+                tk.Button(root, text=button_text, command=lambda k=key, ft=filetypes: choose_file(k, ft)).grid(
+                    row=row, column=2, padx=6, pady=2
+                )
+            else:
+                tk.Button(
+                    root,
+                    text=button_text,
+                    command=lambda k=key: choose_directory(k),
+                ).grid(row=row, column=2, padx=6, pady=2)
 
     tk.Label(root, text="Strategy").grid(row=len(labels), column=0, sticky="w", padx=6, pady=2)
     strategy_var = tk.StringVar(value="pixel")
@@ -557,6 +664,7 @@ def _launch_gui() -> None:
             args = argparse.Namespace(
                 views=entries["views"].get().strip() or None,
                 source_image=entries["source_image"].get().strip() or None,
+                source_image_dir=entries["source_image_dir"].get().strip() or None,
                 center_x=int(entries["center_x"].get()) if entries["center_x"].get().strip() else None,
                 center_y=int(entries["center_y"].get()) if entries["center_y"].get().strip() else None,
                 view_radius=int(entries["view_radius"].get()) if entries["view_radius"].get().strip() else None,

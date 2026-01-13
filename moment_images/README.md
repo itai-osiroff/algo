@@ -44,7 +44,7 @@ python -m moment_images.parameter_sweep \
 - Use **`--view-grid-size`** to control how many views per dimension are extracted. Add **`--view-distance`** to override the computed distance between adjacent view centers.
 - **`--strategy`** accepts `global`, `pixel`, or `combined` to match the strategies available in the interactive flow.
 - Threshold sweeps: **`--global-thresh-*`** control the correlation mask used in the global strategy, while **`--pixel-thresh-*`** affect pixel-wise patch similarity calculations.
-- **HDR assembly**: pass **`--hdr-assemble`** along with **`--views`** shaped `(E, N, N, H, W)` (exposures first) to assemble HDR after rectification. Optional **`--hdr-exposure-times`** accepts comma-separated exposure times (seconds) matching the exposure count.
+- **HDR assembly**: pass **`--hdr-assemble`** with either **`--views`** shaped `(E, N, N, H, W)` (exposures first) or a **`--source-image-dir`** of exposure images. Optional **`--hdr-exposure-times`** accepts comma-separated exposure times (seconds) matching the exposure count.
 
 ### Outputs
 - The sweep caches the generated view grid to `generated_views.npy` inside `--output-dir` before running any rectification iterations.
