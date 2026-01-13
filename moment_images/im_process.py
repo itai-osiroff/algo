@@ -1033,7 +1033,7 @@ def main():
             )
         else:
             refined_ref_view_choice = ref_view_choice
-            assert rect_views_after_global is np.ndarray
+            assert isinstance(rect_views_after_global, np.ndarray)
             sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
                 rect_views_after_global, refined_ref_view_choice, max_disp=refinement_window_size//2,thresh=0.05
             )
