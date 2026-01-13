@@ -147,9 +147,15 @@ def _load_views(path: Path) -> np.ndarray:
     if not path.exists():
         raise FileNotFoundError(f"Views file not found: {path}")
     views = np.load(path)
-    if views.ndim != 4 or views.shape[0] != views.shape[1]:
-        raise ValueError("views must have shape (N, N, H, W)")
-    return views
+    if views.ndim == 4:
+        if views.shape[0] != views.shape[1]:
+            raise ValueError("views must have shape (N, N, H, W)")
+        return views
+    if views.ndim == 5:
+        if views.shape[1] != views.shape[2]:
+            raise ValueError("views must have shape (E, N, N, H, W)")
+        return views
+    raise ValueError("views must have shape (N, N, H, W) or (E, N, N, H, W)")
 
 
 def _generate_views(
@@ -195,6 +201,8 @@ def sweep_parameters(
     zero_fill_roll: bool = True,
     analyze: bool = False,
     live_plot: bool = False,
+    hdr_enabled: bool = False,
+    hdr_exposure_times: Sequence[float] | None = None,
 ) -> None:
     default_config = RectificationRunConfig()
     global_thresholds = list(global_thresholds or [default_config.global_threshold])
@@ -254,6 +262,8 @@ def sweep_parameters(
             zero_fill_roll=zero_fill_roll,
             global_threshold=global_thresh,
             pixel_threshold=pixel_thresh,
+            hdr_enabled=hdr_enabled,
+            hdr_exposure_times=list(hdr_exposure_times) if hdr_exposure_times is not None else None,
         )
 
         result = rectify_views_from_config(views, config)
@@ -335,6 +345,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Save rectification figures (non-interactive) for each run",
     )
     parser.add_argument(
+        "--hdr-assemble",
+        action="store_true",
+        help="Assemble HDR views from a stack of exposures shaped (E, N, N, H, W)",
+    )
+    parser.add_argument(
+        "--hdr-exposure-times",
+        help="Comma-separated exposure times (seconds) matching the exposure count",
+    )
+    parser.add_argument(
         "--analyze",
         action="store_true",
         help="Compute aggregate statistics for sweep metrics after the run",
@@ -362,6 +381,9 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.hdr_assemble and args.views is None:
+        raise SystemExit("HDR assembly requires --views with shape (E, N, N, H, W).")
 
     if args.views is None:
         missing = [
@@ -395,6 +417,11 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         cached_views_path = Path(args.views)
         views = _load_views(cached_views_path)
 
+    if args.hdr_assemble and views.ndim != 5:
+        raise SystemExit("HDR assembly requires views shaped (E, N, N, H, W).")
+    if not args.hdr_assemble and views.ndim == 5:
+        raise SystemExit("Views include multiple exposures; enable --hdr-assemble to use HDR assembly.")
+
     window_sizes = _build_int_range(args.window_start, args.window_stop, args.window_step)
     max_displacements = _build_int_range(args.max_disp_start, args.max_disp_stop, args.max_disp_step)
     gauss_sigmas = _build_float_range(args.gauss_sigma_start, args.gauss_sigma_stop, args.gauss_sigma_step)
@@ -420,6 +447,8 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         zero_fill_roll=args.zero_fill_roll,
         analyze=args.analyze,
         live_plot=args.live_plot,
+        hdr_enabled=args.hdr_assemble,
+        hdr_exposure_times=_parse_float_list(args.hdr_exposure_times),
     )
     return output_dir
 
@@ -429,6 +458,15 @@ def _parse_optional_int(value: str) -> int | None:
     if not value:
         return None
     return int(value)
+
+
+def _parse_float_list(value: str | None) -> list[float] | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return [float(item.strip()) for item in cleaned.split(",") if item.strip()]
 
 
 def _launch_gui() -> None:
@@ -447,6 +485,7 @@ def _launch_gui() -> None:
         ("View grid size", "view_grid_size", "3"),
         ("View distance (optional)", "view_distance", ""),
         ("Output directory", "output_dir", ""),
+        ("HDR exposure times (comma-separated)", "hdr_exposure_times", ""),
         ("Window start", "window_start", "15"),
         ("Window stop", "window_stop", "45"),
         ("Window step", "window_step", "10"),
@@ -498,14 +537,19 @@ def _launch_gui() -> None:
         row=len(labels) + 1, column=1, sticky="w", padx=6, pady=2
     )
 
+    hdr_assemble_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(root, text="Assemble HDR from exposures", variable=hdr_assemble_var).grid(
+        row=len(labels) + 2, column=1, sticky="w", padx=6, pady=2
+    )
+
     analyze_var = tk.BooleanVar(value=False)
     tk.Checkbutton(root, text="Analyze metrics after sweep", variable=analyze_var).grid(
-        row=len(labels) + 2, column=1, sticky="w", padx=6, pady=2
+        row=len(labels) + 3, column=1, sticky="w", padx=6, pady=2
     )
 
     live_plot_var = tk.BooleanVar(value=False)
     tk.Checkbutton(root, text="Show live metrics plot", variable=live_plot_var).grid(
-        row=len(labels) + 3, column=1, sticky="w", padx=6, pady=2
+        row=len(labels) + 4, column=1, sticky="w", padx=6, pady=2
     )
 
     def start_sweep() -> None:
@@ -540,6 +584,8 @@ def _launch_gui() -> None:
                 pixel_thresh_step=float(entries["pixel_thresh_step"].get()),
                 zero_fill_roll=bool(entries["zero_fill_roll"].get().strip().lower() in {"true", "1", "yes"}),
                 save_figures=save_figures_var.get(),
+                hdr_assemble=hdr_assemble_var.get(),
+                hdr_exposure_times=entries["hdr_exposure_times"].get().strip() or None,
                 analyze=analyze_var.get(),
                 live_plot=live_plot_var.get(),
             )
@@ -559,7 +605,7 @@ def _launch_gui() -> None:
         root.destroy()
 
     tk.Button(root, text="Start sweep", command=start_sweep).grid(
-        row=len(labels) + 4, column=1, pady=8
+        row=len(labels) + 5, column=1, pady=8
     )
 
     root.mainloop()
@@ -578,4 +624,3 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
