@@ -996,10 +996,49 @@ def main():
     #calculate similarity matrix
     if rect_strat == 1:
         assert isinstance(rectification_strategy, GlobalTranslationRectificationStrategy)
-        sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
+        # If the user requested center-inverse gaussian HDR assembly, compute the
+        # similarity on the first exposure and apply that same similarity to each
+        # exposure, then assemble HDR from the per-exposure rectified stacks.
+        if gauss_flag == 'y':
+            sim_mat = rectification_strategy.compute_similarity_matrix(
+                views[0, :, :, :, :], ref_view_choice, thresh=0.25
+            )
+            rectified_view_stack = []
+            for i in range(views.shape[0]):
+                av_rect_exposure, rect_views_after_global = rectification_strategy.rectify(
+                    views[i, :, :, :, :], sim_mat, ref_view_choice
+                )
+                rectified_view_stack.append(rect_views_after_global)
+            rectified_view_stack = np.asarray(rectified_view_stack)
+            assert all([isinstance(im, Image.Image) for im in images])
+            hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
+            rect_views_after_global = hdr_views
+            assert isinstance(hdr_views, np.ndarray)
+            av_rect = np.mean(hdr_views, axis=(0, 1))
+            rect_images = hdr_views
+        else:
+            sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
     elif rect_strat == 2:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
-        sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice, thresh=0.05)
+        # Similar flow for pixel-wise-only mode: compute pixel similarity on the
+        # first exposure then rectify each exposure and assemble HDR.
+        if gauss_flag == 'y':
+            sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(
+                views[0, :, :, :, :], ref_view_choice, thresh=0.05
+            )
+            rectified_view_stack = []
+            for i in range(views.shape[0]):
+                av_rect_exposure, rect_views_after_pixel = rectification_strategy.rectify(
+                    views[i, :, :, :, :], sim_mat_pixelwise, ref_view_choice
+                )
+                rectified_view_stack.append(rect_views_after_pixel)
+            rectified_view_stack = np.asarray(rectified_view_stack)
+            hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
+            rect_images = hdr_views
+            assert isinstance(hdr_views, np.ndarray)
+            av_rect = np.mean(hdr_views, axis=(0, 1))
+        else:
+            sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice, thresh=0.05)
     else:
         assert rectification_strategy is None
         assert isinstance(rectification_strategy_global, GlobalTranslationRectificationStrategy)
@@ -1057,12 +1096,13 @@ def main():
         fig_x.suptitle("X translation similarity")
         fig_y.suptitle("Y translation similarity")
 
-        av_rect, rect_images = rectification_strategy.rectify(views, sim_mat, ref_view_choice)
+        # Only run rectify now if we did not already produce HDR-based rectification above
+        if gauss_flag != 'y':
+            av_rect, rect_images = rectification_strategy.rectify(views, sim_mat, ref_view_choice)
     elif rect_strat == 2:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
         disps_y = sim_mat_pixelwise.disps_y
         disps_x = sim_mat_pixelwise.disps_x
-        # sim_mat_scores = sim_mat_pixelwise.scores
         fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
         created_figures.append(fig_x)
         fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
