@@ -1012,8 +1012,8 @@ def main():
             rectified_view_stack = np.asarray(rectified_view_stack)
             assert all([isinstance(im, Image.Image) for im in images])
             hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
-            rect_views_after_global = hdr_views
             assert isinstance(hdr_views, np.ndarray)
+            rect_views_after_global = hdr_views
             av_rect = np.mean(hdr_views, axis=(0, 1))
             rect_images = hdr_views
         else:
@@ -1034,8 +1034,8 @@ def main():
                 rectified_view_stack.append(rect_views_after_pixel)
             rectified_view_stack = np.asarray(rectified_view_stack)
             hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
-            rect_images = hdr_views
             assert isinstance(hdr_views, np.ndarray)
+            rect_images = hdr_views
             av_rect = np.mean(hdr_views, axis=(0, 1))
         else:
             sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice, thresh=0.05)
@@ -1057,8 +1057,8 @@ def main():
             rectified_view_stack = np.asarray(rectified_view_stack)
             assert all([isinstance(im, Image.Image) for im in images])
             hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
-            rect_views_after_global = hdr_views
             assert isinstance(hdr_views, np.ndarray)
+            rect_views_after_global = hdr_views
             av_rect_global = np.mean(hdr_views, axis=(0, 1))
         else:
             sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
