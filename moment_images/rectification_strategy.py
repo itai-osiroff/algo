@@ -402,7 +402,14 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                                     truncate=(gauss_size/gauss_sigma),
                                       mode="constant")
                 if normalized_conv:
-                        norm_mats = 
+                        ref_view_blurred = gaussian_filter(
+                                            ref_view,
+                                            sigma=gauss_sigma,
+                                            truncate=(gauss_size/gauss_sigma),
+                                            mode="constant")
+                        norm_mats = np.sqrt(norm_mats*ref_view_blurred)
+                        norm_mats = norm_mats + 0.1*np.max(norm_mats)
+                        corr_mats = corr_mats / norm_mats
                 corr_stack = corr_mats[:, :, i, j, :, :]  # shape (H, W, D, D)
                 max_val = np.max(corr_stack, axis=(2, 3))
                 scores[:, :, i, j] = max_val
