@@ -47,7 +47,8 @@ class RectificationRunConfig:
 
     Attributes mirror the choices made during the interactive ``main`` flow so
     that external scripts can inject deterministic values when sweeping
-    parameters.
+    parameters. Set ``hdr_enabled`` to ``True`` and provide a stack of exposures
+    shaped ``(E, N, N, H, W)`` to assemble HDR output after rectification.
     """
 
     strategy: str = "pixel"
@@ -62,6 +63,8 @@ class RectificationRunConfig:
     global_threshold: float = 0.25
     pixel_threshold: float = 0.05
     zero_fill_roll: bool = True
+    hdr_enabled: bool = False
+    hdr_exposure_times: Optional[List[float]] = None
 
 
 @dataclass
@@ -116,7 +119,9 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
     """Run rectification with injected parameters instead of interactive prompts.
 
     Args:
-        views: Square grid of grayscale patches shaped ``(N, N, H, W)``.
+        views: Square grid of grayscale patches shaped ``(N, N, H, W)``. When
+            ``config.hdr_enabled`` is ``True``, pass a stack of exposures shaped
+            ``(E, N, N, H, W)`` to enable HDR assembly after rectification.
         config: Rectification options to sweep over.
 
     Returns:
@@ -125,7 +130,26 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         strategy.
     """
 
-    views_arr, ref_view_idx = resolve_reference_view(views)
+    views_input = np.asarray(views)
+    exposure_views: Optional[np.ndarray] = None
+    if views_input.ndim == 5:
+        if not config.hdr_enabled:
+            raise ValueError(
+                "views has shape (E, N, N, H, W) but hdr_enabled is False. "
+                "Enable HDR assembly or provide a single (N, N, H, W) grid."
+            )
+        exposure_views = views_input
+        base_views = exposure_views[0]
+    elif views_input.ndim == 4:
+        if config.hdr_enabled:
+            raise ValueError(
+                "hdr_enabled=True requires views shaped (E, N, N, H, W) with multiple exposures."
+            )
+        base_views = views_input
+    else:
+        raise ValueError("views must have shape (N, N, H, W) or (E, N, N, H, W)")
+
+    views_arr, ref_view_idx = resolve_reference_view(base_views)
 
     # Initialize new-stage holders
     global_similarity = None
@@ -144,9 +168,26 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         global_similarity = rectification_strategy.compute_similarity_matrix(
             views_arr, ref_view_idx, thresh=config.global_threshold
         )
-        global_avg_image, global_rectified_views = rectification_strategy.rectify(
-            views_arr, global_similarity, ref_view_idx
-        )
+        if exposure_views is not None:
+            rectified_view_stack = []
+            for exposure in exposure_views:
+                _, rectified = rectification_strategy.rectify(
+                    exposure, global_similarity, ref_view_idx
+                )
+                rectified_view_stack.append(rectified)
+            rectified_view_stack_arr = np.asarray(rectified_view_stack)
+            hdr_views = assemble_HDR(
+                images=[],
+                exposure_times=config.hdr_exposure_times,
+                views=rectified_view_stack_arr,
+            )
+            assert isinstance(hdr_views, np.ndarray)
+            global_rectified_views = hdr_views
+            global_avg_image = np.mean(hdr_views, axis=(0, 1))
+        else:
+            global_avg_image, global_rectified_views = rectification_strategy.rectify(
+                views_arr, global_similarity, ref_view_idx
+            )
         # final outputs are the global results
         avg_image, rectified_views = global_avg_image, global_rectified_views
     elif strategy == "pixel":
@@ -163,9 +204,26 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             disp_gauss_size=config.disp_gauss_size,
             thresh=config.pixel_threshold,
         )
-        avg_image, rectified_views = rectification_strategy.rectify(
-            views_arr, pixel_similarity, ref_view_idx
-        )
+        if exposure_views is not None:
+            rectified_view_stack = []
+            for exposure in exposure_views:
+                _, rectified = rectification_strategy.rectify(
+                    exposure, pixel_similarity, ref_view_idx
+                )
+                rectified_view_stack.append(rectified)
+            rectified_view_stack_arr = np.asarray(rectified_view_stack)
+            hdr_views = assemble_HDR(
+                images=[],
+                exposure_times=config.hdr_exposure_times,
+                views=rectified_view_stack_arr,
+            )
+            assert isinstance(hdr_views, np.ndarray)
+            avg_image = np.mean(hdr_views, axis=(0, 1))
+            rectified_views = hdr_views
+        else:
+            avg_image, rectified_views = rectification_strategy.rectify(
+                views_arr, pixel_similarity, ref_view_idx
+            )
     else:
         # Combined: perform global once, then pixel refinement on global-rectified views
         rectification_strategy_global = GlobalTranslationRectificationStrategy(
@@ -174,9 +232,26 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         global_similarity = rectification_strategy_global.compute_similarity_matrix(
             views_arr, ref_view_idx, thresh=config.global_threshold
         )
-        global_avg_image, global_rectified_views = rectification_strategy_global.rectify(
-            views_arr, global_similarity, ref_view_idx
-        )
+        if exposure_views is not None:
+            rectified_view_stack = []
+            for exposure in exposure_views:
+                _, rectified = rectification_strategy_global.rectify(
+                    exposure, global_similarity, ref_view_idx
+                )
+                rectified_view_stack.append(rectified)
+            rectified_view_stack_arr = np.asarray(rectified_view_stack)
+            hdr_views = assemble_HDR(
+                images=[],
+                exposure_times=config.hdr_exposure_times,
+                views=rectified_view_stack_arr,
+            )
+            assert isinstance(hdr_views, np.ndarray)
+            global_rectified_views = hdr_views
+            global_avg_image = np.mean(hdr_views, axis=(0, 1))
+        else:
+            global_avg_image, global_rectified_views = rectification_strategy_global.rectify(
+                views_arr, global_similarity, ref_view_idx
+            )
 
         rectification_strategy_pixel = PixelwisePatchRectificationStrategy(
             config.refinement_window_size, zero_fill_roll=config.zero_fill_roll
