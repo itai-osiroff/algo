@@ -373,7 +373,12 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         disps_y = np.zeros((height, width, grid_rows, grid_cols), dtype=np.int32)
         disps_x = np.zeros((height, width, grid_rows, grid_cols), dtype=np.int32)
         base_coords = np.stack(np.meshgrid(np.arange(height), np.arange(width), indexing="ij"), -1)
-
+        if normalized_conv:
+            ref_view_blurred = gaussian_filter(
+                                                ref_view,
+                                                sigma=gauss_sigma,
+                                                truncate=(gauss_size/gauss_sigma),
+                                                mode="constant")
         for i in range(grid_rows):
             for j in range(grid_cols):
                 if i == ref_i and j == ref_j:
@@ -402,11 +407,6 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                                     truncate=(gauss_size/gauss_sigma),
                                       mode="constant")
                 if normalized_conv:
-                        ref_view_blurred = gaussian_filter(
-                                            ref_view,
-                                            sigma=gauss_sigma,
-                                            truncate=(gauss_size/gauss_sigma),
-                                            mode="constant")
                         norm_mats = np.sqrt(norm_mats*ref_view_blurred)
                         norm_mats = norm_mats + 0.1*np.max(norm_mats)
                         corr_mats = corr_mats / norm_mats
