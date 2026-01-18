@@ -301,7 +301,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         self, views: np.ndarray, ref_view_idx: Tuple[int, int], max_disp: Optional[int] = None,
         gauss_sigma: Optional[float] = None, gauss_size: Optional[int] = None,
         disp_gauss_sigma: Optional[float] = None, disp_gauss_size: Optional[int] = None,
-        thresh: Optional[float] = None,
+        thresh: Optional[float] = None, normalized_conv: Optional[bool] = True,
     ) -> PixelwiseSimilarityResult:
         """
         Perform per-pixel patch correlation between each view and the reference.
@@ -366,6 +366,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             ref_view[ref_view < np.max(ref_view)*thresh] = 0.0
 
         corr_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
+        if normalized_conv:
+            norm_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.int32)
         scores = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
         disps_y = np.zeros((height, width, grid_rows, grid_cols), dtype=np.int32)
@@ -390,7 +392,17 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                             truncate=(gauss_size/ gauss_sigma),
                             mode="constant",
                         )
-
+                        if normalized_conv:
+                            norm_shifted_view = self._roll_with_fill(view, shift_y=s_y,
+                                                                      shift_x=s_x,
+                                                                        zero_fill=self.zero_fill_roll)
+                            norm_mats[:, :, i, j, s_y_ind, s_x_ind] = gaussian_filter(
+                                norm_shifted_view*2,
+                                  sigma=gauss_sigma,
+                                    truncate=(gauss_size/gauss_sigma),
+                                      mode="constant")
+                if normalized_conv:
+                        norm_mats = 
                 corr_stack = corr_mats[:, :, i, j, :, :]  # shape (H, W, D, D)
                 max_val = np.max(corr_stack, axis=(2, 3))
                 scores[:, :, i, j] = max_val
