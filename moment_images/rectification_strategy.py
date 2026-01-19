@@ -57,13 +57,15 @@ class PixelwiseSimilarityResult:
     Attributes mirror ``compute_similarity_matrices``: ``coordinates`` holds the
     best-match destination per pixel, ``scores`` stores the corresponding
     correlation values, and ``disps_y``/``disps_x`` cache the raw displacements
-    selected for each view relative to the reference.
+    selected for each view relative to the reference. ``sub_pix_factor`` tracks
+    the upsampling factor used to resolve sub-pixel shifts.
     """
 
     coordinates: np.ndarray
     scores: np.ndarray
     disps_y: np.ndarray
     disps_x: np.ndarray
+    sub_pix_factor: int = 1
 
 
 class RectificationStrategy(ABC):
@@ -302,6 +304,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         gauss_sigma: Optional[float] = None, gauss_size: Optional[int] = None,
         disp_gauss_sigma: Optional[float] = None, disp_gauss_size: Optional[int] = None,
         thresh: Optional[float] = None, normalized_conv: Optional[bool] = True,
+        sub_pix_factor: int = 1,
     ) -> PixelwiseSimilarityResult:
         """
         Perform per-pixel patch correlation between each view and the reference.
@@ -322,11 +325,18 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             disp_gauss_size: Kernel size for displacement smoothing.
             thresh: Relative intensity threshold (0–1) below which reference
                 pixels are ignored.
+            sub_pix_factor: Upsampling factor for sub-pixel displacement
+                searches. ``1`` keeps full-pixel shifts, ``2`` enables half-pixel
+                shifts, and so on.
 
         Returns:
             ``PixelwiseSimilarityResult`` containing correlation scores,
             displacement maps, and target coordinates for each view.
         """
+        if sub_pix_factor < 1:
+            raise ValueError("sub_pix_factor must be >= 1")
+        sub_pix_factor = int(sub_pix_factor)
+
         views_arr = np.asarray(views, dtype=np.float64, copy=True)
         if thresh is not None:
             for i in range(views_arr.shape[0]):
@@ -341,11 +351,6 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             gauss_size = int(gauss_sigma * 6)
         if disp_gauss_sigma is None:
             disp_gauss_sigma = 0.0
-        if disp_gauss_size is None:
-            disp_gauss_size = self.window_radius * 2 + 1
-
-        D = max_disp * 2 + 1
-        disp_arr = np.arange(-max_disp, max_disp + 1)
 
         if views_arr.ndim != 4:
             raise ValueError("views must have shape (N, N, H, W)")
@@ -353,7 +358,32 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         grid_rows, grid_cols, height, width = views_arr.shape
         if grid_rows != grid_cols:
             raise ValueError("views must represent a square grid of views")
-        if self.window_size > height or self.window_size > width:
+        original_height, original_width = height, width
+
+        if sub_pix_factor > 1:
+            resized_views = np.zeros(
+                (grid_rows, grid_cols, height * sub_pix_factor, width * sub_pix_factor),
+                dtype=np.float64,
+            )
+            for i in range(grid_rows):
+                for j in range(grid_cols):
+                    resized_views[i, j] = cv.resize(
+                        views_arr[i, j],
+                        (width * sub_pix_factor, height * sub_pix_factor),
+                        interpolation=cv.INTER_LINEAR,
+                    )
+            views_arr = resized_views
+            height *= sub_pix_factor
+            width *= sub_pix_factor
+
+        effective_window_size = self.window_size * sub_pix_factor
+        effective_window_radius = effective_window_size // 2
+        effective_step_size = 1 if sub_pix_factor > 1 else self.step_size
+        max_disp_scaled = max_disp * sub_pix_factor
+        if disp_gauss_size is None:
+            disp_gauss_size = effective_window_radius * 2 + 1
+
+        if effective_window_size > height or effective_window_size > width:
             raise ValueError("window_size cannot exceed view dimensions")
 
         ref_i, ref_j = ref_view_idx
@@ -365,13 +395,16 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if thresh is not None:
             ref_view[ref_view < np.max(ref_view)*thresh] = 0.0
 
+        D = max_disp_scaled * 2 + 1
+        disp_arr = np.arange(-max_disp_scaled, max_disp_scaled + 1, dtype=np.float32)
+
         corr_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
         if normalized_conv:
             norm_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
-        coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.int32)
+        coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.float32)
         scores = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
-        disps_y = np.zeros((height, width, grid_rows, grid_cols), dtype=np.int32)
-        disps_x = np.zeros((height, width, grid_rows, grid_cols), dtype=np.int32)
+        disps_y = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float32)
+        disps_x = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float32)
         base_coords = np.stack(np.meshgrid(np.arange(height), np.arange(width), indexing="ij"), -1)
         if normalized_conv:
             ref_view_blurred = gaussian_filter(
@@ -384,10 +417,10 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 if i == ref_i and j == ref_j:
                     continue
                 view = views_arr[i, j].astype(np.float32, copy=False)
-                for s_y_ind in range(0, D, self.step_size):
-                    for s_x_ind in range(0, D, self.step_size):
-                        s_y = s_y_ind - max_disp
-                        s_x = s_x_ind - max_disp
+                for s_y_ind in range(0, D, effective_step_size):
+                    for s_x_ind in range(0, D, effective_step_size):
+                        s_y = s_y_ind - max_disp_scaled
+                        s_x = s_x_ind - max_disp_scaled
                         shifted_view = self._roll_with_fill(
                             view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
                         )
@@ -423,8 +456,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 if np.any(zero_mask):
                     idx_y = idx_y.copy()
                     idx_x = idx_x.copy()
-                    idx_y[zero_mask] = max_disp
-                    idx_x[zero_mask] = max_disp
+                    idx_y[zero_mask] = max_disp_scaled
+                    idx_x[zero_mask] = max_disp_scaled
 
                 # compute coordinates: base + displacement, apply gaussian filter if sigma is legal
                 if disp_gauss_sigma is None or disp_gauss_sigma <= 0.0:
@@ -436,7 +469,45 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 coordinates[:, :, i, j, 0] = base_coords[:, :, 0] - disp_arr[idx_y]
                 coordinates[:, :, i, j, 1] = base_coords[:, :, 1] - disp_arr[idx_x]
 
-        return PixelwiseSimilarityResult(coordinates=coordinates, scores=scores, disps_y = disps_y, disps_x = disps_x)
+        if sub_pix_factor > 1:
+            resized_scores = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
+            resized_disps_y = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float32)
+            resized_disps_x = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float32)
+            for i in range(grid_rows):
+                for j in range(grid_cols):
+                    resized_scores[:, :, i, j] = cv.resize(
+                        scores[:, :, i, j],
+                        (original_width, original_height),
+                        interpolation=cv.INTER_LINEAR,
+                    )
+                    resized_disps_y[:, :, i, j] = cv.resize(
+                        disps_y[:, :, i, j],
+                        (original_width, original_height),
+                        interpolation=cv.INTER_LINEAR,
+                    )
+                    resized_disps_x[:, :, i, j] = cv.resize(
+                        disps_x[:, :, i, j],
+                        (original_width, original_height),
+                        interpolation=cv.INTER_LINEAR,
+                    )
+            scores = resized_scores
+            disps_y = resized_disps_y / sub_pix_factor
+            disps_x = resized_disps_x / sub_pix_factor
+            base_coords = np.stack(
+                np.meshgrid(np.arange(original_height), np.arange(original_width), indexing="ij"),
+                -1,
+            ).astype(np.float32)
+            coordinates = np.zeros((original_height, original_width, grid_rows, grid_cols, 2), dtype=np.float32)
+            coordinates[:, :, :, :, 0] = base_coords[:, :, 0][..., None, None] - disps_y
+            coordinates[:, :, :, :, 1] = base_coords[:, :, 1][..., None, None] - disps_x
+
+        return PixelwiseSimilarityResult(
+            coordinates=coordinates,
+            scores=scores,
+            disps_y=disps_y,
+            disps_x=disps_x,
+            sub_pix_factor=sub_pix_factor,
+        )
 
     def rectify(
         self,
