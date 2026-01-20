@@ -179,7 +179,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             rectified_view_stack_arr = np.asarray(rectified_view_stack)
             hdr_views = assemble_HDR(
                 images=[],
-                exposure_times=config.hdr_exposure_times,
+                exposure_times=np.array(config.hdr_exposure_times),
                 views=rectified_view_stack_arr,
             )
             assert isinstance(hdr_views, np.ndarray)
@@ -216,7 +216,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             rectified_view_stack_arr = np.asarray(rectified_view_stack)
             hdr_views = assemble_HDR(
                 images=[],
-                exposure_times=config.hdr_exposure_times,
+                exposure_times=np.array(config.hdr_exposure_times),
                 views=rectified_view_stack_arr,
             )
             assert isinstance(hdr_views, np.ndarray)
@@ -244,7 +244,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             rectified_view_stack_arr = np.asarray(rectified_view_stack)
             hdr_views = assemble_HDR(
                 images=[],
-                exposure_times=config.hdr_exposure_times,
+                exposure_times=np.array(config.hdr_exposure_times),
                 views=rectified_view_stack_arr,
             )
             assert isinstance(hdr_views, np.ndarray)
