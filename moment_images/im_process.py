@@ -63,6 +63,7 @@ class RectificationRunConfig:
     global_threshold: float = 0.25
     pixel_threshold: float = 0.05
     zero_fill_roll: bool = True
+    sub_pix_factor: int = 1
     hdr_enabled: bool = False
     hdr_exposure_times: Optional[List[float]] = None
 
@@ -178,7 +179,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             rectified_view_stack_arr = np.asarray(rectified_view_stack)
             hdr_views = assemble_HDR(
                 images=[],
-                exposure_times=config.hdr_exposure_times,
+                exposure_times=np.array(config.hdr_exposure_times),
                 views=rectified_view_stack_arr,
             )
             assert isinstance(hdr_views, np.ndarray)
@@ -203,6 +204,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             disp_gauss_sigma=config.disp_gauss_sigma,
             disp_gauss_size=config.disp_gauss_size,
             thresh=config.pixel_threshold,
+            sub_pix_factor=config.sub_pix_factor,
         )
         if exposure_views is not None:
             rectified_view_stack = []
@@ -214,7 +216,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             rectified_view_stack_arr = np.asarray(rectified_view_stack)
             hdr_views = assemble_HDR(
                 images=[],
-                exposure_times=config.hdr_exposure_times,
+                exposure_times=np.array(config.hdr_exposure_times),
                 views=rectified_view_stack_arr,
             )
             assert isinstance(hdr_views, np.ndarray)
@@ -242,7 +244,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             rectified_view_stack_arr = np.asarray(rectified_view_stack)
             hdr_views = assemble_HDR(
                 images=[],
-                exposure_times=config.hdr_exposure_times,
+                exposure_times=np.array(config.hdr_exposure_times),
                 views=rectified_view_stack_arr,
             )
             assert isinstance(hdr_views, np.ndarray)
@@ -265,6 +267,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             disp_gauss_sigma=config.disp_gauss_sigma,
             disp_gauss_size=config.disp_gauss_size,
             thresh=config.pixel_threshold,
+            sub_pix_factor=config.sub_pix_factor,
         )
         avg_image, rectified_views = rectification_strategy_pixel.rectify(
             global_rectified_views, pixel_similarity, ref_view_idx
@@ -356,6 +359,8 @@ def generate_rectification_figures(
         # Expect pixel_similarity to expose disps_x and disps_y shaped (H, W, N, N)
         disps_x = getattr(result.pixel_similarity, "disps_x", None)
         disps_y = getattr(result.pixel_similarity, "disps_y", None)
+        sub_pix_factor = getattr(result.pixel_similarity, "sub_pix_factor", 1)
+        subtitle_suffix = f" (sub-pixel factor {sub_pix_factor})" if sub_pix_factor > 1 else ""
         if disps_x is not None and disps_y is not None:
             VG = disps_x.shape[2]  # shape (H, W, N, N)
             fig_x, ax_x = plt.subplots(nrows=VG, ncols=VG, squeeze=False, sharex=True, sharey=True)
@@ -368,8 +373,8 @@ def generate_rectification_figures(
                     ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
                     fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
                     fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
-            fig_x.suptitle("Pixel-Wise X translation similarity")
-            fig_y.suptitle("Pixel-Wise Y translation similarity")
+            fig_x.suptitle(f"Pixel-Wise X translation similarity{subtitle_suffix}")
+            fig_y.suptitle(f"Pixel-Wise Y translation similarity{subtitle_suffix}")
             figures["pixel_maps"].extend([fig_x, fig_y])
 
     # Final rectified views
@@ -1178,6 +1183,8 @@ def main():
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
         disps_y = sim_mat_pixelwise.disps_y
         disps_x = sim_mat_pixelwise.disps_x
+        sub_pix_factor = getattr(sim_mat_pixelwise, "sub_pix_factor", 1)
+        subtitle_suffix = f" (sub-pixel factor {sub_pix_factor})" if sub_pix_factor > 1 else ""
         fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
         created_figures.append(fig_x)
         fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
@@ -1190,8 +1197,8 @@ def main():
                 ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
                 fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
                 fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
-        fig_x.suptitle("X translation similarity")
-        fig_y.suptitle("Y translation similarity")
+        fig_x.suptitle(f"X translation similarity{subtitle_suffix}")
+        fig_y.suptitle(f"Y translation similarity{subtitle_suffix}")
 
         av_rect, rect_images = rectification_strategy.rectify(views, sim_mat_pixelwise, ref_view_choice)
     else:
@@ -1254,6 +1261,8 @@ def main():
         # --- Pixel-wise similarity visualisation (refinement stage) ---
         disps_y = sim_mat_pixelwise.disps_y
         disps_x = sim_mat_pixelwise.disps_x
+        sub_pix_factor = getattr(sim_mat_pixelwise, "sub_pix_factor", 1)
+        subtitle_suffix = f" (sub-pixel factor {sub_pix_factor})" if sub_pix_factor > 1 else ""
         fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
         created_figures.append(fig_x)
         fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
@@ -1266,8 +1275,8 @@ def main():
                 ax_y[idx, jdx].set_title(f"View {idx+1}-{jdx+1} Y translation similarity")
                 fig_x.colorbar(im_x, ax=ax_x[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
                 fig_y.colorbar(im_y, ax=ax_y[idx, jdx], orientation='vertical', fraction=0.02, pad=0.04)
-        fig_x.suptitle("Pixel-Wise X translation similarity")
-        fig_y.suptitle("Pixel-Wise Y translation similarity")
+        fig_x.suptitle(f"Pixel-Wise X translation similarity{subtitle_suffix}")
+        fig_y.suptitle(f"Pixel-Wise Y translation similarity{subtitle_suffix}")
 
         # Perform pixel-wise rectification ONCE on the global-rectified views
         assert isinstance(rectification_strategy_pixel, PixelwisePatchRectificationStrategy)
