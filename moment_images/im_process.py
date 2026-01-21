@@ -894,6 +894,34 @@ def save_figures(figures: List[Figure], save_dir: str, dpi: int = 1000):
         except Exception as e:
             print(f"Failed to save {filename}: {e}")
 
+def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
+    """
+    Save essential workspace variables to a compressed NumPy archive.
+
+    The saved ``.npz`` can be loaded later with ``numpy.load`` for reuse in
+    follow-up analysis sessions.
+    """
+    if not variables:
+        print("No workspace variables provided to save.")
+        return
+    filtered: Dict[str, Any] = {}
+    for key, value in variables.items():
+        if value is None:
+            continue
+        if isinstance(value, Image.Image):
+            filtered[key] = np.asarray(value)
+        else:
+            filtered[key] = value
+    if not filtered:
+        print("No workspace variables available to save.")
+        return
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    try:
+        np.savez_compressed(os.path.join(save_path, "workspace"), **filtered)
+        print(f"Saved workspace variables to: {save_path}")
+    except Exception as exc:
+        print(f"Failed to save workspace variables: {exc}")
+
 def main():
     """Run the interactive light-field rectification workflow."""
     images, image_paths, hdr_flag = get_image_paths()
@@ -944,6 +972,7 @@ def main():
     
     # New: collect created matplotlib figures so we can optionally save them later
     created_figures: List[Figure] = []
+    original_images_chosen: List[np.ndarray] = []
     
     circles_chosen = None
     norm_im_chosen = np.array([])
@@ -970,6 +999,7 @@ def main():
             if input("Use this image for further processing? (y/n): ").lower() == 'y':
                 circles_chosen = circles
                 norm_im_chosen = np.append(norm_im_chosen, im_np)
+                original_images_chosen.append(np.asarray(orig_im))
                 continue
             plt.close("all")
         else:
@@ -993,6 +1023,7 @@ def main():
             if input("Use this image for further processing? (y/n): ").lower() == 'y':
                 circles_chosen = circles
                 norm_im_chosen = np.append(norm_im_chosen, im_np)
+                original_images_chosen.append(np.asarray(orig_im))
                 continue
             plt.close("all")
 
@@ -1067,6 +1098,12 @@ def main():
     
     views_for_rect = np.asarray(views)
     _, ref_view_choice = resolve_reference_view(views_for_rect)
+    sim_mat = None
+    sim_mat_pixelwise = None
+    rect_views_after_global = None
+    av_rect_global = None
+    rect_images = None
+    av_rect = None
 
     # Cleanup of reference view for better correlation
     # view_mask = np.array([val if np.linalg.norm(np.array(np.unravel_index(i, views[ref_view_choice].shape)) - np.array(views[ref_view_choice].shape)//2) < windows[0, 2] else 0 for i, val in enumerate(views[ref_view_choice].flatten())])
@@ -1161,6 +1198,7 @@ def main():
     # Display of similarity matrices
     if rect_strat == 1:
         assert isinstance(rectification_strategy, GlobalTranslationRectificationStrategy)
+        assert sim_mat is not None
         fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
         created_figures.append(fig_x)
         fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
@@ -1179,8 +1217,10 @@ def main():
         # Only run rectify now if we did not already produce HDR-based rectification above
         if gauss_flag != 'y':
             av_rect, rect_images = rectification_strategy.rectify(views, sim_mat, ref_view_choice)
+            rect_views_after_global = rect_images
     elif rect_strat == 2:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
+        assert sim_mat_pixelwise is not None
         disps_y = sim_mat_pixelwise.disps_y
         disps_x = sim_mat_pixelwise.disps_x
         sub_pix_factor = getattr(sim_mat_pixelwise, "sub_pix_factor", 1)
@@ -1203,6 +1243,7 @@ def main():
         av_rect, rect_images = rectification_strategy.rectify(views, sim_mat_pixelwise, ref_view_choice)
     else:
         # --- Global similarity visualisation (uses sim_mat computed earlier) ---
+        assert sim_mat is not None
         disps_y_global = sim_mat[:, :, :, :, 0]
         disps_x_global = sim_mat[:, :, :, :, 1]
         fig_x_global, ax_x_global = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
@@ -1221,6 +1262,7 @@ def main():
         fig_y_global.suptitle("Global Y translation similarity")
 
         # --- Display global-rectified views and overlays (collected for saving) ---
+        assert rect_views_after_global is not None
         for i in range(view_grid_size):
             for j in range(view_grid_size):
                 fig = plt.figure()
@@ -1240,6 +1282,7 @@ def main():
             plt.imshow(overlay)
             plt.title(f"Global Extreme View Overlay ({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})")
 
+        assert av_rect_global is not None
         fig = plt.figure()
         created_figures.append(fig)
         plt.imshow(av_rect_global, cmap="gray")
@@ -1259,6 +1302,7 @@ def main():
         plt.title("Averaged Global Rectified Image - Equalized (clipped, 85%) for contrast")
 
         # --- Pixel-wise similarity visualisation (refinement stage) ---
+        assert sim_mat_pixelwise is not None
         disps_y = sim_mat_pixelwise.disps_y
         disps_x = sim_mat_pixelwise.disps_x
         sub_pix_factor = getattr(sim_mat_pixelwise, "sub_pix_factor", 1)
@@ -1281,16 +1325,20 @@ def main():
         # Perform pixel-wise rectification ONCE on the global-rectified views
         assert isinstance(rectification_strategy_pixel, PixelwisePatchRectificationStrategy)
         av_rect, rect_images = rectification_strategy_pixel.rectify(rect_views_after_global, sim_mat_pixelwise, refined_ref_view_choice)
+        if rect_views_after_global is None:
+            rect_views_after_global = rect_images
     
     # plt.show()    
     # Sharpen image (?)
     sharpen_sets = [(2.0, 2.0), (3.0, 2.0), (2.0, 3.0), (3.0, 3.0)]
     av_rect_sharp = []
+    assert av_rect is not None
     for i in range(len(sharpen_sets)):
         sigma, strength = sharpen_sets[i]
         av_rect_sharp.append(unsharp_mask(av_rect, sigma=sigma, strength=strength))
 
     # Display rectified images views
+    assert rect_images is not None
     for i in range(view_grid_size):
         for j in range(view_grid_size):
             fig = plt.figure()
@@ -1311,6 +1359,7 @@ def main():
     else:
         disp_comp_flag = False
     extreme_overlays = build_extreme_view_overlays(rect_images, ref_index=ref_view_choice)
+    assert rect_views_after_global is not None
     for overlay, (i1, j1), (i2, j2) in extreme_overlays:
         fig = plt.figure()
         created_figures.append(fig)
@@ -1412,6 +1461,38 @@ def main():
             save_dir = input("Enter directory path to save figures (will be created if not exists): ").strip()
             if save_dir:
                 save_figures(created_figures, save_dir, dpi=1000)
+                save_workspace_opt = input(
+                    "Do you want to save essential workspace variables for NumPy loading? (y/n): "
+                ).lower()
+                if save_workspace_opt == 'y':
+                    default_filename = "im_process_workspace.npz"
+                    filename = input(
+                        f"Enter filename for workspace variables (default {default_filename}): "
+                    ).strip() or default_filename
+                    save_path = os.path.join(save_dir, filename)
+                    workspace_data: Dict[str, Any] = {
+                        "original_images": np.stack(original_images_chosen) if original_images_chosen else None,
+                        "normalized_images": norm_im_chosen if norm_im_chosen.size else None,
+                        "extracted_views": views,
+                        "global_rectification_matrix": sim_mat,
+                        "global_rectified_views": rect_views_after_global,
+                        "pixel_displacements_x": disps_x if 'disps_x' in locals() else None,
+                        "pixel_displacements_y": disps_y if 'disps_y' in locals() else None,
+                        "pixel_rectified_views": rect_images if rect_strat in (2, 3) else None,
+                        "average_rectified_image": av_rect,
+                        "average_rectified_global_image": av_rect_global,
+                        "average_rectified_sharpened": np.asarray(av_rect_sharp) if av_rect_sharp else None,
+                        "reference_view_index": np.array(ref_view_choice),
+                        "view_grid_size": np.array(view_grid_size),
+                        "view_distance": np.array(d),
+                        "view_centers": windows,
+                        "rectification_strategy": np.array(rect_strat),
+                        "hdr_enabled": np.array(hdr_flag),
+                        "hdr_exposure_times": exp_times if 'exp_times' in locals() else None,
+                        "gaussian_hdr": np.array(gauss_flag),
+                        "image_paths": np.array(image_paths),
+                    }
+                    save_workspace_variables(save_path, workspace_data)
             else:
                 print("No directory entered. Skipping save.")
     # Close all figures afterwards
