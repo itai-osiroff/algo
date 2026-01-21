@@ -1198,6 +1198,7 @@ def main():
     # Display of similarity matrices
     if rect_strat == 1:
         assert isinstance(rectification_strategy, GlobalTranslationRectificationStrategy)
+        assert sim_mat is not None
         fig_x, ax_x = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
         created_figures.append(fig_x)
         fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
@@ -1219,6 +1220,7 @@ def main():
             rect_views_after_global = rect_images
     elif rect_strat == 2:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
+        assert sim_mat_pixelwise is not None
         disps_y = sim_mat_pixelwise.disps_y
         disps_x = sim_mat_pixelwise.disps_x
         sub_pix_factor = getattr(sim_mat_pixelwise, "sub_pix_factor", 1)
@@ -1241,6 +1243,7 @@ def main():
         av_rect, rect_images = rectification_strategy.rectify(views, sim_mat_pixelwise, ref_view_choice)
     else:
         # --- Global similarity visualisation (uses sim_mat computed earlier) ---
+        assert sim_mat is not None
         disps_y_global = sim_mat[:, :, :, :, 0]
         disps_x_global = sim_mat[:, :, :, :, 1]
         fig_x_global, ax_x_global = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
@@ -1259,6 +1262,7 @@ def main():
         fig_y_global.suptitle("Global Y translation similarity")
 
         # --- Display global-rectified views and overlays (collected for saving) ---
+        assert rect_views_after_global is not None
         for i in range(view_grid_size):
             for j in range(view_grid_size):
                 fig = plt.figure()
@@ -1278,6 +1282,7 @@ def main():
             plt.imshow(overlay)
             plt.title(f"Global Extreme View Overlay ({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})")
 
+        assert av_rect_global is not None
         fig = plt.figure()
         created_figures.append(fig)
         plt.imshow(av_rect_global, cmap="gray")
@@ -1297,6 +1302,7 @@ def main():
         plt.title("Averaged Global Rectified Image - Equalized (clipped, 85%) for contrast")
 
         # --- Pixel-wise similarity visualisation (refinement stage) ---
+        assert sim_mat_pixelwise is not None
         disps_y = sim_mat_pixelwise.disps_y
         disps_x = sim_mat_pixelwise.disps_x
         sub_pix_factor = getattr(sim_mat_pixelwise, "sub_pix_factor", 1)
@@ -1326,11 +1332,13 @@ def main():
     # Sharpen image (?)
     sharpen_sets = [(2.0, 2.0), (3.0, 2.0), (2.0, 3.0), (3.0, 3.0)]
     av_rect_sharp = []
+    assert av_rect is not None
     for i in range(len(sharpen_sets)):
         sigma, strength = sharpen_sets[i]
         av_rect_sharp.append(unsharp_mask(av_rect, sigma=sigma, strength=strength))
 
     # Display rectified images views
+    assert rect_images is not None
     for i in range(view_grid_size):
         for j in range(view_grid_size):
             fig = plt.figure()
@@ -1351,6 +1359,7 @@ def main():
     else:
         disp_comp_flag = False
     extreme_overlays = build_extreme_view_overlays(rect_images, ref_index=ref_view_choice)
+    assert rect_views_after_global is not None
     for overlay, (i1, j1), (i2, j2) in extreme_overlays:
         fig = plt.figure()
         created_figures.append(fig)
