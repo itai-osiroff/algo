@@ -56,7 +56,7 @@ def summarize_array(value: np.ndarray, output_path: Path) -> Dict[str, Any]:
 
 def write_loader(output_dir: Path, index_name: str) -> None:
     loader_path = output_dir / DEFAULT_LOADER_NAME
-    loader_code = f""""""Load unpacked im_process workspace arrays."""
+    loader_code = f"""\"\"\"Load unpacked im_process workspace arrays.\"\"\"
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ INDEX_NAME = "{index_name}"
 
 
 def load_workspace(base_dir: Path | None = None) -> Dict[str, np.ndarray]:
-    """Load all workspace arrays into a dictionary."""
+    \"\"\"Load all workspace arrays into a dictionary.\"\"\"
     root = base_dir or Path(__file__).resolve().parent
     index_path = root / INDEX_NAME
     data = json.loads(index_path.read_text())
