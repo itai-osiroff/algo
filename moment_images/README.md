@@ -60,3 +60,28 @@ python -m moment_images.parameter_sweep --views path/to/views.npy
 ```
 
 Progress is reported with `tqdm`, and the output directory defaults to `sweep_runs/<timestamp>` when not specified. Figure saving runs headlessly and does not display the plots while producing files matching the interactive sizes and formats.
+
+## Unpacking im_process workspace archives
+
+When you choose to save workspace variables from the interactive pipeline, `im_process.py` writes a compressed `workspace.npz` archive. To unpack the archive into individual `.npy` files and a ready-to-import loader script, run:
+
+```bash
+python -m moment_images.unpack_workspace path/to/workspace.npz
+```
+
+By default this creates a `<archive>_unpacked/` folder next to the archive with:
+
+- `workspace_index.json` describing each array (shape/dtype).
+- One `.npy` file per array.
+- `load_workspace.py` for loading everything back into a Python session.
+
+Load the saved arrays later with:
+
+```python
+from pathlib import Path
+from moment_images.unpack_workspace import unpack_workspace
+
+# Or use the loader script in the unpacked directory:
+# from load_workspace import load_workspace
+# workspace = load_workspace(Path("path/to/workspace_unpacked"))
+```
