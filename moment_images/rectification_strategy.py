@@ -65,7 +65,7 @@ class PixelwiseSimilarityResult:
     scores: np.ndarray
     disps_y: np.ndarray
     disps_x: np.ndarray
-    sub_pix_factor: int = 1
+    sub_pix_factor: int = 2
     reference_is_external: bool = False
 
 
@@ -305,7 +305,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         gauss_sigma: Optional[float] = None, gauss_size: Optional[int] = None,
         disp_gauss_sigma: Optional[float] = None, disp_gauss_size: Optional[int] = None,
         thresh: Optional[float] = None, normalized_conv: Optional[bool] = True,
-        sub_pix_factor: int = 1,
+        sub_pix_factor: int = 2,
         reference_view: Optional[np.ndarray] = None,
     ) -> PixelwiseSimilarityResult:
         """
