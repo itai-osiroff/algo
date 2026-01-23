@@ -64,6 +64,7 @@ class RectificationRunConfig:
     pixel_threshold: float = 0.05
     zero_fill_roll: bool = True
     sub_pix_factor: int = 1
+    combined_use_global_avg_reference: bool = True
     hdr_enabled: bool = False
     hdr_exposure_times: Optional[List[float]] = None
 
@@ -258,6 +259,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         rectification_strategy_pixel = PixelwisePatchRectificationStrategy(
             config.refinement_window_size, zero_fill_roll=config.zero_fill_roll
         )
+        reference_view = global_avg_image if config.combined_use_global_avg_reference else None
         pixel_similarity = rectification_strategy_pixel.compute_similarity_matrices(
             global_rectified_views,
             ref_view_idx,
@@ -268,6 +270,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             disp_gauss_size=config.disp_gauss_size,
             thresh=config.pixel_threshold,
             sub_pix_factor=config.sub_pix_factor,
+            reference_view=reference_view,
         )
         avg_image, rectified_views = rectification_strategy_pixel.rectify(
             global_rectified_views, pixel_similarity, ref_view_idx
@@ -1104,6 +1107,7 @@ def main():
     av_rect_global = None
     rect_images = None
     av_rect = None
+    use_global_avg_reference = False
 
     # Cleanup of reference view for better correlation
     # view_mask = np.array([val if np.linalg.norm(np.array(np.unravel_index(i, views[ref_view_choice].shape)) - np.array(views[ref_view_choice].shape)//2) < windows[0, 2] else 0 for i, val in enumerate(views[ref_view_choice].flatten())])
@@ -1181,17 +1185,33 @@ def main():
             sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
             av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(views, sim_mat, ref_view_choice)
         
+        use_global_avg_reference = (
+            input(
+                "Use averaged global-rectified image as reference for pixel-wise rectification? (Y/n): "
+            ).strip().lower()
+            != 'n'
+        )
+        reference_view = av_rect_global if use_global_avg_reference else None
+
         # Prepare pixel-wise similarity on the global-rectified views (refinement)
         if gauss_flag == 'y':
             refined_ref_view_choice = ref_view_choice
             sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
-                hdr_views, refined_ref_view_choice, max_disp=refinement_window_size//2,thresh=0.05
+                hdr_views,
+                refined_ref_view_choice,
+                max_disp=refinement_window_size//2,
+                thresh=0.05,
+                reference_view=reference_view,
             )
         else:
             refined_ref_view_choice = ref_view_choice
             assert isinstance(rect_views_after_global, np.ndarray)
             sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
-                rect_views_after_global, refined_ref_view_choice, max_disp=refinement_window_size//2,thresh=0.05
+                rect_views_after_global,
+                refined_ref_view_choice,
+                max_disp=refinement_window_size//2,
+                thresh=0.05,
+                reference_view=reference_view,
             )
 
     # Assemble and display similarity matrix

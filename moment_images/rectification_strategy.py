@@ -66,6 +66,7 @@ class PixelwiseSimilarityResult:
     disps_y: np.ndarray
     disps_x: np.ndarray
     sub_pix_factor: int = 1
+    reference_is_external: bool = False
 
 
 class RectificationStrategy(ABC):
@@ -305,6 +306,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         disp_gauss_sigma: Optional[float] = None, disp_gauss_size: Optional[int] = None,
         thresh: Optional[float] = None, normalized_conv: Optional[bool] = True,
         sub_pix_factor: int = 1,
+        reference_view: Optional[np.ndarray] = None,
     ) -> PixelwiseSimilarityResult:
         """
         Perform per-pixel patch correlation between each view and the reference.
@@ -390,8 +392,22 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if not (0 <= ref_i < grid_rows and 0 <= ref_j < grid_cols):
             raise ValueError("ref_view_idx must point to a valid view inside views")
 
-        # Setting up and thresholding the reference view according to percentages from maximal value
-        ref_view = views_arr[ref_i, ref_j].astype(np.float32, copy=True)
+        reference_is_external = reference_view is not None
+        if reference_is_external:
+            ref_view = np.asarray(reference_view, dtype=np.float32)
+            if ref_view.ndim != 2:
+                raise ValueError("reference_view must be a 2D array matching a single view")
+            if ref_view.shape == (original_height, original_width) and sub_pix_factor > 1:
+                ref_view = cv.resize(
+                    ref_view,
+                    (width, height),
+                    interpolation=cv.INTER_LINEAR,
+                )
+            if ref_view.shape != (height, width):
+                raise ValueError("reference_view must match the view dimensions")
+        else:
+            # Setting up and thresholding the reference view according to percentages from maximal value
+            ref_view = views_arr[ref_i, ref_j].astype(np.float32, copy=True)
         if thresh is not None:
             ref_view[ref_view < np.max(ref_view)*thresh] = 0.0
 
@@ -414,7 +430,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                                                 mode="constant")
         for i in range(grid_rows):
             for j in range(grid_cols):
-                if i == ref_i and j == ref_j:
+                if not reference_is_external and i == ref_i and j == ref_j:
                     continue
                 view = views_arr[i, j].astype(np.float32, copy=False)
                 for s_y_ind in range(0, D, effective_step_size):
@@ -507,6 +523,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             disps_y=disps_y,
             disps_x=disps_x,
             sub_pix_factor=sub_pix_factor,
+            reference_is_external=reference_is_external,
         )
 
     def rectify(
@@ -563,9 +580,10 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         base_mapping = self._identity_mapping(height, width)
         base_y = base_mapping[:, :, 0]
         base_x = base_mapping[:, :, 1]
+        reference_is_external = getattr(sim_result, "reference_is_external", False)
         for i in range(grid_rows):
             for j in range(grid_cols):
-                if i == ref_i and j == ref_j:
+                if not reference_is_external and i == ref_i and j == ref_j:
                     rectified_views[i, j] = views_arr[i, j]
                     continue
 
