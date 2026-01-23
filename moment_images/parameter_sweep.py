@@ -247,6 +247,7 @@ def sweep_parameters(
     live_plot: bool = False,
     hdr_enabled: bool = False,
     hdr_exposure_times: Sequence[float] | None = None,
+    combined_use_global_avg_reference: bool = True,
 ) -> None:
     default_config = RectificationRunConfig()
     global_thresholds = list(global_thresholds or [default_config.global_threshold])
@@ -308,6 +309,7 @@ def sweep_parameters(
             pixel_threshold=pixel_thresh,
             hdr_enabled=hdr_enabled,
             hdr_exposure_times=list(hdr_exposure_times) if hdr_exposure_times is not None else None,
+            combined_use_global_avg_reference=combined_use_global_avg_reference,
         )
 
         result = rectify_views_from_config(views, config)
@@ -413,6 +415,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--live-plot",
         action="store_true",
         help="Display a live graph of tracked metrics while the sweep runs",
+    )
+    parser.add_argument(
+        "--use-global-avg-reference",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use the averaged global-rectified image as the pixel-wise reference when"
+            " running the combined strategy"
+        ),
     )
     parser.add_argument(
         "--gui",
@@ -537,6 +548,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         live_plot=args.live_plot,
         hdr_enabled=args.hdr_assemble,
         hdr_exposure_times=exposure_times,
+        combined_use_global_avg_reference=args.use_global_avg_reference,
     )
     return output_dir
 
@@ -659,6 +671,13 @@ def _launch_gui() -> None:
         row=len(labels) + 4, column=1, sticky="w", padx=6, pady=2
     )
 
+    use_global_avg_reference_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(
+        root,
+        text="Use global-rectified average as combined reference",
+        variable=use_global_avg_reference_var,
+    ).grid(row=len(labels) + 5, column=1, sticky="w", padx=6, pady=2)
+
     def start_sweep() -> None:
         try:
             args = argparse.Namespace(
@@ -696,6 +715,7 @@ def _launch_gui() -> None:
                 hdr_exposure_times=entries["hdr_exposure_times"].get().strip() or None,
                 analyze=analyze_var.get(),
                 live_plot=live_plot_var.get(),
+                use_global_avg_reference=use_global_avg_reference_var.get(),
             )
         except ValueError as exc:
             messagebox.showerror("Invalid input", str(exc))
@@ -713,7 +733,7 @@ def _launch_gui() -> None:
         root.destroy()
 
     tk.Button(root, text="Start sweep", command=start_sweep).grid(
-        row=len(labels) + 5, column=1, pady=8
+        row=len(labels) + 6, column=1, pady=8
     )
 
     root.mainloop()
