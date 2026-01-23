@@ -60,7 +60,7 @@ class RectificationRunConfig:
     gauss_size: Optional[int] = None
     disp_gauss_sigma: Optional[float] = None
     disp_gauss_size: Optional[int] = None
-    global_threshold: float = 0.25
+    global_threshold: float = 0.15
     pixel_threshold: float = 0.05
     zero_fill_roll: bool = True
     sub_pix_factor: int = 1
@@ -1122,7 +1122,7 @@ def main():
         # exposure, then assemble HDR from the per-exposure rectified stacks.
         if gauss_flag == 'y':
             sim_mat = rectification_strategy.compute_similarity_matrix(
-                views[0, :, :, :, :], ref_view_choice, thresh=0.25
+                views[0, :, :, :, :], ref_view_choice, thresh=0.15
             )
             rectified_view_stack = []
             for i in range(views.shape[0]):
@@ -1138,7 +1138,7 @@ def main():
             av_rect = np.mean(hdr_views, axis=(0, 1))
             rect_images = hdr_views
         else:
-            sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
+            sim_mat = rectification_strategy.compute_similarity_matrix(views, ref_view_choice, thresh=0.15)
     elif rect_strat == 2:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
         # Similar flow for pixel-wise-only mode: compute pixel similarity on the
@@ -1168,7 +1168,7 @@ def main():
         # Compute global similarity and perform global rectification ONCE.
         
         if gauss_flag == 'y':
-            sim_mat = rectification_strategy_global.compute_similarity_matrix(views[0, :, : ,: ,:], ref_view_choice, thresh=0.25)
+            sim_mat = rectification_strategy_global.compute_similarity_matrix(views[0, :, : ,: ,:], ref_view_choice, thresh=0.15)
             rectified_view_stack = []
             for i in range(views.shape[0]):
                 av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(
@@ -1182,7 +1182,7 @@ def main():
             rect_views_after_global = hdr_views
             av_rect_global = np.mean(hdr_views, axis=(0, 1))
         else:
-            sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.25)
+            sim_mat = rectification_strategy_global.compute_similarity_matrix(views, ref_view_choice, thresh=0.15)
             av_rect_global, rect_views_after_global = rectification_strategy_global.rectify(views, sim_mat, ref_view_choice)
         
         use_global_avg_reference = (
