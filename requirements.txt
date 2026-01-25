@@ -1,6 +1,6 @@
 Django
 h5py
-matlabengine
+matlabengine; python_version < "3.14"
 matplotlib
 numpy
 opencv-python
