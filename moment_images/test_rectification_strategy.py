@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -123,6 +124,43 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
 
         self.assertAlmostEqual(rectified_views[0, 1, 1, 1], 1.0)
         np.testing.assert_allclose(avg_image[1, 1], (rectified_views[:, :, 1, 1].sum()) / 4)
+
+    def test_sigma_pyramid_stops_when_sigma_below_threshold(self) -> None:
+        views = np.zeros((1, 1, 2, 2), dtype=np.float32)
+        zero_coords = np.zeros((2, 2, 1, 1, 2), dtype=np.float32)
+        zero_scores = np.zeros((2, 2, 1, 1), dtype=np.float64)
+        zero_disps = np.zeros((2, 2, 1, 1), dtype=np.float32)
+        fake_result = PixelwiseSimilarityResult(
+            coordinates=zero_coords,
+            scores=zero_scores,
+            disps_y=zero_disps,
+            disps_x=zero_disps,
+        )
+        with mock.patch.object(
+            self.strategy,
+            "_compute_similarity_matrices_single",
+            return_value=fake_result,
+        ) as mock_compute:
+            self.strategy.compute_similarity_matrices(
+                views,
+                (0, 0),
+                gauss_sigma=2,
+                use_sigma_pyramid=True,
+            )
+            self.assertEqual(mock_compute.call_count, 1)
+
+        with mock.patch.object(
+            self.strategy,
+            "_compute_similarity_matrices_single",
+            return_value=fake_result,
+        ) as mock_compute:
+            self.strategy.compute_similarity_matrices(
+                views,
+                (0, 0),
+                gauss_sigma=4,
+                use_sigma_pyramid=True,
+            )
+            self.assertEqual(mock_compute.call_count, 2)
 
 
 if __name__ == "__main__":

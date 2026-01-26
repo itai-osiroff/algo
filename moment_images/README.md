@@ -14,6 +14,10 @@ The script will prompt you for image selection and viewpoint choices. Figures ar
 
 > Tip: When running from the repository root, Python automatically discovers the package thanks to the script-local import helper, so no extra `PYTHONPATH` configuration is required.
 
+### Pixelwise sigma pyramid refinement
+
+When running the pixelwise strategy via `RectificationRunConfig`, you can enable `pixel_sigma_pyramid=True` to iteratively refine per-pixel translations by halving the Gaussian blur sigma until it drops below 3 or the displacement updates converge (≤ 1 pixel). Updates that deviate more than 2 pixels from the initial large-sigma estimate are rejected to avoid false matches. This option is off by default.
+
 ## Sweeping rectification parameters
 
 Use `parameter_sweep.py` to iterate over window sizes, displacement limits, and Gaussian smoothing values while saving results for each combination. You can launch a minimal GUI for configuring the sweep (no CLI flags required) with:

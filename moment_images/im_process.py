@@ -62,6 +62,7 @@ class RectificationRunConfig:
     disp_gauss_size: Optional[int] = None
     global_threshold: float = 0.15
     pixel_threshold: float = 0.05
+    pixel_sigma_pyramid: bool = False
     zero_fill_roll: bool = True
     sub_pix_factor: int = 1
     combined_use_global_avg_reference: bool = True
@@ -206,6 +207,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             disp_gauss_size=config.disp_gauss_size,
             thresh=config.pixel_threshold,
             sub_pix_factor=config.sub_pix_factor,
+            use_sigma_pyramid=config.pixel_sigma_pyramid,
         )
         if exposure_views is not None:
             rectified_view_stack = []
@@ -271,6 +273,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             thresh=config.pixel_threshold,
             sub_pix_factor=config.sub_pix_factor,
             reference_view=reference_view,
+            use_sigma_pyramid=config.pixel_sigma_pyramid,
         )
         avg_image, rectified_views = rectification_strategy_pixel.rectify(
             global_rectified_views, pixel_similarity, ref_view_idx
