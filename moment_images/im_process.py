@@ -920,7 +920,7 @@ def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
         return
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     try:
-        np.savez_compressed(os.path.join(save_path, "workspace"), **filtered)
+        np.savez_compressed(os.path.join(save_path), **filtered)
         print(f"Saved workspace variables to: {save_path}")
     except Exception as exc:
         print(f"Failed to save workspace variables: {exc}")
