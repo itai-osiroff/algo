@@ -620,12 +620,15 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             & (np.abs(candidate_disps_x - baseline_disps_x) <= 2)
         )
 
-        constrained_disps_y = np.where(allowed_mask, candidate_disps_y, baseline_disps_y)
-        constrained_disps_x = np.where(allowed_mask, candidate_disps_x, baseline_disps_x)
+        current_disps_y = np.asarray(current_result.disps_y)
+        current_disps_x = np.asarray(current_result.disps_x)
+
+        constrained_disps_y = np.where(allowed_mask, candidate_disps_y, current_disps_y)
+        constrained_disps_x = np.where(allowed_mask, candidate_disps_x, current_disps_x)
         constrained_scores = np.where(
             allowed_mask,
             np.asarray(candidate_result.scores),
-            np.asarray(baseline_result.scores),
+            np.asarray(current_result.scores),
         )
 
         height, width = constrained_disps_y.shape[:2]
@@ -640,8 +643,6 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         coordinates[:, :, :, :, 0] = base_coords[:, :, 0][..., None, None] - constrained_disps_y
         coordinates[:, :, :, :, 1] = base_coords[:, :, 1][..., None, None] - constrained_disps_x
 
-        current_disps_y = np.asarray(current_result.disps_y)
-        current_disps_x = np.asarray(current_result.disps_x)
         converged = np.all(np.abs(constrained_disps_y - current_disps_y) <= 1) and np.all(
             np.abs(constrained_disps_x - current_disps_x) <= 1
         )
