@@ -64,7 +64,7 @@ class RectificationRunConfig:
     pixel_threshold: float = 0.05
     pixel_sigma_pyramid: bool = False
     zero_fill_roll: bool = True
-    sub_pix_factor: int = 1
+    sub_pix_factor: int = 2
     combined_use_global_avg_reference: bool = True
     hdr_enabled: bool = False
     hdr_exposure_times: Optional[List[float]] = None
@@ -1226,7 +1226,7 @@ def main():
         created_figures.append(fig_x)
         fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
         created_figures.append(fig_y)
-        for idx in range(view_grid_size):    
+        for idx in range(view_grid_size):
             for jdx in range(view_grid_size): 
                 im_x = ax_x[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 1], cmap="gray")
                 im_y = ax_y[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 0], cmap="gray")
