@@ -531,7 +531,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                                                                       shift_x=s_x,
                                                                         zero_fill=self.zero_fill_roll)
                             norm_mat_view[:, :, s_y_ind, s_x_ind] = gaussian_filter(
-                                norm_shifted_view*2,
+                                norm_shifted_view**2,
                                   sigma=gauss_sigma,
                                     truncate=(gauss_size/gauss_sigma),
                                       mode="constant")
