@@ -491,9 +491,6 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         D = max_disp_scaled * 2 + 1
         disp_arr = np.arange(-max_disp_scaled, max_disp_scaled + 1, dtype=np.float32)
 
-        corr_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
-        if normalized_conv:
-            norm_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.float32)
         scores = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
         disps_y = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float32)
@@ -509,6 +506,12 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             for j in range(grid_cols):
                 if not reference_is_external and i == ref_i and j == ref_j:
                     continue
+
+                corr_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
+                norm_mat_view = None
+                if normalized_conv:
+                    norm_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
+
                 view = views_arr[i, j].astype(np.float32, copy=False)
                 for s_y_ind in range(0, D, effective_step_size):
                     for s_x_ind in range(0, D, effective_step_size):
@@ -517,7 +520,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         shifted_view = self._roll_with_fill(
                             view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
                         )
-                        corr_mats[:, :, i, j, s_y_ind, s_x_ind] = gaussian_filter(
+                        corr_mat_view[:, :, s_y_ind, s_x_ind] = gaussian_filter(
                             ref_view * shifted_view,
                             sigma=gauss_sigma,
                             truncate=(gauss_size/ gauss_sigma),
@@ -527,16 +530,17 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                             norm_shifted_view = self._roll_with_fill(view, shift_y=s_y,
                                                                       shift_x=s_x,
                                                                         zero_fill=self.zero_fill_roll)
-                            norm_mats[:, :, i, j, s_y_ind, s_x_ind] = gaussian_filter(
+                            norm_mat_view[:, :, s_y_ind, s_x_ind] = gaussian_filter(
                                 norm_shifted_view*2,
                                   sigma=gauss_sigma,
                                     truncate=(gauss_size/gauss_sigma),
                                       mode="constant")
                 if normalized_conv:
-                        norm_mats[: ,:, i, j, :, :] = np.sqrt(norm_mats[:, :, i, j, :, :]*np.tile(ref_view_blurred, [D, D, 1, 1]).T)
-                        norm_mats[:, : ,i, j, :, :] = norm_mats[:, :, i, j, :, :] + 0.1*np.max(norm_mats[:, :, i, j, :, :])
-                        corr_mats[:, :, i, j, :, :] = corr_mats[:, :, i, j, :, :] / norm_mats[:, : ,i ,j, : , :]
-                corr_stack = corr_mats[:, :, i, j, :, :]  # shape (H, W, D, D)
+                        norm_mat_view = np.sqrt(norm_mat_view * ref_view_blurred[:, :, None, None])
+                        norm_mat_view = norm_mat_view + 0.1 * np.max(norm_mat_view)
+                        corr_mat_view = corr_mat_view / norm_mat_view
+
+                corr_stack = corr_mat_view  # shape (H, W, D, D)
                 max_val = np.max(corr_stack, axis=(2, 3))
                 scores[:, :, i, j] = max_val
 
