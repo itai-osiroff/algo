@@ -355,7 +355,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             )
 
         base_sigma = 7 if gauss_sigma is None else gauss_sigma
-        base_size = int(base_sigma * 6) if gauss_size is None else gauss_size
+        base_size = int(base_sigma * 5) if gauss_size is None else gauss_size
         baseline_result = self._compute_similarity_matrices_single(
             views,
             ref_view_idx,
@@ -377,7 +377,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             if next_sigma == current_sigma or next_sigma < 1:
                 break
 
-            next_size = int(next_sigma * 6) if gauss_size is None else gauss_size
+            next_size = int(next_sigma * 5) if gauss_size is None else gauss_size
             candidate_result = self._compute_similarity_matrices_single(
                 views,
                 ref_view_idx,
@@ -427,7 +427,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if gauss_sigma is None:
             gauss_sigma = 7
         if gauss_size is None:
-            gauss_size = int(gauss_sigma * 6)
+            gauss_size = int(gauss_sigma * 5)
         if disp_gauss_sigma is None:
             disp_gauss_sigma = 0.0
 
@@ -454,6 +454,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             views_arr = resized_views
             height *= sub_pix_factor
             width *= sub_pix_factor
+            gauss_sigma *= sub_pix_factor
+            gauss_size = int(gauss_sigma * 5)
 
         effective_window_size = self.window_size * sub_pix_factor
         effective_window_radius = effective_window_size // 2
@@ -527,9 +529,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                             mode="constant",
                         )
                         if normalized_conv:
-                            norm_shifted_view = self._roll_with_fill(view, shift_y=s_y,
-                                                                      shift_x=s_x,
-                                                                        zero_fill=self.zero_fill_roll)
+                            norm_shifted_view = shifted_view.copy()
                             norm_mat_view[:, :, s_y_ind, s_x_ind] = gaussian_filter(
                                 norm_shifted_view**2,
                                   sigma=gauss_sigma,
