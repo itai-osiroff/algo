@@ -6,8 +6,8 @@ from moment_images.rectification_strategy import PixelwisePatchRectificationStra
 class TestRectificationStrategyPyramid(unittest.TestCase):
 
     def setUp(self):
-        self.strategy = PixelwisePatchRectificationStrategy()
-        self.h, self.w = 10, 10
+        self.strategy = PixelwisePatchRectificationStrategy(window_size=11, step_size=1)
+        self.h, self.w = 20, 20
         self.grid_rows, self.grid_cols = 1, 1
 
     def _create_result(self, val):
@@ -25,71 +25,39 @@ class TestRectificationStrategyPyramid(unittest.TestCase):
         )
 
     @patch.object(PixelwisePatchRectificationStrategy, '_compute_similarity_matrices_single')
-    def test_sigma_pyramid_sequence_and_constraint(self, mock_compute):
+    def test_sigma_pyramid_sequence_and_chaining(self, mock_compute):
         # Scenario:
-        # Step 1 (Sigma 7): Return 0. Baseline = 0.
-        # Step 2 (Sigma 4): Return 1.5.
-        #   Diff vs Baseline(0) is 1.5. Valid (<=2). Current -> 1.5.
-        #   Diff vs Old Current (0) is 1.5 (>1). Not converged.
-        # Step 3 (Sigma 2): Return 5.
-        #   Diff vs Baseline(0) is 5. Invalid (>2).
-        #   Constraint logic:
-        #     If reverts to baseline: new val is 0. Diff vs Old Current(1.5) is 1.5. Not converged?
-        #     If keeps current: new val is 1.5. Diff vs Old Current(1.5) is 0. Converged.
+        # Step 1 (Sigma 7): Returns Res1.
+        # Step 2 (Sigma 3): Called with prev_result=Res1. Returns Res2.
+        # Step 3 (Sigma 1): Called with prev_result=Res2. Returns Res3.
+
+        res1 = self._create_result(1.0)
+        res2 = self._create_result(2.0)
+        res3 = self._create_result(3.0)
 
         def side_effect(*args, **kwargs):
             sigma = kwargs.get('gauss_sigma')
+            prev = kwargs.get('prev_result')
+
             if sigma == 7:
-                return self._create_result(0.0)
-            elif sigma == 4:
-                return self._create_result(1.5)
-            elif sigma == 2:
-                return self._create_result(5.0)
+                # First call, prev should be None (or not passed)
+                if prev is not None:
+                     raise AssertionError("First call should have prev_result=None")
+                return res1
+            elif sigma == 3:
+                if prev is not res1:
+                    raise AssertionError("Second call should use res1 as prev_result")
+                return res2
+            elif sigma == 1:
+                if prev is not res2:
+                    raise AssertionError("Third call should use res2 as prev_result")
+                return res3
             return self._create_result(0.0)
 
         mock_compute.side_effect = side_effect
 
-        views = np.zeros((1, 1, 10, 10))
-        # gauss_sigma=7 triggers the 7 -> 4 -> 2 sequence
-        res = self.strategy.compute_similarity_matrices(
-            views, (0, 0),
-            use_sigma_pyramid=True,
-            gauss_sigma=7
-        )
-
-        # Verify call sequence
-        calls = mock_compute.call_args_list
-        sigmas = [c.kwargs['gauss_sigma'] for c in calls]
-        self.assertEqual(sigmas, [7, 4.0, 2.0], "Should iterate through sigmas 7, 4, 2")
-
-        # Verify result logic
-        # If the code reverts to baseline (0) on error, this will be 0.
-        # If the code keeps previous value (1.5) on error, this will be 1.5.
-        self.assertEqual(res.disps_y[0,0,0,0], 1.5,
-                         "Should keep the previous valid value (1.5) when the new value (5.0) deviates too much from baseline (0.0)")
-
-    @patch.object(PixelwisePatchRectificationStrategy, '_compute_similarity_matrices_single')
-    def test_sigma_pyramid_convergence(self, mock_compute):
-        # Scenario: Convergence
-        # Step 1 (Sigma 7): 0.
-        # Step 2 (Sigma 4): 0.5. Diff vs 0 is 0.5 (<=1). Converged?
-        # Check logic: converged = np.all(abs(constrained - current) <= 1)
-        # constrained (0.5) - current (0) = 0.5 <= 1. True.
-        # So it should stop after Sigma 4, and NOT run Sigma 2.
-
-        def side_effect(*args, **kwargs):
-            sigma = kwargs.get('gauss_sigma')
-            if sigma == 7:
-                return self._create_result(0.0)
-            elif sigma == 4:
-                return self._create_result(0.5)
-            elif sigma == 2:
-                return self._create_result(100.0) # Should not be reached
-            return self._create_result(0.0)
-
-        mock_compute.side_effect = side_effect
-
-        views = np.zeros((1, 1, 10, 10))
+        views = np.zeros((1, 1, 20, 20))
+        # gauss_sigma=7 triggers 7 -> 3 -> 1
         res = self.strategy.compute_similarity_matrices(
             views, (0, 0),
             use_sigma_pyramid=True,
@@ -97,6 +65,50 @@ class TestRectificationStrategyPyramid(unittest.TestCase):
         )
 
         calls = mock_compute.call_args_list
-        sigmas = [c.kwargs['gauss_sigma'] for c in calls]
-        self.assertEqual(sigmas, [7, 4.0], "Should stop after sigma 4 due to convergence")
-        self.assertEqual(res.disps_y[0,0,0,0], 0.5)
+        sigmas = [c.kwargs.get('gauss_sigma') for c in calls]
+        self.assertEqual(sigmas, [7, 3, 1], "Should iterate through sigmas 7, 3, 1")
+        self.assertIs(res, res3)
+
+    def test_masking_logic_in_single_step(self):
+        # Use actual implementation logic (no mock) to test the masking
+        H, W = 20, 20
+        views = np.zeros((1, 1, H, W), dtype=np.float32)
+
+        # Reference: dot at 10, 10
+        ref_view = np.zeros((H, W), dtype=np.float32)
+        ref_view[10, 10] = 1.0
+
+        # View: dot at 10, 5. Correct displacement is (0, 5).
+        views[0, 0, 10, 5] = 1.0
+
+        # Run WITHOUT prev_result
+        # max_disp=5
+        # It should find (0, 5).
+        res = self.strategy._compute_similarity_matrices_single(
+            views, (0, 0), max_disp=5,
+            reference_view=ref_view,
+            sub_pix_factor=1,
+            normalized_conv=False,
+            gauss_sigma=0.1,
+            gauss_size=1
+        )
+        self.assertEqual(res.disps_x[10,10,0,0], 5.0)
+
+        # Now create a prev_result saying disp is (0, 0).
+        # Window +/- 2. So range [-2, 2].
+        # (0, 5) is outside.
+        # It should NOT find (0, 5).
+        prev_result = self._create_result(0.0) # all zeros
+
+        res_constrained = self.strategy._compute_similarity_matrices_single(
+            views, (0, 0), max_disp=5,
+            reference_view=ref_view,
+            sub_pix_factor=1,
+            normalized_conv=False,
+            gauss_sigma=0.1,
+            gauss_size=1,
+            prev_result=prev_result
+        )
+
+        self.assertNotEqual(res_constrained.disps_x[10,10,0,0], 5.0)
+        self.assertLessEqual(abs(res_constrained.disps_x[10,10,0,0]), 2.0)

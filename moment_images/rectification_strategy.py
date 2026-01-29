@@ -356,7 +356,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
         base_sigma = 7 if gauss_sigma is None else gauss_sigma
         base_size = int(base_sigma * 5) if gauss_size is None else gauss_size
-        baseline_result = self._compute_similarity_matrices_single(
+        current_result = self._compute_similarity_matrices_single(
             views,
             ref_view_idx,
             max_disp=max_disp,
@@ -370,15 +370,14 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             reference_view=reference_view,
         )
 
-        current_result = baseline_result
-        current_sigma = float(base_sigma)
-        while current_sigma >= 3:
-            next_sigma = float(np.ceil(current_sigma / 2.0))
-            if next_sigma == current_sigma or next_sigma < 1:
+        current_sigma = int(base_sigma)
+        while current_sigma > 1:
+            next_sigma = int(current_sigma / 2)
+            if next_sigma < 1:
                 break
 
             next_size = int(next_sigma * 5) if gauss_size is None else gauss_size
-            candidate_result = self._compute_similarity_matrices_single(
+            current_result = self._compute_similarity_matrices_single(
                 views,
                 ref_view_idx,
                 max_disp=max_disp,
@@ -390,16 +389,10 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 normalized_conv=normalized_conv,
                 sub_pix_factor=sub_pix_factor,
                 reference_view=reference_view,
+                prev_result=current_result,
             )
 
-            current_result, converged = self._constrain_sigma_pyramid_update(
-                baseline_result,
-                current_result,
-                candidate_result,
-            )
             current_sigma = next_sigma
-            if current_sigma < 3 or converged:
-                break
 
         return current_result
 
@@ -410,6 +403,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         thresh: Optional[float] = None, normalized_conv: Optional[bool] = True,
         sub_pix_factor: int = 2,
         reference_view: Optional[np.ndarray] = None,
+        prev_result: Optional[PixelwiseSimilarityResult] = None,
     ) -> PixelwiseSimilarityResult:
         """Compute pixelwise similarity matrices for a single Gaussian sigma."""
         if sub_pix_factor < 1:
@@ -541,6 +535,25 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         corr_mat_view = corr_mat_view / norm_mat_view
 
                 corr_stack = corr_mat_view  # shape (H, W, D, D)
+
+                if prev_result is not None:
+                    p_dy = prev_result.disps_y[:, :, i, j]
+                    p_dx = prev_result.disps_x[:, :, i, j]
+
+                    if sub_pix_factor > 1:
+                        p_dy = cv.resize(p_dy, (width, height), interpolation=cv.INTER_NEAREST)
+                        p_dx = cv.resize(p_dx, (width, height), interpolation=cv.INTER_NEAREST)
+                        # Scale displacements to match scaled resolution
+                        p_dy = p_dy * sub_pix_factor
+                        p_dx = p_dx * sub_pix_factor
+
+                    limit = 2.0 * sub_pix_factor
+
+                    mask_y = np.abs(disp_arr[None, None, :] - p_dy[:, :, None]) <= limit
+                    mask_x = np.abs(disp_arr[None, None, :] - p_dx[:, :, None]) <= limit
+
+                    corr_stack *= (mask_y[:, :, :, None] & mask_x[:, :, None, :])
+
                 max_val = np.max(corr_stack, axis=(2, 3))
                 scores[:, :, i, j] = max_val
 
@@ -605,62 +618,6 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             disps_x=disps_x,
             sub_pix_factor=sub_pix_factor,
             reference_is_external=reference_is_external,
-        )
-
-    @staticmethod
-    def _constrain_sigma_pyramid_update(
-        baseline_result: PixelwiseSimilarityResult,
-        current_result: PixelwiseSimilarityResult,
-        candidate_result: PixelwiseSimilarityResult,
-    ) -> Tuple[PixelwiseSimilarityResult, bool]:
-        """Apply sigma pyramid constraints and report convergence status."""
-        baseline_disps_y = np.asarray(baseline_result.disps_y)
-        baseline_disps_x = np.asarray(baseline_result.disps_x)
-        candidate_disps_y = np.asarray(candidate_result.disps_y)
-        candidate_disps_x = np.asarray(candidate_result.disps_x)
-
-        allowed_mask = (
-            (np.abs(candidate_disps_y - baseline_disps_y) <= 2)
-            & (np.abs(candidate_disps_x - baseline_disps_x) <= 2)
-        )
-
-        current_disps_y = np.asarray(current_result.disps_y)
-        current_disps_x = np.asarray(current_result.disps_x)
-
-        constrained_disps_y = np.where(allowed_mask, candidate_disps_y, current_disps_y)
-        constrained_disps_x = np.where(allowed_mask, candidate_disps_x, current_disps_x)
-        constrained_scores = np.where(
-            allowed_mask,
-            np.asarray(candidate_result.scores),
-            np.asarray(current_result.scores),
-        )
-
-        height, width = constrained_disps_y.shape[:2]
-        base_coords = np.stack(
-            np.meshgrid(np.arange(height), np.arange(width), indexing="ij"),
-            -1,
-        ).astype(np.float32)
-        coordinates = np.zeros(
-            (height, width) + constrained_disps_y.shape[2:] + (2,),
-            dtype=np.float32,
-        )
-        coordinates[:, :, :, :, 0] = base_coords[:, :, 0][..., None, None] - constrained_disps_y
-        coordinates[:, :, :, :, 1] = base_coords[:, :, 1][..., None, None] - constrained_disps_x
-
-        converged = np.all(np.abs(constrained_disps_y - current_disps_y) <= 1) and np.all(
-            np.abs(constrained_disps_x - current_disps_x) <= 1
-        )
-
-        return (
-            PixelwiseSimilarityResult(
-                coordinates=coordinates,
-                scores=constrained_scores,
-                disps_y=constrained_disps_y,
-                disps_x=constrained_disps_x,
-                sub_pix_factor=candidate_result.sub_pix_factor,
-                reference_is_external=candidate_result.reference_is_external,
-            ),
-            converged,
         )
 
     def rectify(
