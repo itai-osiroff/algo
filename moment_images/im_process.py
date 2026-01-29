@@ -930,6 +930,7 @@ def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
     The saved ``.npz`` can be loaded later with ``numpy.load`` for reuse in
     follow-up analysis sessions.
     """
+    import scipy.io
     if not variables:
         print("No workspace variables provided to save.")
         return
@@ -947,9 +948,13 @@ def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     try:
         np.savez_compressed(os.path.join(save_path), **filtered)
-        print(f"Saved workspace variables to: {save_path}")
+        print(f"Saved .npy workspace variables to: {save_path}")
     except Exception as exc:
-        print(f"Failed to save workspace variables: {exc}")
+        print(f"Failed to save .npy workspace variables: {exc}")
+    try:
+        scipy.io.savemat(os.path.join(save_path.replace(".npz", ".mat")), filtered)
+    except Exception as e:
+        print(f"Failed to save .mat file: {e}")
 
 def main():
     """Run the interactive light-field rectification workflow."""
