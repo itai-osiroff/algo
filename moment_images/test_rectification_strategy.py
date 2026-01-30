@@ -147,7 +147,8 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
                 gauss_sigma=2,
                 use_sigma_pyramid=True,
             )
-            self.assertEqual(mock_compute.call_count, 1)
+            # 2 -> 1
+            self.assertEqual(mock_compute.call_count, 2)
 
         with mock.patch.object(
             self.strategy,
@@ -160,7 +161,8 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
                 gauss_sigma=4,
                 use_sigma_pyramid=True,
             )
-            self.assertEqual(mock_compute.call_count, 2)
+            # 4 -> 2 -> 1
+            self.assertEqual(mock_compute.call_count, 3)
 
 
 if __name__ == "__main__":

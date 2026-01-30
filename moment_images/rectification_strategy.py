@@ -503,39 +503,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 if not reference_is_external and i == ref_i and j == ref_j:
                     continue
 
-                corr_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
-                norm_mat_view = None
-                if normalized_conv:
-                    norm_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
-
-                view = views_arr[i, j].astype(np.float32, copy=False)
-                for s_y_ind in range(0, D, effective_step_size):
-                    for s_x_ind in range(0, D, effective_step_size):
-                        s_y = s_y_ind - max_disp_scaled
-                        s_x = s_x_ind - max_disp_scaled
-                        shifted_view = self._roll_with_fill(
-                            view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
-                        )
-                        corr_mat_view[:, :, s_y_ind, s_x_ind] = gaussian_filter(
-                            ref_view * shifted_view,
-                            sigma=gauss_sigma,
-                            truncate=(gauss_size/ gauss_sigma),
-                            mode="constant",
-                        )
-                        if normalized_conv:
-                            norm_shifted_view = shifted_view.copy()
-                            norm_mat_view[:, :, s_y_ind, s_x_ind] = gaussian_filter(
-                                norm_shifted_view**2,
-                                  sigma=gauss_sigma,
-                                    truncate=(gauss_size/gauss_sigma),
-                                      mode="constant")
-                if normalized_conv:
-                        norm_mat_view = np.sqrt(norm_mat_view * ref_view_blurred[:, :, None, None])
-                        norm_mat_view = norm_mat_view + 0.1 * np.max(norm_mat_view)
-                        corr_mat_view = corr_mat_view / norm_mat_view
-
-                corr_stack = corr_mat_view  # shape (H, W, D, D)
-
+                p_dy, p_dx = None, None
+                limit = None
                 if prev_result is not None:
                     p_dy = prev_result.disps_y[:, :, i, j]
                     p_dx = prev_result.disps_x[:, :, i, j]
@@ -549,11 +518,47 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
                     limit = 2.0 * sub_pix_factor
 
-                    mask_y = np.abs(disp_arr[None, None, :] - p_dy[:, :, None]) <= limit
-                    mask_x = np.abs(disp_arr[None, None, :] - p_dx[:, :, None]) <= limit
+                corr_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
+                norm_mat_view = None
+                if normalized_conv:
+                    norm_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
 
-                    corr_stack *= (mask_y[:, :, :, None] & mask_x[:, :, None, :])
+                view = views_arr[i, j].astype(np.float32, copy=False)
+                for s_y_ind in range(0, D, effective_step_size):
+                    for s_x_ind in range(0, D, effective_step_size):
+                        s_y = s_y_ind - max_disp_scaled
+                        s_x = s_x_ind - max_disp_scaled
+                        shifted_view = self._roll_with_fill(
+                            view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
+                        )
+                        corr = gaussian_filter(
+                            ref_view * shifted_view,
+                            sigma=gauss_sigma,
+                            truncate=(gauss_size/ gauss_sigma),
+                            mode="constant",
+                        )
 
+                        if p_dy is not None:
+                            current_dy = disp_arr[s_y_ind]
+                            current_dx = disp_arr[s_x_ind]
+                            mask = (np.abs(p_dy - current_dy) <= limit) & (np.abs(p_dx - current_dx) <= limit)
+                            corr[~mask] = 0.0
+
+                        corr_mat_view[:, :, s_y_ind, s_x_ind] = corr
+
+                        if normalized_conv:
+                            norm_shifted_view = shifted_view.copy()
+                            norm_mat_view[:, :, s_y_ind, s_x_ind] = gaussian_filter(
+                                norm_shifted_view**2,
+                                  sigma=gauss_sigma,
+                                    truncate=(gauss_size/gauss_sigma),
+                                      mode="constant")
+                if normalized_conv:
+                        norm_mat_view = np.sqrt(norm_mat_view * ref_view_blurred[:, :, None, None])
+                        norm_mat_view = norm_mat_view + 0.1 * np.max(norm_mat_view)
+                        corr_mat_view = corr_mat_view / norm_mat_view
+
+                corr_stack = corr_mat_view  # shape (H, W, D, D)
                 max_val = np.max(corr_stack, axis=(2, 3))
                 scores[:, :, i, j] = max_val
 
