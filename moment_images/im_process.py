@@ -1228,6 +1228,18 @@ def main():
         )
         reference_view = av_rect_global if use_global_avg_reference else None
 
+    # Debug mode - small region
+        # crop_i = [71//2, 278//2]
+        # crop_j = [266//2, 414//2]
+        # debug_views = np.zeros((rect_views_after_global.shape[0], rect_views_after_global.shape[1], crop_i[1]-crop_i[0], crop_j[1]-crop_j[0]))
+        # for i in range(view_grid_size):
+        #     for j in range(view_grid_size):
+        #         debug_views[i, j, :, :] = rect_views_after_global[i, j, crop_i[0]:crop_i[1], crop_j[0]:crop_j[1]]
+        # rect_views_after_global = debug_views
+        # reference_view = reference_view[crop_i[0]:crop_i[1], crop_j[0]:crop_j[1]] if reference_view is not None else None
+        # av_rect_global = av_rect_global[crop_i[0]:crop_i[1], crop_j[0]:crop_j[1]] if av_rect_global is not None else None
+    # End debug mode
+
         # Prepare pixel-wise similarity on the global-rectified views (refinement)
         if gauss_flag == 'y':
             refined_ref_view_choice = ref_view_choice
