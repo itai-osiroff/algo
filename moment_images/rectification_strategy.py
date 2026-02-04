@@ -554,9 +554,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                                     truncate=(gauss_size/gauss_sigma),
                                       mode="constant")
                 if normalized_conv:
-                        norm_mat_view = np.sqrt(norm_mat_view * ref_view_blurred[:, :, None, None])
-                        norm_mat_view = norm_mat_view + 0.1 * np.max(norm_mat_view)
-                        corr_mat_view = corr_mat_view / norm_mat_view
+                    norm_mat_view = np.sqrt(norm_mat_view * ref_view_blurred[:, :, None, None])
+                    norm_mat_view = norm_mat_view + 0.1 * np.max(norm_mat_view)
+                    corr_mat_view = corr_mat_view / norm_mat_view
 
                 corr_stack = corr_mat_view  # shape (H, W, D, D)
                 max_val = np.max(corr_stack, axis=(2, 3))
