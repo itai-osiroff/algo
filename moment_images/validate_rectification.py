@@ -13,7 +13,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.widgets import RectangleSelector
 import numpy as np
 import cv2 as cv
-from PIL import Image, ImageEnhance
+from PIL import Image
 
 # Ensure local modules can be imported
 if __package__ is None or __package__ == "":
@@ -37,29 +37,30 @@ class InteractiveImageAdjuster:
         if self.original_image_pil is None:
             raise ValueError(f"Could not load image: {image_path}")
 
-        # Keep original mode for saturation adjustment, but ensure it's RGB if we want to adjust color
-        if self.original_image_pil.mode not in ('RGB', 'L'):
-             self.original_image_pil = self.original_image_pil.convert('RGB')
+        # Geometric state (rotated/flipped)
+        # We work with the original PIL image for geometric transforms to handle high bit depth if possible
+        # but PIL rotation might convert 16-bit to something else depending on version.
+        # Safest is to keep it in PIL for now.
+        self.geo_image_pil = self.original_image_pil.copy()
+
+        # Calculate raw min/max for the sliders
+        # We use numpy for this
+        raw_arr = np.asarray(self.original_image_pil)
+        self.raw_min_val = float(raw_arr.min())
+        self.raw_max_val = float(raw_arr.max())
+
+        # Display range state (min/max intensity)
+        self.display_min = self.raw_min_val
+        self.display_max = self.raw_max_val
 
         # Reference image (numpy array, likely grayscale)
         self.reference_image = reference_image
-
-        # Geometric state (rotated/flipped)
-        self.geo_image_pil = self.original_image_pil.copy()
-
-        # Display state (enhanced)
-        self.current_image_pil = self.geo_image_pil.copy()
 
         # Transformations state
         self.rotation = 0 # 0, 90, 180, 270
         self.flip_h = False
         self.flip_v = False
         self.crop_box = None # (left, upper, right, lower)
-
-        # Enhancement state
-        self.brightness = 1.0
-        self.contrast = 1.0
-        self.saturation = 1.0
 
         self.show_ref_var = tk.BooleanVar(value=False)
 
@@ -85,24 +86,27 @@ class InteractiveImageAdjuster:
         self.btn_crop = tk.Button(geo_frame, text="Crop: OFF", command=self._toggle_crop)
         self.btn_crop.pack(side=tk.LEFT, padx=2)
 
-        # Enhancement controls
-        enh_frame = tk.LabelFrame(toolbar_frame, text="Enhance")
+        # Enhancement controls (Min/Max Intensity)
+        enh_frame = tk.LabelFrame(toolbar_frame, text="Range")
         enh_frame.pack(side=tk.LEFT, padx=5, fill=tk.Y)
 
-        tk.Label(enh_frame, text="Bright:").pack(side=tk.LEFT)
-        self.scale_bright = Scale(enh_frame, from_=0.1, to=3.0, resolution=0.1, orient=tk.HORIZONTAL, command=self._on_scale_change)
-        self.scale_bright.set(1.0)
-        self.scale_bright.pack(side=tk.LEFT, padx=2)
+        # We need a range that makes sense.
+        # If the image is 16-bit, values can be 0-65535.
+        # Resolution needs to be granular enough.
 
-        tk.Label(enh_frame, text="Contr:").pack(side=tk.LEFT)
-        self.scale_contr = Scale(enh_frame, from_=0.1, to=3.0, resolution=0.1, orient=tk.HORIZONTAL, command=self._on_scale_change)
-        self.scale_contr.set(1.0)
-        self.scale_contr.pack(side=tk.LEFT, padx=2)
+        tk.Label(enh_frame, text="Min:").pack(side=tk.LEFT)
+        self.scale_min = Scale(enh_frame, from_=self.raw_min_val, to=self.raw_max_val,
+                               resolution=(self.raw_max_val - self.raw_min_val)/200.0 if self.raw_max_val != self.raw_min_val else 1,
+                               orient=tk.HORIZONTAL, command=self._on_scale_change)
+        self.scale_min.set(self.raw_min_val)
+        self.scale_min.pack(side=tk.LEFT, padx=2)
 
-        tk.Label(enh_frame, text="Sat:").pack(side=tk.LEFT)
-        self.scale_sat = Scale(enh_frame, from_=0.0, to=3.0, resolution=0.1, orient=tk.HORIZONTAL, command=self._on_scale_change)
-        self.scale_sat.set(1.0)
-        self.scale_sat.pack(side=tk.LEFT, padx=2)
+        tk.Label(enh_frame, text="Max:").pack(side=tk.LEFT)
+        self.scale_max = Scale(enh_frame, from_=self.raw_min_val, to=self.raw_max_val,
+                               resolution=(self.raw_max_val - self.raw_min_val)/200.0 if self.raw_max_val != self.raw_min_val else 1,
+                               orient=tk.HORIZONTAL, command=self._on_scale_change)
+        self.scale_max.set(self.raw_max_val)
+        self.scale_max.pack(side=tk.LEFT, padx=2)
 
         # Reference checkbox
         if self.reference_image is not None:
@@ -127,47 +131,32 @@ class InteractiveImageAdjuster:
         self.crop_active = False
 
     def _on_scale_change(self, _):
-        self.brightness = self.scale_bright.get()
-        self.contrast = self.scale_contr.get()
-        self.saturation = self.scale_sat.get()
-        self._update_image_enhancement()
+        self.display_min = self.scale_min.get()
+        self.display_max = self.scale_max.get()
 
-    def _update_image_enhancement(self):
-        # Apply enhancements to the geometric image
-        img = self.geo_image_pil.copy()
+        # Ensure min < max
+        if self.display_min >= self.display_max:
+             # Prevent crossing
+             # Either clamp or ignore?
+             # If user drags min past max, maybe push max?
+             pass
 
-        # Brightness
-        if self.brightness != 1.0:
-            enhancer = ImageEnhance.Brightness(img)
-            img = enhancer.enhance(self.brightness)
-
-        # Contrast
-        if self.contrast != 1.0:
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(self.contrast)
-
-        # Saturation (only if RGB)
-        if self.saturation != 1.0 and img.mode != 'L':
-             enhancer = ImageEnhance.Color(img)
-             img = enhancer.enhance(self.saturation)
-
-        self.current_image_pil = img
         self._update_display()
 
     def _rotate(self, angle):
         self.geo_image_pil = self.geo_image_pil.rotate(angle, expand=True)
         self.crop_box = None
-        self._update_image_enhancement()
+        self._update_display()
 
     def _flip_h(self):
         self.geo_image_pil = self.geo_image_pil.transpose(Image.FLIP_LEFT_RIGHT)
         self.crop_box = None
-        self._update_image_enhancement()
+        self._update_display()
 
     def _flip_v(self):
         self.geo_image_pil = self.geo_image_pil.transpose(Image.FLIP_TOP_BOTTOM)
         self.crop_box = None
-        self._update_image_enhancement()
+        self._update_display()
 
     def _toggle_crop(self):
         self.crop_active = not self.crop_active
@@ -185,13 +174,31 @@ class InteractiveImageAdjuster:
 
     def _reset(self):
         self.geo_image_pil = self.original_image_pil.copy()
-        self.scale_bright.set(1.0)
-        self.scale_contr.set(1.0)
-        self.scale_sat.set(1.0)
+        self.scale_min.set(self.raw_min_val)
+        self.scale_max.set(self.raw_max_val)
+        self.display_min = self.raw_min_val
+        self.display_max = self.raw_max_val
         self.crop_box = None
         self.crop_active = False
         self.btn_crop.config(text="Crop: OFF", bg="SystemButtonFace")
-        self._update_image_enhancement()
+        self._update_display()
+
+    def _get_display_image(self):
+        # Convert geometric PIL image to numpy
+        img_arr = np.asarray(self.geo_image_pil).astype(np.float32)
+
+        # Apply normalization based on display_min / display_max
+        # Clip to range
+        clipped = np.clip(img_arr, self.display_min, self.display_max)
+
+        # Scale to 0-255
+        divisor = (self.display_max - self.display_min)
+        if divisor <= 1e-8:
+            divisor = 1.0 # avoid div by zero, output will be 0
+
+        normalized = (clipped - self.display_min) / divisor * 255.0
+
+        return normalized.astype(np.uint8)
 
     def _update_display(self):
         if not hasattr(self, 'fig'): return
@@ -211,13 +218,10 @@ class InteractiveImageAdjuster:
         else:
             ax_edit = self.fig.add_subplot(111)
 
-        im_array = np.asarray(self.current_image_pil)
-        if self.current_image_pil.mode == 'L':
-             ax_edit.imshow(im_array, cmap='gray')
-        else:
-             ax_edit.imshow(im_array)
+        display_img = self._get_display_image()
 
-        ax_edit.set_title("Adjust Image")
+        ax_edit.imshow(display_img, cmap='gray')
+        ax_edit.set_title("Adjust Image (Min/Max Scaling)")
 
         # Re-initialize selector
         self.rs = RectangleSelector(
@@ -236,24 +240,33 @@ class InteractiveImageAdjuster:
         self.canvas.draw()
 
     def _finish(self):
-        # Apply crop if selected
-        final_img = self.current_image_pil
+        # We need to return the final image with geometry AND the intensity scaling applied.
+        # First, we need to handle crop on the geometric image if it exists.
+
+        final_pil = self.geo_image_pil
         if self.crop_box:
             xmin, xmax, ymin, ymax = self.rs.extents
-            w, h = final_img.size
+            w, h = final_pil.size
             xmin = max(0, min(xmin, w))
             xmax = max(0, min(xmax, w))
             ymin = max(0, min(ymin, h))
             ymax = max(0, min(ymax, h))
 
             if xmax > xmin and ymax > ymin:
-                final_img = final_img.crop((xmin, ymin, xmax, ymax))
+                final_pil = final_pil.crop((xmin, ymin, xmax, ymax))
 
-        # Convert to grayscale for downstream processing if not already
-        if final_img.mode != 'L':
-             final_img = final_img.convert('L')
+        # Now convert to numpy and apply the intensity scaling
+        img_arr = np.asarray(final_pil).astype(np.float32)
 
-        self.result_image = np.asarray(final_img)
+        # Apply normalization based on display_min / display_max
+        clipped = np.clip(img_arr, self.display_min, self.display_max)
+        divisor = (self.display_max - self.display_min)
+        if divisor <= 1e-8:
+            divisor = 1.0
+
+        normalized = (clipped - self.display_min) / divisor * 255.0
+
+        self.result_image = normalized.astype(np.uint8)
         self.is_done = True
         self.top.destroy()
         self.master.quit()
