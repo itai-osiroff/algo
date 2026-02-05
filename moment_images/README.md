@@ -18,6 +18,7 @@ This package focuses on rectifying light-field view grids extracted from graysca
 - `parameter_sweep.py` — CLI/GUI runner that drives rectification over a parameter grid.
 - `sweep_analysis.py` — Metric computation and aggregation for sweep outputs.
 - `unpack_workspace.py` — GUI helper for unpacking `.npz` workspace archives saved by `im_process.py`.
+- `validate_rectification.py` — Tool to validate rectification results against new images from other cameras.
 
 ---
 
@@ -216,6 +217,38 @@ Metrics include:
 - **Laplacian energy**: sum of squared Laplacian response.
 
 `analyze_summary_data()` aggregates these across all runs and records minima, maxima, and means, which are then saved by `save_analysis()`.
+
+---
+
+## Validation tool (`validate_rectification.py`)
+
+This tool allows you to validate your rectification results by comparing the rectified workspace output against new images from other cameras (e.g., Validation Camera, Thorcam).
+
+### Features
+
+- **Interactive Adjustment**:
+  - Rotate (Left/Right 90°), Flip (Horizontal/Vertical).
+  - Crop tool.
+  - **Image Enhancement**: Adjust Brightness, Contrast, and Saturation.
+  - **Side-by-Side View**: Compare the image being edited with the reference global average from the workspace.
+- **Auto-Alignment**: Optionally automatically align the validation images to the rectified reference using ECC (Enhanced Correlation Coefficient) translation alignment.
+- **Comparison**: Generates overlay anaglyphs, difference maps, and side-by-side figures.
+
+### Usage
+
+1. Run the script:
+   ```bash
+   python -m moment_images.validate_rectification
+   ```
+2. Select the `im_process` workspace file (`.npz`) containing the rectified result.
+3. Select the Validation Camera image and Thorcam image when prompted.
+4. Use the interactive window to adjust each image.
+   - Use sliders to match the brightness/contrast of the reference.
+   - Toggle "Show Ref" to see the reference image side-by-side.
+   - Click "Done" when satisfied.
+5. Choose whether to perform **Auto Alignment** to refine the registration.
+6. Inspect the generated comparison figures.
+7. Save the results and workspace if desired.
 
 ---
 
