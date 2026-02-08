@@ -27,7 +27,7 @@ else:
 class InteractiveImageAdjuster:
     """GUI to adjust an image (rotate, flip, crop) before processing."""
 
-    def __init__(self, master, image_path, reference_image=None, title="Adjust Image"):
+    def __init__(self, master, image_path, reference_image=None, title="Adjust Image", camera_type=None):
         self.master = master
         self.top = tk.Toplevel(master)
         self.top.title(title)
@@ -42,6 +42,9 @@ class InteractiveImageAdjuster:
         # but PIL rotation might convert 16-bit to something else depending on version.
         # Safest is to keep it in PIL for now.
         self.geo_image_pil = self.original_image_pil.copy()
+        
+        # Apply default operations based on camera type
+        self._apply_default_operations(camera_type)
 
         # Calculate raw min/max for the sliders
         # We use numpy for this
@@ -69,6 +72,16 @@ class InteractiveImageAdjuster:
 
         self._init_ui()
         self._update_display()
+
+    def _apply_default_operations(self, camera_type):
+        """Apply default geometric operations based on camera type."""
+        if camera_type == "validation":
+            # Right rotation -> flip vertical
+            self.geo_image_pil = self.geo_image_pil.rotate(-90, expand=True)  # Right rotation
+            self.geo_image_pil = self.geo_image_pil.transpose(Image.FLIP_TOP_BOTTOM)  # Flip vertical
+        elif camera_type == "thorcam":
+            # Right rotation
+            self.geo_image_pil = self.geo_image_pil.rotate(-90, expand=True)  # Right rotation
 
     def _init_ui(self):
         # Toolbar Frame
@@ -411,7 +424,7 @@ def main():
 
     # 4. Process Validation Image
     print("Adjusting Validation Image...")
-    adj_val = InteractiveImageAdjuster(root, val_path, reference_image=rectified_img, title="Adjust Validation Image")
+    adj_val = InteractiveImageAdjuster(root, val_path, reference_image=rectified_img, title="Adjust Validation Image", camera_type="validation")
     val_processed = adj_val.run()
     if val_processed is None:
         print("Validation image processing cancelled.")
@@ -419,7 +432,7 @@ def main():
 
     # 5. Process Thorcam Image
     print("Adjusting Thorcam Image...")
-    adj_thor = InteractiveImageAdjuster(root, thor_path, reference_image=rectified_img, title="Adjust Thorcam Image")
+    adj_thor = InteractiveImageAdjuster(root, thor_path, reference_image=rectified_img, title="Adjust Thorcam Image", camera_type="thorcam")
     thor_processed = adj_thor.run()
     if thor_processed is None:
         print("Thorcam image processing cancelled.")
