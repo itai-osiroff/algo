@@ -289,66 +289,311 @@ class InteractiveImageAdjuster:
         self.top.wait_window()
         return self.result_image
 
-def auto_align_images(ref_img: np.ndarray, target_img: np.ndarray) -> np.ndarray:
+
+class InteractiveScaleAdjuster:
+    """GUI to anisotropically scale an image against an optional reference."""
+
+    def __init__(self, master, input_image: np.ndarray, reference_image=None, title="Scale Correct Image"):
+        self.master = master
+        self.top = tk.Toplevel(master)
+        self.top.title(title)
+        self.top.geometry("1100x800")
+
+        self.input_image = np.asarray(input_image)
+        if self.input_image.ndim == 3:
+            self.input_image = cv.cvtColor(self.input_image, cv.COLOR_BGR2GRAY)
+
+        self.reference_image = reference_image
+        if self.reference_image is not None and self.reference_image.ndim == 3:
+            self.reference_image = cv.cvtColor(self.reference_image, cv.COLOR_BGR2GRAY)
+
+        self.scale_x_var = tk.DoubleVar(value=1.0)
+        self.scale_y_var = tk.DoubleVar(value=1.0)
+        self.show_ref_var = tk.BooleanVar(value=False)
+        self.resize_for_downstream_var = tk.BooleanVar(value=True)
+        self.resize_for_downstream = True
+
+        self.result_image = None
+        self.top.protocol("WM_DELETE_WINDOW", self._cancel)
+        self._init_ui()
+        self._update_display()
+
+    def _init_ui(self):
+        toolbar_frame = tk.Frame(self.top)
+        toolbar_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        scale_frame = tk.LabelFrame(toolbar_frame, text="Scale")
+        scale_frame.pack(side=tk.LEFT, padx=5, fill=tk.Y)
+
+        tk.Label(scale_frame, text="X Scale:").pack(side=tk.LEFT, padx=(4, 0))
+        self.scale_x = Scale(
+            scale_frame,
+            from_=0.2,
+            to=3.0,
+            resolution=0.01,
+            orient=tk.HORIZONTAL,
+            variable=self.scale_x_var,
+            command=self._on_scale_change,
+            length=220,
+        )
+        self.scale_x.pack(side=tk.LEFT, padx=4)
+
+        tk.Label(scale_frame, text="Y Scale:").pack(side=tk.LEFT, padx=(8, 0))
+        self.scale_y = Scale(
+            scale_frame,
+            from_=0.2,
+            to=3.0,
+            resolution=0.01,
+            orient=tk.HORIZONTAL,
+            variable=self.scale_y_var,
+            command=self._on_scale_change,
+            length=220,
+        )
+        self.scale_y.pack(side=tk.LEFT, padx=4)
+
+        if self.reference_image is not None:
+            tk.Checkbutton(
+                toolbar_frame,
+                text="Show Ref",
+                variable=self.show_ref_var,
+                command=self._update_display,
+            ).pack(side=tk.LEFT, padx=10)
+
+        tk.Checkbutton(
+            toolbar_frame,
+            text="Resize To Ref Downstream",
+            variable=self.resize_for_downstream_var,
+        ).pack(side=tk.LEFT, padx=10)
+
+        tk.Button(toolbar_frame, text="Reset", command=self._reset).pack(side=tk.LEFT, padx=10)
+        tk.Button(toolbar_frame, text="Done", command=self._finish, bg="green", fg="white").pack(side=tk.RIGHT, padx=5)
+
+        self.fig = Figure(figsize=(10, 8), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.top)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.toolbar = NavigationToolbar2Tk(self.canvas, self.top)
+        self.toolbar.update()
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def _on_scale_change(self, _):
+        self._update_display()
+
+    @staticmethod
+    def _scale_image(
+        src_img: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+    ) -> np.ndarray:
+        src_h, src_w = src_img.shape[:2]
+
+        scaled_w = max(1, int(round(src_w * scale_x)))
+        scaled_h = max(1, int(round(src_h * scale_y)))
+        return cv.resize(src_img, (scaled_w, scaled_h), interpolation=cv.INTER_LINEAR)
+
+    def _build_scaled_output(self) -> np.ndarray:
+        return self._scale_image(
+            self.input_image,
+            float(self.scale_x_var.get()),
+            float(self.scale_y_var.get()),
+        )
+
+    def _update_display(self):
+        if not hasattr(self, "fig"):
+            return
+
+        self.fig.clf()
+        scaled_img = self._build_scaled_output()
+        display_img = im_process.min_max_normalize(scaled_img)
+
+        show_ref = self.show_ref_var.get() and self.reference_image is not None
+        if show_ref:
+            ax_ref = self.fig.add_subplot(121)
+            ax_ref.imshow(self.reference_image, cmap="gray")
+            ax_ref.set_title("Reference (Global Avg)")
+            ax_edit = self.fig.add_subplot(122)
+        else:
+            ax_edit = self.fig.add_subplot(111)
+
+        ax_edit.imshow(display_img, cmap="gray")
+        ax_edit.set_title(
+            f"Scale Corrected (X={self.scale_x_var.get():.2f}, Y={self.scale_y_var.get():.2f})"
+        )
+        self.canvas.draw()
+
+    def _reset(self):
+        self.scale_x_var.set(1.0)
+        self.scale_y_var.set(1.0)
+        self._update_display()
+
+    def _finish(self):
+        self.result_image = self._build_scaled_output()
+        self.resize_for_downstream = bool(self.resize_for_downstream_var.get())
+        self.top.destroy()
+        self.master.quit()
+
+    def _cancel(self):
+        self.result_image = None
+        self.resize_for_downstream = bool(self.resize_for_downstream_var.get())
+        self.top.destroy()
+        self.master.quit()
+
+    def run(self):
+        self.top.wait_window()
+        return self.result_image
+
+
+def _normalize_to_uint8(img: np.ndarray) -> np.ndarray:
+    """Convert arbitrary-range grayscale image to uint8 for robust matching."""
+    norm = im_process.min_max_normalize(img)
+    return np.asarray(norm).astype(np.uint8)
+
+
+def _find_template_match(search_img: np.ndarray, template_img: np.ndarray) -> tuple[int, int, float]:
+    """Find template location in search image using normalized cross-correlation."""
+    search_u8 = _normalize_to_uint8(search_img)
+    template_u8 = _normalize_to_uint8(template_img)
+    match = cv.matchTemplate(search_u8, template_u8, cv.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv.minMaxLoc(match)
+    return int(max_loc[0]), int(max_loc[1]), float(max_val)
+
+
+def prepare_images_for_comparison(
+    ref_img: np.ndarray,
+    target_img: np.ndarray,
+    resize_to_reference: bool = True,
+) -> tuple[np.ndarray, np.ndarray, str, float | None]:
+    """
+    Build shape-compatible image pair for downstream overlay/diff comparison.
+    """
+    ref_h, ref_w = ref_img.shape[:2]
+    tgt_h, tgt_w = target_img.shape[:2]
+
+    if resize_to_reference:
+        if (tgt_h, tgt_w) == (ref_h, ref_w):
+            return ref_img, target_img, "same_shape", None
+        target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
+        return ref_img, target_resized, "resized_to_reference", None
+
+    # Containment mode: compare overlapping ROI without global resize.
+    if tgt_h <= ref_h and tgt_w <= ref_w:
+        x, y, score = _find_template_match(ref_img, target_img)
+        ref_roi = ref_img[y:y + tgt_h, x:x + tgt_w]
+        return ref_roi, target_img, "target_in_reference", score
+
+    if ref_h <= tgt_h and ref_w <= tgt_w:
+        x, y, score = _find_template_match(target_img, ref_img)
+        tgt_roi = target_img[y:y + ref_h, x:x + ref_w]
+        return ref_img, tgt_roi, "reference_in_target", score
+
+    # Mixed dimensions (one wider, the other taller): fallback to resize.
+    target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
+    return ref_img, target_resized, "mixed_dims_fallback_resize", None
+
+
+def _ecc_align_same_size(ref_img: np.ndarray, target_img: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
+    """Run ECC alignment for equal-shape images and return aligned image + score + warp."""
+    ref_gray = ref_img.astype(np.float32)
+    target_gray = target_img.astype(np.float32)
+
+    warp_mode = cv.MOTION_AFFINE
+    warp_matrix = np.eye(2, 3, dtype=np.float32)
+    criteria = (cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 500, 1e-5)
+    cc, warp_matrix = cv.findTransformECC(ref_gray, target_gray, warp_matrix, warp_mode, criteria)
+
+    h, w = ref_img.shape[:2]
+    aligned_img = cv.warpAffine(
+        target_img,
+        warp_matrix,
+        (w, h),
+        flags=cv.INTER_LINEAR + cv.WARP_INVERSE_MAP,
+    )
+    return aligned_img.astype(target_img.dtype), float(cc), warp_matrix
+
+
+def auto_align_images(
+    ref_img: np.ndarray,
+    target_img: np.ndarray,
+    resize_to_reference: bool = True,
+) -> np.ndarray:
     """
     Align target_img to ref_img using ECC (Translation).
     Returns aligned_img.
     """
     try:
-        # Resize target to match ref size if different (for initial estimation)
-        # But warpAffine needs same size output.
-        h, w = ref_img.shape
+        ref_h, ref_w = ref_img.shape[:2]
+        tgt_h, tgt_w = target_img.shape[:2]
 
-        # Ensure target is same size before alignment?
-        # Typically rectification produces same size images.
-        # But if the user cropped the target, it might be different size.
-        # If sizes differ, we should probably resize target to match ref first?
-        # Or place target in center?
-        # The simplest is resize.
-        target_resized = cv.resize(target_img, (w, h), interpolation=cv.INTER_LINEAR)
+        if resize_to_reference:
+            target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
+            aligned_img, cc, _ = _ecc_align_same_size(ref_img, target_resized)
+            print(f"Auto-alignment successful (resized mode). Correlation: {cc:.4f}")
+            return aligned_img
 
-        ref_gray = ref_img.astype(np.float32)
-        target_gray = target_resized.astype(np.float32)
+        # Containment mode: align without forcing global resize.
+        if tgt_h <= ref_h and tgt_w <= ref_w:
+            x, y, score = _find_template_match(ref_img, target_img)
+            ref_roi = ref_img[y:y + tgt_h, x:x + tgt_w]
+            aligned_img, cc, _ = _ecc_align_same_size(ref_roi, target_img)
+            print(
+                f"Auto-alignment successful (containment: target in reference). "
+                f"Template score={score:.4f}, ECC={cc:.4f}"
+            )
+            return aligned_img
 
-        warp_mode = cv.MOTION_AFFINE
-        warp_matrix = np.eye(2, 3, dtype=np.float32)
-        criteria = (cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 500, 1e-5)
+        if ref_h <= tgt_h and ref_w <= tgt_w:
+            x, y, score = _find_template_match(target_img, ref_img)
+            target_roi = target_img[y:y + ref_h, x:x + ref_w]
+            _, cc, warp_matrix = _ecc_align_same_size(ref_img, target_roi)
+            aligned_full = cv.warpAffine(
+                target_img,
+                warp_matrix,
+                (tgt_w, tgt_h),
+                flags=cv.INTER_LINEAR + cv.WARP_INVERSE_MAP,
+            )
+            print(
+                f"Auto-alignment successful (containment: reference in target). "
+                f"Template score={score:.4f}, ECC={cc:.4f}"
+            )
+            return aligned_full.astype(target_img.dtype)
 
-        (cc, warp_matrix) = cv.findTransformECC(ref_gray, target_gray, warp_matrix, warp_mode, criteria)
-
-        # Use WARP_INVERSE_MAP as ECC finds the map from template (ref) to input (target)
-        aligned_img = cv.warpAffine(target_resized, warp_matrix, (w, h), flags=cv.INTER_LINEAR + cv.WARP_INVERSE_MAP)
-
-        print(f"Auto-alignment successful. Correlation: {cc:.4f}")
-        return aligned_img.astype(target_img.dtype)
+        print("Auto-alignment containment mode fell back to resize mode due to mixed dimensions.")
+        target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
+        aligned_img, cc, _ = _ecc_align_same_size(ref_img, target_resized)
+        print(f"Auto-alignment successful (fallback resized mode). Correlation: {cc:.4f}")
+        return aligned_img
 
     except Exception as e:
         print(f"Auto-alignment failed: {e}")
-        # Fallback to resized version
-        if 'target_resized' in locals():
-             return target_resized
-        return cv.resize(target_img, (ref_img.shape[1], ref_img.shape[0]))
+        if resize_to_reference:
+            return cv.resize(target_img, (ref_img.shape[1], ref_img.shape[0]))
+        return target_img
 
 
-def compare_images(rectified_img: np.ndarray, input_img: np.ndarray, input_name: str) -> list[Figure]:
+def compare_images(
+    rectified_img: np.ndarray,
+    input_img: np.ndarray,
+    input_name: str,
+    resize_to_reference: bool = True,
+) -> list[Figure]:
     """
     Compare input image to rectified image.
-    Resizes input_img to match rectified_img shape.
+    In containment mode, compares best matching ROIs without global resize.
     Returns list of figures.
     """
     figures = []
 
-    # 1. Resize input to match rectified (if not already aligned)
-    h, w = rectified_img.shape
-
-    if input_img.shape != (h, w):
-        input_resized = cv.resize(input_img, (w, h), interpolation=cv.INTER_LINEAR)
-    else:
-        input_resized = input_img
+    ref_comp, input_comp, mode, score = prepare_images_for_comparison(
+        rectified_img,
+        input_img,
+        resize_to_reference=resize_to_reference,
+    )
 
     # Ensure float for processing
-    rect_norm = im_process.min_max_normalize(rectified_img).astype(np.float32) / 255.0
-    input_norm = im_process.min_max_normalize(input_resized).astype(np.float32) / 255.0
+    rect_norm = im_process.min_max_normalize(ref_comp).astype(np.float32) / 255.0
+    input_norm = im_process.min_max_normalize(input_comp).astype(np.float32) / 255.0
+    h, w = rect_norm.shape
 
     # 2. Overlay (Anaglyph)
     # Red = Rectified, Green = Input.
@@ -358,7 +603,23 @@ def compare_images(rectified_img: np.ndarray, input_img: np.ndarray, input_name:
 
     fig1 = plt.figure(figsize=(10, 8))
     plt.imshow(overlay2)
-    plt.title(f"Overlay: Red=Rectified, Green={input_name}")
+    title_suffix = ""
+    if mode == "target_in_reference":
+        title_suffix = f" [Containment: {input_name} in Rectified"
+        if score is not None:
+            title_suffix += f", score={score:.3f}"
+        title_suffix += "]"
+    elif mode == "reference_in_target":
+        title_suffix = f" [Containment: Rectified in {input_name}"
+        if score is not None:
+            title_suffix += f", score={score:.3f}"
+        title_suffix += "]"
+    elif mode == "resized_to_reference":
+        title_suffix = " [Resized to reference]"
+    elif mode == "mixed_dims_fallback_resize":
+        title_suffix = " [Mixed dims fallback resize]"
+
+    plt.title(f"Overlay: Red=Rectified, Green={input_name}{title_suffix}")
     # Add a custom legend
     from matplotlib.lines import Line2D
     custom_lines = [Line2D([0], [0], color='red', lw=4),
@@ -371,15 +632,15 @@ def compare_images(rectified_img: np.ndarray, input_img: np.ndarray, input_name:
     fig2 = plt.figure(figsize=(10, 8))
     im = plt.imshow(diff, cmap='viridis') # viridis is good for intensity
     im_process.add_colorbar(im)
-    plt.title(f"Absolute Difference: |Rectified - {input_name}|")
+    plt.title(f"Absolute Difference: |Rectified - {input_name}|{title_suffix}")
     figures.append(fig2)
 
     # 4. Side by Side
     fig3, axes = plt.subplots(1, 2, figsize=(12, 6))
     axes[0].imshow(rect_norm, cmap='gray')
-    axes[0].set_title("Rectified Image")
+    axes[0].set_title("Rectified Image (comparison frame)")
     axes[1].imshow(input_norm, cmap='gray')
-    axes[1].set_title(f"{input_name}")
+    axes[1].set_title(f"{input_name} (comparison frame)")
     figures.append(fig3)
 
     return figures
@@ -438,24 +699,78 @@ def main():
         print("Thorcam image processing cancelled.")
         return
 
-    # 6. Auto Align
+    val_resize_to_reference = True
+    thor_resize_to_reference = True
+
+    # 6. Optional Manual Scale Correction
+    if messagebox.askyesno(
+        "Manual Scale Correction",
+        "Do you want to open a second window to manually scale images (X/Y) against the reference?",
+    ):
+        print("Scale-correcting Validation Image...")
+        scale_val = InteractiveScaleAdjuster(
+            root,
+            val_processed,
+            reference_image=rectified_img,
+            title="Scale Validation Image",
+        )
+        val_scaled = scale_val.run()
+        if val_scaled is not None:
+            val_processed = val_scaled
+            val_resize_to_reference = scale_val.resize_for_downstream
+        else:
+            print("Validation scale correction skipped/cancelled.")
+
+        print("Scale-correcting Thorcam Image...")
+        scale_thor = InteractiveScaleAdjuster(
+            root,
+            thor_processed,
+            reference_image=rectified_img,
+            title="Scale Thorcam Image",
+        )
+        thor_scaled = scale_thor.run()
+        if thor_scaled is not None:
+            thor_processed = thor_scaled
+            thor_resize_to_reference = scale_thor.resize_for_downstream
+        else:
+            print("Thorcam scale correction skipped/cancelled.")
+
+    # 7. Auto Align (optional, after all manual edits)
     if messagebox.askyesno("Auto Align", "Do you want to automatically align the images to the rectified reference?"):
         print("Aligning Validation Image...")
-        val_processed = auto_align_images(rectified_img, val_processed)
+        val_processed = auto_align_images(
+            rectified_img,
+            val_processed,
+            resize_to_reference=val_resize_to_reference,
+        )
         print("Aligning Thorcam Image...")
-        thor_processed = auto_align_images(rectified_img, thor_processed)
+        thor_processed = auto_align_images(
+            rectified_img,
+            thor_processed,
+            resize_to_reference=thor_resize_to_reference,
+        )
 
-    # 7. Compare
+    # 8. Compare
     print("Generating comparisons...")
-    figs_val = compare_images(rectified_img, val_processed, "Validation")
-    figs_thor = compare_images(rectified_img, thor_processed, "Thorcam")
+    figs_val = compare_images(
+        rectified_img,
+        val_processed,
+        "Validation",
+        resize_to_reference=val_resize_to_reference,
+    )
+    figs_thor = compare_images(
+        rectified_img,
+        thor_processed,
+        "Thorcam",
+        resize_to_reference=thor_resize_to_reference,
+    )
 
     all_figures = figs_val + figs_thor
 
     # Show figures
     plt.show()
 
-    # 8. Save
+    # 9. Save
     if messagebox.askyesno("Save", "Do you want to save the figures and workspace?"):
         save_dir = filedialog.askdirectory(title="Select Save Directory")
         if save_dir:
@@ -468,8 +783,10 @@ def main():
                 "rectified_image": rectified_img,
                 "validation_input_original": np.asarray(Image.open(val_path).convert('L')),
                 "validation_processed": val_processed,
+                "validation_resize_to_reference": np.array(val_resize_to_reference),
                 "thorcam_input_original": np.asarray(Image.open(thor_path).convert('L')),
-                "thorcam_processed": thor_processed
+                "thorcam_processed": thor_processed,
+                "thorcam_resize_to_reference": np.array(thor_resize_to_reference),
             }
             im_process.save_workspace_variables(save_path, vars_to_save)
             messagebox.showinfo("Success", f"Saved to {save_dir}")
