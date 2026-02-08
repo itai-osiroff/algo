@@ -310,7 +310,7 @@ def auto_align_images(ref_img: np.ndarray, target_img: np.ndarray) -> np.ndarray
         ref_gray = ref_img.astype(np.float32)
         target_gray = target_resized.astype(np.float32)
 
-        warp_mode = cv.MOTION_TRANSLATION
+        warp_mode = cv.MOTION_AFFINE
         warp_matrix = np.eye(2, 3, dtype=np.float32)
         criteria = (cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 500, 1e-5)
 
