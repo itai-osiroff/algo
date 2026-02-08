@@ -15,6 +15,8 @@ import numpy as np
 import cv2 as cv
 from PIL import Image
 
+MIN_TEMPLATE_MATCH_SCORE = 0.20
+
 # Ensure local modules can be imported
 if __package__ is None or __package__ == "":
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -293,7 +295,15 @@ class InteractiveImageAdjuster:
 class InteractiveScaleAdjuster:
     """GUI to anisotropically scale an image against an optional reference."""
 
-    def __init__(self, master, input_image: np.ndarray, reference_image=None, title="Scale Correct Image"):
+    def __init__(
+        self,
+        master,
+        input_image: np.ndarray,
+        reference_image=None,
+        title="Scale Correct Image",
+        default_scale_x: float = 1.0,
+        default_scale_y: float = 1.0,
+    ):
         self.master = master
         self.top = tk.Toplevel(master)
         self.top.title(title)
@@ -307,8 +317,15 @@ class InteractiveScaleAdjuster:
         if self.reference_image is not None and self.reference_image.ndim == 3:
             self.reference_image = cv.cvtColor(self.reference_image, cv.COLOR_BGR2GRAY)
 
-        self.scale_x_var = tk.DoubleVar(value=1.0)
-        self.scale_y_var = tk.DoubleVar(value=1.0)
+        self.scale_min = 0.001
+        self.scale_max = 8.00
+        self.default_scale_x = float(np.clip(default_scale_x, self.scale_min, self.scale_max))
+        self.default_scale_y = float(np.clip(default_scale_y, self.scale_min, self.scale_max))
+        self.scale_x_value = self.default_scale_x
+        self.scale_y_value = self.default_scale_y
+        self.scale_x_var = tk.StringVar(value=f"{self.scale_x_value:.4f}")
+        self.scale_y_var = tk.StringVar(value=f"{self.scale_y_value:.4f}")
+        self.scale_status_var = tk.StringVar(value="")
         self.show_ref_var = tk.BooleanVar(value=False)
         self.resize_for_downstream_var = tk.BooleanVar(value=True)
         self.resize_for_downstream = True
@@ -325,31 +342,33 @@ class InteractiveScaleAdjuster:
         scale_frame = tk.LabelFrame(toolbar_frame, text="Scale")
         scale_frame.pack(side=tk.LEFT, padx=5, fill=tk.Y)
 
-        tk.Label(scale_frame, text="X Scale:").pack(side=tk.LEFT, padx=(4, 0))
-        self.scale_x = Scale(
-            scale_frame,
-            from_=0.2,
-            to=3.0,
-            resolution=0.01,
-            orient=tk.HORIZONTAL,
-            variable=self.scale_x_var,
-            command=self._on_scale_change,
-            length=220,
-        )
-        self.scale_x.pack(side=tk.LEFT, padx=4)
+        tk.Label(scale_frame, text="X Scale:").pack(side=tk.LEFT, padx=(4, 2))
+        self.scale_x_entry = tk.Entry(scale_frame, textvariable=self.scale_x_var, width=8)
+        self.scale_x_entry.pack(side=tk.LEFT, padx=(0, 8))
 
-        tk.Label(scale_frame, text="Y Scale:").pack(side=tk.LEFT, padx=(8, 0))
-        self.scale_y = Scale(
+        tk.Label(scale_frame, text="Y Scale:").pack(side=tk.LEFT, padx=(0, 2))
+        self.scale_y_entry = tk.Entry(scale_frame, textvariable=self.scale_y_var, width=8)
+        self.scale_y_entry.pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Label(
             scale_frame,
-            from_=0.2,
-            to=3.0,
-            resolution=0.01,
-            orient=tk.HORIZONTAL,
-            variable=self.scale_y_var,
-            command=self._on_scale_change,
-            length=220,
+            text=f"Limits: {self.scale_min:.3f} to {self.scale_max:.3f}",
+            fg="gray25",
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.scale_status_label = tk.Label(
+            scale_frame,
+            textvariable=self.scale_status_var,
+            fg="red",
         )
-        self.scale_y.pack(side=tk.LEFT, padx=4)
+        self.scale_status_label.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.scale_x_entry.bind("<KeyRelease>", self._on_scale_entry_change)
+        self.scale_x_entry.bind("<FocusOut>", self._on_scale_entry_commit)
+        self.scale_x_entry.bind("<Return>", self._on_scale_entry_commit)
+        self.scale_y_entry.bind("<KeyRelease>", self._on_scale_entry_change)
+        self.scale_y_entry.bind("<FocusOut>", self._on_scale_entry_commit)
+        self.scale_y_entry.bind("<Return>", self._on_scale_entry_commit)
 
         if self.reference_image is not None:
             tk.Checkbutton(
@@ -377,8 +396,48 @@ class InteractiveScaleAdjuster:
         self.toolbar.update()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-    def _on_scale_change(self, _):
+    def _parse_scale_value(self, raw_value: str, axis_label: str) -> tuple[float | None, str | None]:
+        value_text = raw_value.strip()
+        if value_text == "":
+            return None, f"{axis_label} scale is empty"
+
+        try:
+            parsed = float(value_text)
+        except ValueError:
+            return None, f"{axis_label} scale must be numeric"
+
+        if parsed < self.scale_min or parsed > self.scale_max:
+            return None, (
+                f"{axis_label} scale out of range "
+                f"({self.scale_min:.3f}-{self.scale_max:.3f})"
+            )
+
+        return parsed, None
+
+    def _apply_scale_entries(self, commit: bool = False) -> bool:
+        x_val, x_err = self._parse_scale_value(self.scale_x_var.get(), "X")
+        y_val, y_err = self._parse_scale_value(self.scale_y_var.get(), "Y")
+
+        if x_err or y_err:
+            error_text = x_err if x_err else y_err
+            self.scale_status_var.set(error_text)
+            if commit:
+                self.scale_x_var.set(f"{self.scale_x_value:.4f}")
+                self.scale_y_var.set(f"{self.scale_y_value:.4f}")
+                self.scale_status_var.set("")
+            return False
+
+        self.scale_x_value = float(x_val)
+        self.scale_y_value = float(y_val)
+        self.scale_status_var.set("")
         self._update_display()
+        return True
+
+    def _on_scale_entry_change(self, _event):
+        self._apply_scale_entries(commit=False)
+
+    def _on_scale_entry_commit(self, _event):
+        self._apply_scale_entries(commit=True)
 
     @staticmethod
     def _scale_image(
@@ -395,8 +454,8 @@ class InteractiveScaleAdjuster:
     def _build_scaled_output(self) -> np.ndarray:
         return self._scale_image(
             self.input_image,
-            float(self.scale_x_var.get()),
-            float(self.scale_y_var.get()),
+            self.scale_x_value,
+            self.scale_y_value,
         )
 
     def _update_display(self):
@@ -418,16 +477,20 @@ class InteractiveScaleAdjuster:
 
         ax_edit.imshow(display_img, cmap="gray")
         ax_edit.set_title(
-            f"Scale Corrected (X={self.scale_x_var.get():.2f}, Y={self.scale_y_var.get():.2f})"
+            f"Scale Corrected (X={self.scale_x_value:.2f}, Y={self.scale_y_value:.2f})"
         )
         self.canvas.draw()
 
     def _reset(self):
-        self.scale_x_var.set(1.0)
-        self.scale_y_var.set(1.0)
+        self.scale_x_value = self.default_scale_x
+        self.scale_y_value = self.default_scale_y
+        self.scale_x_var.set(f"{self.scale_x_value:.4f}")
+        self.scale_y_var.set(f"{self.scale_y_value:.4f}")
+        self.scale_status_var.set("")
         self._update_display()
 
     def _finish(self):
+        self._apply_scale_entries(commit=True)
         self.result_image = self._build_scaled_output()
         self.resize_for_downstream = bool(self.resize_for_downstream_var.get())
         self.top.destroy()
@@ -459,10 +522,51 @@ def _find_template_match(search_img: np.ndarray, template_img: np.ndarray) -> tu
     return int(max_loc[0]), int(max_loc[1]), float(max_val)
 
 
+def _find_containment_match(
+    ref_img: np.ndarray,
+    target_img: np.ndarray,
+    prefer_smaller_pixels_contained: bool = False,
+) -> tuple[str, int, int, float] | None:
+    """Return containment mode and best-match coordinates for non-resize comparisons."""
+    ref_h, ref_w = ref_img.shape[:2]
+    tgt_h, tgt_w = target_img.shape[:2]
+
+    def _match_for_mode(mode: str) -> tuple[str, int, int, float] | None:
+        if mode == "target_in_reference":
+            if tgt_h <= ref_h and tgt_w <= ref_w:
+                x, y, score = _find_template_match(ref_img, target_img)
+                return mode, x, y, score
+            return None
+
+        if ref_h <= tgt_h and ref_w <= tgt_w:
+            x, y, score = _find_template_match(target_img, ref_img)
+            return mode, x, y, score
+        return None
+
+    if prefer_smaller_pixels_contained:
+        target_pixels = tgt_h * tgt_w
+        ref_pixels = ref_h * ref_w
+        preferred_mode = "target_in_reference" if target_pixels <= ref_pixels else "reference_in_target"
+        preferred_match = _match_for_mode(preferred_mode)
+        if preferred_match is not None:
+            return preferred_match
+
+    standard_match = _match_for_mode("target_in_reference")
+    if standard_match is not None:
+        return standard_match
+
+    standard_match = _match_for_mode("reference_in_target")
+    if standard_match is not None:
+        return standard_match
+
+    return None
+
+
 def prepare_images_for_comparison(
     ref_img: np.ndarray,
     target_img: np.ndarray,
     resize_to_reference: bool = True,
+    prefer_smaller_pixels_contained: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, str, float | None]:
     """
     Build shape-compatible image pair for downstream overlay/diff comparison.
@@ -477,15 +581,27 @@ def prepare_images_for_comparison(
         return ref_img, target_resized, "resized_to_reference", None
 
     # Containment mode: compare overlapping ROI without global resize.
-    if tgt_h <= ref_h and tgt_w <= ref_w:
-        x, y, score = _find_template_match(ref_img, target_img)
-        ref_roi = ref_img[y:y + tgt_h, x:x + tgt_w]
-        return ref_roi, target_img, "target_in_reference", score
+    match_result = _find_containment_match(
+        ref_img,
+        target_img,
+        prefer_smaller_pixels_contained=prefer_smaller_pixels_contained,
+    )
+    if match_result is not None:
+        mode, x, y, score = match_result
+        if score >= MIN_TEMPLATE_MATCH_SCORE:
+            if mode == "target_in_reference":
+                ref_roi = ref_img[y:y + tgt_h, x:x + tgt_w]
+                return ref_roi, target_img, mode, score
+            tgt_roi = target_img[y:y + ref_h, x:x + ref_w]
+            return ref_img, tgt_roi, mode, score
 
-    if ref_h <= tgt_h and ref_w <= tgt_w:
-        x, y, score = _find_template_match(target_img, ref_img)
-        tgt_roi = target_img[y:y + ref_h, x:x + ref_w]
-        return ref_img, tgt_roi, "reference_in_target", score
+        print(
+            "Containment match confidence too low "
+            f"({score:.4f} < {MIN_TEMPLATE_MATCH_SCORE:.2f}); "
+            "falling back to resize-based comparison."
+        )
+        target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
+        return ref_img, target_resized, "low_score_fallback_resize", score
 
     # Mixed dimensions (one wider, the other taller): fallback to resize.
     target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
@@ -516,6 +632,7 @@ def auto_align_images(
     ref_img: np.ndarray,
     target_img: np.ndarray,
     resize_to_reference: bool = True,
+    prefer_smaller_pixels_contained: bool = False,
 ) -> np.ndarray:
     """
     Align target_img to ref_img using ECC (Translation).
@@ -532,26 +649,33 @@ def auto_align_images(
             return aligned_img
 
         # Containment mode: align without forcing global resize.
-        if tgt_h <= ref_h and tgt_w <= ref_w:
-            x, y, score = _find_template_match(ref_img, target_img)
-            ref_roi = ref_img[y:y + tgt_h, x:x + tgt_w]
-            aligned_img, cc, _ = _ecc_align_same_size(ref_roi, target_img)
-            print(
-                f"Auto-alignment successful (containment: target in reference). "
-                f"Template score={score:.4f}, ECC={cc:.4f}"
-            )
-            return aligned_img
+        match_result = _find_containment_match(
+            ref_img,
+            target_img,
+            prefer_smaller_pixels_contained=prefer_smaller_pixels_contained,
+        )
+        if match_result is not None:
+            mode, x, y, score = match_result
+            if score < MIN_TEMPLATE_MATCH_SCORE:
+                print(
+                    "Auto-alignment skipped in containment mode due to low match score "
+                    f"({score:.4f} < {MIN_TEMPLATE_MATCH_SCORE:.2f})."
+                )
+                return target_img
 
-        if ref_h <= tgt_h and ref_w <= tgt_w:
-            x, y, score = _find_template_match(target_img, ref_img)
+            if mode == "target_in_reference":
+                ref_roi = ref_img[y:y + tgt_h, x:x + tgt_w]
+                aligned_img, cc, _ = _ecc_align_same_size(ref_roi, target_img)
+                print(
+                    f"Auto-alignment successful (containment: target in reference). "
+                    f"Template score={score:.4f}, ECC={cc:.4f}"
+                )
+                return aligned_img
+
             target_roi = target_img[y:y + ref_h, x:x + ref_w]
-            _, cc, warp_matrix = _ecc_align_same_size(ref_img, target_roi)
-            aligned_full = cv.warpAffine(
-                target_img,
-                warp_matrix,
-                (tgt_w, tgt_h),
-                flags=cv.INTER_LINEAR + cv.WARP_INVERSE_MAP,
-            )
+            aligned_roi, cc, _ = _ecc_align_same_size(ref_img, target_roi)
+            aligned_full = target_img.copy()
+            aligned_full[y:y + ref_h, x:x + ref_w] = aligned_roi
             print(
                 f"Auto-alignment successful (containment: reference in target). "
                 f"Template score={score:.4f}, ECC={cc:.4f}"
@@ -576,6 +700,7 @@ def compare_images(
     input_img: np.ndarray,
     input_name: str,
     resize_to_reference: bool = True,
+    prefer_smaller_pixels_contained: bool = False,
 ) -> list[Figure]:
     """
     Compare input image to rectified image.
@@ -588,6 +713,7 @@ def compare_images(
         rectified_img,
         input_img,
         resize_to_reference=resize_to_reference,
+        prefer_smaller_pixels_contained=prefer_smaller_pixels_contained,
     )
 
     # Ensure float for processing
@@ -616,6 +742,8 @@ def compare_images(
         title_suffix += "]"
     elif mode == "resized_to_reference":
         title_suffix = " [Resized to reference]"
+    elif mode == "low_score_fallback_resize":
+        title_suffix = " [Low-score fallback resize]"
     elif mode == "mixed_dims_fallback_resize":
         title_suffix = " [Mixed dims fallback resize]"
 
@@ -701,23 +829,27 @@ def main():
 
     val_resize_to_reference = True
     thor_resize_to_reference = True
+    manual_scale_opt_in = False
 
     # 6. Optional Manual Scale Correction
     if messagebox.askyesno(
         "Manual Scale Correction",
         "Do you want to open a second window to manually scale images (X/Y) against the reference?",
     ):
+        manual_scale_opt_in = True
         print("Scale-correcting Validation Image...")
         scale_val = InteractiveScaleAdjuster(
             root,
             val_processed,
             reference_image=rectified_img,
             title="Scale Validation Image",
+            default_scale_x=0.038,
+            default_scale_y=0.035,
         )
         val_scaled = scale_val.run()
+        val_resize_to_reference = scale_val.resize_for_downstream
         if val_scaled is not None:
             val_processed = val_scaled
-            val_resize_to_reference = scale_val.resize_for_downstream
         else:
             print("Validation scale correction skipped/cancelled.")
 
@@ -727,11 +859,13 @@ def main():
             thor_processed,
             reference_image=rectified_img,
             title="Scale Thorcam Image",
+            default_scale_x=0.07,
+            default_scale_y=0.07,
         )
         thor_scaled = scale_thor.run()
+        thor_resize_to_reference = scale_thor.resize_for_downstream
         if thor_scaled is not None:
             thor_processed = thor_scaled
-            thor_resize_to_reference = scale_thor.resize_for_downstream
         else:
             print("Thorcam scale correction skipped/cancelled.")
 
@@ -742,12 +876,14 @@ def main():
             rectified_img,
             val_processed,
             resize_to_reference=val_resize_to_reference,
+            prefer_smaller_pixels_contained=manual_scale_opt_in,
         )
         print("Aligning Thorcam Image...")
         thor_processed = auto_align_images(
             rectified_img,
             thor_processed,
             resize_to_reference=thor_resize_to_reference,
+            prefer_smaller_pixels_contained=manual_scale_opt_in,
         )
 
     # 8. Compare
@@ -757,12 +893,14 @@ def main():
         val_processed,
         "Validation",
         resize_to_reference=val_resize_to_reference,
+        prefer_smaller_pixels_contained=manual_scale_opt_in,
     )
     figs_thor = compare_images(
         rectified_img,
         thor_processed,
         "Thorcam",
         resize_to_reference=thor_resize_to_reference,
+        prefer_smaller_pixels_contained=manual_scale_opt_in,
     )
 
     all_figures = figs_val + figs_thor
