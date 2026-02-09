@@ -5,6 +5,7 @@ Allows interactive processing (rotation, flipping, cropping) of input images.
 
 import os
 import sys
+from dataclasses import dataclass
 import tkinter as tk
 from tkinter import filedialog, messagebox, Scale
 import matplotlib.pyplot as plt
@@ -519,7 +520,10 @@ def _find_template_match(search_img: np.ndarray, template_img: np.ndarray) -> tu
     template_u8 = _normalize_to_uint8(template_img)
     match = cv.matchTemplate(search_u8, template_u8, cv.TM_CCOEFF_NORMED)
     _, max_val, _, max_loc = cv.minMaxLoc(match)
-    return int(max_loc[0]), int(max_loc[1]), float(max_val)
+    score = float(max_val)
+    if not np.isfinite(score):
+        score = -1.0
+    return int(max_loc[0]), int(max_loc[1]), score
 
 
 def _find_containment_match(
@@ -527,39 +531,67 @@ def _find_containment_match(
     target_img: np.ndarray,
     prefer_smaller_pixels_contained: bool = False,
 ) -> tuple[str, int, int, float] | None:
-    """Return containment mode and best-match coordinates for non-resize comparisons."""
+    """
+    Decide containment direction and placement using AS-IS template matching.
+
+    Modes:
+    - ``target_in_reference``: target is contained in reference.
+    - ``reference_in_target``: reference is contained in target.
+    """
     ref_h, ref_w = ref_img.shape[:2]
     tgt_h, tgt_w = target_img.shape[:2]
 
-    def _match_for_mode(mode: str) -> tuple[str, int, int, float] | None:
-        if mode == "target_in_reference":
-            if tgt_h <= ref_h and tgt_w <= ref_w:
-                x, y, score = _find_template_match(ref_img, target_img)
-                return mode, x, y, score
-            return None
+    target_is_smaller = tgt_h <= ref_h and tgt_w <= ref_w and (tgt_h < ref_h or tgt_w < ref_w)
+    if prefer_smaller_pixels_contained and target_is_smaller:
+        x, y, score = _find_template_match(ref_img, target_img)
+        return "target_in_reference", x, y, score
 
-        if ref_h <= tgt_h and ref_w <= tgt_w:
-            x, y, score = _find_template_match(target_img, ref_img)
-            return mode, x, y, score
+    candidates: list[tuple[str, int, int, float]] = []
+    if tgt_h <= ref_h and tgt_w <= ref_w:
+        x, y, score = _find_template_match(ref_img, target_img)
+        candidates.append(("target_in_reference", x, y, score))
+
+    if ref_h <= tgt_h and ref_w <= tgt_w:
+        x, y, score = _find_template_match(target_img, ref_img)
+        candidates.append(("reference_in_target", x, y, score))
+
+    if not candidates:
         return None
 
-    if prefer_smaller_pixels_contained:
-        target_pixels = tgt_h * tgt_w
-        ref_pixels = ref_h * ref_w
-        preferred_mode = "target_in_reference" if target_pixels <= ref_pixels else "reference_in_target"
-        preferred_match = _match_for_mode(preferred_mode)
-        if preferred_match is not None:
-            return preferred_match
+    return max(candidates, key=lambda candidate: candidate[3])
 
-    standard_match = _match_for_mode("target_in_reference")
-    if standard_match is not None:
-        return standard_match
 
-    standard_match = _match_for_mode("reference_in_target")
-    if standard_match is not None:
-        return standard_match
+@dataclass
+class ComparisonData:
+    """Prepared comparison frames and metadata for visualization."""
 
-    return None
+    mode: str
+    score: float | None
+    match_found: bool
+    side_reference: np.ndarray
+    side_input: np.ndarray
+    diff_containing: np.ndarray | None = None
+    diff_contained: np.ndarray | None = None
+    containing_label: str | None = None
+    contained_label: str | None = None
+
+
+def _comparison_mode_suffix(mode: str, score: float | None) -> str:
+    if mode == "target_in_reference":
+        return f" [Match: input in reference, score={score:.3f}]" if score is not None else " [Match: input in reference]"
+    if mode == "reference_in_target":
+        return f" [Match: reference in input, score={score:.3f}]" if score is not None else " [Match: reference in input]"
+    if mode == "resized_to_reference":
+        return " [Resized to reference]"
+    if mode == "same_shape_no_resize":
+        return " [Same size, no resize]"
+    if mode == "same_shape":
+        return " [Same size]"
+    if mode == "low_confidence_match":
+        return f" [No good match, best score={score:.3f}]" if score is not None else " [No good match]"
+    if mode == "no_containment_match":
+        return " [No containment scenario]"
+    return ""
 
 
 def prepare_images_for_comparison(
@@ -567,45 +599,97 @@ def prepare_images_for_comparison(
     target_img: np.ndarray,
     resize_to_reference: bool = True,
     prefer_smaller_pixels_contained: bool = False,
-) -> tuple[np.ndarray, np.ndarray, str, float | None]:
+) -> ComparisonData:
     """
-    Build shape-compatible image pair for downstream overlay/diff comparison.
+    Prepare visualization frames for comparison.
+
+    If a good containment match is found, side-by-side uses the contained image
+    and the corresponding crop from the containing image. Otherwise, side-by-side
+    falls back to original scales and diff/overlay are disabled.
     """
     ref_h, ref_w = ref_img.shape[:2]
     tgt_h, tgt_w = target_img.shape[:2]
 
     if resize_to_reference:
-        if (tgt_h, tgt_w) == (ref_h, ref_w):
-            return ref_img, target_img, "same_shape", None
-        target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
-        return ref_img, target_resized, "resized_to_reference", None
+        target_resized = target_img if (tgt_h, tgt_w) == (ref_h, ref_w) else cv.resize(
+            target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR
+        )
+        mode = "same_shape" if (tgt_h, tgt_w) == (ref_h, ref_w) else "resized_to_reference"
+        return ComparisonData(
+            mode=mode,
+            score=None,
+            match_found=True,
+            side_reference=ref_img,
+            side_input=target_resized,
+            diff_containing=ref_img,
+            diff_contained=target_resized,
+            containing_label="Reference",
+            contained_label="Input",
+        )
 
-    # Containment mode: compare overlapping ROI without global resize.
+    if (tgt_h, tgt_w) == (ref_h, ref_w):
+        return ComparisonData(
+            mode="same_shape_no_resize",
+            score=None,
+            match_found=True,
+            side_reference=ref_img,
+            side_input=target_img,
+            diff_containing=ref_img,
+            diff_contained=target_img,
+            containing_label="Reference",
+            contained_label="Input",
+        )
+
     match_result = _find_containment_match(
         ref_img,
         target_img,
         prefer_smaller_pixels_contained=prefer_smaller_pixels_contained,
     )
-    if match_result is not None:
-        mode, x, y, score = match_result
-        if score >= MIN_TEMPLATE_MATCH_SCORE:
-            if mode == "target_in_reference":
-                ref_roi = ref_img[y:y + tgt_h, x:x + tgt_w]
-                return ref_roi, target_img, mode, score
-            tgt_roi = target_img[y:y + ref_h, x:x + ref_w]
-            return ref_img, tgt_roi, mode, score
-
-        print(
-            "Containment match confidence too low "
-            f"({score:.4f} < {MIN_TEMPLATE_MATCH_SCORE:.2f}); "
-            "falling back to resize-based comparison."
+    if match_result is None:
+        return ComparisonData(
+            mode="no_containment_match",
+            score=None,
+            match_found=False,
+            side_reference=ref_img,
+            side_input=target_img,
         )
-        target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
-        return ref_img, target_resized, "low_score_fallback_resize", score
 
-    # Mixed dimensions (one wider, the other taller): fallback to resize.
-    target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
-    return ref_img, target_resized, "mixed_dims_fallback_resize", None
+    mode, x, y, score = match_result
+    if score < MIN_TEMPLATE_MATCH_SCORE:
+        return ComparisonData(
+            mode="low_confidence_match",
+            score=score,
+            match_found=False,
+            side_reference=ref_img,
+            side_input=target_img,
+        )
+
+    if mode == "target_in_reference":
+        reference_crop = ref_img[y:y + tgt_h, x:x + tgt_w]
+        return ComparisonData(
+            mode=mode,
+            score=score,
+            match_found=True,
+            side_reference=reference_crop,
+            side_input=target_img,
+            diff_containing=reference_crop,
+            diff_contained=target_img,
+            containing_label="Reference Crop",
+            contained_label="Input",
+        )
+
+    input_crop = target_img[y:y + ref_h, x:x + ref_w]
+    return ComparisonData(
+        mode=mode,
+        score=score,
+        match_found=True,
+        side_reference=ref_img,
+        side_input=input_crop,
+        diff_containing=input_crop,
+        diff_contained=ref_img,
+        containing_label="Input Crop",
+        contained_label="Reference",
+    )
 
 
 def _ecc_align_same_size(ref_img: np.ndarray, target_img: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
@@ -613,7 +697,7 @@ def _ecc_align_same_size(ref_img: np.ndarray, target_img: np.ndarray) -> tuple[n
     ref_gray = ref_img.astype(np.float32)
     target_gray = target_img.astype(np.float32)
 
-    warp_mode = cv.MOTION_AFFINE
+    warp_mode = cv.MOTION_TRANSLATION
     warp_matrix = np.eye(2, 3, dtype=np.float32)
     criteria = (cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 500, 1e-5)
     cc, warp_matrix = cv.findTransformECC(ref_gray, target_gray, warp_matrix, warp_mode, criteria)
@@ -646,6 +730,11 @@ def auto_align_images(
             target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
             aligned_img, cc, _ = _ecc_align_same_size(ref_img, target_resized)
             print(f"Auto-alignment successful (resized mode). Correlation: {cc:.4f}")
+            return aligned_img
+
+        if (tgt_h, tgt_w) == (ref_h, ref_w):
+            aligned_img, cc, _ = _ecc_align_same_size(ref_img, target_img)
+            print(f"Auto-alignment successful (same-size non-resize mode). Correlation: {cc:.4f}")
             return aligned_img
 
         # Containment mode: align without forcing global resize.
@@ -682,11 +771,8 @@ def auto_align_images(
             )
             return aligned_full.astype(target_img.dtype)
 
-        print("Auto-alignment containment mode fell back to resize mode due to mixed dimensions.")
-        target_resized = cv.resize(target_img, (ref_w, ref_h), interpolation=cv.INTER_LINEAR)
-        aligned_img, cc, _ = _ecc_align_same_size(ref_img, target_resized)
-        print(f"Auto-alignment successful (fallback resized mode). Correlation: {cc:.4f}")
-        return aligned_img
+        print("Auto-alignment skipped: could not determine containment without resizing.")
+        return target_img
 
     except Exception as e:
         print(f"Auto-alignment failed: {e}")
@@ -709,67 +795,65 @@ def compare_images(
     """
     figures = []
 
-    ref_comp, input_comp, mode, score = prepare_images_for_comparison(
+    # Always show an as-is comparison (original reference scale vs processed input scale),
+    # even when containment matching is weak or fails.
+    ref_as_is_norm = im_process.min_max_normalize(rectified_img).astype(np.float32) / 255.0
+    input_as_is_norm = im_process.min_max_normalize(input_img).astype(np.float32) / 255.0
+    fig_as_is, axes_as_is = plt.subplots(1, 2, figsize=(12, 6))
+    axes_as_is[0].imshow(ref_as_is_norm, cmap='gray')
+    axes_as_is[0].set_title(f"Reference (As-Is) [{rectified_img.shape[0]}x{rectified_img.shape[1]}]")
+    axes_as_is[1].imshow(input_as_is_norm, cmap='gray')
+    axes_as_is[1].set_title(f"{input_name} (As-Edited As-Is) [{input_img.shape[0]}x{input_img.shape[1]}]")
+    figures.append(fig_as_is)
+
+    comp_data = prepare_images_for_comparison(
         rectified_img,
         input_img,
         resize_to_reference=resize_to_reference,
         prefer_smaller_pixels_contained=prefer_smaller_pixels_contained,
     )
 
-    # Ensure float for processing
-    rect_norm = im_process.min_max_normalize(ref_comp).astype(np.float32) / 255.0
-    input_norm = im_process.min_max_normalize(input_comp).astype(np.float32) / 255.0
-    h, w = rect_norm.shape
+    side_ref_norm = im_process.min_max_normalize(comp_data.side_reference).astype(np.float32) / 255.0
+    side_input_norm = im_process.min_max_normalize(comp_data.side_input).astype(np.float32) / 255.0
+    title_suffix = _comparison_mode_suffix(comp_data.mode, comp_data.score)
 
-    # 2. Overlay (Anaglyph)
-    # Red = Rectified, Green = Input.
-    overlay2 = np.zeros((h, w, 3), dtype=np.float32)
-    overlay2[..., 0] = rect_norm
-    overlay2[..., 1] = input_norm
+    # A. Side-by-side view (always shown)
+    fig_side, axes = plt.subplots(1, 2, figsize=(12, 6))
+    axes[0].imshow(side_ref_norm, cmap='gray')
+    axes[0].set_title(f"Reference View{title_suffix}")
+    axes[1].imshow(side_input_norm, cmap='gray')
+    axes[1].set_title(f"{input_name} View{title_suffix}")
+    figures.append(fig_side)
 
-    fig1 = plt.figure(figsize=(10, 8))
-    plt.imshow(overlay2)
-    title_suffix = ""
-    if mode == "target_in_reference":
-        title_suffix = f" [Containment: {input_name} in Rectified"
-        if score is not None:
-            title_suffix += f", score={score:.3f}"
-        title_suffix += "]"
-    elif mode == "reference_in_target":
-        title_suffix = f" [Containment: Rectified in {input_name}"
-        if score is not None:
-            title_suffix += f", score={score:.3f}"
-        title_suffix += "]"
-    elif mode == "resized_to_reference":
-        title_suffix = " [Resized to reference]"
-    elif mode == "low_score_fallback_resize":
-        title_suffix = " [Low-score fallback resize]"
-    elif mode == "mixed_dims_fallback_resize":
-        title_suffix = " [Mixed dims fallback resize]"
+    # B/C only if a good containment/resize match exists.
+    if not comp_data.match_found or comp_data.diff_containing is None or comp_data.diff_contained is None:
+        print(f"{input_name}: no good containment match for diff/overlay; showing as-is + side-by-side only.")
+        return figures
 
-    plt.title(f"Overlay: Red=Rectified, Green={input_name}{title_suffix}")
-    # Add a custom legend
-    from matplotlib.lines import Line2D
-    custom_lines = [Line2D([0], [0], color='red', lw=4),
-                    Line2D([0], [0], color='green', lw=4)]
-    plt.legend(custom_lines, ['Rectified', input_name], loc='upper right')
-    figures.append(fig1)
+    containing_norm = im_process.min_max_normalize(comp_data.diff_containing).astype(np.float32) / 255.0
+    contained_norm = im_process.min_max_normalize(comp_data.diff_contained).astype(np.float32) / 255.0
 
-    # 3. Difference Map
-    diff = np.abs(rect_norm - input_norm)
-    fig2 = plt.figure(figsize=(10, 8))
-    im = plt.imshow(diff, cmap='viridis') # viridis is good for intensity
+    # B. Difference map at contained-image scale.
+    diff = np.abs(containing_norm - contained_norm)
+    fig_diff = plt.figure(figsize=(10, 8))
+    im = plt.imshow(diff, cmap='viridis')
     im_process.add_colorbar(im)
-    plt.title(f"Absolute Difference: |Rectified - {input_name}|{title_suffix}")
-    figures.append(fig2)
+    plt.title(f"Difference |Containing Crop - Contained|{title_suffix}")
+    figures.append(fig_diff)
 
-    # 4. Side by Side
-    fig3, axes = plt.subplots(1, 2, figsize=(12, 6))
-    axes[0].imshow(rect_norm, cmap='gray')
-    axes[0].set_title("Rectified Image (comparison frame)")
-    axes[1].imshow(input_norm, cmap='gray')
-    axes[1].set_title(f"{input_name} (comparison frame)")
-    figures.append(fig3)
+    # C. Overlay of contained over containing crop.
+    overlay = np.zeros((contained_norm.shape[0], contained_norm.shape[1], 3), dtype=np.float32)
+    overlay[..., 0] = containing_norm
+    overlay[..., 1] = contained_norm
+    fig_overlay = plt.figure(figsize=(10, 8))
+    plt.imshow(overlay)
+    plt.title(f"Overlay: Red=Containing, Green=Contained{title_suffix}")
+    from matplotlib.lines import Line2D
+    label_containing = comp_data.containing_label or "Containing"
+    label_contained = comp_data.contained_label or "Contained"
+    custom_lines = [Line2D([0], [0], color='red', lw=4), Line2D([0], [0], color='green', lw=4)]
+    plt.legend(custom_lines, [label_containing, label_contained], loc='upper right')
+    figures.append(fig_overlay)
 
     return figures
 
