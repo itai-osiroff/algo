@@ -285,7 +285,6 @@ class InteractiveImageAdjuster:
         self.result_image = normalized.astype(np.uint8)
         self.is_done = True
         self.top.destroy()
-        self.master.quit()
 
     def run(self):
         # Wait for window to close
@@ -495,13 +494,11 @@ class InteractiveScaleAdjuster:
         self.result_image = self._build_scaled_output()
         self.resize_for_downstream = bool(self.resize_for_downstream_var.get())
         self.top.destroy()
-        self.master.quit()
 
     def _cancel(self):
         self.result_image = None
         self.resize_for_downstream = bool(self.resize_for_downstream_var.get())
         self.top.destroy()
-        self.master.quit()
 
     def run(self):
         self.top.wait_window()
