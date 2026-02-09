@@ -997,7 +997,14 @@ def main():
         save_dir = filedialog.askdirectory(title="Select Save Directory")
         if save_dir:
             # Save Figures
-            im_process.save_figures(all_figures, save_dir)
+            filename_changes = im_process.save_figures(all_figures, save_dir)
+
+            # Notify user of any filename changes
+            if filename_changes:
+                changes_message = "The following filenames were regularized for compatibility:\n\n"
+                for original, regularized in sorted(filename_changes.items()):
+                    changes_message += f"  {original}\n    → {regularized}\n"
+                messagebox.showinfo("Filename Changes", changes_message)
 
             # Save Workspace
             save_path = os.path.join(save_dir, "validation_workspace.npz")

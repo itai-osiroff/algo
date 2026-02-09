@@ -891,17 +891,44 @@ def build_extreme_view_overlays(rect_images: np.ndarray, ref_index: Optional[Tup
 
     return overlays
 
-def save_figures(figures: List[Figure], save_dir: str, dpi: int = 1000):
+def _regularize_filename(original_filename: str) -> str:
+    """
+    Regularize a filename by removing/replacing invalid characters.
+    
+    Replaces spaces with underscores, removes special characters, and ensures
+    the filename is safe for all filesystems.
+    """
+    # Replace spaces with underscores
+    regularized = original_filename.replace(' ', '_')
+    # Remove invalid characters for Windows/Unix filesystems
+    invalid_chars = r'<>:"|?*\/'
+    for char in invalid_chars:
+        regularized = regularized.replace(char, '')
+    # Remove leading/trailing dots and spaces
+    regularized = regularized.strip('. ')
+    # Collapse multiple underscores
+    while '__' in regularized:
+        regularized = regularized.replace('__', '_')
+    return regularized
+
+
+def save_figures(figures: List[Figure], save_dir: str, dpi: int = 1000) -> Dict[str, str]:
     """
     Persist matplotlib figures to disk with sanitized titles as filenames.
 
     Figures without titles fall back to ``figure_<index>.jpg``. Non-fatal save
     errors are reported to stdout so the rest of the batch can continue.
+    
+    Returns:
+        Dict mapping original intended filenames to actual saved filenames.
+        If a filename was regularized, both will differ. Empty dict if no figures saved.
     """
     if not figures:
         print("No figures to save.")
-        return
+        return {}
     os.makedirs(save_dir, exist_ok=True)
+    filename_changes = {}
+    
     for idx, fig in enumerate(figures, start=1):
         # Get the figure title in a type-safe way (avoid accessing private attributes directly)
         title_obj = getattr(cast(Any, fig), "_suptitle", None)
@@ -909,19 +936,31 @@ def save_figures(figures: List[Figure], save_dir: str, dpi: int = 1000):
         if not title:
             # Try to get title from axes
             if fig.axes and fig.axes[0].get_title():
-                title = fig.axes[0].get_title()
+                title = slugify(fig.axes[0].get_title())
         
         # Use title if available, otherwise use default naming
         if title:
-            filename = os.path.join(save_dir, f"{title}.jpg")
+            intended_filename = f"{title}.jpg"
         else:
-            filename = os.path.join(save_dir, f"figure_{idx}.jpg")
+            intended_filename = f"figure_{idx}.jpg"
+        
+        # Regularize the filename
+        regularized_filename = _regularize_filename(intended_filename)
+        
+        # Build full paths
+        full_path = os.path.join(save_dir, regularized_filename)
         
         try:
-            fig.savefig(filename, format='jpg', dpi=dpi, bbox_inches='tight')
-            print(f"Saved: {filename}")
+            fig.savefig(full_path, format='jpg', dpi=dpi, bbox_inches='tight')
+            print(f"Saved: {full_path}")
+            
+            # Track if filename was changed
+            if intended_filename != regularized_filename:
+                filename_changes[intended_filename] = regularized_filename
         except Exception as e:
-            print(f"Failed to save {filename}: {e}")
+            print(f"Failed to save {full_path}: {e}")
+    
+    return filename_changes
 
 def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
     """
