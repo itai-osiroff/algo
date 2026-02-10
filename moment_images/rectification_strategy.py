@@ -307,6 +307,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         thresh: Optional[float] = None, normalized_conv: Optional[bool] = True,
         sub_pix_factor: int = 2,
         reference_view: Optional[np.ndarray] = None,
+        use_sigma_pyramid: bool = False,
     ) -> PixelwiseSimilarityResult:
         """
         Perform per-pixel patch correlation between each view and the reference.
@@ -327,6 +328,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             disp_gauss_size: Kernel size for displacement smoothing.
             thresh: Relative intensity threshold (0–1) below which reference
                 pixels are ignored.
+            use_sigma_pyramid: When ``True``, iteratively recompute similarities
+                with smaller Gaussian sigmas while constraining updates to stay
+                within two pixels of the initial displacement estimates.
             sub_pix_factor: Upsampling factor for sub-pixel displacement
                 searches. ``1`` keeps full-pixel shifts, ``2`` enables half-pixel
                 shifts, and so on.
@@ -335,6 +339,73 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             ``PixelwiseSimilarityResult`` containing correlation scores,
             displacement maps, and target coordinates for each view.
         """
+        if not use_sigma_pyramid:
+            return self._compute_similarity_matrices_single(
+                views,
+                ref_view_idx,
+                max_disp=max_disp,
+                gauss_sigma=gauss_sigma,
+                gauss_size=gauss_size,
+                disp_gauss_sigma=disp_gauss_sigma,
+                disp_gauss_size=disp_gauss_size,
+                thresh=thresh,
+                normalized_conv=normalized_conv,
+                sub_pix_factor=sub_pix_factor,
+                reference_view=reference_view,
+            )
+
+        base_sigma = 7 if gauss_sigma is None else gauss_sigma
+        base_size = int(base_sigma * 5) if gauss_size is None else gauss_size
+        current_result = self._compute_similarity_matrices_single(
+            views,
+            ref_view_idx,
+            max_disp=max_disp,
+            gauss_sigma=base_sigma,
+            gauss_size=base_size,
+            disp_gauss_sigma=disp_gauss_sigma,
+            disp_gauss_size=disp_gauss_size,
+            thresh=thresh,
+            normalized_conv=normalized_conv,
+            sub_pix_factor=sub_pix_factor,
+            reference_view=reference_view,
+        )
+
+        current_sigma = int(base_sigma)
+        while current_sigma > 1:
+            next_sigma = int(current_sigma / 2)
+            if next_sigma < 1:
+                break
+
+            next_size = int(next_sigma * 5) if gauss_size is None else gauss_size
+            current_result = self._compute_similarity_matrices_single(
+                views,
+                ref_view_idx,
+                max_disp=max_disp,
+                gauss_sigma=next_sigma,
+                gauss_size=next_size,
+                disp_gauss_sigma=disp_gauss_sigma,
+                disp_gauss_size=disp_gauss_size,
+                thresh=thresh,
+                normalized_conv=normalized_conv,
+                sub_pix_factor=sub_pix_factor,
+                reference_view=reference_view,
+                prev_result=current_result,
+            )
+
+            current_sigma = next_sigma
+
+        return current_result
+
+    def _compute_similarity_matrices_single(
+        self, views: np.ndarray, ref_view_idx: Tuple[int, int], max_disp: Optional[int] = None,
+        gauss_sigma: Optional[float] = None, gauss_size: Optional[int] = None,
+        disp_gauss_sigma: Optional[float] = None, disp_gauss_size: Optional[int] = None,
+        thresh: Optional[float] = None, normalized_conv: Optional[bool] = True,
+        sub_pix_factor: int = 2,
+        reference_view: Optional[np.ndarray] = None,
+        prev_result: Optional[PixelwiseSimilarityResult] = None,
+    ) -> PixelwiseSimilarityResult:
+        """Compute pixelwise similarity matrices for a single Gaussian sigma."""
         if sub_pix_factor < 1:
             raise ValueError("sub_pix_factor must be >= 1")
         sub_pix_factor = int(sub_pix_factor)
@@ -350,7 +421,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if gauss_sigma is None:
             gauss_sigma = 7
         if gauss_size is None:
-            gauss_size = int(gauss_sigma * 6)
+            gauss_size = int(gauss_sigma * 5)
         if disp_gauss_sigma is None:
             disp_gauss_sigma = 0.0
 
@@ -377,6 +448,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             views_arr = resized_views
             height *= sub_pix_factor
             width *= sub_pix_factor
+            gauss_sigma *= sub_pix_factor
+            gauss_size = int(gauss_sigma * 5)
 
         effective_window_size = self.window_size * sub_pix_factor
         effective_window_radius = effective_window_size // 2
@@ -414,9 +487,6 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         D = max_disp_scaled * 2 + 1
         disp_arr = np.arange(-max_disp_scaled, max_disp_scaled + 1, dtype=np.float32)
 
-        corr_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
-        if normalized_conv:
-            norm_mats = np.zeros((height, width, grid_rows, grid_cols, D, D), dtype=np.float32)
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.float32)
         scores = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
         disps_y = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float32)
@@ -432,6 +502,27 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             for j in range(grid_cols):
                 if not reference_is_external and i == ref_i and j == ref_j:
                     continue
+
+                p_dy, p_dx = None, None
+                limit = None
+                if prev_result is not None:
+                    p_dy = prev_result.disps_y[:, :, i, j]
+                    p_dx = prev_result.disps_x[:, :, i, j]
+
+                    if sub_pix_factor > 1:
+                        p_dy = cv.resize(p_dy, (width, height), interpolation=cv.INTER_NEAREST)
+                        p_dx = cv.resize(p_dx, (width, height), interpolation=cv.INTER_NEAREST)
+                        # Scale displacements to match scaled resolution
+                        p_dy = p_dy * sub_pix_factor
+                        p_dx = p_dx * sub_pix_factor
+
+                    limit = 2.0 * sub_pix_factor
+
+                corr_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
+                norm_mat_view = None
+                if normalized_conv:
+                    norm_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
+
                 view = views_arr[i, j].astype(np.float32, copy=False)
                 for s_y_ind in range(0, D, effective_step_size):
                     for s_x_ind in range(0, D, effective_step_size):
@@ -440,26 +531,34 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         shifted_view = self._roll_with_fill(
                             view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
                         )
-                        corr_mats[:, :, i, j, s_y_ind, s_x_ind] = gaussian_filter(
+                        corr = gaussian_filter(
                             ref_view * shifted_view,
                             sigma=gauss_sigma,
                             truncate=(gauss_size/ gauss_sigma),
                             mode="constant",
                         )
+
+                        if p_dy is not None:
+                            current_dy = disp_arr[s_y_ind]
+                            current_dx = disp_arr[s_x_ind]
+                            mask = (np.abs(p_dy - current_dy) <= limit) & (np.abs(p_dx - current_dx) <= limit)
+                            corr[~mask] = 0.0
+
+                        corr_mat_view[:, :, s_y_ind, s_x_ind] = corr
+
                         if normalized_conv:
-                            norm_shifted_view = self._roll_with_fill(view, shift_y=s_y,
-                                                                      shift_x=s_x,
-                                                                        zero_fill=self.zero_fill_roll)
-                            norm_mats[:, :, i, j, s_y_ind, s_x_ind] = gaussian_filter(
-                                norm_shifted_view*2,
+                            norm_shifted_view = shifted_view.copy()
+                            norm_mat_view[:, :, s_y_ind, s_x_ind] = gaussian_filter(
+                                norm_shifted_view**2,
                                   sigma=gauss_sigma,
                                     truncate=(gauss_size/gauss_sigma),
                                       mode="constant")
                 if normalized_conv:
-                        norm_mats[: ,:, i, j, :, :] = np.sqrt(norm_mats[:, :, i, j, :, :]*np.tile(ref_view_blurred, [D, D, 1, 1]).T)
-                        norm_mats[:, : ,i, j, :, :] = norm_mats[:, :, i, j, :, :] + 0.1*np.max(norm_mats[:, :, i, j, :, :])
-                        corr_mats[:, :, i, j, :, :] = corr_mats[:, :, i, j, :, :] / norm_mats[:, : ,i ,j, : , :]
-                corr_stack = corr_mats[:, :, i, j, :, :]  # shape (H, W, D, D)
+                    norm_mat_view = np.sqrt(norm_mat_view * ref_view_blurred[:, :, None, None])
+                    norm_mat_view = norm_mat_view + 0.1 * np.max(norm_mat_view)
+                    corr_mat_view = corr_mat_view / norm_mat_view
+
+                corr_stack = corr_mat_view  # shape (H, W, D, D)
                 max_val = np.max(corr_stack, axis=(2, 3))
                 scores[:, :, i, j] = max_val
 

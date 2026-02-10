@@ -383,8 +383,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--disp-gauss-start", type=float, default=0.0)
     parser.add_argument("--disp-gauss-stop", type=float, default=1.0)
     parser.add_argument("--disp-gauss-step", type=float, default=1.0)
-    parser.add_argument("--global-thresh-start", type=float, default=0.25)
-    parser.add_argument("--global-thresh-stop", type=float, default=0.25)
+    parser.add_argument("--global-thresh-start", type=float, default=0.15)
+    parser.add_argument("--global-thresh-stop", type=float, default=0.15)
     parser.add_argument("--global-thresh-step", type=float, default=0.05)
     parser.add_argument("--pixel-thresh-start", type=float, default=0.05)
     parser.add_argument("--pixel-thresh-stop", type=float, default=0.05)
@@ -599,8 +599,8 @@ def _launch_gui() -> None:
         ("Disp gauss start", "disp_gauss_start", "0.0"),
         ("Disp gauss stop", "disp_gauss_stop", "1.0"),
         ("Disp gauss step", "disp_gauss_step", "1.0"),
-        ("Global thresh start", "global_thresh_start", "0.25"),
-        ("Global thresh stop", "global_thresh_stop", "0.25"),
+        ("Global thresh start", "global_thresh_start", "0.15"),
+        ("Global thresh stop", "global_thresh_stop", "0.15"),
         ("Global thresh step", "global_thresh_step", "0.05"),
         ("Pixel thresh start", "pixel_thresh_start", "0.05"),
         ("Pixel thresh stop", "pixel_thresh_stop", "0.05"),

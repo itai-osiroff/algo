@@ -62,8 +62,9 @@ class RectificationRunConfig:
     disp_gauss_size: Optional[int] = None
     global_threshold: float = 0.15
     pixel_threshold: float = 0.05
+    pixel_sigma_pyramid: bool = False
     zero_fill_roll: bool = True
-    sub_pix_factor: int = 1
+    sub_pix_factor: int = 2
     combined_use_global_avg_reference: bool = True
     hdr_enabled: bool = False
     hdr_exposure_times: Optional[List[float]] = None
@@ -86,6 +87,12 @@ class RectificationResult:
     global_rectified_views: Optional[np.ndarray] = None
     global_avg_image: Optional[np.ndarray] = None
     pixel_similarity: Optional[Any] = None
+
+
+def add_colorbar(mappable: Any, ax: Optional[plt.Axes] = None) -> None:
+    """Attach a colorbar to the provided axes for a given image."""
+    target_ax = ax or plt.gca()
+    target_ax.figure.colorbar(mappable, ax=target_ax, orientation="vertical", fraction=0.046, pad=0.04)
 
 
 def load_image(image_path: str) -> Optional[Image.Image]:
@@ -206,6 +213,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             disp_gauss_size=config.disp_gauss_size,
             thresh=config.pixel_threshold,
             sub_pix_factor=config.sub_pix_factor,
+            use_sigma_pyramid=config.pixel_sigma_pyramid,
         )
         if exposure_views is not None:
             rectified_view_stack = []
@@ -271,6 +279,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             thresh=config.pixel_threshold,
             sub_pix_factor=config.sub_pix_factor,
             reference_view=reference_view,
+            use_sigma_pyramid=config.pixel_sigma_pyramid,
         )
         avg_image, rectified_views = rectification_strategy_pixel.rectify(
             global_rectified_views, pixel_similarity, ref_view_idx
@@ -316,7 +325,8 @@ def generate_rectification_figures(
         for i in range(VG):
             for j in range(VG):
                 fig = plt.figure()
-                plt.imshow(result.input_views[i, j], cmap="gray")
+                im = plt.imshow(result.input_views[i, j], cmap="gray")
+                add_colorbar(im)
                 plt.title(f"Original View {i+1}-{j+1}")
                 figures["original_views"].append(fig)
 
@@ -344,7 +354,8 @@ def generate_rectification_figures(
         for i in range(VG):
             for j in range(VG):
                 fig = plt.figure()
-                plt.imshow(result.global_rectified_views[i, j], cmap="gray")
+                im = plt.imshow(result.global_rectified_views[i, j], cmap="gray")
+                add_colorbar(im)
                 plt.title(f"Global Rectified View {i+1}-{j+1}")
                 figures["global_rectified_views"].append(fig)
 
@@ -353,7 +364,8 @@ def generate_rectification_figures(
             extreme_overlays_global = build_extreme_view_overlays(result.global_rectified_views, ref_index=result.ref_view_index)
             for overlay, (i1, j1), (i2, j2) in extreme_overlays_global:
                 fig = plt.figure()
-                plt.imshow(overlay)
+                im = plt.imshow(overlay)
+                add_colorbar(im)
                 plt.title(f"Global Extreme Overlay ({i1+1}-{j1+1}) vs ({i2+1}-{j2+1})")
                 figures["overlays"].append(fig)
 
@@ -385,7 +397,8 @@ def generate_rectification_figures(
     for i in range(VG):
         for j in range(VG):
             fig = plt.figure()
-            plt.imshow(result.rectified_views[i, j], cmap="gray")
+            im = plt.imshow(result.rectified_views[i, j], cmap="gray")
+            add_colorbar(im)
             plt.title(f"Rectified View {i+1}-{j+1}")
             figures["rectified_views"].append(fig)
 
@@ -393,35 +406,47 @@ def generate_rectification_figures(
     extreme_overlays = build_extreme_view_overlays(result.rectified_views, ref_index=result.ref_view_index)
     for overlay, (i1, j1), (i2, j2) in extreme_overlays:
         fig = plt.figure()
-        plt.imshow(overlay)
+        im = plt.imshow(overlay)
+        add_colorbar(im)
         plt.title(f"Overlay ({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})")
         figures["overlays"].append(fig)
 
     # Averages: final and histogram-equalized + clipped, plus global average if available
     fig_avg = plt.figure()
-    plt.imshow(result.avg_image, cmap="gray")
+    im = plt.imshow(result.avg_image, cmap="gray")
+    add_colorbar(im)
     plt.title("Averaged Rectified Image")
     figures["averages"].append(fig_avg)
 
     fig_eq = plt.figure()
     base_img = np.clip(result.avg_image, 0, 255).astype("uint8")
     eq_img = np.clip(cv.equalizeHist(base_img), 0.85 * 255, 255)
-    plt.imshow(eq_img, cmap="gray")
+    im = plt.imshow(eq_img, cmap="gray")
+    add_colorbar(im)
     plt.title("Averaged Rectified Image - Equalized (clipped, 85%) for contrast")
     figures["averages"].append(fig_eq)
 
     if result.global_avg_image is not None:
         fig_gavg = plt.figure()
-        plt.imshow(result.global_avg_image, cmap="gray")
+        im = plt.imshow(result.global_avg_image, cmap="gray")
+        add_colorbar(im)
         plt.title("Global Averaged Rectified Image")
         figures["averages"].append(fig_gavg)
 
         fig_gavg_eq = plt.figure()
         g_base = np.clip(result.global_avg_image, 0, 255).astype("uint8")
         g_eq = np.clip(cv.equalizeHist(g_base), 0.85 * 255, 255)
-        plt.imshow(g_eq, cmap="gray")
+        im = plt.imshow(g_eq, cmap="gray")
+        add_colorbar(im)
         plt.title("Global Averaged Rectified Image - Equalized (clipped, 85%) for contrast")
         figures["averages"].append(fig_gavg_eq)
+
+        fig_diff = plt.figure()
+        diff_img = result.global_avg_image.astype(np.float32) - result.avg_image.astype(np.float32)
+        im = plt.imshow(diff_img, cmap="gray")
+        add_colorbar(im)
+        plt.title("Global Avg - Final Avg Rectified Image")
+        figures["averages"].append(fig_diff)
 
     return figures
 
@@ -758,7 +783,8 @@ def display_circles(image: Image.Image, circles: np.ndarray):
         cv.circle(cimg, (i[0], i[1]), 2, (0, 0, 255), 3)    # Center
     
     plt.figure()
-    plt.imshow(cimg)
+    im = plt.imshow(cimg)
+    add_colorbar(im)
     plt.show()
 
 def extract_views(image_np: np.ndarray, base_circle: np.ndarray, num_views: int, view_dist: int) -> np.ndarray:
@@ -865,17 +891,44 @@ def build_extreme_view_overlays(rect_images: np.ndarray, ref_index: Optional[Tup
 
     return overlays
 
-def save_figures(figures: List[Figure], save_dir: str, dpi: int = 1000):
+def _regularize_filename(original_filename: str) -> str:
+    """
+    Regularize a filename by removing/replacing invalid characters.
+    
+    Replaces spaces with underscores, removes special characters, and ensures
+    the filename is safe for all filesystems.
+    """
+    # Replace spaces with underscores
+    regularized = original_filename.replace(' ', '_')
+    # Remove invalid characters for Windows/Unix filesystems
+    invalid_chars = r'<>:"|?*\/'
+    for char in invalid_chars:
+        regularized = regularized.replace(char, '')
+    # Remove leading/trailing dots and spaces
+    regularized = regularized.strip('. ')
+    # Collapse multiple underscores
+    while '__' in regularized:
+        regularized = regularized.replace('__', '_')
+    return regularized
+
+
+def save_figures(figures: List[Figure], save_dir: str, dpi: int = 1000) -> Dict[str, str]:
     """
     Persist matplotlib figures to disk with sanitized titles as filenames.
 
     Figures without titles fall back to ``figure_<index>.jpg``. Non-fatal save
     errors are reported to stdout so the rest of the batch can continue.
+    
+    Returns:
+        Dict mapping original intended filenames to actual saved filenames.
+        If a filename was regularized, both will differ. Empty dict if no figures saved.
     """
     if not figures:
         print("No figures to save.")
-        return
+        return {}
     os.makedirs(save_dir, exist_ok=True)
+    filename_changes = {}
+    
     for idx, fig in enumerate(figures, start=1):
         # Get the figure title in a type-safe way (avoid accessing private attributes directly)
         title_obj = getattr(cast(Any, fig), "_suptitle", None)
@@ -883,19 +936,31 @@ def save_figures(figures: List[Figure], save_dir: str, dpi: int = 1000):
         if not title:
             # Try to get title from axes
             if fig.axes and fig.axes[0].get_title():
-                title = fig.axes[0].get_title()
+                title = slugify(fig.axes[0].get_title())
         
         # Use title if available, otherwise use default naming
         if title:
-            filename = os.path.join(save_dir, f"{title}.jpg")
+            intended_filename = f"{title}.jpg"
         else:
-            filename = os.path.join(save_dir, f"figure_{idx}.jpg")
+            intended_filename = f"figure_{idx}.jpg"
+        
+        # Regularize the filename
+        regularized_filename = _regularize_filename(intended_filename)
+        
+        # Build full paths
+        full_path = os.path.join(save_dir, regularized_filename)
         
         try:
-            fig.savefig(filename, format='jpg', dpi=dpi, bbox_inches='tight')
-            print(f"Saved: {filename}")
+            fig.savefig(full_path, format='jpg', dpi=dpi, bbox_inches='tight')
+            print(f"Saved: {full_path}")
+            
+            # Track if filename was changed
+            if intended_filename != regularized_filename:
+                filename_changes[intended_filename] = regularized_filename
         except Exception as e:
-            print(f"Failed to save {filename}: {e}")
+            print(f"Failed to save {full_path}: {e}")
+    
+    return filename_changes
 
 def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
     """
@@ -904,6 +969,7 @@ def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
     The saved ``.npz`` can be loaded later with ``numpy.load`` for reuse in
     follow-up analysis sessions.
     """
+    import scipy.io
     if not variables:
         print("No workspace variables provided to save.")
         return
@@ -921,9 +987,13 @@ def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     try:
         np.savez_compressed(os.path.join(save_path), **filtered)
-        print(f"Saved workspace variables to: {save_path}")
+        print(f"Saved .npy workspace variables to: {save_path}")
     except Exception as exc:
-        print(f"Failed to save workspace variables: {exc}")
+        print(f"Failed to save .npy workspace variables: {exc}")
+    try:
+        scipy.io.savemat(os.path.join(save_path.replace(".npz", ".mat")), filtered)
+    except Exception as e:
+        print(f"Failed to save .mat file: {e}")
 
 def main():
     """Run the interactive light-field rectification workflow."""
@@ -988,10 +1058,12 @@ def main():
         if viewpoint_method == 'm':
             fig = plt.figure(1)
             created_figures.append(fig)
-            plt.imshow(im_np, cmap='gray')
+            im = plt.imshow(im_np, cmap='gray')
+            add_colorbar(im)
             fig = plt.figure(2)
             created_figures.append(fig)
-            plt.imshow(np.clip(cv.equalizeHist(im_np), 0.85*255, 255), cmap='gray')
+            im = plt.imshow(np.clip(cv.equalizeHist(im_np), 0.85*255, 255), cmap='gray')
+            add_colorbar(im)
             plt.show()
             center_x = int(input(f"Enter center x coordinate of viewpoint: "))
             center_y = int(input(f"Enter center y coordinate of viewpoint: "))
@@ -1010,7 +1082,8 @@ def main():
             if roi_strategy == 'specific':
                 fig = plt.figure()
                 created_figures.append(fig)
-                plt.imshow(im_np, cmap='gray')
+                im = plt.imshow(im_np, cmap='gray')
+                add_colorbar(im)
                 plt.show()
             roi, roi_offset = select_roi(im_np, roi_strategy, DEFAULT_SEARCH_RADIUS_MAX)
 
@@ -1076,9 +1149,10 @@ def main():
             fig = plt.figure()
             created_figures.append(fig)
             if len(views.shape) == 4:
-                plt.imshow(views[i, j], cmap="gray")
+                im = plt.imshow(views[i, j], cmap="gray")
             else:
-                plt.imshow(views[0, i, j], cmap="gray")
+                im = plt.imshow(views[0, i, j], cmap="gray")
+            add_colorbar(im)
             plt.title(f"View {i+1}-{j+1}")
     plt.show()
     plt.close("all")
@@ -1193,6 +1267,18 @@ def main():
         )
         reference_view = av_rect_global if use_global_avg_reference else None
 
+    # Debug mode - small region
+        # crop_i = [71//2, 278//2]
+        # crop_j = [266//2, 414//2]
+        # debug_views = np.zeros((rect_views_after_global.shape[0], rect_views_after_global.shape[1], crop_i[1]-crop_i[0], crop_j[1]-crop_j[0]))
+        # for i in range(view_grid_size):
+        #     for j in range(view_grid_size):
+        #         debug_views[i, j, :, :] = rect_views_after_global[i, j, crop_i[0]:crop_i[1], crop_j[0]:crop_j[1]]
+        # rect_views_after_global = debug_views
+        # reference_view = reference_view[crop_i[0]:crop_i[1], crop_j[0]:crop_j[1]] if reference_view is not None else None
+        # av_rect_global = av_rect_global[crop_i[0]:crop_i[1], crop_j[0]:crop_j[1]] if av_rect_global is not None else None
+    # End debug mode
+
         # Prepare pixel-wise similarity on the global-rectified views (refinement)
         if gauss_flag == 'y':
             refined_ref_view_choice = ref_view_choice
@@ -1223,7 +1309,7 @@ def main():
         created_figures.append(fig_x)
         fig_y, ax_y = plt.subplots(nrows=view_grid_size, ncols=view_grid_size, sharex=True, sharey=True)
         created_figures.append(fig_y)
-        for idx in range(view_grid_size):    
+        for idx in range(view_grid_size):
             for jdx in range(view_grid_size): 
                 im_x = ax_x[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 1], cmap="gray")
                 im_y = ax_y[idx,jdx].imshow(sim_mat[idx, jdx, :, :, 0], cmap="gray")
@@ -1238,6 +1324,7 @@ def main():
         if gauss_flag != 'y':
             av_rect, rect_images = rectification_strategy.rectify(views, sim_mat, ref_view_choice)
             rect_views_after_global = rect_images
+            av_rect_global = av_rect
     elif rect_strat == 2:
         assert isinstance(rectification_strategy, PixelwisePatchRectificationStrategy)
         assert sim_mat_pixelwise is not None
@@ -1291,7 +1378,8 @@ def main():
                 _fullscreen = getattr(manager, "full_screen_toggle", None)
                 if callable(_fullscreen):
                     _fullscreen()
-                plt.imshow(rect_views_after_global[i, j], cmap="gray")
+                im = plt.imshow(rect_views_after_global[i, j], cmap="gray")
+                add_colorbar(im)
                 plt.title(f"Global Rectified View {i+1}-{j+1}")
 
         # Pass reference view to include reference comparisons
@@ -1299,13 +1387,15 @@ def main():
         for overlay, (i1, j1), (i2, j2) in extreme_overlays_global:
             fig = plt.figure()
             created_figures.append(fig)
-            plt.imshow(overlay)
+            im = plt.imshow(overlay)
+            add_colorbar(im)
             plt.title(f"Global Extreme View Overlay ({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})")
 
         assert av_rect_global is not None
         fig = plt.figure()
         created_figures.append(fig)
-        plt.imshow(av_rect_global, cmap="gray")
+        im = plt.imshow(av_rect_global, cmap="gray")
+        add_colorbar(im)
         manager = plt.get_current_fig_manager()
         _fullscreen = getattr(manager, "full_screen_toggle", None)
         if callable(_fullscreen):
@@ -1314,7 +1404,8 @@ def main():
 
         fig = plt.figure()
         created_figures.append(fig)
-        plt.imshow(np.clip(cv.equalizeHist(av_rect_global.astype('uint8')), 0.85*255, 255), cmap="gray")
+        im = plt.imshow(np.clip(cv.equalizeHist(av_rect_global.astype('uint8')), 0.85*255, 255), cmap="gray")
+        add_colorbar(im)
         manager = plt.get_current_fig_manager()
         _fullscreen = getattr(manager, "full_screen_toggle", None)
         if callable(_fullscreen):
@@ -1367,7 +1458,8 @@ def main():
             _fullscreen = getattr(manager, "full_screen_toggle", None)
             if callable(_fullscreen):
                 _fullscreen()
-            plt.imshow(rect_images[i, j], cmap="gray")
+            im = plt.imshow(rect_images[i, j], cmap="gray")
+            add_colorbar(im)
             plt.title(f"Rectified View {i+1}-{j+1}")
     # plt.show()
     # plt.close("all")
@@ -1383,7 +1475,8 @@ def main():
     for overlay, (i1, j1), (i2, j2) in extreme_overlays:
         fig = plt.figure()
         created_figures.append(fig)
-        plt.imshow(overlay)
+        im = plt.imshow(overlay)
+        add_colorbar(im)
         plt.title(
             "Extreme View Overlay "
             f"({i1 + 1}-{j1 + 1}) vs ({i2 + 1}-{j2 + 1})"
@@ -1434,14 +1527,17 @@ def main():
             im5 = ax5.imshow(masked_y_view2, cmap="gray")
             ax5.set_title("Masked Y × Original")
 
-            ax_overlay.imshow(overlay)
+            im_overlay = ax_overlay.imshow(overlay)
             ax_overlay.set_title(f"Overlay (Red=({i1+1}-{j1+1}), Green=({i2+1}-{j2+1}))")
 
             # Add colorbars for the masked maps to emphasise displacement regions
+            fig_all.colorbar(im0, ax=ax0, orientation='vertical', fraction=0.035, pad=0.02)
             fig_all.colorbar(im1, ax=ax1, orientation='vertical', fraction=0.035, pad=0.02)
             fig_all.colorbar(im2, ax=ax2, orientation='vertical', fraction=0.035, pad=0.02)
+            fig_all.colorbar(im3, ax=ax3, orientation='vertical', fraction=0.035, pad=0.02)
             fig_all.colorbar(im4, ax=ax4, orientation='vertical', fraction=0.035, pad=0.02)
             fig_all.colorbar(im5, ax=ax5, orientation='vertical', fraction=0.035, pad=0.02)
+            fig_all.colorbar(im_overlay, ax=ax_overlay, orientation='vertical', fraction=0.035, pad=0.02)
 
             fig_all.suptitle(f"Displacement masks and original views: ({i1+1}-{j1+1}) vs ({i2+1}-{j2+1})")
             created_figures.append(fig_all)
@@ -1449,7 +1545,8 @@ def main():
     # Display the averaged rectified image
     fig = plt.figure()
     created_figures.append(fig)
-    plt.imshow(av_rect, cmap="gray")
+    im = plt.imshow(av_rect, cmap="gray")
+    add_colorbar(im)
     manager = plt.get_current_fig_manager()
     _fullscreen = getattr(manager, "full_screen_toggle", None)
     if callable(_fullscreen):
@@ -1457,16 +1554,29 @@ def main():
     plt.title("Averaged Rectified Image")
     fig = plt.figure()
     created_figures.append(fig)
-    plt.imshow(np.clip(cv.equalizeHist(av_rect.astype('uint8')), 0.85*255, 255), cmap="gray")
+    im = plt.imshow(np.clip(cv.equalizeHist(av_rect.astype('uint8')), 0.85*255, 255), cmap="gray")
+    add_colorbar(im)
     manager = plt.get_current_fig_manager()
     _fullscreen = getattr(manager, "full_screen_toggle", None)
     if callable(_fullscreen):
         _fullscreen()
     plt.title("Averaged Rectified Image - Equalized (clipped, 85%) for contrast")
+    if av_rect_global is not None:
+        fig = plt.figure()
+        created_figures.append(fig)
+        diff_img = av_rect_global.astype(np.float32) - av_rect.astype(np.float32)
+        im = plt.imshow(diff_img, cmap="gray")
+        add_colorbar(im)
+        manager = plt.get_current_fig_manager()
+        _fullscreen = getattr(manager, "full_screen_toggle", None)
+        if callable(_fullscreen):
+            _fullscreen()
+        plt.title("Global Avg - Final Avg Rectified Image")
     for i in range(len(sharpen_sets)):
         fig = plt.figure()
         created_figures.append(fig)
-        plt.imshow(av_rect_sharp[i], cmap="gray")
+        im = plt.imshow(av_rect_sharp[i], cmap="gray")
+        add_colorbar(im)
         manager = plt.get_current_fig_manager()
         _fullscreen = getattr(manager, "full_screen_toggle", None)
         if callable(_fullscreen):
