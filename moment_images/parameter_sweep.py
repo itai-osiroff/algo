@@ -131,6 +131,11 @@ def _save_run_artifacts(
     Image.fromarray(avg_image.astype("uint8")).save(avg_img_path)
 
     np.save(run_dir / "rectified_views.npy", rectified_views)
+    np.savez_compressed(
+        run_dir / "rectified_views.npz",
+        rectified_views=rectified_views,
+        average_rectified_image=avg_image,
+    )
     with (run_dir / "config.json").open("w", encoding="utf-8") as fp:
         json.dump(asdict(config), fp, indent=2)
 

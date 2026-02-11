@@ -193,7 +193,8 @@ The grid is built from:
 Each run creates a folder with:
 
 - `avg_rectified.png` — averaged rectified output.
-- `rectified_views.npy` — full rectified stack.
+- `rectified_views.npy` — full rectified stack (legacy-compatible output).
+- `rectified_views.npz` — compressed rectified stack plus `average_rectified_image` for downstream tools.
 - `config.json` — the configuration used for this run.
 
 The sweep writes a top-level `summary.json` with metrics for each run. When `--analyze` is enabled it also writes:
@@ -240,7 +241,7 @@ This tool allows you to validate your rectification results by comparing the rec
    ```bash
    python -m moment_images.validate_rectification
    ```
-2. Select the `im_process` workspace file (`.npz`) containing the rectified result.
+2. Select either an `im_process` workspace (`.npz`) or a sweep output (`rectified_views.npy` or `rectified_views.npz`).
 3. Select the Validation Camera image and Thorcam image when prompted.
 4. Use the interactive window to adjust each image.
    - Use sliders to match the brightness/contrast of the reference.
