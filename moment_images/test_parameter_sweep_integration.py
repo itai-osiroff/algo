@@ -30,6 +30,7 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
 
     run_dir = output_dir / "win1_disp0_g1.0_dg0.0_pt0.05"
     sweep_rectified = np.load(run_dir / "rectified_views.npy")
+    sweep_rectified_npz = np.load(run_dir / "rectified_views.npz")["rectified_views"]
 
     direct_config = RectificationRunConfig(
         strategy="pixel",
@@ -46,6 +47,7 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
     direct_result = rectify_views_from_config(views, direct_config)
 
     np.testing.assert_allclose(sweep_rectified, direct_result.rectified_views)
+    np.testing.assert_allclose(sweep_rectified_npz, direct_result.rectified_views)
     np.testing.assert_allclose(sweep_rectified.mean(axis=(0, 1)), direct_result.avg_image)
 
 

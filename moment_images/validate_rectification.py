@@ -27,6 +27,49 @@ else:
     from . import im_process
     from .unpack_workspace import load_workspace_variables
 
+
+def _average_rectified_from_stack(stack: np.ndarray) -> np.ndarray:
+    """Convert saved rectified stack outputs into a 2D average rectified image."""
+    if stack.ndim == 2:
+        return stack
+    if stack.ndim == 4:
+        return stack.mean(axis=(0, 1))
+    raise ValueError(
+        "Expected rectified image with 2D shape or rectified views stack with 4D shape "
+        f"(N, N, H, W), got {stack.shape}."
+    )
+
+
+def load_rectified_reference(path: str) -> np.ndarray:
+    """Load a reference rectified image from workspace/sweep outputs (.npz/.npy)."""
+    suffix = os.path.splitext(path)[1].lower()
+
+    if suffix == ".npy":
+        return _average_rectified_from_stack(np.load(path))
+
+    if suffix == ".npz":
+        with np.load(path) as data:
+            if "average_rectified_image" in data:
+                return data["average_rectified_image"]
+            if "rectified_image" in data:
+                return data["rectified_image"]
+            if "rectified_views" in data:
+                return _average_rectified_from_stack(data["rectified_views"])
+
+        workspace = load_workspace_variables(path)
+        if "average_rectified_image" in workspace:
+            return workspace["average_rectified_image"]
+        if "rectified_image" in workspace:
+            return workspace["rectified_image"]
+        if "rectified_views" in workspace:
+            return _average_rectified_from_stack(workspace["rectified_views"])
+
+        raise ValueError(
+            "NPZ file does not contain 'average_rectified_image', 'rectified_image', or 'rectified_views'."
+        )
+
+    raise ValueError("Unsupported file type. Please provide a .npz workspace/output or .npy rectified views file.")
+
 class InteractiveImageAdjuster:
     """GUI to adjust an image (rotate, flip, crop) before processing."""
 
@@ -859,24 +902,24 @@ def main():
     root.withdraw() # Hide main window
 
     # 1. Load Workspace
-    print("Please select the im_process workspace file (.npz).")
-    workspace_path = filedialog.askopenfilename(title="Select Workspace File", filetypes=[("NPZ Files", "*.npz")])
-    if not workspace_path:
-        print("No workspace selected. Exiting.")
+    print("Please select a rectification output (.npz workspace/sweep output or .npy rectified views).")
+    rectified_path = filedialog.askopenfilename(
+        title="Select Rectification Output",
+        filetypes=[
+            ("Rectification Outputs", "*.npz;*.npy"),
+            ("NPZ Files", "*.npz"),
+            ("NPY Files", "*.npy"),
+        ],
+    )
+    if not rectified_path:
+        print("No rectification output selected. Exiting.")
         return
 
     try:
-        workspace = load_workspace_variables(workspace_path)
+        rectified_img = load_rectified_reference(rectified_path)
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to load workspace: {e}")
+        messagebox.showerror("Error", f"Failed to load rectification output: {e}")
         return
-
-    # Extract rectified image
-    if 'average_rectified_image' not in workspace:
-        messagebox.showerror("Error", "Workspace does not contain 'average_rectified_image'.")
-        return
-
-    rectified_img = workspace['average_rectified_image']
 
     # 2. Load Validation Image
     print("Please select the Validation Camera image.")
