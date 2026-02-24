@@ -16,6 +16,55 @@ from moment_images.im_process import RectificationRunConfig, RectificationResult
 ImageMetrics = Dict[str, float]
 
 
+def _haar_axis_decompose(values: np.ndarray, axis: int) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Return low/high Haar components along an axis, trimming odd lengths."""
+
+    size = values.shape[axis]
+    even_size = size - (size % 2)
+    if even_size < 2:
+        return None, None
+
+    slicer = [slice(None)] * values.ndim
+    slicer[axis] = slice(0, even_size)
+    trimmed = values[tuple(slicer)]
+
+    even_idx = [slice(None)] * values.ndim
+    odd_idx = [slice(None)] * values.ndim
+    even_idx[axis] = slice(0, even_size, 2)
+    odd_idx[axis] = slice(1, even_size, 2)
+
+    scale = np.sqrt(2.0)
+    low = (trimmed[tuple(even_idx)] + trimmed[tuple(odd_idx)]) / scale
+    high = (trimmed[tuple(even_idx)] - trimmed[tuple(odd_idx)]) / scale
+    return low, high
+
+
+def _haar_dwt2_level(image: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Compute one 2D Haar decomposition level (LL, LH, HL, HH)."""
+
+    low_cols, high_cols = _haar_axis_decompose(image, axis=1)
+    if low_cols is None or high_cols is None:
+        return None, None, None, None
+
+    ll, lh = _haar_axis_decompose(low_cols, axis=0)
+    hl, hh = _haar_axis_decompose(high_cols, axis=0)
+    return ll, lh, hl, hh
+
+
+def _haar_level2_hv_energy(image: np.ndarray) -> float:
+    """Energy of level-2 Haar horizontal/vertical detail subbands."""
+
+    ll1, _, _, _ = _haar_dwt2_level(image)
+    if ll1 is None:
+        return 0.0
+
+    _, lh2, hl2, _ = _haar_dwt2_level(ll1)
+    if lh2 is None or hl2 is None:
+        return 0.0
+
+    return float(np.sum(np.square(lh2)) + np.sum(np.square(hl2)))
+
+
 def compute_image_metrics(image: np.ndarray) -> ImageMetrics:
     """Compute intensity and edge-focused statistics for a single image."""
 
@@ -32,7 +81,7 @@ def compute_image_metrics(image: np.ndarray) -> ImageMetrics:
         "total_variation": float(np.sum(np.abs(dx)) + np.sum(np.abs(dy))),
         "sum_squared_gradient": float(np.sum(np.square(grad_x)) + np.sum(np.square(grad_y))),
         "laplacian_variance": float(np.var(laplacian)),
-        "laplacian_energy": float(np.sum(np.square(laplacian))),
+        "dwt_level2_hv_energy": _haar_level2_hv_energy(as_float),
     }
 
 

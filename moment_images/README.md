@@ -215,7 +215,7 @@ Metrics include:
 - **Total variation**: sum of absolute differences in X and Y.
 - **Sum of squared gradients**: sum of gradient magnitudes squared.
 - **Laplacian variance**: variance of the Laplacian response.
-- **Laplacian energy**: sum of squared Laplacian response.
+- **Level-2 Haar DWT HV energy**: sum of squared coefficients from level-2 horizontal and vertical detail subbands.
 
 `analyze_summary_data()` aggregates these across all runs and records minima, maxima, and means, which are then saved by `save_analysis()`.
 
