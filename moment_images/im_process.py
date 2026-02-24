@@ -1158,19 +1158,35 @@ def main():
     plt.close("all")
 
     rect_strat = int(input("Start rectification process. Choose the rectification strategy:\n1: Global Translation Rectification\n2: Pixel-wise Patch Rectification\n3: Combined (Global followed by Pixel-wise refinement)\nEnter your choice:"))
+    pixel_max_displacement: Optional[int] = None
+    refinement_max_displacement: Optional[int] = None
     if rect_strat == 1:
         rectification_strategy = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
         rectification_strategy_global = None
         rectification_strategy_pixel = None
     elif rect_strat == 2:
-        sim_window_size = int(input("Enter similarity window size (odd integer, default 7): ") or 14)
+        sim_window_size = int(input("Enter similarity window size (odd integer, default 15): ") or 15)
+        max_disp_text = input(
+            "Enter maximum displacement for pixel-wise search "
+            "(press Enter to use the config/default behavior: window radius): "
+        ).strip()
+        pixel_max_displacement = int(max_disp_text) if max_disp_text else None
         rectification_strategy = PixelwisePatchRectificationStrategy(sim_window_size, zero_fill_roll=True)
         rectification_strategy_global = None
         rectification_strategy_pixel = None
     else:
         rectification_strategy = None
         rectification_strategy_global = GlobalTranslationRectificationStrategy(CORRELATION_PAD_WIDTH)
-        refinement_window_size = int(input("Enter maximum displacement for pixel-wise refinement (odd integer, default 7): ") or 14)
+        refinement_window_size = int(
+            input("Enter pixel-wise refinement similarity window size (odd integer, default 15): ") or 15
+        )
+        refinement_max_disp_text = input(
+            "Enter maximum displacement for pixel-wise refinement "
+            "(press Enter to use the config/default behavior: window radius): "
+        ).strip()
+        refinement_max_displacement = (
+            int(refinement_max_disp_text) if refinement_max_disp_text else None
+        )
         rectification_strategy_pixel = PixelwisePatchRectificationStrategy(refinement_window_size, zero_fill_roll=True)
     
     views_for_rect = np.asarray(views)
@@ -1219,7 +1235,10 @@ def main():
         # first exposure then rectify each exposure and assemble HDR.
         if gauss_flag == 'y':
             sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(
-                views[0, :, :, :, :], ref_view_choice, thresh=0.05
+                views[0, :, :, :, :],
+                ref_view_choice,
+                max_disp=pixel_max_displacement,
+                thresh=0.05,
             )
             rectified_view_stack = []
             for i in range(views.shape[0]):
@@ -1233,7 +1252,12 @@ def main():
             rect_images = hdr_views
             av_rect = np.mean(hdr_views, axis=(0, 1))
         else:
-            sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(views, ref_view_choice, thresh=0.05)
+            sim_mat_pixelwise = rectification_strategy.compute_similarity_matrices(
+                views,
+                ref_view_choice,
+                max_disp=pixel_max_displacement,
+                thresh=0.05,
+            )
     else:
         assert rectification_strategy is None
         assert isinstance(rectification_strategy_global, GlobalTranslationRectificationStrategy)
@@ -1285,7 +1309,7 @@ def main():
             sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
                 hdr_views,
                 refined_ref_view_choice,
-                max_disp=refinement_window_size//2,
+                max_disp=refinement_max_displacement,
                 thresh=0.05,
                 reference_view=reference_view,
             )
@@ -1295,7 +1319,7 @@ def main():
             sim_mat_pixelwise = rectification_strategy_pixel.compute_similarity_matrices(
                 rect_views_after_global,
                 refined_ref_view_choice,
-                max_disp=refinement_window_size//2,
+                max_disp=refinement_max_displacement,
                 thresh=0.05,
                 reference_view=reference_view,
             )

@@ -300,6 +300,8 @@ def sweep_parameters(
             global_thresh = default_config.global_threshold
         else:
             win, max_disp, gauss, disp_gauss, global_thresh, pixel_thresh = combo  # type: ignore[misc]
+        # Keep max_displacement explicit and independent from the patch window size
+        # to match RectificationRunConfig semantics across rectification entrypoints.
         config = RectificationRunConfig(
             strategy=strategy,
             similarity_window_size=win,
@@ -376,12 +378,45 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Directory to write sweep artifacts (defaults to sweep_runs/<timestamp>)",
     )
     parser.add_argument("--strategy", choices=["global", "pixel", "combined"], default="pixel")
-    parser.add_argument("--window-start", type=int, default=15)
-    parser.add_argument("--window-stop", type=int, default=45)
-    parser.add_argument("--window-step", type=int, default=10)
-    parser.add_argument("--max-disp-start", type=int, default=5)
-    parser.add_argument("--max-disp-stop", type=int, default=25)
-    parser.add_argument("--max-disp-step", type=int, default=10)
+    parser.add_argument(
+        "--window-start",
+        type=int,
+        default=15,
+        help="Pixel-wise patch window size sweep start (pixel / combined refinement)",
+    )
+    parser.add_argument(
+        "--window-stop",
+        type=int,
+        default=45,
+        help="Pixel-wise patch window size sweep stop",
+    )
+    parser.add_argument(
+        "--window-step",
+        type=int,
+        default=10,
+        help="Pixel-wise patch window size sweep step",
+    )
+    parser.add_argument(
+        "--max-disp-start",
+        type=int,
+        default=5,
+        help=(
+            "Explicit pixel-wise maximum displacement sweep start "
+            "(independent from window size; maps to RectificationRunConfig.max_displacement)"
+        ),
+    )
+    parser.add_argument(
+        "--max-disp-stop",
+        type=int,
+        default=25,
+        help="Explicit pixel-wise maximum displacement sweep stop",
+    )
+    parser.add_argument(
+        "--max-disp-step",
+        type=int,
+        default=10,
+        help="Explicit pixel-wise maximum displacement sweep step",
+    )
     parser.add_argument("--gauss-sigma-start", type=float, default=3.0)
     parser.add_argument("--gauss-sigma-stop", type=float, default=7.0)
     parser.add_argument("--gauss-sigma-step", type=float, default=2.0)
@@ -595,9 +630,9 @@ def _launch_gui() -> None:
         ("Window start", "window_start", "15"),
         ("Window stop", "window_stop", "45"),
         ("Window step", "window_step", "10"),
-        ("Max disp start", "max_disp_start", "5"),
-        ("Max disp stop", "max_disp_stop", "25"),
-        ("Max disp step", "max_disp_step", "10"),
+        ("Max disp start (search)", "max_disp_start", "5"),
+        ("Max disp stop (search)", "max_disp_stop", "25"),
+        ("Max disp step (search)", "max_disp_step", "10"),
         ("Gauss sigma start", "gauss_sigma_start", "3.0"),
         ("Gauss sigma stop", "gauss_sigma_stop", "7.0"),
         ("Gauss sigma step", "gauss_sigma_step", "2.0"),
