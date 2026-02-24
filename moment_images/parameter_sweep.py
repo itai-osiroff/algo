@@ -306,7 +306,7 @@ def sweep_parameters(
             refinement_window_size=win,
             max_displacement=max_disp,
             gauss_sigma=gauss,
-            gauss_size=int(gauss * 6),
+            gauss_size=int(gauss * 5),
             disp_gauss_sigma=disp_gauss,
             disp_gauss_size=win,
             zero_fill_roll=zero_fill_roll,
