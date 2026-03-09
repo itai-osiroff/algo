@@ -817,7 +817,15 @@ class GuidedValidationEditor:
         controls = tk.Frame(self.top)
         controls.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
 
-        geo_frame = tk.LabelFrame(controls, text="Geometry")
+        # Split controls across multiple rows so action buttons stay visible on all displays.
+        row_primary = tk.Frame(controls)
+        row_primary.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+        row_intensity = tk.Frame(controls)
+        row_intensity.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+        row_actions = tk.Frame(controls)
+        row_actions.pack(side=tk.TOP, fill=tk.X)
+
+        geo_frame = tk.LabelFrame(row_primary, text="Geometry")
         geo_frame.pack(side=tk.LEFT, padx=4, pady=2)
         tk.Button(geo_frame, text="Rot L", command=lambda: self._rotate(90)).pack(side=tk.LEFT, padx=2)
         tk.Button(geo_frame, text="Rot R", command=lambda: self._rotate(-90)).pack(side=tk.LEFT, padx=2)
@@ -826,7 +834,44 @@ class GuidedValidationEditor:
         self.btn_crop = tk.Button(geo_frame, text="Crop OFF", command=self._toggle_crop)
         self.btn_crop.pack(side=tk.LEFT, padx=2)
 
-        intensity_frame = tk.LabelFrame(controls, text="Intensity")
+        scale_frame = tk.LabelFrame(row_primary, text="Scale")
+        scale_frame.pack(side=tk.LEFT, padx=4, pady=2)
+        tk.Label(scale_frame, text="X").pack(side=tk.LEFT, padx=(4, 1))
+        self.scale_x_entry = tk.Entry(scale_frame, textvariable=self.scale_x_var, width=8)
+        self.scale_x_entry.pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(scale_frame, text="Y").pack(side=tk.LEFT, padx=(0, 1))
+        self.scale_y_entry = tk.Entry(scale_frame, textvariable=self.scale_y_var, width=8)
+        self.scale_y_entry.pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(scale_frame, text=f"[{SCALE_MIN:.3f}, {SCALE_MAX:.3f}]").pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(scale_frame, textvariable=self.scale_status_var, fg="red").pack(side=tk.LEFT)
+        self.scale_x_entry.bind("<KeyRelease>", self._on_scale_entry_change)
+        self.scale_x_entry.bind("<FocusOut>", self._on_scale_entry_commit)
+        self.scale_x_entry.bind("<Return>", self._on_scale_entry_commit)
+        self.scale_y_entry.bind("<KeyRelease>", self._on_scale_entry_change)
+        self.scale_y_entry.bind("<FocusOut>", self._on_scale_entry_commit)
+        self.scale_y_entry.bind("<Return>", self._on_scale_entry_commit)
+
+        align_frame = tk.LabelFrame(row_primary, text="Alignment")
+        align_frame.pack(side=tk.LEFT, padx=4, pady=2)
+        tk.Label(align_frame, text="Mode").pack(side=tk.LEFT, padx=(4, 2))
+        mode_menu = ttk.Combobox(
+            align_frame,
+            textvariable=self.mode_var,
+            values=[VALIDATION_MODE_PRESERVE, VALIDATION_MODE_FIT],
+            width=16,
+            state="readonly",
+        )
+        mode_menu.pack(side=tk.LEFT, padx=2)
+        mode_menu.bind("<<ComboboxSelected>>", self._on_mode_change)
+        tk.Checkbutton(
+            align_frame,
+            text="Auto Align",
+            variable=self.auto_align_var,
+            command=self._on_auto_align_toggle,
+        ).pack(side=tk.LEFT, padx=6)
+        tk.Button(align_frame, text="Run Alignment", command=self._run_alignment).pack(side=tk.LEFT, padx=4)
+
+        intensity_frame = tk.LabelFrame(row_intensity, text="Intensity")
         intensity_frame.pack(side=tk.LEFT, padx=4, pady=2)
         tk.Label(intensity_frame, text="Min").pack(side=tk.LEFT)
         resolution = max((self.raw_max_val - self.raw_min_val) / 250.0, 1e-3)
@@ -854,44 +899,7 @@ class GuidedValidationEditor:
         self.scale_intensity_max.set(self.raw_max_val)
         self.scale_intensity_max.pack(side=tk.LEFT, padx=2)
 
-        scale_frame = tk.LabelFrame(controls, text="Scale")
-        scale_frame.pack(side=tk.LEFT, padx=4, pady=2)
-        tk.Label(scale_frame, text="X").pack(side=tk.LEFT, padx=(4, 1))
-        self.scale_x_entry = tk.Entry(scale_frame, textvariable=self.scale_x_var, width=8)
-        self.scale_x_entry.pack(side=tk.LEFT, padx=(0, 6))
-        tk.Label(scale_frame, text="Y").pack(side=tk.LEFT, padx=(0, 1))
-        self.scale_y_entry = tk.Entry(scale_frame, textvariable=self.scale_y_var, width=8)
-        self.scale_y_entry.pack(side=tk.LEFT, padx=(0, 6))
-        tk.Label(scale_frame, text=f"[{SCALE_MIN:.3f}, {SCALE_MAX:.3f}]").pack(side=tk.LEFT, padx=(0, 6))
-        tk.Label(scale_frame, textvariable=self.scale_status_var, fg="red").pack(side=tk.LEFT)
-        self.scale_x_entry.bind("<KeyRelease>", self._on_scale_entry_change)
-        self.scale_x_entry.bind("<FocusOut>", self._on_scale_entry_commit)
-        self.scale_x_entry.bind("<Return>", self._on_scale_entry_commit)
-        self.scale_y_entry.bind("<KeyRelease>", self._on_scale_entry_change)
-        self.scale_y_entry.bind("<FocusOut>", self._on_scale_entry_commit)
-        self.scale_y_entry.bind("<Return>", self._on_scale_entry_commit)
-
-        align_frame = tk.LabelFrame(controls, text="Alignment")
-        align_frame.pack(side=tk.LEFT, padx=4, pady=2)
-        tk.Label(align_frame, text="Mode").pack(side=tk.LEFT, padx=(4, 2))
-        mode_menu = ttk.Combobox(
-            align_frame,
-            textvariable=self.mode_var,
-            values=[VALIDATION_MODE_PRESERVE, VALIDATION_MODE_FIT],
-            width=16,
-            state="readonly",
-        )
-        mode_menu.pack(side=tk.LEFT, padx=2)
-        mode_menu.bind("<<ComboboxSelected>>", self._on_mode_change)
-        tk.Checkbutton(
-            align_frame,
-            text="Auto Align",
-            variable=self.auto_align_var,
-            command=self._on_auto_align_toggle,
-        ).pack(side=tk.LEFT, padx=6)
-        tk.Button(align_frame, text="Run Alignment", command=self._run_alignment).pack(side=tk.LEFT, padx=4)
-
-        outputs_frame = tk.LabelFrame(controls, text="Outputs")
+        outputs_frame = tk.LabelFrame(row_actions, text="Outputs")
         outputs_frame.pack(side=tk.LEFT, padx=4, pady=2)
         ttk.Combobox(
             outputs_frame,
@@ -903,7 +911,7 @@ class GuidedValidationEditor:
         tk.Button(outputs_frame, text="Reset Section", command=self._reset_section).pack(side=tk.LEFT, padx=2)
         tk.Button(outputs_frame, text="Reset All", command=self._reset_all).pack(side=tk.LEFT, padx=2)
 
-        done_frame = tk.Frame(controls)
+        done_frame = tk.Frame(row_actions)
         done_frame.pack(side=tk.RIGHT, padx=6)
         tk.Button(done_frame, text="Cancel", command=self._cancel).pack(side=tk.RIGHT, padx=4)
         tk.Button(done_frame, text="Done", bg="green", fg="white", command=self._finish).pack(side=tk.RIGHT, padx=4)

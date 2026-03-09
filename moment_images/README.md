@@ -225,15 +225,19 @@ Metrics include:
 
 This tool allows you to validate your rectification results by comparing the rectified workspace output against new images from other cameras (e.g., Validation Camera, Thorcam).
 
-### Features
+### Full GUI Guide
 
-- **Interactive Adjustment**:
-  - Rotate (Left/Right 90°), Flip (Horizontal/Vertical).
-  - Crop tool.
-  - **Image Enhancement**: Adjust Brightness, Contrast, and Saturation.
-  - **Side-by-Side View**: Compare the image being edited with the reference global average from the workspace.
-- **Auto-Alignment**: Optionally automatically align the validation images to the rectified reference using ECC (Enhanced Correlation Coefficient) translation alignment.
-- **Comparison**: Generates overlay anaglyphs, difference maps, and side-by-side figures.
+For complete step-by-step usage and control behavior, see:
+
+- `moment_images/VALIDATE_RECTIFICATION_GUI_GUIDE.md`
+
+The guide covers:
+
+- Launch flow and file selection
+- Detailed control reference (Geometry, Intensity, Scale, Alignment, Outputs)
+- Preview tabs and status bar interpretation
+- Recommended workflow per image
+- Save outputs and troubleshooting
 
 ### Usage
 
@@ -243,13 +247,9 @@ This tool allows you to validate your rectification results by comparing the rec
    ```
 2. Select either an `im_process` workspace (`.npz`) or a sweep output (`rectified_views.npy` or `rectified_views.npz`).
 3. Select the Validation Camera image and Thorcam image when prompted.
-4. Use the interactive window to adjust each image.
-   - Use sliders to match the brightness/contrast of the reference.
-   - Toggle "Show Ref" to see the reference image side-by-side.
-   - Click "Done" when satisfied.
-5. Choose whether to perform **Auto Alignment** to refine the registration.
-6. Inspect the generated comparison figures.
-7. Save the results and workspace if desired.
+4. Edit each image in the GUI and click `Done`.
+5. Inspect the generated comparison figures.
+6. Save the results and workspace if desired.
 
 ---
 
