@@ -53,7 +53,7 @@ class ValidationOptions:
     """Controls for how comparison and alignment are performed."""
 
     mode: ValidationMode = VALIDATION_MODE_PRESERVE
-    auto_align: bool = True
+    auto_align: bool = False
     align_model: AlignmentModel = ALIGNMENT_MODEL_TRANSLATION_ECC
     joint_norm_percentiles: tuple[float, float] = (1.0, 99.0)
     template_score_threshold: float = MIN_TEMPLATE_MATCH_SCORE
@@ -195,7 +195,7 @@ def _resolve_options(
     threshold = MIN_TEMPLATE_MATCH_SCORE
     if prefer_smaller_pixels_contained:
         threshold = MIN_TEMPLATE_MATCH_SCORE
-    return ValidationOptions(mode=mode, auto_align=True, template_score_threshold=threshold).normalized()
+    return ValidationOptions(mode=mode, auto_align=False, template_score_threshold=threshold).normalized()
 
 
 def _to_gray_float32(image: Image.Image | np.ndarray) -> np.ndarray:
@@ -794,7 +794,7 @@ class GuidedValidationEditor:
         self.intensity_max_value = raw_max
 
         self.mode_var = tk.StringVar(value=VALIDATION_MODE_PRESERVE)
-        self.auto_align_var = tk.BooleanVar(value=True)
+        self.auto_align_var = tk.BooleanVar(value=False)
         self.scale_x_var = tk.StringVar(value=f"{self.scale_x_value:.4f}")
         self.scale_y_var = tk.StringVar(value=f"{self.scale_y_value:.4f}")
         self.scale_status_var = tk.StringVar(value="")
@@ -1308,7 +1308,7 @@ class GuidedValidationEditor:
         self.scale_x_var.set("1.0000")
         self.scale_y_var.set("1.0000")
         self.mode_var.set(VALIDATION_MODE_PRESERVE)
-        self.auto_align_var.set(True)
+        self.auto_align_var.set(False)
         self._invalidate_alignment()
         self._schedule_preview()
 
