@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tkinter as tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import RectangleSelector
@@ -303,6 +305,55 @@ def _joint_normalize_pair(
 ) -> tuple[np.ndarray, np.ndarray]:
     low, high = _joint_norm_bounds(img_a, img_b, percentiles)
     return _normalize_with_bounds(img_a, low, high), _normalize_with_bounds(img_b, low, high)
+
+
+def _finite_display_bounds(image: np.ndarray) -> tuple[float, float]:
+    arr = np.asarray(image, dtype=np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    low = float(np.min(finite))
+    high = float(np.max(finite))
+    if high <= low:
+        high = low + 1.0
+    return low, high
+
+
+def _imshow_with_colorbar(
+    ax: plt.Axes,
+    image: np.ndarray,
+    *,
+    cmap: str = "gray",
+    vmin: float | None = None,
+    vmax: float | None = None,
+    label: str | None = None,
+):
+    if vmin is None or vmax is None:
+        auto_low, auto_high = _finite_display_bounds(image)
+        if vmin is None:
+            vmin = auto_low
+        if vmax is None:
+            vmax = auto_high
+    im = ax.imshow(image, cmap=cmap, vmin=vmin, vmax=vmax)
+    cbar = ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    if label:
+        cbar.set_label(label)
+    return im
+
+
+def _add_overlay_channel_colorbars(ax: plt.Axes, overlay_image: np.ndarray) -> None:
+    ref_low, ref_high = _finite_display_bounds(overlay_image[..., 0])
+    input_low, input_high = _finite_display_bounds(overlay_image[..., 1])
+
+    ref_mappable = ScalarMappable(norm=Normalize(vmin=ref_low, vmax=ref_high), cmap="Reds")
+    ref_mappable.set_array(overlay_image[..., 0])
+    ref_cbar = ax.figure.colorbar(ref_mappable, ax=ax, fraction=0.046, pad=0.04)
+    ref_cbar.set_label("Reference (Red)")
+
+    input_mappable = ScalarMappable(norm=Normalize(vmin=input_low, vmax=input_high), cmap="Greens")
+    input_mappable.set_array(overlay_image[..., 1])
+    input_cbar = ax.figure.colorbar(input_mappable, ax=ax, fraction=0.046, pad=0.12)
+    input_cbar.set_label("Input (Green)")
 
 
 def _normalize_to_uint8(img: np.ndarray) -> np.ndarray:
@@ -676,15 +727,27 @@ def compare_images(
     figures: list[Figure] = []
 
     # As-is
-    as_ref_norm, as_input_norm = _joint_normalize_pair(
+    fig_as_is, axes_as_is = plt.subplots(1, 2, figsize=(12, 6))
+    as_is_low, as_is_high = _joint_norm_bounds(
         comp_data.as_is_reference, comp_data.as_is_input, opts.joint_norm_percentiles
     )
-    fig_as_is, axes_as_is = plt.subplots(1, 2, figsize=(12, 6))
-    axes_as_is[0].imshow(as_ref_norm, cmap="gray")
+    _imshow_with_colorbar(
+        axes_as_is[0],
+        comp_data.as_is_reference,
+        cmap="gray",
+        vmin=as_is_low,
+        vmax=as_is_high,
+    )
     axes_as_is[0].set_title(
         f"Reference As-Is [{comp_data.as_is_reference.shape[0]}x{comp_data.as_is_reference.shape[1]}]"
     )
-    axes_as_is[1].imshow(as_input_norm, cmap="gray")
+    _imshow_with_colorbar(
+        axes_as_is[1],
+        comp_data.as_is_input,
+        cmap="gray",
+        vmin=as_is_low,
+        vmax=as_is_high,
+    )
     axes_as_is[1].set_title(
         f"{input_name} As-Edited [{comp_data.as_is_input.shape[0]}x{comp_data.as_is_input.shape[1]}]"
     )
@@ -693,13 +756,25 @@ def compare_images(
     # Registered
     fig_reg, axes_reg = plt.subplots(1, 2, figsize=(12, 6))
     if comp_data.registered_reference.size > 0 and comp_data.registered_input.size > 0:
-        reg_ref_norm, reg_input_norm = _joint_normalize_pair(
+        reg_low, reg_high = _joint_norm_bounds(
             comp_data.registered_reference,
             comp_data.registered_input,
             opts.joint_norm_percentiles,
         )
-        axes_reg[0].imshow(reg_ref_norm, cmap="gray")
-        axes_reg[1].imshow(reg_input_norm, cmap="gray")
+        _imshow_with_colorbar(
+            axes_reg[0],
+            comp_data.registered_reference,
+            cmap="gray",
+            vmin=reg_low,
+            vmax=reg_high,
+        )
+        _imshow_with_colorbar(
+            axes_reg[1],
+            comp_data.registered_input,
+            cmap="gray",
+            vmin=reg_low,
+            vmax=reg_high,
+        )
         axes_reg[0].set_title(f"Reference Registered{mode_suffix}")
         axes_reg[1].set_title(f"{input_name} Registered{mode_suffix}")
     else:
@@ -709,38 +784,38 @@ def compare_images(
     figures.append(fig_reg)
 
     # Difference
-    fig_diff = plt.figure(figsize=(10, 8))
+    fig_diff, ax_diff = plt.subplots(1, 1, figsize=(10, 8))
     if comp_data.diff_image is not None:
-        im = plt.imshow(comp_data.diff_image, cmap="viridis")
-        im_process.add_colorbar(im)
-        plt.title(f"Difference |Reference - {input_name}|{mode_suffix}")
+        _imshow_with_colorbar(ax_diff, comp_data.diff_image, cmap="viridis", label="|Reference - Input|")
+        ax_diff.set_title(f"Difference |Reference - {input_name}|{mode_suffix}")
     else:
-        plt.axis("off")
-        plt.text(
+        ax_diff.axis("off")
+        ax_diff.text(
             0.5,
             0.5,
             f"Difference unavailable\nstatus: {comp_data.status}",
             ha="center",
             va="center",
         )
-        plt.title(f"Difference (Unavailable){mode_suffix}")
+        ax_diff.set_title(f"Difference (Unavailable){mode_suffix}")
     figures.append(fig_diff)
 
     # Overlay
-    fig_overlay = plt.figure(figsize=(10, 8))
+    fig_overlay, ax_overlay = plt.subplots(1, 1, figsize=(10, 8))
     if comp_data.overlay_image is not None:
-        plt.imshow(comp_data.overlay_image)
-        plt.title(f"Overlay Red=Reference, Green={input_name}{mode_suffix}")
+        ax_overlay.imshow(comp_data.overlay_image)
+        _add_overlay_channel_colorbars(ax_overlay, comp_data.overlay_image)
+        ax_overlay.set_title(f"Overlay Red=Reference, Green={input_name}{mode_suffix}")
     else:
-        plt.axis("off")
-        plt.text(
+        ax_overlay.axis("off")
+        ax_overlay.text(
             0.5,
             0.5,
             f"Overlay unavailable\nstatus: {comp_data.status}",
             ha="center",
             va="center",
         )
-        plt.title(f"Overlay (Unavailable){mode_suffix}")
+        ax_overlay.set_title(f"Overlay (Unavailable){mode_suffix}")
     figures.append(fig_overlay)
 
     return figures
@@ -799,6 +874,7 @@ class GuidedValidationEditor:
         self.scale_y_var = tk.StringVar(value=f"{self.scale_y_value:.4f}")
         self.scale_status_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="")
+        self.hover_status_var = tk.StringVar(value="Hover: move cursor over an image to inspect pixel values")
         self.reset_section_var = tk.StringVar(value="geometry")
 
         self.fig_as_is: Figure | None = None
@@ -918,6 +994,8 @@ class GuidedValidationEditor:
 
         status_label = tk.Label(self.top, textvariable=self.status_var, anchor="w", fg="navy")
         status_label.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
+        hover_label = tk.Label(self.top, textvariable=self.hover_status_var, anchor="w", fg="darkgreen")
+        hover_label.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 4))
 
         notebook = ttk.Notebook(self.top)
         notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=4)
@@ -950,8 +1028,68 @@ class GuidedValidationEditor:
         self.canvas_overlay = FigureCanvasTkAgg(self.fig_overlay, master=tab_overlay)
         self.canvas_overlay.draw()
         self.canvas_overlay.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._bind_hover_readout()
 
         self.top.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _bind_hover_readout(self) -> None:
+        for canvas in (self.canvas_as_is, self.canvas_registered, self.canvas_diff, self.canvas_overlay):
+            if canvas is None:
+                continue
+            canvas.mpl_connect("motion_notify_event", self._on_canvas_hover)
+            canvas.mpl_connect("figure_leave_event", self._on_canvas_leave)
+
+    def _on_canvas_leave(self, _event: object) -> None:
+        self.hover_status_var.set("Hover: move cursor over an image to inspect pixel values")
+
+    def _on_canvas_hover(self, event: object) -> None:
+        ax = getattr(event, "inaxes", None)
+        xdata = getattr(event, "xdata", None)
+        ydata = getattr(event, "ydata", None)
+        if ax is None or xdata is None or ydata is None:
+            self.hover_status_var.set("Hover: move cursor over an image to inspect pixel values")
+            return
+        images = getattr(ax, "images", [])
+        if not images:
+            self.hover_status_var.set("Hover: move cursor over an image to inspect pixel values")
+            return
+
+        arr = np.asarray(images[-1].get_array())
+        if arr.ndim < 2:
+            self.hover_status_var.set("Hover: move cursor over an image to inspect pixel values")
+            return
+
+        ix = int(np.rint(float(xdata)))
+        iy = int(np.rint(float(ydata)))
+        h, w = arr.shape[:2]
+        if ix < 0 or iy < 0 or ix >= w or iy >= h:
+            self.hover_status_var.set("Hover: move cursor over an image to inspect pixel values")
+            return
+
+        pixel = arr[iy, ix]
+        title = ax.get_title() or "Image"
+        if np.ndim(pixel) == 0:
+            if np.isfinite(float(pixel)):
+                pixel_text = f"{float(pixel):.6g}"
+            else:
+                pixel_text = "nan"
+            self.hover_status_var.set(f"{title} | x={ix}, y={iy}, value={pixel_text}")
+            return
+
+        channel_values = np.ravel(np.asarray(pixel, dtype=np.float32))
+        if channel_values.size >= 3:
+            labels = ("R", "G", "B")
+            parts: list[str] = []
+            for idx, channel in enumerate(channel_values[:3]):
+                label = labels[idx]
+                parts.append(f"{label}={float(channel):.6g}" if np.isfinite(channel) else f"{label}=nan")
+            self.hover_status_var.set(f"{title} | x={ix}, y={iy}, " + ", ".join(parts))
+            return
+
+        values_text = ", ".join(
+            f"{float(v):.6g}" if np.isfinite(v) else "nan" for v in channel_values
+        )
+        self.hover_status_var.set(f"{title} | x={ix}, y={iy}, value=[{values_text}]")
 
     def _parse_scale_value(self, raw_value: str, axis_label: str) -> tuple[float | None, str | None]:
         value_text = raw_value.strip()
@@ -1170,14 +1308,24 @@ class GuidedValidationEditor:
         ax_ref = self.fig_as_is.add_subplot(121)
         ax_edit = self.fig_as_is.add_subplot(122)
 
-        ref_norm, edit_norm = _joint_normalize_pair(
-            self.reference_image, crop_preview, (1.0, 99.0)
+        as_is_low, as_is_high = _joint_norm_bounds(self.reference_image, crop_preview, (1.0, 99.0))
+        _imshow_with_colorbar(
+            ax_ref,
+            self.reference_image,
+            cmap="gray",
+            vmin=as_is_low,
+            vmax=as_is_high,
         )
-        ax_ref.imshow(ref_norm, cmap="gray")
         ax_ref.set_title(
             f"Reference As-Is [{self.reference_image.shape[0]}x{self.reference_image.shape[1]}]"
         )
-        ax_edit.imshow(edit_norm, cmap="gray")
+        _imshow_with_colorbar(
+            ax_edit,
+            crop_preview,
+            cmap="gray",
+            vmin=as_is_low,
+            vmax=as_is_high,
+        )
         ax_edit.set_title(
             f"Input Edit View (Crop Select) [{crop_preview.shape[0]}x{crop_preview.shape[1]}]"
         )
@@ -1224,11 +1372,23 @@ class GuidedValidationEditor:
         suffix = _comparison_mode_suffix(comp_data.mode, comp_data.score, comp_data.ecc_score)
 
         if comp_data.registered_reference.size > 0 and comp_data.registered_input.size > 0:
-            ref_norm, input_norm = _joint_normalize_pair(
+            reg_low, reg_high = _joint_norm_bounds(
                 comp_data.registered_reference, comp_data.registered_input, options.joint_norm_percentiles
             )
-            ax_ref.imshow(ref_norm, cmap="gray")
-            ax_input.imshow(input_norm, cmap="gray")
+            _imshow_with_colorbar(
+                ax_ref,
+                comp_data.registered_reference,
+                cmap="gray",
+                vmin=reg_low,
+                vmax=reg_high,
+            )
+            _imshow_with_colorbar(
+                ax_input,
+                comp_data.registered_input,
+                cmap="gray",
+                vmin=reg_low,
+                vmax=reg_high,
+            )
             ax_ref.set_title(f"Reference Registered{suffix}")
             ax_input.set_title(f"Input Registered{suffix}")
         else:
@@ -1244,8 +1404,7 @@ class GuidedValidationEditor:
         self.fig_diff.clf()
         ax = self.fig_diff.add_subplot(111)
         if comp_data.diff_image is not None:
-            im = ax.imshow(comp_data.diff_image, cmap="viridis")
-            self.fig_diff.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            _imshow_with_colorbar(ax, comp_data.diff_image, cmap="viridis", label="|Reference - Input|")
             ax.set_title("Difference (Joint-Normalized)")
         else:
             ax.axis("off")
@@ -1260,6 +1419,7 @@ class GuidedValidationEditor:
         ax = self.fig_overlay.add_subplot(111)
         if comp_data.overlay_image is not None:
             ax.imshow(comp_data.overlay_image)
+            _add_overlay_channel_colorbars(ax, comp_data.overlay_image)
             ax.set_title("Overlay: Red=Reference, Green=Input")
         else:
             ax.axis("off")
