@@ -119,6 +119,7 @@ class ValidationImageResult:
     alignment_result: AlignmentResult | None
     scale_x: float
     scale_y: float
+    preblur_before_resize: bool
     intensity_min: float
     intensity_max: float
     crop_box: tuple[int, int, int, int] | None
@@ -261,11 +262,29 @@ def _apply_intensity_window(image: np.ndarray, min_val: float, max_val: float) -
     return (clipped - lo) / (hi - lo) * 255.0
 
 
-def _scale_image(src_img: np.ndarray, scale_x: float, scale_y: float) -> np.ndarray:
+def _scale_image(
+    src_img: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+    *,
+    preblur_before_resize: bool = False,
+) -> np.ndarray:
     src_h, src_w = src_img.shape[:2]
     scaled_w = max(1, int(round(src_w * float(scale_x))))
     scaled_h = max(1, int(round(src_h * float(scale_y))))
-    return cv.resize(src_img, (scaled_w, scaled_h), interpolation=cv.INTER_LINEAR)
+
+    resize_source = src_img
+    if preblur_before_resize:
+        safe_scale_x = max(float(scale_x), 1e-12)
+        safe_scale_y = max(float(scale_y), 1e-12)
+        kernel_w = max(1, int(np.ceil(1.0 / safe_scale_x)))
+        kernel_h = max(1, int(np.ceil(1.0 / safe_scale_y)))
+        kernel_w = min(kernel_w, src_w)
+        kernel_h = min(kernel_h, src_h)
+        if kernel_w > 1 or kernel_h > 1:
+            resize_source = cv.blur(src_img, (kernel_w, kernel_h))
+
+    return cv.resize(resize_source, (scaled_w, scaled_h), interpolation=cv.INTER_LINEAR)
 
 
 def _joint_norm_bounds(
@@ -853,6 +872,7 @@ class GuidedValidationEditor:
 
         self.scale_x_value = 1.0
         self.scale_y_value = 1.0
+        self.preblur_before_resize = True
         self.alignment_result: AlignmentResult | None = None
         self._alignment_dirty = True
         self._preview_job: str | None = None
@@ -872,6 +892,7 @@ class GuidedValidationEditor:
         self.auto_align_var = tk.BooleanVar(value=False)
         self.scale_x_var = tk.StringVar(value=f"{self.scale_x_value:.4f}")
         self.scale_y_var = tk.StringVar(value=f"{self.scale_y_value:.4f}")
+        self.preblur_var = tk.BooleanVar(value=self.preblur_before_resize)
         self.scale_status_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="")
         self.hover_status_var = tk.StringVar(value="Hover: move cursor over an image to inspect pixel values")
@@ -926,6 +947,12 @@ class GuidedValidationEditor:
         self.scale_y_entry.bind("<KeyRelease>", self._on_scale_entry_change)
         self.scale_y_entry.bind("<FocusOut>", self._on_scale_entry_commit)
         self.scale_y_entry.bind("<Return>", self._on_scale_entry_commit)
+        tk.Checkbutton(
+            scale_frame,
+            text="Pre-blur before resize",
+            variable=self.preblur_var,
+            command=self._on_preblur_toggle,
+        ).pack(side=tk.LEFT, padx=(0, 6))
 
         align_frame = tk.LabelFrame(row_primary, text="Alignment")
         align_frame.pack(side=tk.LEFT, padx=4, pady=2)
@@ -1131,6 +1158,11 @@ class GuidedValidationEditor:
         if self._apply_scale_entries(commit=True):
             self._schedule_preview()
 
+    def _on_preblur_toggle(self) -> None:
+        self.preblur_before_resize = bool(self.preblur_var.get())
+        self._invalidate_alignment()
+        self._schedule_preview()
+
     def _rotate(self, delta_deg: int) -> None:
         self.rotation_deg = (self.rotation_deg + delta_deg) % 360
         self._invalidate_alignment()
@@ -1222,7 +1254,12 @@ class GuidedValidationEditor:
             crop_box=self.crop_box,
         )
         intensity = _apply_intensity_window(geom, self.intensity_min_value, self.intensity_max_value)
-        return _scale_image(intensity, self.scale_x_value, self.scale_y_value)
+        return _scale_image(
+            intensity,
+            self.scale_x_value,
+            self.scale_y_value,
+            preblur_before_resize=self.preblur_before_resize,
+        )
 
     def _build_crop_preview_image(self, *, apply_scale: bool = True) -> np.ndarray:
         geom_no_crop = _apply_geometry(
@@ -1234,7 +1271,12 @@ class GuidedValidationEditor:
         )
         intensity = _apply_intensity_window(geom_no_crop, self.intensity_min_value, self.intensity_max_value)
         if apply_scale:
-            return _scale_image(intensity, self.scale_x_value, self.scale_y_value)
+            return _scale_image(
+                intensity,
+                self.scale_x_value,
+                self.scale_y_value,
+                preblur_before_resize=self.preblur_before_resize,
+            )
         return intensity
 
     def _invalidate_alignment(self) -> None:
@@ -1455,6 +1497,8 @@ class GuidedValidationEditor:
             self.scale_y_value = 1.0
             self.scale_x_var.set("1.0000")
             self.scale_y_var.set("1.0000")
+            self.preblur_before_resize = True
+            self.preblur_var.set(True)
         elif section == "alignment":
             self.alignment_result = None
             self._alignment_dirty = True
@@ -1478,6 +1522,8 @@ class GuidedValidationEditor:
         self.scale_y_value = 1.0
         self.scale_x_var.set("1.0000")
         self.scale_y_var.set("1.0000")
+        self.preblur_before_resize = True
+        self.preblur_var.set(True)
         self.mode_var.set(VALIDATION_MODE_PRESERVE)
         self.auto_align_var.set(False)
         self._invalidate_alignment()
@@ -1500,6 +1546,7 @@ class GuidedValidationEditor:
             alignment_result=alignment_result,
             scale_x=self.scale_x_value,
             scale_y=self.scale_y_value,
+            preblur_before_resize=self.preblur_before_resize,
             intensity_min=self.intensity_min_value,
             intensity_max=self.intensity_max_value,
             crop_box=self.crop_box,
@@ -1580,6 +1627,7 @@ def _save_workspace_data(
         "validation_mode": np.array(val_result.options.mode),
         "validation_auto_align": np.array(val_result.options.auto_align),
         "validation_scale_factors": np.array([val_result.scale_x, val_result.scale_y], dtype=np.float32),
+        "validation_preblur_before_resize": np.array(val_result.preblur_before_resize),
         "validation_intensity_window": np.array([val_result.intensity_min, val_result.intensity_max], dtype=np.float32),
         "validation_crop_box": _crop_box_to_array(val_result.crop_box),
         "validation_rotation_deg": np.array(val_result.rotation_deg, dtype=np.int32),
@@ -1598,6 +1646,7 @@ def _save_workspace_data(
         "thorcam_mode": np.array(thor_result.options.mode),
         "thorcam_auto_align": np.array(thor_result.options.auto_align),
         "thorcam_scale_factors": np.array([thor_result.scale_x, thor_result.scale_y], dtype=np.float32),
+        "thorcam_preblur_before_resize": np.array(thor_result.preblur_before_resize),
         "thorcam_intensity_window": np.array([thor_result.intensity_min, thor_result.intensity_max], dtype=np.float32),
         "thorcam_crop_box": _crop_box_to_array(thor_result.crop_box),
         "thorcam_rotation_deg": np.array(thor_result.rotation_deg, dtype=np.int32),

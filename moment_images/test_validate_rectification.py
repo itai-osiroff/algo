@@ -9,7 +9,10 @@ import numpy as np
 from moment_images.validate_rectification import (
     VALIDATION_MODE_FIT,
     VALIDATION_MODE_PRESERVE,
+    ValidationImageResult,
     ValidationOptions,
+    _save_workspace_data,
+    _scale_image,
     auto_align_images,
     compare_images,
     load_rectified_reference,
@@ -154,3 +157,96 @@ def test_alignment_failure_returns_status_without_silent_change():
 
     assert aligned.status.startswith("ecc_failed")
     assert np.isnan(aligned.aligned_image).all()
+
+
+def test_scale_image_without_preblur_matches_bilinear_resize():
+    src = np.arange(6 * 8, dtype=np.float32).reshape(8, 6)
+    expected = cv.resize(src, (3, 4), interpolation=cv.INTER_LINEAR)
+
+    actual = _scale_image(src, 0.5, 0.5, preblur_before_resize=False)
+
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_scale_image_preblur_downscale_isotropic_matches_explicit_blur_then_resize():
+    src = np.arange(6 * 8, dtype=np.float32).reshape(8, 6)
+    expected = cv.resize(cv.blur(src, (2, 2)), (3, 4), interpolation=cv.INTER_LINEAR)
+
+    actual = _scale_image(src, 0.5, 0.5, preblur_before_resize=True)
+
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_scale_image_preblur_downscale_anisotropic_matches_explicit_blur_then_resize():
+    src = np.arange(10 * 8, dtype=np.float32).reshape(8, 10)
+    expected = cv.resize(cv.blur(src, (2, 4)), (5, 2), interpolation=cv.INTER_LINEAR)
+
+    actual = _scale_image(src, 0.5, 0.25, preblur_before_resize=True)
+
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_scale_image_preblur_upscale_uses_unit_kernel_and_matches_bilinear():
+    src = np.arange(6 * 8, dtype=np.float32).reshape(8, 6)
+    expected = cv.resize(src, (12, 12), interpolation=cv.INTER_LINEAR)
+
+    actual = _scale_image(src, 2.0, 1.5, preblur_before_resize=True)
+
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_save_workspace_data_persists_preblur_flags(tmp_path):
+    rectified = np.zeros((8, 8), dtype=np.float32)
+    val_path = tmp_path / "val.png"
+    thor_path = tmp_path / "thor.png"
+    save_path = tmp_path / "validation_workspace.npz"
+
+    val_u8 = np.full((8, 8), 80, dtype=np.uint8)
+    thor_u8 = np.full((8, 8), 140, dtype=np.uint8)
+    assert cv.imwrite(str(val_path), val_u8)
+    assert cv.imwrite(str(thor_path), thor_u8)
+
+    opts = ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=False)
+    val_result = ValidationImageResult(
+        processed_image=rectified.copy(),
+        options=opts,
+        alignment_result=None,
+        scale_x=1.0,
+        scale_y=1.0,
+        preblur_before_resize=True,
+        intensity_min=0.0,
+        intensity_max=255.0,
+        crop_box=None,
+        rotation_deg=0,
+        flip_h=False,
+        flip_v=False,
+    )
+    thor_result = ValidationImageResult(
+        processed_image=rectified.copy(),
+        options=opts,
+        alignment_result=None,
+        scale_x=1.0,
+        scale_y=1.0,
+        preblur_before_resize=False,
+        intensity_min=0.0,
+        intensity_max=255.0,
+        crop_box=None,
+        rotation_deg=0,
+        flip_h=False,
+        flip_v=False,
+    )
+
+    _save_workspace_data(
+        save_path=str(save_path),
+        rectified_img=rectified,
+        val_path=str(val_path),
+        thor_path=str(thor_path),
+        val_result=val_result,
+        thor_result=thor_result,
+    )
+
+    with np.load(save_path) as workspace:
+        assert "validation_preblur_before_resize" in workspace
+        assert "thorcam_preblur_before_resize" in workspace
+        assert bool(workspace["validation_preblur_before_resize"]) is True
+        assert bool(workspace["thorcam_preblur_before_resize"]) is False

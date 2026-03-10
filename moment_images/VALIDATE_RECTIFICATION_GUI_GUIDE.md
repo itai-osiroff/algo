@@ -80,12 +80,17 @@ Crop details:
 
 - `X`: horizontal scale factor
 - `Y`: vertical scale factor
+- `Pre-blur before resize`: apply a normalized box blur before scaling (default: on)
 - Valid range is shown in the GUI: `[0.001, 8.000]`
 
 Scale behavior:
 
 - Numeric validation happens as you type.
 - Invalid values are rejected on commit and reverted to last valid values.
+- When pre-blur is enabled, a uniform energy-conserving kernel is applied before resize:
+  - `kx = ceil(1 / X)`
+  - `ky = ceil(1 / Y)`
+  - (with minimum kernel size `1` per axis)
 - Scale changes invalidate previous alignment results.
 
 ### Alignment
