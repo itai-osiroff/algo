@@ -132,7 +132,7 @@ Windowing behavior:
 
 ### As-Is
 
-- Left: reference image (joint-normalized with current preview image)
+- Left: reference image (joint-normalized with current edited image before X/Y display scaling)
 - Right: edited input view used for crop interaction
 - Shows crop rectangle overlay when crop is set
 
@@ -240,9 +240,8 @@ Try:
 
 ## Notes on Camera Defaults
 
-Before manual edits, camera-specific defaults are applied:
+No camera-specific defaults are applied automatically before editing.
 
-- Validation camera: rotate 90 degrees clockwise, then vertical flip
-- Thorcam: rotate 90 degrees clockwise
-
-This is automatic and occurs before GUI editing.
+Validation and Thorcam now enter the editor through the same preprocessing path
+(same load/grayscale/intensity/scale/alignment pipeline). Use Geometry controls
+(rotate/flip/crop) to set orientation manually when needed.

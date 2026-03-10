@@ -212,11 +212,8 @@ def _to_gray_float32(image: Image.Image | np.ndarray) -> np.ndarray:
 
 
 def _apply_camera_defaults(image: np.ndarray, camera_type: str | None) -> np.ndarray:
-    if camera_type == "validation":
-        rotated = cv.rotate(image, cv.ROTATE_90_CLOCKWISE)
-        return cv.flip(rotated, 0)  # vertical flip
-    if camera_type == "thorcam":
-        return cv.rotate(image, cv.ROTATE_90_CLOCKWISE)
+    # Keep preprocessing identical across camera sources; geometry is edited manually in the GUI.
+    _ = camera_type
     return image
 
 
@@ -728,15 +725,16 @@ def compare_images(
 
     # As-is
     fig_as_is, axes_as_is = plt.subplots(1, 2, figsize=(12, 6))
-    as_is_low, as_is_high = _joint_norm_bounds(
-        comp_data.as_is_reference, comp_data.as_is_input, opts.joint_norm_percentiles
-    )
+    # Keep each as-is panel independent so the loaded reference appearance is not
+    # affected by edited-input scaling/intensity.
+    ref_as_is_low, ref_as_is_high = _finite_display_bounds(comp_data.as_is_reference)
+    input_as_is_low, input_as_is_high = _finite_display_bounds(comp_data.as_is_input)
     _imshow_with_colorbar(
         axes_as_is[0],
         comp_data.as_is_reference,
         cmap="gray",
-        vmin=as_is_low,
-        vmax=as_is_high,
+        vmin=ref_as_is_low,
+        vmax=ref_as_is_high,
     )
     axes_as_is[0].set_title(
         f"Reference As-Is [{comp_data.as_is_reference.shape[0]}x{comp_data.as_is_reference.shape[1]}]"
@@ -745,8 +743,8 @@ def compare_images(
         axes_as_is[1],
         comp_data.as_is_input,
         cmap="gray",
-        vmin=as_is_low,
-        vmax=as_is_high,
+        vmin=input_as_is_low,
+        vmax=input_as_is_high,
     )
     axes_as_is[1].set_title(
         f"{input_name} As-Edited [{comp_data.as_is_input.shape[0]}x{comp_data.as_is_input.shape[1]}]"
@@ -843,7 +841,9 @@ class GuidedValidationEditor:
 
         self.original_image = _to_gray_float32(loaded)
         self.base_image = _apply_camera_defaults(self.original_image, camera_type)
-        self.reference_image = _to_gray_float32(reference_image)
+        # Keep an isolated reference copy for preview rendering and alignment.
+        self.reference_image = _to_gray_float32(reference_image).copy()
+        self.reference_display_low, self.reference_display_high = _finite_display_bounds(self.reference_image)
 
         self.rotation_deg = 0
         self.flip_h = False
@@ -1224,7 +1224,7 @@ class GuidedValidationEditor:
         intensity = _apply_intensity_window(geom, self.intensity_min_value, self.intensity_max_value)
         return _scale_image(intensity, self.scale_x_value, self.scale_y_value)
 
-    def _build_crop_preview_image(self) -> np.ndarray:
+    def _build_crop_preview_image(self, *, apply_scale: bool = True) -> np.ndarray:
         geom_no_crop = _apply_geometry(
             self.base_image,
             rotation_deg=self.rotation_deg,
@@ -1233,7 +1233,9 @@ class GuidedValidationEditor:
             crop_box=None,
         )
         intensity = _apply_intensity_window(geom_no_crop, self.intensity_min_value, self.intensity_max_value)
-        return _scale_image(intensity, self.scale_x_value, self.scale_y_value)
+        if apply_scale:
+            return _scale_image(intensity, self.scale_x_value, self.scale_y_value)
+        return intensity
 
     def _invalidate_alignment(self) -> None:
         self.alignment_result = None
@@ -1275,9 +1277,10 @@ class GuidedValidationEditor:
             options=options,
             alignment_result=alignment_for_preview,
         )
-        crop_preview = self._build_crop_preview_image()
+        crop_preview = self._build_crop_preview_image(apply_scale=True)
+        crop_preview_for_norm = self._build_crop_preview_image(apply_scale=False)
 
-        self._render_as_is_tab(crop_preview)
+        self._render_as_is_tab(crop_preview, crop_preview_for_norm)
         self._render_registered_tab(comp_data, options)
         self._render_diff_tab(comp_data)
         self._render_overlay_tab(comp_data)
@@ -1301,20 +1304,28 @@ class GuidedValidationEditor:
         status_parts.append(f"Compare={comp_data.status}")
         self.status_var.set(" | ".join(status_parts))
 
-    def _render_as_is_tab(self, crop_preview: np.ndarray) -> None:
+    def _render_as_is_tab(
+        self,
+        crop_preview: np.ndarray,
+        crop_preview_for_norm: np.ndarray | None = None,
+    ) -> None:
         if self.fig_as_is is None or self.canvas_as_is is None:
             return
         self.fig_as_is.clf()
         ax_ref = self.fig_as_is.add_subplot(121)
         ax_edit = self.fig_as_is.add_subplot(122)
 
-        as_is_low, as_is_high = _joint_norm_bounds(self.reference_image, crop_preview, (1.0, 99.0))
+        # Keep reference display independent from input edits (scale/crop/intensity).
+        ref_low = self.reference_display_low
+        ref_high = self.reference_display_high
+        norm_source = crop_preview if crop_preview_for_norm is None else crop_preview_for_norm
+        input_low, input_high = _finite_display_bounds(norm_source)
         _imshow_with_colorbar(
             ax_ref,
             self.reference_image,
             cmap="gray",
-            vmin=as_is_low,
-            vmax=as_is_high,
+            vmin=ref_low,
+            vmax=ref_high,
         )
         ax_ref.set_title(
             f"Reference As-Is [{self.reference_image.shape[0]}x{self.reference_image.shape[1]}]"
@@ -1323,8 +1334,8 @@ class GuidedValidationEditor:
             ax_edit,
             crop_preview,
             cmap="gray",
-            vmin=as_is_low,
-            vmax=as_is_high,
+            vmin=input_low,
+            vmax=input_high,
         )
         ax_edit.set_title(
             f"Input Edit View (Crop Select) [{crop_preview.shape[0]}x{crop_preview.shape[1]}]"
@@ -1652,7 +1663,7 @@ def main() -> None:
         val_path,
         reference_image=rectified_img,
         title="Validation Editor - Validation Camera",
-        camera_type="validation",
+        camera_type=None,
     )
     val_result = editor_val.run()
     if val_result is None:
@@ -1665,7 +1676,7 @@ def main() -> None:
         thor_path,
         reference_image=rectified_img,
         title="Validation Editor - Thorcam",
-        camera_type="thorcam",
+        camera_type=None,
     )
     thor_result = editor_thor.run()
     if thor_result is None:
