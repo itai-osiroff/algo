@@ -1616,10 +1616,10 @@ def _save_workspace_data(
     vars_to_save: dict[str, np.ndarray | np.bool_ | np.float32 | np.int32] = {
         # Backward-compatible keys
         "rectified_image": rectified_img,
-        "validation_input_original": np.asarray(Image.open(val_path).convert("L")),
+        "validation_input_original": np.asarray(Image.open(val_path)),
         "validation_processed": val_result.processed_image,
         "validation_resize_to_reference": np.array(val_resize_to_reference),
-        "thorcam_input_original": np.asarray(Image.open(thor_path).convert("L")),
+        "thorcam_input_original": np.asarray(Image.open(thor_path)),
         "thorcam_processed": thor_result.processed_image,
         "thorcam_resize_to_reference": np.array(thor_resize_to_reference),
         # Extended metadata for reproducibility
