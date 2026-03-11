@@ -91,6 +91,8 @@ Scale behavior:
   - `kx = ceil(1 / X)`
   - `ky = ceil(1 / Y)`
   - (with minimum kernel size `1` per axis)
+- After resize, finite output values are linearly remapped to the finite min/max
+  of the pre-resize image, so X/Y scaling preserves the input dynamic range.
 - Scale changes invalidate previous alignment results.
 
 ### Alignment
@@ -115,7 +117,7 @@ Mode behavior:
 
 Windowing behavior:
 
-- Input values are clipped to `[Min, Max]` then mapped to `[0, 255]`.
+- Input values are clipped to `[Min, Max]` in native image units (no fixed-range remap).
 - If `Min >= Max`, the GUI nudges `Max` upward to maintain a valid window.
 
 ### Outputs

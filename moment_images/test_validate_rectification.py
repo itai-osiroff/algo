@@ -11,6 +11,7 @@ from moment_images.validate_rectification import (
     VALIDATION_MODE_PRESERVE,
     ValidationImageResult,
     ValidationOptions,
+    _apply_intensity_window,
     _save_workspace_data,
     _scale_image,
     auto_align_images,
@@ -159,40 +160,73 @@ def test_alignment_failure_returns_status_without_silent_change():
     assert np.isnan(aligned.aligned_image).all()
 
 
-def test_scale_image_without_preblur_matches_bilinear_resize():
-    src = np.arange(6 * 8, dtype=np.float32).reshape(8, 6)
-    expected = cv.resize(src, (3, 4), interpolation=cv.INTER_LINEAR)
+def _assert_finite_range_preserved(src: np.ndarray, out: np.ndarray) -> None:
+    src_vals = np.asarray(src, dtype=np.float32)
+    out_vals = np.asarray(out, dtype=np.float32)
+    src_finite = src_vals[np.isfinite(src_vals)]
+    out_finite = out_vals[np.isfinite(out_vals)]
 
+    assert src_finite.size > 0
+    assert out_finite.size > 0
+    np.testing.assert_allclose(float(np.min(out_finite)), float(np.min(src_finite)), rtol=0.0, atol=1e-5)
+    np.testing.assert_allclose(float(np.max(out_finite)), float(np.max(src_finite)), rtol=0.0, atol=1e-5)
+
+
+def test_scale_image_without_preblur_preserves_finite_range():
+    src = np.linspace(-7.5, 23.75, 48, dtype=np.float32).reshape(8, 6)
     actual = _scale_image(src, 0.5, 0.5, preblur_before_resize=False)
 
-    np.testing.assert_allclose(actual, expected)
+    assert actual.shape == (4, 3)
+    _assert_finite_range_preserved(src, actual)
 
 
-def test_scale_image_preblur_downscale_isotropic_matches_explicit_blur_then_resize():
-    src = np.arange(6 * 8, dtype=np.float32).reshape(8, 6)
-    expected = cv.resize(cv.blur(src, (2, 2)), (3, 4), interpolation=cv.INTER_LINEAR)
-
+def test_scale_image_preblur_downscale_isotropic_preserves_finite_range():
+    src = np.linspace(-11.0, 31.0, 48, dtype=np.float32).reshape(8, 6)
     actual = _scale_image(src, 0.5, 0.5, preblur_before_resize=True)
 
-    np.testing.assert_allclose(actual, expected)
+    assert actual.shape == (4, 3)
+    _assert_finite_range_preserved(src, actual)
 
 
-def test_scale_image_preblur_downscale_anisotropic_matches_explicit_blur_then_resize():
-    src = np.arange(10 * 8, dtype=np.float32).reshape(8, 10)
-    expected = cv.resize(cv.blur(src, (2, 4)), (5, 2), interpolation=cv.INTER_LINEAR)
-
+def test_scale_image_preblur_downscale_anisotropic_preserves_finite_range():
+    src = np.linspace(4.0, 104.0, 80, dtype=np.float32).reshape(8, 10)
     actual = _scale_image(src, 0.5, 0.25, preblur_before_resize=True)
 
-    np.testing.assert_allclose(actual, expected)
+    assert actual.shape == (2, 5)
+    _assert_finite_range_preserved(src, actual)
 
 
-def test_scale_image_preblur_upscale_uses_unit_kernel_and_matches_bilinear():
-    src = np.arange(6 * 8, dtype=np.float32).reshape(8, 6)
-    expected = cv.resize(src, (12, 12), interpolation=cv.INTER_LINEAR)
-
+def test_scale_image_preblur_upscale_preserves_finite_range():
+    src = np.linspace(3.0, 36.0, 48, dtype=np.float32).reshape(8, 6)
     actual = _scale_image(src, 2.0, 1.5, preblur_before_resize=True)
 
+    assert actual.shape == (12, 12)
+    _assert_finite_range_preserved(src, actual)
+
+
+def test_scale_image_preserves_nan_and_finite_range():
+    src = np.array(
+        [
+            [0.0, 1.0, 2.0],
+            [3.0, np.nan, 5.0],
+            [6.0, 7.0, 8.0],
+        ],
+        dtype=np.float32,
+    )
+    actual = _scale_image(src, 1.0, 1.0, preblur_before_resize=False)
+
+    assert actual.shape == src.shape
+    assert np.isnan(actual[1, 1])
+    _assert_finite_range_preserved(src, actual)
+
+
+def test_apply_intensity_window_clips_without_rescaling():
+    src = np.array([[-10.0, 0.0, 2.5, 10.0, 50.0]], dtype=np.float32)
+    actual = _apply_intensity_window(src, 0.0, 10.0)
+    expected = np.array([[0.0, 0.0, 2.5, 10.0, 10.0]], dtype=np.float32)
+
     np.testing.assert_allclose(actual, expected)
+    assert float(np.max(actual)) == 10.0
 
 
 def test_save_workspace_data_persists_preblur_flags(tmp_path):

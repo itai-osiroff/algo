@@ -258,8 +258,7 @@ def _apply_intensity_window(image: np.ndarray, min_val: float, max_val: float) -
     hi = float(max_val)
     if hi <= lo:
         hi = lo + 1.0
-    clipped = np.clip(arr, lo, hi)
-    return (clipped - lo) / (hi - lo) * 255.0
+    return np.clip(arr, lo, hi)
 
 
 def _scale_image(
@@ -284,7 +283,36 @@ def _scale_image(
         if kernel_w > 1 or kernel_h > 1:
             resize_source = cv.blur(src_img, (kernel_w, kernel_h))
 
-    return cv.resize(resize_source, (scaled_w, scaled_h), interpolation=cv.INTER_LINEAR)
+    resized = cv.resize(resize_source, (scaled_w, scaled_h), interpolation=cv.INTER_LINEAR)
+    out = np.asarray(resized, dtype=np.float32).copy()
+
+    # Preserve the finite range of the pre-resize input while leaving NaNs untouched.
+    src_arr = np.asarray(src_img, dtype=np.float32)
+    src_finite_mask = np.isfinite(src_arr)
+    if not np.any(src_finite_mask):
+        return out
+
+    src_finite = src_arr[src_finite_mask]
+    src_low = float(np.min(src_finite))
+    src_high = float(np.max(src_finite))
+
+    out_finite_mask = np.isfinite(out)
+    if not np.any(out_finite_mask):
+        return out
+    if src_high <= src_low:
+        out[out_finite_mask] = src_low
+        return out
+
+    out_finite = out[out_finite_mask]
+    out_low = float(np.min(out_finite))
+    out_high = float(np.max(out_finite))
+    if out_high <= out_low:
+        out[out_finite_mask] = src_low
+        return out
+
+    normalized = (out_finite - out_low) / (out_high - out_low)
+    out[out_finite_mask] = normalized * (src_high - src_low) + src_low
+    return out
 
 
 def _joint_norm_bounds(
