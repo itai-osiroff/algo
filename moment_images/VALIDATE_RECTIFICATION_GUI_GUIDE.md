@@ -16,7 +16,7 @@ For each camera image, you can:
 - Apply anisotropic scaling (`X`, `Y`)
 - Choose comparison mode (`preserve_scale` or `fit_reference`)
 - Run translation-only ECC alignment
-- Inspect four preview tabs before committing
+- Inspect six preview tabs before committing
 
 At the end, the tool generates comparison figures and can save a `validation_workspace.npz` with full metadata for reproducibility.
 
@@ -91,8 +91,8 @@ Scale behavior:
   - `kx = ceil(1 / X)`
   - `ky = ceil(1 / Y)`
   - (with minimum kernel size `1` per axis)
-- After resize, finite output values are linearly remapped to the finite min/max
-  of the pre-resize image, so X/Y scaling preserves the input dynamic range.
+- After resize, values stay in native units from the blur/resize pipeline
+  (no post-resize min/max remap).
 - Scale changes invalidate previous alignment results.
 
 ### Alignment
@@ -139,25 +139,43 @@ Windowing behavior:
 
 ### As-Is
 
-- Left: reference image (joint-normalized with current edited image before X/Y display scaling)
+- Left: reference image with its own display bounds
 - Right: edited input view used for crop interaction
+- Input uses independent display bounds (estimated from the pre-scale crop-preview source)
 - Shows crop rectangle overlay when crop is set
 
 ### Registered ROI
 
 - Shows reference/input after registration rules are applied
+- Both panels use the same shared native-unit bounds for direct visual comparison
 - Includes mode/score context in title when available
 
-### Difference
+### Diff (Native)
 
-- `|reference - input|` on joint-normalized registered pair
+- `|reference - input|` computed on the registered pair in native intensity units
+- Colorbar starts at 0 and scales to observed max absolute difference
 - If not available, tab shows status text explaining why
 
-### Overlay
+### Diff (Norm)
+
+- `|reference - input|` on joint-normalized registered pair
+- Normalized display range is fixed to `[0, 1]`
+- If not available, tab shows status text explaining why
+
+### Overlay (Native)
+
+- RGB composite built from registered images in native units with one shared bound pair:
+  - Red channel: reference
+  - Green channel: input
+- Both channel colorbars use the same native-unit range
+- If not available, tab shows status text explaining why
+
+### Overlay (Norm)
 
 - RGB composite:
   - Red channel: reference
   - Green channel: input
+- Joint-normalized channel colorbars are fixed to `[0, 1]`
 - If not available, tab shows status text explaining why
 
 ## Status Bar Meanings
@@ -186,19 +204,21 @@ Run `Run Alignment` to refresh alignment with current edits.
    - start with `preserve_scale` if you care about manual scale factors
    - use `fit_reference` if you want direct same-size comparison
 5. Click `Run Alignment`.
-6. Review `Registered ROI`, `Difference`, and `Overlay`.
+6. Review `Registered ROI`, `Diff (Native)`, `Diff (Norm)`, `Overlay (Native)`, and `Overlay (Norm)`.
 7. Click `Done`.
 
 Repeat for the second camera image.
 
 ## After Both Editors
 
-The script generates four Matplotlib figures per camera image:
+The script generates six Matplotlib figures per camera image:
 
 1. As-is pair
 2. Registered pair
-3. Difference map
-4. Overlay
+3. Difference map (native units)
+4. Difference map (joint-normalized)
+5. Overlay (native units)
+6. Overlay (joint-normalized)
 
 You can then choose to save:
 

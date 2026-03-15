@@ -106,8 +106,12 @@ class ComparisonData:
     as_is_input: np.ndarray
     registered_reference: np.ndarray
     registered_input: np.ndarray
-    diff_image: np.ndarray | None = None
-    overlay_image: np.ndarray | None = None
+    registered_native_low: float | None = None
+    registered_native_high: float | None = None
+    diff_native_image: np.ndarray | None = None
+    diff_normalized_image: np.ndarray | None = None
+    overlay_native_image: np.ndarray | None = None
+    overlay_normalized_image: np.ndarray | None = None
 
 
 @dataclass
@@ -120,6 +124,7 @@ class ValidationImageResult:
     scale_x: float
     scale_y: float
     preblur_before_resize: bool
+    preserve_flux_sum: bool
     intensity_min: float
     intensity_max: float
     crop_box: tuple[int, int, int, int] | None
@@ -267,6 +272,7 @@ def _scale_image(
     scale_y: float,
     *,
     preblur_before_resize: bool = False,
+    preserve_flux_sum: bool = False,
 ) -> np.ndarray:
     src_h, src_w = src_img.shape[:2]
     scaled_w = max(1, int(round(src_w * float(scale_x))))
@@ -283,36 +289,19 @@ def _scale_image(
         if kernel_w > 1 or kernel_h > 1:
             resize_source = cv.blur(src_img, (kernel_w, kernel_h))
 
-    resized = cv.resize(resize_source, (scaled_w, scaled_h), interpolation=cv.INTER_LINEAR)
-    out = np.asarray(resized, dtype=np.float32).copy()
+    resized = np.asarray(cv.resize(resize_source, (scaled_w, scaled_h), interpolation=cv.INTER_LINEAR), dtype=np.float32)
 
-    # Preserve the finite range of the pre-resize input while leaving NaNs untouched.
-    src_arr = np.asarray(src_img, dtype=np.float32)
-    src_finite_mask = np.isfinite(src_arr)
-    if not np.any(src_finite_mask):
-        return out
-
-    src_finite = src_arr[src_finite_mask]
-    src_low = float(np.min(src_finite))
-    src_high = float(np.max(src_finite))
-
-    out_finite_mask = np.isfinite(out)
-    if not np.any(out_finite_mask):
-        return out
-    if src_high <= src_low:
-        out[out_finite_mask] = src_low
-        return out
-
-    out_finite = out[out_finite_mask]
-    out_low = float(np.min(out_finite))
-    out_high = float(np.max(out_finite))
-    if out_high <= out_low:
-        out[out_finite_mask] = src_low
-        return out
-
-    normalized = (out_finite - out_low) / (out_high - out_low)
-    out[out_finite_mask] = normalized * (src_high - src_low) + src_low
-    return out
+    did_downsample = scaled_w < src_w or scaled_h < src_h
+    if preserve_flux_sum and did_downsample:
+        source_arr = np.asarray(src_img, dtype=np.float32)
+        source_finite = np.isfinite(source_arr)
+        resized_finite = np.isfinite(resized)
+        if np.any(source_finite) and np.any(resized_finite):
+            source_sum = float(np.sum(source_arr[source_finite], dtype=np.float64))
+            resized_sum = float(np.sum(resized[resized_finite], dtype=np.float64))
+            if np.isfinite(source_sum) and np.isfinite(resized_sum) and abs(resized_sum) > 1e-12:
+                resized = resized * np.float32(source_sum / resized_sum)
+    return np.asarray(resized, dtype=np.float32)
 
 
 def _joint_norm_bounds(
@@ -334,6 +323,10 @@ def _joint_norm_bounds(
     if high <= low:
         high = low + 1.0
     return low, high
+
+
+def _joint_finite_bounds(img_a: np.ndarray, img_b: np.ndarray) -> tuple[float, float]:
+    return _joint_norm_bounds(img_a, img_b, (0.0, 100.0))
 
 
 def _normalize_with_bounds(image: np.ndarray, low: float, high: float) -> np.ndarray:
@@ -385,19 +378,59 @@ def _imshow_with_colorbar(
     return im
 
 
-def _add_overlay_channel_colorbars(ax: plt.Axes, overlay_image: np.ndarray) -> None:
-    ref_low, ref_high = _finite_display_bounds(overlay_image[..., 0])
-    input_low, input_high = _finite_display_bounds(overlay_image[..., 1])
+def _add_overlay_channel_colorbars(
+    ax: plt.Axes,
+    *,
+    red_source: np.ndarray,
+    green_source: np.ndarray,
+    red_label: str,
+    green_label: str,
+    vmin: float,
+    vmax: float,
+) -> None:
+    if vmax <= vmin:
+        vmax = vmin + 1.0
 
-    ref_mappable = ScalarMappable(norm=Normalize(vmin=ref_low, vmax=ref_high), cmap="Reds")
-    ref_mappable.set_array(overlay_image[..., 0])
-    ref_cbar = ax.figure.colorbar(ref_mappable, ax=ax, fraction=0.046, pad=0.04)
-    ref_cbar.set_label("Reference (Red)")
+    red_mappable = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap="Reds")
+    red_mappable.set_array(np.asarray(red_source, dtype=np.float32))
+    ref_cbar = ax.figure.colorbar(red_mappable, ax=ax, fraction=0.046, pad=0.04)
+    ref_cbar.set_label(red_label)
 
-    input_mappable = ScalarMappable(norm=Normalize(vmin=input_low, vmax=input_high), cmap="Greens")
-    input_mappable.set_array(overlay_image[..., 1])
-    input_cbar = ax.figure.colorbar(input_mappable, ax=ax, fraction=0.046, pad=0.12)
-    input_cbar.set_label("Input (Green)")
+    green_mappable = ScalarMappable(norm=Normalize(vmin=vmin, vmax=vmax), cmap="Greens")
+    green_mappable.set_array(np.asarray(green_source, dtype=np.float32))
+    input_cbar = ax.figure.colorbar(green_mappable, ax=ax, fraction=0.046, pad=0.12)
+    input_cbar.set_label(green_label)
+
+
+def _add_overlay_channel_colorbars_native(
+    ax: plt.Axes,
+    *,
+    reference_native: np.ndarray,
+    input_native: np.ndarray,
+    low: float,
+    high: float,
+) -> None:
+    _add_overlay_channel_colorbars(
+        ax,
+        red_source=reference_native,
+        green_source=input_native,
+        red_label="Reference (Red, native units)",
+        green_label="Input (Green, native units)",
+        vmin=low,
+        vmax=high,
+    )
+
+
+def _add_overlay_channel_colorbars_normalized(ax: plt.Axes, overlay_image: np.ndarray) -> None:
+    _add_overlay_channel_colorbars(
+        ax,
+        red_source=overlay_image[..., 0],
+        green_source=overlay_image[..., 1],
+        red_label="Reference (Red, joint-normalized)",
+        green_label="Input (Green, joint-normalized)",
+        vmin=0.0,
+        vmax=1.0,
+    )
 
 
 def _normalize_to_uint8(img: np.ndarray) -> np.ndarray:
@@ -713,14 +746,24 @@ def prepare_images_for_comparison(
         reg_ref = reg_ref[:min_h, :min_w]
         reg_input = reg_input[:min_h, :min_w]
 
-    diff_image: np.ndarray | None = None
-    overlay_image: np.ndarray | None = None
+    registered_native_low: float | None = None
+    registered_native_high: float | None = None
+    diff_native_image: np.ndarray | None = None
+    diff_normalized_image: np.ndarray | None = None
+    overlay_native_image: np.ndarray | None = None
+    overlay_normalized_image: np.ndarray | None = None
     if match_found and reg_ref.size > 0 and reg_input.size > 0 and reg_ref.shape == reg_input.shape:
+        registered_native_low, registered_native_high = _joint_finite_bounds(reg_ref, reg_input)
+        diff_native_image = np.abs(reg_ref - reg_input)
+        overlay_native_image = np.zeros((reg_ref.shape[0], reg_ref.shape[1], 3), dtype=np.float32)
+        overlay_native_image[..., 0] = _normalize_with_bounds(reg_ref, registered_native_low, registered_native_high)
+        overlay_native_image[..., 1] = _normalize_with_bounds(reg_input, registered_native_low, registered_native_high)
+
         reg_ref_norm, reg_input_norm = _joint_normalize_pair(reg_ref, reg_input, opts.joint_norm_percentiles)
-        diff_image = np.abs(reg_ref_norm - reg_input_norm)
-        overlay_image = np.zeros((reg_ref_norm.shape[0], reg_ref_norm.shape[1], 3), dtype=np.float32)
-        overlay_image[..., 0] = reg_ref_norm
-        overlay_image[..., 1] = reg_input_norm
+        diff_normalized_image = np.abs(reg_ref_norm - reg_input_norm)
+        overlay_normalized_image = np.zeros((reg_ref_norm.shape[0], reg_ref_norm.shape[1], 3), dtype=np.float32)
+        overlay_normalized_image[..., 0] = reg_ref_norm
+        overlay_normalized_image[..., 1] = reg_input_norm
 
     return ComparisonData(
         mode=mode,
@@ -732,8 +775,12 @@ def prepare_images_for_comparison(
         as_is_input=target,
         registered_reference=reg_ref,
         registered_input=reg_input,
-        diff_image=diff_image,
-        overlay_image=overlay_image,
+        registered_native_low=registered_native_low,
+        registered_native_high=registered_native_high,
+        diff_native_image=diff_native_image,
+        diff_normalized_image=diff_normalized_image,
+        overlay_native_image=overlay_native_image,
+        overlay_normalized_image=overlay_normalized_image,
     )
 
 
@@ -750,11 +797,13 @@ def compare_images(
     """
     Compare input image to rectified image and return figure objects.
 
-    Produces four figures:
+    Produces six figures:
     1) As-is pair
     2) Registered pair
-    3) Difference map (or status panel)
-    4) Overlay (or status panel)
+    3) Difference map in native units
+    4) Difference map in joint-normalized units
+    5) Overlay in native units
+    6) Overlay in joint-normalized units
     """
     opts = _resolve_options(
         options=options,
@@ -798,14 +847,14 @@ def compare_images(
     )
     figures.append(fig_as_is)
 
-    # Registered
+    # Registered (native units, shared finite bounds)
     fig_reg, axes_reg = plt.subplots(1, 2, figsize=(12, 6))
     if comp_data.registered_reference.size > 0 and comp_data.registered_input.size > 0:
-        reg_low, reg_high = _joint_norm_bounds(
-            comp_data.registered_reference,
-            comp_data.registered_input,
-            opts.joint_norm_percentiles,
-        )
+        if comp_data.registered_native_low is None or comp_data.registered_native_high is None:
+            reg_low, reg_high = _joint_finite_bounds(comp_data.registered_reference, comp_data.registered_input)
+        else:
+            reg_low = comp_data.registered_native_low
+            reg_high = comp_data.registered_native_high
         _imshow_with_colorbar(
             axes_reg[0],
             comp_data.registered_reference,
@@ -828,40 +877,100 @@ def compare_images(
             ax.text(0.5, 0.5, "No registered ROI", ha="center", va="center")
     figures.append(fig_reg)
 
-    # Difference
-    fig_diff, ax_diff = plt.subplots(1, 1, figsize=(10, 8))
-    if comp_data.diff_image is not None:
-        _imshow_with_colorbar(ax_diff, comp_data.diff_image, cmap="viridis", label="|Reference - Input|")
-        ax_diff.set_title(f"Difference |Reference - {input_name}|{mode_suffix}")
+    # Difference (native units)
+    fig_diff_native, ax_diff_native = plt.subplots(1, 1, figsize=(10, 8))
+    if comp_data.diff_native_image is not None:
+        _, diff_native_high = _finite_display_bounds(comp_data.diff_native_image)
+        _imshow_with_colorbar(
+            ax_diff_native,
+            comp_data.diff_native_image,
+            cmap="viridis",
+            vmin=0.0,
+            vmax=diff_native_high,
+            label="|Reference - Input| (native units)",
+        )
+        ax_diff_native.set_title(f"Difference (Native Units) |Reference - {input_name}|{mode_suffix}")
     else:
-        ax_diff.axis("off")
-        ax_diff.text(
+        ax_diff_native.axis("off")
+        ax_diff_native.text(
             0.5,
             0.5,
             f"Difference unavailable\nstatus: {comp_data.status}",
             ha="center",
             va="center",
         )
-        ax_diff.set_title(f"Difference (Unavailable){mode_suffix}")
-    figures.append(fig_diff)
+        ax_diff_native.set_title(f"Difference (Native Unavailable){mode_suffix}")
+    figures.append(fig_diff_native)
 
-    # Overlay
-    fig_overlay, ax_overlay = plt.subplots(1, 1, figsize=(10, 8))
-    if comp_data.overlay_image is not None:
-        ax_overlay.imshow(comp_data.overlay_image)
-        _add_overlay_channel_colorbars(ax_overlay, comp_data.overlay_image)
-        ax_overlay.set_title(f"Overlay Red=Reference, Green={input_name}{mode_suffix}")
+    # Difference (joint-normalized)
+    fig_diff_norm, ax_diff_norm = plt.subplots(1, 1, figsize=(10, 8))
+    if comp_data.diff_normalized_image is not None:
+        _imshow_with_colorbar(
+            ax_diff_norm,
+            comp_data.diff_normalized_image,
+            cmap="viridis",
+            vmin=0.0,
+            vmax=1.0,
+            label="|Reference - Input| (joint-normalized)",
+        )
+        ax_diff_norm.set_title(f"Difference (Joint-Normalized) |Reference - {input_name}|{mode_suffix}")
     else:
-        ax_overlay.axis("off")
-        ax_overlay.text(
+        ax_diff_norm.axis("off")
+        ax_diff_norm.text(
+            0.5,
+            0.5,
+            f"Difference unavailable\nstatus: {comp_data.status}",
+            ha="center",
+            va="center",
+        )
+        ax_diff_norm.set_title(f"Difference (Joint-Normalized Unavailable){mode_suffix}")
+    figures.append(fig_diff_norm)
+
+    # Overlay (native units; shared finite bounds)
+    fig_overlay_native, ax_overlay_native = plt.subplots(1, 1, figsize=(10, 8))
+    if (
+        comp_data.overlay_native_image is not None
+        and comp_data.registered_native_low is not None
+        and comp_data.registered_native_high is not None
+    ):
+        ax_overlay_native.imshow(comp_data.overlay_native_image)
+        _add_overlay_channel_colorbars_native(
+            ax_overlay_native,
+            reference_native=comp_data.registered_reference,
+            input_native=comp_data.registered_input,
+            low=comp_data.registered_native_low,
+            high=comp_data.registered_native_high,
+        )
+        ax_overlay_native.set_title(f"Overlay (Native Units) Red=Reference, Green={input_name}{mode_suffix}")
+    else:
+        ax_overlay_native.axis("off")
+        ax_overlay_native.text(
             0.5,
             0.5,
             f"Overlay unavailable\nstatus: {comp_data.status}",
             ha="center",
             va="center",
         )
-        ax_overlay.set_title(f"Overlay (Unavailable){mode_suffix}")
-    figures.append(fig_overlay)
+        ax_overlay_native.set_title(f"Overlay (Native Unavailable){mode_suffix}")
+    figures.append(fig_overlay_native)
+
+    # Overlay (joint-normalized)
+    fig_overlay_norm, ax_overlay_norm = plt.subplots(1, 1, figsize=(10, 8))
+    if comp_data.overlay_normalized_image is not None:
+        ax_overlay_norm.imshow(comp_data.overlay_normalized_image)
+        _add_overlay_channel_colorbars_normalized(ax_overlay_norm, comp_data.overlay_normalized_image)
+        ax_overlay_norm.set_title(f"Overlay (Joint-Normalized) Red=Reference, Green={input_name}{mode_suffix}")
+    else:
+        ax_overlay_norm.axis("off")
+        ax_overlay_norm.text(
+            0.5,
+            0.5,
+            f"Overlay unavailable\nstatus: {comp_data.status}",
+            ha="center",
+            va="center",
+        )
+        ax_overlay_norm.set_title(f"Overlay (Joint-Normalized Unavailable){mode_suffix}")
+    figures.append(fig_overlay_norm)
 
     return figures
 
@@ -901,6 +1010,7 @@ class GuidedValidationEditor:
         self.scale_x_value = 1.0
         self.scale_y_value = 1.0
         self.preblur_before_resize = True
+        self.preserve_flux_sum = True
         self.alignment_result: AlignmentResult | None = None
         self._alignment_dirty = True
         self._preview_job: str | None = None
@@ -921,6 +1031,7 @@ class GuidedValidationEditor:
         self.scale_x_var = tk.StringVar(value=f"{self.scale_x_value:.4f}")
         self.scale_y_var = tk.StringVar(value=f"{self.scale_y_value:.4f}")
         self.preblur_var = tk.BooleanVar(value=self.preblur_before_resize)
+        self.preserve_flux_var = tk.BooleanVar(value=self.preserve_flux_sum)
         self.scale_status_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="")
         self.hover_status_var = tk.StringVar(value="Hover: move cursor over an image to inspect pixel values")
@@ -928,12 +1039,16 @@ class GuidedValidationEditor:
 
         self.fig_as_is: Figure | None = None
         self.fig_registered: Figure | None = None
-        self.fig_diff: Figure | None = None
-        self.fig_overlay: Figure | None = None
+        self.fig_diff_native: Figure | None = None
+        self.fig_diff_norm: Figure | None = None
+        self.fig_overlay_native: Figure | None = None
+        self.fig_overlay_norm: Figure | None = None
         self.canvas_as_is: FigureCanvasTkAgg | None = None
         self.canvas_registered: FigureCanvasTkAgg | None = None
-        self.canvas_diff: FigureCanvasTkAgg | None = None
-        self.canvas_overlay: FigureCanvasTkAgg | None = None
+        self.canvas_diff_native: FigureCanvasTkAgg | None = None
+        self.canvas_diff_norm: FigureCanvasTkAgg | None = None
+        self.canvas_overlay_native: FigureCanvasTkAgg | None = None
+        self.canvas_overlay_norm: FigureCanvasTkAgg | None = None
 
         self._init_ui()
         self._schedule_preview()
@@ -980,6 +1095,12 @@ class GuidedValidationEditor:
             text="Pre-blur before resize",
             variable=self.preblur_var,
             command=self._on_preblur_toggle,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Checkbutton(
+            scale_frame,
+            text="Preserve flux sum",
+            variable=self.preserve_flux_var,
+            command=self._on_preserve_flux_toggle,
         ).pack(side=tk.LEFT, padx=(0, 6))
 
         align_frame = tk.LabelFrame(row_primary, text="Alignment")
@@ -1057,12 +1178,16 @@ class GuidedValidationEditor:
 
         tab_as_is = ttk.Frame(notebook)
         tab_registered = ttk.Frame(notebook)
-        tab_diff = ttk.Frame(notebook)
-        tab_overlay = ttk.Frame(notebook)
+        tab_diff_native = ttk.Frame(notebook)
+        tab_diff_norm = ttk.Frame(notebook)
+        tab_overlay_native = ttk.Frame(notebook)
+        tab_overlay_norm = ttk.Frame(notebook)
         notebook.add(tab_as_is, text="As-Is")
         notebook.add(tab_registered, text="Registered ROI")
-        notebook.add(tab_diff, text="Difference")
-        notebook.add(tab_overlay, text="Overlay")
+        notebook.add(tab_diff_native, text="Diff (Native)")
+        notebook.add(tab_diff_norm, text="Diff (Norm)")
+        notebook.add(tab_overlay_native, text="Overlay (Native)")
+        notebook.add(tab_overlay_norm, text="Overlay (Norm)")
 
         self.fig_as_is = Figure(figsize=(10, 7), dpi=100)
         self.canvas_as_is = FigureCanvasTkAgg(self.fig_as_is, master=tab_as_is)
@@ -1074,21 +1199,38 @@ class GuidedValidationEditor:
         self.canvas_registered.draw()
         self.canvas_registered.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        self.fig_diff = Figure(figsize=(10, 7), dpi=100)
-        self.canvas_diff = FigureCanvasTkAgg(self.fig_diff, master=tab_diff)
-        self.canvas_diff.draw()
-        self.canvas_diff.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.fig_diff_native = Figure(figsize=(10, 7), dpi=100)
+        self.canvas_diff_native = FigureCanvasTkAgg(self.fig_diff_native, master=tab_diff_native)
+        self.canvas_diff_native.draw()
+        self.canvas_diff_native.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        self.fig_overlay = Figure(figsize=(10, 7), dpi=100)
-        self.canvas_overlay = FigureCanvasTkAgg(self.fig_overlay, master=tab_overlay)
-        self.canvas_overlay.draw()
-        self.canvas_overlay.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.fig_diff_norm = Figure(figsize=(10, 7), dpi=100)
+        self.canvas_diff_norm = FigureCanvasTkAgg(self.fig_diff_norm, master=tab_diff_norm)
+        self.canvas_diff_norm.draw()
+        self.canvas_diff_norm.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self.fig_overlay_native = Figure(figsize=(10, 7), dpi=100)
+        self.canvas_overlay_native = FigureCanvasTkAgg(self.fig_overlay_native, master=tab_overlay_native)
+        self.canvas_overlay_native.draw()
+        self.canvas_overlay_native.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self.fig_overlay_norm = Figure(figsize=(10, 7), dpi=100)
+        self.canvas_overlay_norm = FigureCanvasTkAgg(self.fig_overlay_norm, master=tab_overlay_norm)
+        self.canvas_overlay_norm.draw()
+        self.canvas_overlay_norm.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._bind_hover_readout()
 
         self.top.protocol("WM_DELETE_WINDOW", self._cancel)
 
     def _bind_hover_readout(self) -> None:
-        for canvas in (self.canvas_as_is, self.canvas_registered, self.canvas_diff, self.canvas_overlay):
+        for canvas in (
+            self.canvas_as_is,
+            self.canvas_registered,
+            self.canvas_diff_native,
+            self.canvas_diff_norm,
+            self.canvas_overlay_native,
+            self.canvas_overlay_norm,
+        ):
             if canvas is None:
                 continue
             canvas.mpl_connect("motion_notify_event", self._on_canvas_hover)
@@ -1191,6 +1333,11 @@ class GuidedValidationEditor:
         self._invalidate_alignment()
         self._schedule_preview()
 
+    def _on_preserve_flux_toggle(self) -> None:
+        self.preserve_flux_sum = bool(self.preserve_flux_var.get())
+        self._invalidate_alignment()
+        self._schedule_preview()
+
     def _rotate(self, delta_deg: int) -> None:
         self.rotation_deg = (self.rotation_deg + delta_deg) % 360
         self._invalidate_alignment()
@@ -1287,6 +1434,7 @@ class GuidedValidationEditor:
             self.scale_x_value,
             self.scale_y_value,
             preblur_before_resize=self.preblur_before_resize,
+            preserve_flux_sum=self.preserve_flux_sum,
         )
 
     def _build_crop_preview_image(self, *, apply_scale: bool = True) -> np.ndarray:
@@ -1304,6 +1452,7 @@ class GuidedValidationEditor:
                 self.scale_x_value,
                 self.scale_y_value,
                 preblur_before_resize=self.preblur_before_resize,
+                preserve_flux_sum=self.preserve_flux_sum,
             )
         return intensity
 
@@ -1351,13 +1500,16 @@ class GuidedValidationEditor:
         crop_preview_for_norm = self._build_crop_preview_image(apply_scale=False)
 
         self._render_as_is_tab(crop_preview, crop_preview_for_norm)
-        self._render_registered_tab(comp_data, options)
-        self._render_diff_tab(comp_data)
-        self._render_overlay_tab(comp_data)
+        self._render_registered_tab(comp_data)
+        self._render_diff_native_tab(comp_data)
+        self._render_diff_norm_tab(comp_data)
+        self._render_overlay_native_tab(comp_data)
+        self._render_overlay_norm_tab(comp_data)
 
         status_parts = [
             f"Mode={options.mode}",
             f"Input={processed.shape[0]}x{processed.shape[1]}",
+            f"Flux={'on' if self.preserve_flux_sum else 'off'}",
             f"Crop={'set' if self.crop_box is not None else 'none'}",
         ]
         if options.auto_align:
@@ -1444,7 +1596,7 @@ class GuidedValidationEditor:
         self._crop_selector.set_active(self.crop_active)
         self.canvas_as_is.draw()
 
-    def _render_registered_tab(self, comp_data: ComparisonData, options: ValidationOptions) -> None:
+    def _render_registered_tab(self, comp_data: ComparisonData) -> None:
         if self.fig_registered is None or self.canvas_registered is None:
             return
         self.fig_registered.clf()
@@ -1453,9 +1605,11 @@ class GuidedValidationEditor:
         suffix = _comparison_mode_suffix(comp_data.mode, comp_data.score, comp_data.ecc_score)
 
         if comp_data.registered_reference.size > 0 and comp_data.registered_input.size > 0:
-            reg_low, reg_high = _joint_norm_bounds(
-                comp_data.registered_reference, comp_data.registered_input, options.joint_norm_percentiles
-            )
+            if comp_data.registered_native_low is None or comp_data.registered_native_high is None:
+                reg_low, reg_high = _joint_finite_bounds(comp_data.registered_reference, comp_data.registered_input)
+            else:
+                reg_low = comp_data.registered_native_low
+                reg_high = comp_data.registered_native_high
             _imshow_with_colorbar(
                 ax_ref,
                 comp_data.registered_reference,
@@ -1479,34 +1633,88 @@ class GuidedValidationEditor:
             ax_input.text(0.5, 0.5, f"Status: {comp_data.status}", ha="center", va="center")
         self.canvas_registered.draw()
 
-    def _render_diff_tab(self, comp_data: ComparisonData) -> None:
-        if self.fig_diff is None or self.canvas_diff is None:
+    def _render_diff_native_tab(self, comp_data: ComparisonData) -> None:
+        if self.fig_diff_native is None or self.canvas_diff_native is None:
             return
-        self.fig_diff.clf()
-        ax = self.fig_diff.add_subplot(111)
-        if comp_data.diff_image is not None:
-            _imshow_with_colorbar(ax, comp_data.diff_image, cmap="viridis", label="|Reference - Input|")
+        self.fig_diff_native.clf()
+        ax = self.fig_diff_native.add_subplot(111)
+        if comp_data.diff_native_image is not None:
+            _, native_high = _finite_display_bounds(comp_data.diff_native_image)
+            _imshow_with_colorbar(
+                ax,
+                comp_data.diff_native_image,
+                cmap="viridis",
+                vmin=0.0,
+                vmax=native_high,
+                label="|Reference - Input| (native units)",
+            )
+            ax.set_title("Difference (Native Units)")
+        else:
+            ax.axis("off")
+            ax.text(0.5, 0.5, f"Difference unavailable\n{comp_data.status}", ha="center", va="center")
+            ax.set_title("Difference (Native Unavailable)")
+        self.canvas_diff_native.draw()
+
+    def _render_diff_norm_tab(self, comp_data: ComparisonData) -> None:
+        if self.fig_diff_norm is None or self.canvas_diff_norm is None:
+            return
+        self.fig_diff_norm.clf()
+        ax = self.fig_diff_norm.add_subplot(111)
+        if comp_data.diff_normalized_image is not None:
+            _imshow_with_colorbar(
+                ax,
+                comp_data.diff_normalized_image,
+                cmap="viridis",
+                vmin=0.0,
+                vmax=1.0,
+                label="|Reference - Input| (joint-normalized)",
+            )
             ax.set_title("Difference (Joint-Normalized)")
         else:
             ax.axis("off")
             ax.text(0.5, 0.5, f"Difference unavailable\n{comp_data.status}", ha="center", va="center")
-            ax.set_title("Difference Unavailable")
-        self.canvas_diff.draw()
+            ax.set_title("Difference (Joint-Normalized Unavailable)")
+        self.canvas_diff_norm.draw()
 
-    def _render_overlay_tab(self, comp_data: ComparisonData) -> None:
-        if self.fig_overlay is None or self.canvas_overlay is None:
+    def _render_overlay_native_tab(self, comp_data: ComparisonData) -> None:
+        if self.fig_overlay_native is None or self.canvas_overlay_native is None:
             return
-        self.fig_overlay.clf()
-        ax = self.fig_overlay.add_subplot(111)
-        if comp_data.overlay_image is not None:
-            ax.imshow(comp_data.overlay_image)
-            _add_overlay_channel_colorbars(ax, comp_data.overlay_image)
-            ax.set_title("Overlay: Red=Reference, Green=Input")
+        self.fig_overlay_native.clf()
+        ax = self.fig_overlay_native.add_subplot(111)
+        if (
+            comp_data.overlay_native_image is not None
+            and comp_data.registered_native_low is not None
+            and comp_data.registered_native_high is not None
+        ):
+            ax.imshow(comp_data.overlay_native_image)
+            _add_overlay_channel_colorbars_native(
+                ax,
+                reference_native=comp_data.registered_reference,
+                input_native=comp_data.registered_input,
+                low=comp_data.registered_native_low,
+                high=comp_data.registered_native_high,
+            )
+            ax.set_title("Overlay (Native Units): Red=Reference, Green=Input")
         else:
             ax.axis("off")
             ax.text(0.5, 0.5, f"Overlay unavailable\n{comp_data.status}", ha="center", va="center")
-            ax.set_title("Overlay Unavailable")
-        self.canvas_overlay.draw()
+            ax.set_title("Overlay (Native Unavailable)")
+        self.canvas_overlay_native.draw()
+
+    def _render_overlay_norm_tab(self, comp_data: ComparisonData) -> None:
+        if self.fig_overlay_norm is None or self.canvas_overlay_norm is None:
+            return
+        self.fig_overlay_norm.clf()
+        ax = self.fig_overlay_norm.add_subplot(111)
+        if comp_data.overlay_normalized_image is not None:
+            ax.imshow(comp_data.overlay_normalized_image)
+            _add_overlay_channel_colorbars_normalized(ax, comp_data.overlay_normalized_image)
+            ax.set_title("Overlay (Joint-Normalized): Red=Reference, Green=Input")
+        else:
+            ax.axis("off")
+            ax.text(0.5, 0.5, f"Overlay unavailable\n{comp_data.status}", ha="center", va="center")
+            ax.set_title("Overlay (Joint-Normalized Unavailable)")
+        self.canvas_overlay_norm.draw()
 
     def _reset_section(self) -> None:
         section = self.reset_section_var.get()
@@ -1527,6 +1735,8 @@ class GuidedValidationEditor:
             self.scale_y_var.set("1.0000")
             self.preblur_before_resize = True
             self.preblur_var.set(True)
+            self.preserve_flux_sum = True
+            self.preserve_flux_var.set(True)
         elif section == "alignment":
             self.alignment_result = None
             self._alignment_dirty = True
@@ -1552,6 +1762,8 @@ class GuidedValidationEditor:
         self.scale_y_var.set("1.0000")
         self.preblur_before_resize = True
         self.preblur_var.set(True)
+        self.preserve_flux_sum = True
+        self.preserve_flux_var.set(True)
         self.mode_var.set(VALIDATION_MODE_PRESERVE)
         self.auto_align_var.set(False)
         self._invalidate_alignment()
@@ -1575,6 +1787,7 @@ class GuidedValidationEditor:
             scale_x=self.scale_x_value,
             scale_y=self.scale_y_value,
             preblur_before_resize=self.preblur_before_resize,
+            preserve_flux_sum=self.preserve_flux_sum,
             intensity_min=self.intensity_min_value,
             intensity_max=self.intensity_max_value,
             crop_box=self.crop_box,
@@ -1656,6 +1869,7 @@ def _save_workspace_data(
         "validation_auto_align": np.array(val_result.options.auto_align),
         "validation_scale_factors": np.array([val_result.scale_x, val_result.scale_y], dtype=np.float32),
         "validation_preblur_before_resize": np.array(val_result.preblur_before_resize),
+        "validation_preserve_flux_sum": np.array(val_result.preserve_flux_sum),
         "validation_intensity_window": np.array([val_result.intensity_min, val_result.intensity_max], dtype=np.float32),
         "validation_crop_box": _crop_box_to_array(val_result.crop_box),
         "validation_rotation_deg": np.array(val_result.rotation_deg, dtype=np.int32),
@@ -1675,6 +1889,7 @@ def _save_workspace_data(
         "thorcam_auto_align": np.array(thor_result.options.auto_align),
         "thorcam_scale_factors": np.array([thor_result.scale_x, thor_result.scale_y], dtype=np.float32),
         "thorcam_preblur_before_resize": np.array(thor_result.preblur_before_resize),
+        "thorcam_preserve_flux_sum": np.array(thor_result.preserve_flux_sum),
         "thorcam_intensity_window": np.array([thor_result.intensity_min, thor_result.intensity_max], dtype=np.float32),
         "thorcam_crop_box": _crop_box_to_array(thor_result.crop_box),
         "thorcam_rotation_deg": np.array(thor_result.rotation_deg, dtype=np.int32),

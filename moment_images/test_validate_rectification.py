@@ -94,8 +94,12 @@ def test_joint_normalization_diff_exposes_offset():
     comp = prepare_images_for_comparison(ref, target, options=options)
 
     assert comp.match_found
-    assert comp.diff_image is not None
-    assert float(np.mean(comp.diff_image)) > 0.1
+    assert comp.diff_native_image is not None
+    assert comp.diff_normalized_image is not None
+    np.testing.assert_allclose(comp.diff_native_image, np.full_like(comp.diff_native_image, 20.0), rtol=0.0, atol=1e-5)
+    assert float(np.mean(comp.diff_normalized_image)) > 0.1
+    assert float(np.nanmin(comp.diff_normalized_image)) >= 0.0
+    assert float(np.nanmax(comp.diff_normalized_image)) <= 1.0
 
 
 def test_low_confidence_match_suppresses_diff_and_overlay():
@@ -111,8 +115,10 @@ def test_low_confidence_match_suppresses_diff_and_overlay():
     comp = prepare_images_for_comparison(ref, target, options=options)
 
     assert not comp.match_found
-    assert comp.diff_image is None
-    assert comp.overlay_image is None
+    assert comp.diff_native_image is None
+    assert comp.diff_normalized_image is None
+    assert comp.overlay_native_image is None
+    assert comp.overlay_normalized_image is None
     assert comp.status in {"low_confidence_match", "no_containment_match"}
 
 
@@ -143,7 +149,7 @@ def test_differing_shapes_still_produce_figures_without_crash():
     figures = compare_images(ref, target, "Synthetic", options=options)
 
     try:
-        assert len(figures) == 4
+        assert len(figures) == 6
     finally:
         for fig in figures:
             plt.close(fig)
@@ -160,51 +166,81 @@ def test_alignment_failure_returns_status_without_silent_change():
     assert np.isnan(aligned.aligned_image).all()
 
 
-def _assert_finite_range_preserved(src: np.ndarray, out: np.ndarray) -> None:
-    src_vals = np.asarray(src, dtype=np.float32)
-    out_vals = np.asarray(out, dtype=np.float32)
-    src_finite = src_vals[np.isfinite(src_vals)]
-    out_finite = out_vals[np.isfinite(out_vals)]
+def _expected_scale_image(
+    src: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+    *,
+    preblur_before_resize: bool,
+    preserve_flux_sum: bool = False,
+) -> np.ndarray:
+    src_arr = np.asarray(src, dtype=np.float32)
+    src_h, src_w = src_arr.shape[:2]
+    scaled_w = max(1, int(round(src_w * float(scale_x))))
+    scaled_h = max(1, int(round(src_h * float(scale_y))))
 
-    assert src_finite.size > 0
-    assert out_finite.size > 0
-    np.testing.assert_allclose(float(np.min(out_finite)), float(np.min(src_finite)), rtol=0.0, atol=1e-5)
-    np.testing.assert_allclose(float(np.max(out_finite)), float(np.max(src_finite)), rtol=0.0, atol=1e-5)
+    resize_source = src_arr
+    if preblur_before_resize:
+        safe_scale_x = max(float(scale_x), 1e-12)
+        safe_scale_y = max(float(scale_y), 1e-12)
+        kernel_w = max(1, int(np.ceil(1.0 / safe_scale_x)))
+        kernel_h = max(1, int(np.ceil(1.0 / safe_scale_y)))
+        kernel_w = min(kernel_w, src_w)
+        kernel_h = min(kernel_h, src_h)
+        if kernel_w > 1 or kernel_h > 1:
+            resize_source = cv.blur(src_arr, (kernel_w, kernel_h))
+
+    expected = np.asarray(cv.resize(resize_source, (scaled_w, scaled_h), interpolation=cv.INTER_LINEAR), dtype=np.float32)
+
+    did_downsample = scaled_w < src_w or scaled_h < src_h
+    if preserve_flux_sum and did_downsample:
+        source_finite = np.isfinite(src_arr)
+        expected_finite = np.isfinite(expected)
+        if np.any(source_finite) and np.any(expected_finite):
+            source_sum = float(np.sum(src_arr[source_finite], dtype=np.float64))
+            expected_sum = float(np.sum(expected[expected_finite], dtype=np.float64))
+            if np.isfinite(source_sum) and np.isfinite(expected_sum) and abs(expected_sum) > 1e-12:
+                expected = expected * np.float32(source_sum / expected_sum)
+    return expected
 
 
-def test_scale_image_without_preblur_preserves_finite_range():
+def test_scale_image_without_preblur_matches_cv_resize():
     src = np.linspace(-7.5, 23.75, 48, dtype=np.float32).reshape(8, 6)
     actual = _scale_image(src, 0.5, 0.5, preblur_before_resize=False)
+    expected = _expected_scale_image(src, 0.5, 0.5, preblur_before_resize=False)
 
     assert actual.shape == (4, 3)
-    _assert_finite_range_preserved(src, actual)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
 
-def test_scale_image_preblur_downscale_isotropic_preserves_finite_range():
+def test_scale_image_preblur_downscale_isotropic_matches_blur_then_resize():
     src = np.linspace(-11.0, 31.0, 48, dtype=np.float32).reshape(8, 6)
     actual = _scale_image(src, 0.5, 0.5, preblur_before_resize=True)
+    expected = _expected_scale_image(src, 0.5, 0.5, preblur_before_resize=True)
 
     assert actual.shape == (4, 3)
-    _assert_finite_range_preserved(src, actual)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
 
-def test_scale_image_preblur_downscale_anisotropic_preserves_finite_range():
+def test_scale_image_preblur_downscale_anisotropic_matches_blur_then_resize():
     src = np.linspace(4.0, 104.0, 80, dtype=np.float32).reshape(8, 10)
     actual = _scale_image(src, 0.5, 0.25, preblur_before_resize=True)
+    expected = _expected_scale_image(src, 0.5, 0.25, preblur_before_resize=True)
 
     assert actual.shape == (2, 5)
-    _assert_finite_range_preserved(src, actual)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
 
-def test_scale_image_preblur_upscale_preserves_finite_range():
+def test_scale_image_preblur_upscale_matches_cv_resize():
     src = np.linspace(3.0, 36.0, 48, dtype=np.float32).reshape(8, 6)
     actual = _scale_image(src, 2.0, 1.5, preblur_before_resize=True)
+    expected = _expected_scale_image(src, 2.0, 1.5, preblur_before_resize=True)
 
     assert actual.shape == (12, 12)
-    _assert_finite_range_preserved(src, actual)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
 
-def test_scale_image_preserves_nan_and_finite_range():
+def test_scale_image_identity_matches_cv_resize_with_nan():
     src = np.array(
         [
             [0.0, 1.0, 2.0],
@@ -214,10 +250,59 @@ def test_scale_image_preserves_nan_and_finite_range():
         dtype=np.float32,
     )
     actual = _scale_image(src, 1.0, 1.0, preblur_before_resize=False)
+    expected = _expected_scale_image(src, 1.0, 1.0, preblur_before_resize=False)
 
     assert actual.shape == src.shape
-    assert np.isnan(actual[1, 1])
-    _assert_finite_range_preserved(src, actual)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6, equal_nan=True)
+
+
+def test_scale_image_flux_preservation_downsample_conserves_sum():
+    src = np.linspace(2.0, 98.0, 80, dtype=np.float32).reshape(8, 10)
+    actual = _scale_image(src, 0.5, 0.5, preblur_before_resize=False, preserve_flux_sum=True)
+    expected = _expected_scale_image(src, 0.5, 0.5, preblur_before_resize=False, preserve_flux_sum=True)
+
+    assert actual.shape == (4, 5)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
+    np.testing.assert_allclose(
+        np.sum(actual, dtype=np.float64),
+        np.sum(src, dtype=np.float64),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_scale_image_flux_preservation_anisotropic_preblur_conserves_sum():
+    src = np.linspace(-5.0, 195.0, 240, dtype=np.float32).reshape(12, 20)
+    actual = _scale_image(src, 0.5, 0.25, preblur_before_resize=True, preserve_flux_sum=True)
+    expected = _expected_scale_image(src, 0.5, 0.25, preblur_before_resize=True, preserve_flux_sum=True)
+
+    assert actual.shape == (3, 10)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
+    np.testing.assert_allclose(
+        np.sum(actual, dtype=np.float64),
+        np.sum(src, dtype=np.float64),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_scale_image_flux_preservation_upscale_matches_no_flux_behavior():
+    src = np.linspace(3.0, 36.0, 48, dtype=np.float32).reshape(8, 6)
+    actual = _scale_image(src, 2.0, 1.5, preblur_before_resize=True, preserve_flux_sum=True)
+    expected = _expected_scale_image(src, 2.0, 1.5, preblur_before_resize=True, preserve_flux_sum=False)
+
+    assert actual.shape == (12, 12)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
+
+
+def test_scale_image_flux_preservation_zero_sum_downsample_stays_finite():
+    src = np.zeros((8, 6), dtype=np.float32)
+    actual = _scale_image(src, 0.5, 0.5, preblur_before_resize=False, preserve_flux_sum=True)
+    expected = _expected_scale_image(src, 0.5, 0.5, preblur_before_resize=False, preserve_flux_sum=True)
+
+    assert actual.shape == (4, 3)
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
 
 def test_apply_intensity_window_clips_without_rescaling():
@@ -229,7 +314,7 @@ def test_apply_intensity_window_clips_without_rescaling():
     assert float(np.max(actual)) == 10.0
 
 
-def test_save_workspace_data_persists_preblur_flags(tmp_path):
+def test_save_workspace_data_persists_resize_processing_flags(tmp_path):
     rectified = np.zeros((8, 8), dtype=np.float32)
     val_path = tmp_path / "val.png"
     thor_path = tmp_path / "thor.png"
@@ -248,6 +333,7 @@ def test_save_workspace_data_persists_preblur_flags(tmp_path):
         scale_x=1.0,
         scale_y=1.0,
         preblur_before_resize=True,
+        preserve_flux_sum=True,
         intensity_min=0.0,
         intensity_max=255.0,
         crop_box=None,
@@ -262,6 +348,7 @@ def test_save_workspace_data_persists_preblur_flags(tmp_path):
         scale_x=1.0,
         scale_y=1.0,
         preblur_before_resize=False,
+        preserve_flux_sum=False,
         intensity_min=0.0,
         intensity_max=255.0,
         crop_box=None,
@@ -281,6 +368,10 @@ def test_save_workspace_data_persists_preblur_flags(tmp_path):
 
     with np.load(save_path) as workspace:
         assert "validation_preblur_before_resize" in workspace
+        assert "validation_preserve_flux_sum" in workspace
         assert "thorcam_preblur_before_resize" in workspace
+        assert "thorcam_preserve_flux_sum" in workspace
         assert bool(workspace["validation_preblur_before_resize"]) is True
+        assert bool(workspace["validation_preserve_flux_sum"]) is True
         assert bool(workspace["thorcam_preblur_before_resize"]) is False
+        assert bool(workspace["thorcam_preserve_flux_sum"]) is False
