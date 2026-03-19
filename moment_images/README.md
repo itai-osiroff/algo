@@ -48,6 +48,42 @@ Launch the GUI to configure the sweep without CLI flags:
 python -m moment_images.parameter_sweep --gui
 ```
 
+### System gain calibration (CLI + GUI)
+
+Compute camera system gain using the Teledyne mean-variance workflow:
+
+- bias = dark reference (single pre-averaged image or averaged directory stack)
+- flat1 + flat2 = even-illumination captures (single images or averaged stacks)
+- gain = `mean(flat1 - bias) / variance((flat2 - flat1) ROI)` where variance is derived from the ROI standard deviation as `std^2 / 2`
+
+CLI example with single images:
+
+```bash
+python -m moment_images.main_thor_gain \
+  --bias-image path/to/bias.tiff \
+  --flat1-image path/to/flat1.tiff \
+  --flat2-image path/to/flat2.tiff \
+  --roi-size 100 \
+  --output-json gain_result.json
+```
+
+CLI example with directory stacks:
+
+```bash
+python -m moment_images.main_thor_gain \
+  --bias-dir path/to/bias_frames \
+  --flat1-dir path/to/flat1_frames \
+  --flat2-dir path/to/flat2_frames \
+  --pattern "*.tif*" \
+  --roi-size 100
+```
+
+Launch the GUI alternative:
+
+```bash
+python -m moment_images.main_thor_gain --gui
+```
+
 ---
 
 ## Interactive pipeline (`im_process.py`)
