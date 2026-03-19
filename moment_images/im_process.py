@@ -68,6 +68,7 @@ class RectificationRunConfig:
     combined_use_global_avg_reference: bool = True
     hdr_enabled: bool = False
     hdr_exposure_times: Optional[List[float]] = None
+    normalize_to_8bit: bool = False
 
 
 @dataclass
@@ -93,6 +94,48 @@ def add_colorbar(mappable: Any, ax: Optional[plt.Axes] = None) -> None:
     """Attach a colorbar to the provided axes for a given image."""
     target_ax = ax or plt.gca()
     target_ax.figure.colorbar(mappable, ax=target_ax, orientation="vertical", fraction=0.046, pad=0.04)
+
+
+def to_uint8_proxy(image: Image.Image | np.ndarray) -> np.ndarray:
+    """Create a temporary uint8 visualization proxy without mutating the source."""
+    image_arr = np.asarray(image)
+    if image_arr.dtype == np.uint8:
+        return image_arr.copy()
+
+    image_float = np.asarray(image_arr, dtype=np.float64)
+    image_float = np.nan_to_num(image_float, nan=0.0, posinf=0.0, neginf=0.0)
+    min_val = float(np.min(image_float))
+    max_val = float(np.max(image_float))
+    if np.isclose(min_val, max_val):
+        return np.zeros_like(image_float, dtype=np.uint8)
+
+    scaled = (image_float - min_val) / (max_val - min_val) * 255.0
+    return np.clip(scaled, 0, 255).astype(np.uint8)
+
+
+def equalized_contrast_proxy(
+    image: Image.Image | np.ndarray,
+    clip_fraction: float = 0.85,
+) -> np.ndarray:
+    """Equalize histogram for display using a temporary uint8 proxy image."""
+    base = to_uint8_proxy(image)
+    equalized = cv.equalizeHist(base)
+    clip_floor = int(round(clip_fraction * 255))
+    return np.clip(equalized, clip_floor, 255).astype(np.uint8)
+
+
+def prepare_processing_and_detection_images(
+    image: Image.Image, normalize_to_8bit: bool
+) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
+    """Build processing and detection representations for one source image."""
+    if normalize_to_8bit:
+        normalized = np.asarray(min_max_normalize(image))
+        detection_proxy = normalized
+        return normalized, detection_proxy, Image.fromarray(detection_proxy)
+
+    processing_image = np.asarray(image).copy()
+    detection_proxy = to_uint8_proxy(processing_image)
+    return processing_image, detection_proxy, Image.fromarray(detection_proxy)
 
 
 def load_image(image_path: str) -> Optional[Image.Image]:
@@ -189,6 +232,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
                 images=[],
                 exposure_times=np.array(config.hdr_exposure_times),
                 views=rectified_view_stack_arr,
+                normalize_to_8bit=config.normalize_to_8bit,
             )
             assert isinstance(hdr_views, np.ndarray)
             global_rectified_views = hdr_views
@@ -227,6 +271,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
                 images=[],
                 exposure_times=np.array(config.hdr_exposure_times),
                 views=rectified_view_stack_arr,
+                normalize_to_8bit=config.normalize_to_8bit,
             )
             assert isinstance(hdr_views, np.ndarray)
             avg_image = np.mean(hdr_views, axis=(0, 1))
@@ -255,6 +300,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
                 images=[],
                 exposure_times=np.array(config.hdr_exposure_times),
                 views=rectified_view_stack_arr,
+                normalize_to_8bit=config.normalize_to_8bit,
             )
             assert isinstance(hdr_views, np.ndarray)
             global_rectified_views = hdr_views
@@ -419,8 +465,7 @@ def generate_rectification_figures(
     figures["averages"].append(fig_avg)
 
     fig_eq = plt.figure()
-    base_img = np.clip(result.avg_image, 0, 255).astype("uint8")
-    eq_img = np.clip(cv.equalizeHist(base_img), 0.85 * 255, 255)
+    eq_img = equalized_contrast_proxy(result.avg_image)
     im = plt.imshow(eq_img, cmap="gray")
     add_colorbar(im)
     plt.title("Averaged Rectified Image - Equalized (clipped, 85%) for contrast")
@@ -434,8 +479,7 @@ def generate_rectification_figures(
         figures["averages"].append(fig_gavg)
 
         fig_gavg_eq = plt.figure()
-        g_base = np.clip(result.global_avg_image, 0, 255).astype("uint8")
-        g_eq = np.clip(cv.equalizeHist(g_base), 0.85 * 255, 255)
+        g_eq = equalized_contrast_proxy(result.global_avg_image)
         im = plt.imshow(g_eq, cmap="gray")
         add_colorbar(im)
         plt.title("Global Averaged Rectified Image - Equalized (clipped, 85%) for contrast")
@@ -485,7 +529,8 @@ def min_max_normalize(image: Image.Image | np.ndarray, min_val: int = 0, max_val
 
     if np.isclose(img_min, img_max):
         print("Warning: The image has no variation in pixel values. Returning a copy of the original input.")
-        return image.copy() if is_pil else image_array.copy().astype(np.uint8)
+        flat_uint8 = np.clip(image_array, 0, 255).astype(np.uint8)
+        return Image.fromarray(flat_uint8) if is_pil else flat_uint8
 
     normalized_array = (image_array - img_min) / (img_max - img_min) * 255.0
     normalized_uint8 = normalized_array.astype(np.uint8)
@@ -527,14 +572,15 @@ def assemble_HDR(
     images: List[Image.Image],
     exposure_times: Optional[np.ndarray] = None,
     views: Optional[np.ndarray] = None,
+    normalize_to_8bit: bool = False,
 ) -> Image.Image | np.ndarray:
     """
     Build and tone-map an HDR image using weighted HDR.
 
     Images (or rectified view stacks) are converted to numpy arrays, and a
     weights vector is constructed per pixel by normalizing each pixel by
-    exposure times and clipped where the source is saturated. The final HDR
-    image is assembled by averaging the weighted pixel values across all
+    exposure times and clipping saturated regions. The final HDR image is
+    assembled by averaging the weighted pixel values across all
     images/exposures.
 
     Args:
@@ -544,6 +590,8 @@ def assemble_HDR(
         views: Optional stack shaped ``(E, N, N, H, W)`` of rectified views for
             each exposure. When provided, HDR is assembled per view and the
             resulting view grid is returned as a NumPy array.
+        normalize_to_8bit: When ``True``, normalize inputs to uint8 before HDR
+            weighting. When ``False``, preserve raw intensity values.
 
     Returns:
         HDR output as a ``PIL.Image`` when ``views`` is ``None``; otherwise a
@@ -561,6 +609,27 @@ def assemble_HDR(
             raise ValueError("Exposure times must be positive.")
         return times_arr
 
+    def compute_weighted_hdr(
+        stack: np.ndarray,
+        times_arr: np.ndarray,
+        cutoff_thresh: np.ndarray,
+    ) -> np.ndarray:
+        exposure_exponent = 0.5
+        num_exposures = len(times_arr)
+        weights = np.zeros_like(stack, dtype=np.float64)
+        for i in range(num_exposures):
+            scaled = stack[i] / np.power(times_arr[i], exposure_exponent)
+            scaled = np.maximum(scaled, 0.0)
+            cutoff_value = float(np.max(stack[i]) * cutoff_thresh[i])
+            if normalize_to_8bit:
+                cutoff_value = min(cutoff_value, 255.0)
+            valid_mask = stack[i] < cutoff_value
+            weights[i] = np.power(scaled, num_exposures) * valid_mask
+
+        denom = np.fmax(np.sum(weights, axis=0), np.ones_like(weights[0]) * 1e-8)
+        weights_norm = weights / denom[None, ...]
+        return np.sum(weights_norm * stack, axis=0)
+
     if views is not None:
         views_arr = np.asarray(views, dtype=np.float64)
         if views_arr.ndim != 5:
@@ -575,63 +644,40 @@ def assemble_HDR(
         cn2 = np.ceil(height / 2)
         gauss = np.exp(((gx - cn1) ** 2 + (gy - cn2) ** 2) / (2 * (0.6 * cn1) ** 2))
         views_weighted = views_arr * gauss[None, None, None, :, :]
-        for i in range(views_weighted.shape[0]):
-            for j in range(views_weighted.shape[1]):
-                for k in range(views_weighted.shape[2]):
-                    views_weighted[i, j, k] = min_max_normalize(views_weighted[i, j, k])
+        if normalize_to_8bit:
+            normalized_weighted = np.zeros_like(views_weighted, dtype=np.float64)
+            for i in range(views_weighted.shape[0]):
+                for j in range(views_weighted.shape[1]):
+                    for k in range(views_weighted.shape[2]):
+                        normalized_weighted[i, j, k] = np.asarray(
+                            min_max_normalize(views_weighted[i, j, k]), dtype=np.float64
+                        )
+            views_weighted = normalized_weighted
 
-        exposure_exponent = 0.5
-        cutoff_thresh = np.linspace(0.5, 1, len(exposure_times))
-        weights = np.array(
-            [
-                np.power(
-                    views_weighted[i] / np.power(exposure_times[i], exposure_exponent),
-                    len(exposure_times),
-                )
-                * (
-                    views_weighted[i]
-                    < np.fmin(
-                        np.max(views_weighted[i]) * cutoff_thresh[i],
-                        np.ones_like(views_weighted[i]) * 255,
-                    )
-                )
-                for i in range(len(exposure_times))
-            ]
-        )
-        weights_norm = np.array(
-            [
-                np.divide(
-                    weights[i],
-                    np.fmax(np.sum(weights, axis=0), np.ones_like(weights[i]) * 1e-8),
-                )
-                for i in range(weights.shape[0])
-            ]
-        )
-        hdr_views = np.sum(
-            [weights_norm[i] * views_weighted[i] for i in range(len(exposure_times))],
-            axis=0,
-        )
+        cutoff_thresh = np.linspace(0.5, 1, len(exposure_times), dtype=np.float64)
+        hdr_views = compute_weighted_hdr(views_weighted, exposure_times, cutoff_thresh)
         return hdr_views
 
     if not images:
         raise ValueError("No images provided for HDR assembly.")
 
-    # Normalize/validate exposure_times and make sure it's a 1D numpy array of float32
-    # Convert PIL Images to numpy arrays
-    np_images = [np.array(min_max_normalize(image)) for image in images]
+    if normalize_to_8bit:
+        np_images = np.asarray(
+            [np.asarray(min_max_normalize(image), dtype=np.float64) for image in images],
+            dtype=np.float64,
+        )
+    else:
+        np_images = np.asarray(
+            [np.asarray(image, dtype=np.float64) for image in images], dtype=np.float64
+        )
 
     exposure_times = normalize_exposure_times(exposure_times, len(np_images))
 
-
-    # Assemble weight vector
-    exposure_exponent = 0.5
-    cutoff_thresh = [0.5, 1]
-    weights = np.array([np.power(np_images[i]/np.power(exposure_times[i], exposure_exponent), len(exposure_times))*
-                        (np_images[i] < np.fmin(np.max(np_images[i])*cutoff_thresh[i], np.ones_like(np_images[i])*255))
-                          for i in range(len(np_images))])
-    weights_norm = np.array([np.divide(weights[i, :, :],np.fmax(np.sum(weights, axis=0), np.ones_like(weights[i, :, :])*1e-8)) for i in range(weights.shape[0])])
-    hdr_im = np.sum([weights_norm[i, :, :] * np_images[i] for i in range(len(np_images))], axis=0)
-    return min_max_normalize(Image.fromarray(hdr_im))
+    cutoff_thresh = np.linspace(0.5, 1, len(exposure_times), dtype=np.float64)
+    hdr_im = compute_weighted_hdr(np_images, exposure_times, cutoff_thresh)
+    if normalize_to_8bit:
+        return min_max_normalize(Image.fromarray(hdr_im))
+    return Image.fromarray(hdr_im.astype(np.float32))
 
 def get_image_paths() -> Tuple[List[Image.Image], List[str], bool]:
     """
@@ -1003,6 +1049,11 @@ def main():
         print("No images loaded. Exiting.")
         return
 
+    normalize_to_8bit = (
+        input("Normalize image intensities to 8-bit for processing? (y/N): ").strip().lower()
+        == "y"
+    )
+
     if hdr_flag:
         exp_time = input("Do you want to enter exposure times for the images or generate them automatically? (manual/auto): ").lower()
         if exp_time == 'auto':
@@ -1015,10 +1066,13 @@ def main():
         gauss_flag = input("Apply center-inverse gaussian (y/n)? ").lower()
         if gauss_flag != 'y':
             print("Assembling HDR image...")
-            hdr_image = assemble_HDR(images, exp_times)
-            # Convert numpy array back to PIL Image if needed
-            if isinstance(hdr_image, np.ndarray):
-                hdr_image = Image.fromarray(np.clip(hdr_image, 0, 255).astype('uint8'))
+            hdr_image = assemble_HDR(
+                images,
+                exp_times,
+                normalize_to_8bit=normalize_to_8bit,
+            )
+            if not isinstance(hdr_image, Image.Image):
+                raise ValueError("assemble_HDR(images=...) must return a PIL.Image.")
             images = [hdr_image]
             print("HDR image assembled successfully.")
         else:
@@ -1040,40 +1094,46 @@ def main():
     if not images:
         print("No images found for processing. Exiting.")
         return
-    
-    processed_images = [(im, min_max_normalize(im)) for im in images]
+
+    processed_images: List[Tuple[Image.Image, np.ndarray, np.ndarray, Image.Image]] = []
+    for image in images:
+        processing_image, detection_proxy, detection_proxy_pil = prepare_processing_and_detection_images(
+            image,
+            normalize_to_8bit=normalize_to_8bit,
+        )
+        processed_images.append((image, processing_image, detection_proxy, detection_proxy_pil))
     
     # New: collect created matplotlib figures so we can optionally save them later
     created_figures: List[Figure] = []
     original_images_chosen: List[np.ndarray] = []
+    processing_images_chosen: List[np.ndarray] = []
+    detection_images_chosen: List[np.ndarray] = []
     
     circles_chosen = None
-    norm_im_chosen = np.array([])
 
-    for orig_im, norm_im in processed_images:
-        im_np = np.array(norm_im)
+    for orig_im, processing_im, detection_im, detection_im_pil in processed_images:
         
         # give user choice between using circle-detection to find viewpoints, or manually setting the viewpoints
         viewpoint_method = input("Select viewpoint selection method - circle-detection or manual? (c/m)").lower()
         if viewpoint_method == 'm':
             fig = plt.figure(1)
             created_figures.append(fig)
-            im = plt.imshow(im_np, cmap='gray')
+            im = plt.imshow(detection_im, cmap='gray')
             add_colorbar(im)
             fig = plt.figure(2)
             created_figures.append(fig)
-            im = plt.imshow(np.clip(cv.equalizeHist(im_np), 0.85*255, 255), cmap='gray')
+            im = plt.imshow(equalized_contrast_proxy(detection_im), cmap='gray')
             add_colorbar(im)
             plt.show()
             center_x = int(input(f"Enter center x coordinate of viewpoint: "))
             center_y = int(input(f"Enter center y coordinate of viewpoint: "))
             radius = int(input(f"Enter radius of viewpoint: ")) #Expected size of each viewpoint is 250 pixels->radius~125 pixels
             circles = np.array([[[center_x, center_y, radius]]])
-            assert isinstance(norm_im, Image.Image)
-            display_circles(norm_im, circles)
+            display_circles(detection_im_pil, circles)
             if input("Use this image for further processing? (y/n): ").lower() == 'y':
                 circles_chosen = circles
-                norm_im_chosen = np.append(norm_im_chosen, im_np)
+                processing_images_chosen.append(processing_im)
+                detection_images_chosen.append(detection_im)
                 original_images_chosen.append(np.asarray(orig_im))
                 continue
             plt.close("all")
@@ -1082,10 +1142,10 @@ def main():
             if roi_strategy == 'specific':
                 fig = plt.figure()
                 created_figures.append(fig)
-                im = plt.imshow(im_np, cmap='gray')
+                im = plt.imshow(detection_im, cmap='gray')
                 add_colorbar(im)
                 plt.show()
-            roi, roi_offset = select_roi(im_np, roi_strategy, DEFAULT_SEARCH_RADIUS_MAX)
+            roi, roi_offset = select_roi(detection_im, roi_strategy, DEFAULT_SEARCH_RADIUS_MAX)
 
             circles = detect_and_adjust_circles(roi, roi_offset, DEFAULT_SEARCH_RADIUS_MIN, DEFAULT_SEARCH_RADIUS_MAX)
             
@@ -1093,31 +1153,38 @@ def main():
                 print("No circles found in this image. ")
                 continue
             
-            assert norm_im is Image.Image
-            display_circles(norm_im, circles)
+            display_circles(detection_im_pil, circles)
             
             if input("Use this image for further processing? (y/n): ").lower() == 'y':
                 circles_chosen = circles
-                norm_im_chosen = np.append(norm_im_chosen, im_np)
+                processing_images_chosen.append(processing_im)
+                detection_images_chosen.append(detection_im)
                 original_images_chosen.append(np.asarray(orig_im))
                 continue
             plt.close("all")
 
-    norm_im_chosen = np.reshape(norm_im_chosen, (-1, im_np.shape[0], im_np.shape[1]))
-
-    if circles_chosen is None or norm_im_chosen.size == 0:
+    if circles_chosen is None or not processing_images_chosen:
         print("No image selected for processing/Problem with constructing ROI structure. Exiting.")
         return
+
+    processing_im_chosen = np.stack(processing_images_chosen, axis=0)
+    detection_im_chosen = np.stack(detection_images_chosen, axis=0)
     
     windows = circles_chosen[0, :2]
     d = int(np.floor(VIEW_DISTANCE_SCALE_FACTOR * 2 * np.max(windows[:, 2])))
     
     view_grid_size = int(input(f"Enter view grid size *default {DEFAULT_VIEW_GRID_SIZE}*: ") or DEFAULT_VIEW_GRID_SIZE)
-    if norm_im_chosen.size != 0:
-        views = np.array([])
-        for i in range(norm_im_chosen.shape[0]):
-            views = np.append(views, extract_views(norm_im_chosen[i], windows[0], view_grid_size, d))
-        views = np.reshape(views, (norm_im_chosen.shape[0], view_grid_size, view_grid_size, d, d))
+    if processing_im_chosen.size != 0:
+        views = np.stack(
+            [
+                extract_views(processing_im_chosen[i], windows[0], view_grid_size, d)
+                for i in range(processing_im_chosen.shape[0])
+            ],
+            axis=0,
+        )
+    else:
+        print("No image selected for view extraction. Exiting.")
+        return
 
     views = np.squeeze(views)
 
@@ -1132,9 +1199,9 @@ def main():
     #             for j_im in range(views[0, 0].shape[0]):
     #                 if i == center_i and j == center_j:
     #                      continue
-    #                 if i_im > 78 and i_im < 91 and j_im > 137 and j_im < 147:
+    #                 if i_im > 115 and i_im <118 and j_im >114 and j_im < 119:
     #                     debug_views[i, j, i_im-4, j_im-4] = views[center_i, center_j, i_im, j_im]
-    #                 elif i_im > 78+4 and i_im < 91+4 and j_im > 137+4 and j_im < 147+4:
+    #                 elif i_im > 115+4 and i_im < 118+4 and j_im > 114+4 and j_im < 119+4:
     #                     debug_views[i, j, i_im, j_im] = 0
     #                 else:
     #                     debug_views[i, j, i_im, j_im] = views[center_i, center_j, i_im, j_im]
@@ -1222,7 +1289,12 @@ def main():
                 rectified_view_stack.append(rect_views_after_global)
             rectified_view_stack = np.asarray(rectified_view_stack)
             assert all([isinstance(im, Image.Image) for im in images])
-            hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
+            hdr_views = assemble_HDR(
+                images,
+                exp_times,
+                rectified_view_stack,
+                normalize_to_8bit=normalize_to_8bit,
+            )
             assert isinstance(hdr_views, np.ndarray)
             rect_views_after_global = hdr_views
             av_rect = np.mean(hdr_views, axis=(0, 1))
@@ -1247,7 +1319,12 @@ def main():
                 )
                 rectified_view_stack.append(rect_views_after_pixel)
             rectified_view_stack = np.asarray(rectified_view_stack)
-            hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
+            hdr_views = assemble_HDR(
+                images,
+                exp_times,
+                rectified_view_stack,
+                normalize_to_8bit=normalize_to_8bit,
+            )
             assert isinstance(hdr_views, np.ndarray)
             rect_images = hdr_views
             av_rect = np.mean(hdr_views, axis=(0, 1))
@@ -1275,7 +1352,12 @@ def main():
                 rectified_view_stack.append(rect_views_after_global)
             rectified_view_stack = np.asarray(rectified_view_stack)
             assert all([isinstance(im, Image.Image) for im in images])
-            hdr_views = assemble_HDR(images, exp_times, rectified_view_stack)
+            hdr_views = assemble_HDR(
+                images,
+                exp_times,
+                rectified_view_stack,
+                normalize_to_8bit=normalize_to_8bit,
+            )
             assert isinstance(hdr_views, np.ndarray)
             rect_views_after_global = hdr_views
             av_rect_global = np.mean(hdr_views, axis=(0, 1))
@@ -1428,7 +1510,7 @@ def main():
 
         fig = plt.figure()
         created_figures.append(fig)
-        im = plt.imshow(np.clip(cv.equalizeHist(av_rect_global.astype('uint8')), 0.85*255, 255), cmap="gray")
+        im = plt.imshow(equalized_contrast_proxy(av_rect_global), cmap="gray")
         add_colorbar(im)
         manager = plt.get_current_fig_manager()
         _fullscreen = getattr(manager, "full_screen_toggle", None)
@@ -1578,7 +1660,7 @@ def main():
     plt.title("Averaged Rectified Image")
     fig = plt.figure()
     created_figures.append(fig)
-    im = plt.imshow(np.clip(cv.equalizeHist(av_rect.astype('uint8')), 0.85*255, 255), cmap="gray")
+    im = plt.imshow(equalized_contrast_proxy(av_rect), cmap="gray")
     add_colorbar(im)
     manager = plt.get_current_fig_manager()
     _fullscreen = getattr(manager, "full_screen_toggle", None)
@@ -1626,7 +1708,10 @@ def main():
                     save_path = os.path.join(save_dir, filename)
                     workspace_data: Dict[str, Any] = {
                         "original_images": np.stack(original_images_chosen) if original_images_chosen else None,
-                        "normalized_images": norm_im_chosen if norm_im_chosen.size else None,
+                        "normalized_images": detection_im_chosen if detection_im_chosen.size else None,
+                        "processing_images_for_rectification": (
+                            processing_im_chosen if processing_im_chosen.size else None
+                        ),
                         "extracted_views": views,
                         "global_rectification_matrix": sim_mat,
                         "global_rectified_views": rect_views_after_global,
@@ -1642,6 +1727,7 @@ def main():
                         "view_centers": windows,
                         "rectification_strategy": np.array(rect_strat),
                         "hdr_enabled": np.array(hdr_flag),
+                        "normalize_to_8bit": np.array(normalize_to_8bit),
                         "hdr_exposure_times": exp_times if 'exp_times' in locals() else None,
                         "gaussian_hdr": np.array(gauss_flag),
                         "image_paths": np.array(image_paths),

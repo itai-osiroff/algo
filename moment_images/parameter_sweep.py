@@ -128,7 +128,8 @@ def _save_run_artifacts(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     avg_img_path = run_dir / "avg_rectified.png"
-    Image.fromarray(avg_image.astype("uint8")).save(avg_img_path)
+    avg_preview = np.asarray(min_max_normalize(avg_image), dtype=np.uint8)
+    Image.fromarray(avg_preview).save(avg_img_path)
 
     np.save(run_dir / "rectified_views.npy", rectified_views)
     np.savez_compressed(
@@ -171,13 +172,16 @@ def _generate_views(
     grid_size: int,
     view_distance: int | None,
     cache_dir: Path,
+    normalize_to_8bit: bool = False,
 ) -> tuple[np.ndarray, Path]:
     if not image_path.exists():
         raise FileNotFoundError(f"Source image not found: {image_path}")
 
     image = Image.open(image_path)
-    normalized = min_max_normalize(image)
-    image_np = np.array(normalized)
+    if normalize_to_8bit:
+        image_np = np.asarray(min_max_normalize(image))
+    else:
+        image_np = np.asarray(image).copy()
 
     distance = view_distance
     if distance is None:
@@ -200,6 +204,7 @@ def _generate_exposure_views(
     grid_size: int,
     view_distance: int | None,
     cache_dir: Path,
+    normalize_to_8bit: bool = False,
 ) -> tuple[np.ndarray, Path]:
     if not image_dir.exists():
         raise FileNotFoundError(f"Source image directory not found: {image_dir}")
@@ -224,8 +229,10 @@ def _generate_exposure_views(
     exposure_views: list[np.ndarray] = []
     for image_path in image_paths:
         image = Image.open(image_path)
-        normalized = min_max_normalize(image)
-        image_np = np.array(normalized)
+        if normalize_to_8bit:
+            image_np = np.asarray(min_max_normalize(image))
+        else:
+            image_np = np.asarray(image).copy()
         views = extract_views(image_np, base_circle, grid_size, distance)
         exposure_views.append(views)
 
@@ -253,6 +260,7 @@ def sweep_parameters(
     hdr_enabled: bool = False,
     hdr_exposure_times: Sequence[float] | None = None,
     combined_use_global_avg_reference: bool = True,
+    normalize_to_8bit: bool = False,
 ) -> None:
     default_config = RectificationRunConfig()
     global_thresholds = list(global_thresholds or [default_config.global_threshold])
@@ -317,6 +325,7 @@ def sweep_parameters(
             hdr_enabled=hdr_enabled,
             hdr_exposure_times=list(hdr_exposure_times) if hdr_exposure_times is not None else None,
             combined_use_global_avg_reference=combined_use_global_avg_reference,
+            normalize_to_8bit=normalize_to_8bit,
         )
 
         result = rectify_views_from_config(views, config)
@@ -466,6 +475,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--normalize-to-8bit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Normalize source images to 8-bit before view extraction and HDR assembly. "
+            "Disabled by default to preserve raw intensities."
+        ),
+    )
+    parser.add_argument(
         "--gui",
         action="store_true",
         help="Launch a minimal GUI for configuring the sweep instead of using CLI flags",
@@ -516,6 +534,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
                 grid_size=args.view_grid_size,
                 view_distance=args.view_distance,
                 cache_dir=output_dir,
+                normalize_to_8bit=args.normalize_to_8bit,
             )
             print(f"Generated exposure views once and cached to {cached_views_path}")
         else:
@@ -544,6 +563,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
                 grid_size=args.view_grid_size,
                 view_distance=args.view_distance,
                 cache_dir=output_dir,
+                normalize_to_8bit=args.normalize_to_8bit,
             )
             print(f"Generated views once and cached to {cached_views_path}")
     else:
@@ -589,6 +609,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         hdr_enabled=args.hdr_assemble,
         hdr_exposure_times=exposure_times,
         combined_use_global_avg_reference=args.use_global_avg_reference,
+        normalize_to_8bit=args.normalize_to_8bit,
     )
     return output_dir
 
@@ -718,6 +739,13 @@ def _launch_gui() -> None:
         variable=use_global_avg_reference_var,
     ).grid(row=len(labels) + 5, column=1, sticky="w", padx=6, pady=2)
 
+    normalize_to_8bit_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(
+        root,
+        text="Normalize source images to 8-bit",
+        variable=normalize_to_8bit_var,
+    ).grid(row=len(labels) + 6, column=1, sticky="w", padx=6, pady=2)
+
     def start_sweep() -> None:
         try:
             args = argparse.Namespace(
@@ -756,6 +784,7 @@ def _launch_gui() -> None:
                 analyze=analyze_var.get(),
                 live_plot=live_plot_var.get(),
                 use_global_avg_reference=use_global_avg_reference_var.get(),
+                normalize_to_8bit=normalize_to_8bit_var.get(),
             )
         except ValueError as exc:
             messagebox.showerror("Invalid input", str(exc))
@@ -773,7 +802,7 @@ def _launch_gui() -> None:
         root.destroy()
 
     tk.Button(root, text="Start sweep", command=start_sweep).grid(
-        row=len(labels) + 6, column=1, pady=8
+        row=len(labels) + 7, column=1, pady=8
     )
 
     root.mainloop()
