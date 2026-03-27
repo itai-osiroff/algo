@@ -10,12 +10,19 @@ interactive ``main`` workflow.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import math
+import os
 import sys
-from dataclasses import asdict
+import time
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from itertools import product
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from PIL import Image
@@ -117,6 +124,601 @@ def _build_float_range(start: float, stop: float, step: float) -> List[float]:
         values.append(round(current, 4))
         current += step
     return values
+
+
+DEFAULT_SCORE_WEIGHTS: Dict[str, float] = {
+    "laplacian_variance": 0.25,
+    "dwt_level2_hv_energy": 0.25,
+    "sum_squared_gradient": 0.25,
+    "total_variation": 0.25,
+}
+
+
+@dataclass
+class SweepDatasetSpec:
+    """Specification for one dataset participating in a sweep experiment."""
+
+    dataset_id: str
+    views_path: Optional[str] = None
+    source_image: Optional[str] = None
+    source_image_dir: Optional[str] = None
+    center_x: Optional[int] = None
+    center_y: Optional[int] = None
+    view_radius: Optional[int] = None
+    view_grid_size: int = 3
+    view_distance: Optional[int] = None
+    hdr_enabled: Optional[bool] = None
+    hdr_exposure_times: Optional[List[float]] = None
+    normalize_to_8bit: bool = False
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, object]) -> "SweepDatasetSpec":
+        dataset_id = str(payload.get("id") or payload.get("dataset_id") or "").strip()
+        if not dataset_id:
+            raise ValueError("Each dataset entry must provide a non-empty 'id'.")
+
+        exposure_times = payload.get("hdr_exposure_times")
+        parsed_exposure_times: Optional[List[float]] = None
+        if exposure_times is not None:
+            parsed_exposure_times = [float(val) for val in exposure_times]  # type: ignore[arg-type]
+
+        hdr_enabled_raw = payload.get("hdr_enabled")
+        hdr_enabled = None if hdr_enabled_raw is None else bool(hdr_enabled_raw)
+
+        return cls(
+            dataset_id=dataset_id,
+            views_path=cast(Optional[str], payload.get("views") or payload.get("views_path")),
+            source_image=cast(Optional[str], payload.get("source_image")),
+            source_image_dir=cast(Optional[str], payload.get("source_image_dir")),
+            center_x=cast(Optional[int], payload.get("center_x")),
+            center_y=cast(Optional[int], payload.get("center_y")),
+            view_radius=cast(Optional[int], payload.get("view_radius")),
+            view_grid_size=int(payload.get("view_grid_size", 3)),
+            view_distance=cast(Optional[int], payload.get("view_distance")),
+            hdr_enabled=hdr_enabled,
+            hdr_exposure_times=parsed_exposure_times,
+            normalize_to_8bit=bool(payload.get("normalize_to_8bit", False)),
+        )
+
+
+@dataclass
+class SweepSearchSpace:
+    """Strategy-specific parameter search space."""
+
+    strategy: str
+    similarity_window_sizes: List[int] = field(default_factory=lambda: [15, 25, 35, 45])
+    refinement_window_sizes: List[int] = field(default_factory=lambda: [15, 25, 35, 45])
+    max_displacements: List[int] = field(default_factory=lambda: [5, 15, 25])
+    gauss_sigmas: List[float] = field(default_factory=lambda: [3.0, 5.0, 7.0])
+    disp_gauss_sigmas: List[float] = field(default_factory=lambda: [0.0, 1.0])
+    global_thresholds: List[float] = field(default_factory=lambda: [0.15])
+    pixel_thresholds: List[float] = field(default_factory=lambda: [0.05])
+    sub_pix_factors: List[int] = field(default_factory=lambda: [1, 2])
+    pixel_sigma_pyramid: List[bool] = field(default_factory=lambda: [False, True])
+    zero_fill_roll: List[bool] = field(default_factory=lambda: [True])
+    correlation_pad_widths: List[int] = field(default_factory=lambda: [RectificationRunConfig().correlation_pad_width])
+    combined_use_global_avg_reference: List[bool] = field(default_factory=lambda: [True])
+    gauss_sizes: Optional[List[int]] = None
+    disp_gauss_sizes: Optional[List[int]] = None
+
+    @classmethod
+    def from_dict(cls, strategy: str, payload: Optional[Dict[str, object]]) -> "SweepSearchSpace":
+        raw = payload or {}
+        return cls(
+            strategy=strategy,
+            similarity_window_sizes=[int(v) for v in raw.get("similarity_window_sizes", raw.get("window_sizes", [15, 25, 35, 45]))],  # type: ignore[arg-type]
+            refinement_window_sizes=[int(v) for v in raw.get("refinement_window_sizes", raw.get("window_sizes", [15, 25, 35, 45]))],  # type: ignore[arg-type]
+            max_displacements=[int(v) for v in raw.get("max_displacements", [5, 15, 25])],  # type: ignore[arg-type]
+            gauss_sigmas=[float(v) for v in raw.get("gauss_sigmas", [3.0, 5.0, 7.0])],  # type: ignore[arg-type]
+            disp_gauss_sigmas=[float(v) for v in raw.get("disp_gauss_sigmas", [0.0, 1.0])],  # type: ignore[arg-type]
+            global_thresholds=[float(v) for v in raw.get("global_thresholds", [0.15])],  # type: ignore[arg-type]
+            pixel_thresholds=[float(v) for v in raw.get("pixel_thresholds", [0.05])],  # type: ignore[arg-type]
+            sub_pix_factors=[int(v) for v in raw.get("sub_pix_factors", [1, 2])],  # type: ignore[arg-type]
+            pixel_sigma_pyramid=[bool(v) for v in raw.get("pixel_sigma_pyramid", [False, True])],  # type: ignore[arg-type]
+            zero_fill_roll=[bool(v) for v in raw.get("zero_fill_roll", [True])],  # type: ignore[arg-type]
+            correlation_pad_widths=[int(v) for v in raw.get("correlation_pad_widths", [RectificationRunConfig().correlation_pad_width])],  # type: ignore[arg-type]
+            combined_use_global_avg_reference=[bool(v) for v in raw.get("combined_use_global_avg_reference", [True])],  # type: ignore[arg-type]
+            gauss_sizes=None
+            if raw.get("gauss_sizes") is None
+            else [int(v) for v in raw.get("gauss_sizes", [])],  # type: ignore[arg-type]
+            disp_gauss_sizes=None
+            if raw.get("disp_gauss_sizes") is None
+            else [int(v) for v in raw.get("disp_gauss_sizes", [])],  # type: ignore[arg-type]
+        )
+
+
+@dataclass
+class SweepStageSpec:
+    """Controls two-stage coarse/fine search behavior."""
+
+    total_budget_per_dataset: int = 320
+    stage1_fraction: float = 0.6
+    top_k: int = 8
+    max_workers: Optional[int] = None
+
+
+@dataclass
+class SweepScoringSpec:
+    """Controls composite metric scoring and robustness aggregation."""
+
+    metric_weights: Dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SCORE_WEIGHTS))
+    runtime_penalty_weight: float = 0.0
+    robustness_lambda: float = 0.5
+    missing_dataset_penalty: float = 1.0
+    metric_scope: str = "global_and_local_metrics"
+
+
+@dataclass
+class SweepExperimentSpec:
+    """Top-level experiment definition loaded from ``--spec`` JSON."""
+
+    datasets: List[SweepDatasetSpec]
+    search_spaces: Dict[str, SweepSearchSpace]
+    strategies: List[str] = field(default_factory=lambda: ["pixel", "combined"])
+    stages: SweepStageSpec = field(default_factory=SweepStageSpec)
+    scoring: SweepScoringSpec = field(default_factory=SweepScoringSpec)
+    output_dir: Optional[str] = None
+    save_figures: bool = False
+    analyze: bool = True
+    keep_all_run_artifacts: bool = True
+    random_seed: int = 0
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, object]) -> "SweepExperimentSpec":
+        datasets_raw = cast(List[Dict[str, object]], payload.get("datasets", []))
+        if not datasets_raw:
+            raise ValueError("spec must provide at least one dataset entry under 'datasets'.")
+        datasets = [SweepDatasetSpec.from_dict(item) for item in datasets_raw]
+
+        strategies = [str(item).lower() for item in cast(List[object], payload.get("strategies", ["pixel", "combined"]))]
+        if not strategies:
+            strategies = ["pixel", "combined"]
+        valid_strategies = {"pixel", "combined", "global"}
+        invalid = [strategy for strategy in strategies if strategy not in valid_strategies]
+        if invalid:
+            raise ValueError(f"Unsupported strategies in spec: {invalid}")
+
+        search_spaces_raw = cast(Dict[str, Dict[str, object]], payload.get("search_spaces", {}))
+        search_spaces: Dict[str, SweepSearchSpace] = {}
+        for strategy in strategies:
+            search_spaces[strategy] = SweepSearchSpace.from_dict(
+                strategy=strategy,
+                payload=search_spaces_raw.get(strategy),
+            )
+
+        stages_raw = cast(Dict[str, object], payload.get("stages", {}))
+        stages = SweepStageSpec(
+            total_budget_per_dataset=int(stages_raw.get("total_budget_per_dataset", 320)),
+            stage1_fraction=float(stages_raw.get("stage1_fraction", 0.6)),
+            top_k=int(stages_raw.get("top_k", 8)),
+            max_workers=cast(Optional[int], stages_raw.get("max_workers")),
+        )
+
+        scoring_raw = cast(Dict[str, object], payload.get("scoring", {}))
+        metric_weights = cast(Optional[Dict[str, float]], scoring_raw.get("metric_weights"))
+        scoring = SweepScoringSpec(
+            metric_weights=dict(metric_weights) if metric_weights else dict(DEFAULT_SCORE_WEIGHTS),
+            runtime_penalty_weight=float(scoring_raw.get("runtime_penalty_weight", 0.0)),
+            robustness_lambda=float(scoring_raw.get("robustness_lambda", 0.5)),
+            missing_dataset_penalty=float(scoring_raw.get("missing_dataset_penalty", 1.0)),
+            metric_scope=str(scoring_raw.get("metric_scope", "global_and_local_metrics")),
+        )
+
+        return cls(
+            datasets=datasets,
+            search_spaces=search_spaces,
+            strategies=strategies,
+            stages=stages,
+            scoring=scoring,
+            output_dir=cast(Optional[str], payload.get("output_dir")),
+            save_figures=bool(payload.get("save_figures", False)),
+            analyze=bool(payload.get("analyze", True)),
+            keep_all_run_artifacts=bool(payload.get("keep_all_run_artifacts", True)),
+            random_seed=int(payload.get("random_seed", 0)),
+        )
+
+
+@dataclass
+class PreparedDataset:
+    """Runtime-ready dataset after views have been validated/generated once."""
+
+    dataset_id: str
+    views_path: Path
+    hdr_enabled: bool
+    hdr_exposure_times: Optional[List[float]]
+    normalize_to_8bit: bool
+
+
+@dataclass
+class SweepCandidate:
+    """One strategy-specific rectification candidate."""
+
+    strategy: str
+    params: Dict[str, object]
+    config: RectificationRunConfig
+    candidate_id: str = ""
+
+
+def _normalize_window_size(window: int) -> int:
+    if window < 1:
+        raise ValueError("window size must be positive")
+    if window % 2 == 0:
+        return window + 1
+    return window
+
+
+def _derive_gauss_size(gauss_sigma: float) -> int:
+    size = max(1, int(round(gauss_sigma * 5)))
+    return size
+
+
+def _strategy_param_keys(strategy: str) -> List[str]:
+    if strategy == "pixel":
+        return [
+            "similarity_window_size",
+            "max_displacement",
+            "gauss_sigma",
+            "disp_gauss_sigma",
+            "pixel_threshold",
+            "sub_pix_factor",
+            "pixel_sigma_pyramid",
+            "zero_fill_roll",
+        ]
+    if strategy == "combined":
+        return [
+            "correlation_pad_width",
+            "global_threshold",
+            "refinement_window_size",
+            "max_displacement",
+            "gauss_sigma",
+            "disp_gauss_sigma",
+            "pixel_threshold",
+            "sub_pix_factor",
+            "pixel_sigma_pyramid",
+            "combined_use_global_avg_reference",
+            "zero_fill_roll",
+        ]
+    if strategy == "global":
+        return [
+            "correlation_pad_width",
+            "global_threshold",
+        ]
+    raise ValueError(f"Unsupported strategy: {strategy}")
+
+
+def _candidate_signature(candidate: SweepCandidate) -> str:
+    return json.dumps(asdict(candidate.config), sort_keys=True)
+
+
+def _limit_candidates(candidates: Sequence[SweepCandidate], budget: Optional[int]) -> List[SweepCandidate]:
+    if budget is None:
+        return list(candidates)
+    if budget <= 0:
+        return []
+    if len(candidates) <= budget:
+        return list(candidates)
+    raw = np.linspace(0, len(candidates) - 1, budget)
+    indices = sorted({int(round(val)) for val in raw})
+    if not indices:
+        return []
+    while len(indices) < budget:
+        for idx in range(len(candidates)):
+            if idx not in indices:
+                indices.append(idx)
+            if len(indices) >= budget:
+                break
+    indices = sorted(indices[:budget])
+    return [candidates[idx] for idx in indices]
+
+
+def _assign_candidate_ids(candidates: Sequence[SweepCandidate], prefix: str) -> List[SweepCandidate]:
+    assigned: List[SweepCandidate] = []
+    for idx, candidate in enumerate(candidates):
+        clone = SweepCandidate(
+            strategy=candidate.strategy,
+            params=dict(candidate.params),
+            config=candidate.config,
+            candidate_id=f"{prefix}{idx:04d}",
+        )
+        assigned.append(clone)
+    return assigned
+
+
+def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> SweepCandidate:
+    defaults = RectificationRunConfig()
+    if strategy == "pixel":
+        window = _normalize_window_size(int(params["similarity_window_size"]))
+        gauss_sigma = float(params["gauss_sigma"])
+        disp_gauss_sigma = float(params["disp_gauss_sigma"])
+        gauss_size = int(params.get("gauss_size", _derive_gauss_size(gauss_sigma)))
+        disp_gauss_size = int(params.get("disp_gauss_size", window))
+        config = RectificationRunConfig(
+            strategy="pixel",
+            similarity_window_size=window,
+            refinement_window_size=window,
+            max_displacement=int(params["max_displacement"]),
+            gauss_sigma=gauss_sigma,
+            gauss_size=gauss_size,
+            disp_gauss_sigma=disp_gauss_sigma,
+            disp_gauss_size=disp_gauss_size,
+            global_threshold=defaults.global_threshold,
+            pixel_threshold=float(params["pixel_threshold"]),
+            pixel_sigma_pyramid=bool(params["pixel_sigma_pyramid"]),
+            zero_fill_roll=bool(params["zero_fill_roll"]),
+            sub_pix_factor=int(params["sub_pix_factor"]),
+        )
+        normalized_params = dict(params)
+        normalized_params["similarity_window_size"] = window
+        normalized_params["gauss_size"] = gauss_size
+        normalized_params["disp_gauss_size"] = disp_gauss_size
+        return SweepCandidate(strategy="pixel", params=normalized_params, config=config)
+
+    if strategy == "combined":
+        window = _normalize_window_size(int(params["refinement_window_size"]))
+        gauss_sigma = float(params["gauss_sigma"])
+        disp_gauss_sigma = float(params["disp_gauss_sigma"])
+        gauss_size = int(params.get("gauss_size", _derive_gauss_size(gauss_sigma)))
+        disp_gauss_size = int(params.get("disp_gauss_size", window))
+        config = RectificationRunConfig(
+            strategy="combined",
+            similarity_window_size=defaults.similarity_window_size,
+            refinement_window_size=window,
+            correlation_pad_width=int(params["correlation_pad_width"]),
+            max_displacement=int(params["max_displacement"]),
+            gauss_sigma=gauss_sigma,
+            gauss_size=gauss_size,
+            disp_gauss_sigma=disp_gauss_sigma,
+            disp_gauss_size=disp_gauss_size,
+            global_threshold=float(params["global_threshold"]),
+            pixel_threshold=float(params["pixel_threshold"]),
+            pixel_sigma_pyramid=bool(params["pixel_sigma_pyramid"]),
+            zero_fill_roll=bool(params["zero_fill_roll"]),
+            sub_pix_factor=int(params["sub_pix_factor"]),
+            combined_use_global_avg_reference=bool(params["combined_use_global_avg_reference"]),
+        )
+        normalized_params = dict(params)
+        normalized_params["refinement_window_size"] = window
+        normalized_params["gauss_size"] = gauss_size
+        normalized_params["disp_gauss_size"] = disp_gauss_size
+        return SweepCandidate(strategy="combined", params=normalized_params, config=config)
+
+    if strategy == "global":
+        config = RectificationRunConfig(
+            strategy="global",
+            correlation_pad_width=int(params["correlation_pad_width"]),
+            global_threshold=float(params["global_threshold"]),
+        )
+        return SweepCandidate(strategy="global", params=dict(params), config=config)
+
+    raise ValueError(f"Unsupported strategy: {strategy}")
+
+
+def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]]:
+    strategy = search_space.strategy.lower()
+    if strategy == "pixel":
+        values = product(
+            search_space.similarity_window_sizes,
+            search_space.max_displacements,
+            search_space.gauss_sigmas,
+            search_space.disp_gauss_sigmas,
+            search_space.pixel_thresholds,
+            search_space.sub_pix_factors,
+            search_space.pixel_sigma_pyramid,
+            search_space.zero_fill_roll,
+        )
+        return [
+            {
+                "similarity_window_size": int(win),
+                "max_displacement": int(max_disp),
+                "gauss_sigma": float(gauss_sigma),
+                "disp_gauss_sigma": float(disp_gauss_sigma),
+                "pixel_threshold": float(pixel_threshold),
+                "sub_pix_factor": int(sub_pix_factor),
+                "pixel_sigma_pyramid": bool(pixel_sigma_pyramid),
+                "zero_fill_roll": bool(zero_fill_roll),
+            }
+            for (
+                win,
+                max_disp,
+                gauss_sigma,
+                disp_gauss_sigma,
+                pixel_threshold,
+                sub_pix_factor,
+                pixel_sigma_pyramid,
+                zero_fill_roll,
+            ) in values
+        ]
+
+    if strategy == "combined":
+        values = product(
+            search_space.correlation_pad_widths,
+            search_space.global_thresholds,
+            search_space.refinement_window_sizes,
+            search_space.max_displacements,
+            search_space.gauss_sigmas,
+            search_space.disp_gauss_sigmas,
+            search_space.pixel_thresholds,
+            search_space.sub_pix_factors,
+            search_space.pixel_sigma_pyramid,
+            search_space.combined_use_global_avg_reference,
+            search_space.zero_fill_roll,
+        )
+        return [
+            {
+                "correlation_pad_width": int(correlation_pad_width),
+                "global_threshold": float(global_threshold),
+                "refinement_window_size": int(refinement_window_size),
+                "max_displacement": int(max_disp),
+                "gauss_sigma": float(gauss_sigma),
+                "disp_gauss_sigma": float(disp_gauss_sigma),
+                "pixel_threshold": float(pixel_threshold),
+                "sub_pix_factor": int(sub_pix_factor),
+                "pixel_sigma_pyramid": bool(pixel_sigma_pyramid),
+                "combined_use_global_avg_reference": bool(combined_use_global_avg_reference),
+                "zero_fill_roll": bool(zero_fill_roll),
+            }
+            for (
+                correlation_pad_width,
+                global_threshold,
+                refinement_window_size,
+                max_disp,
+                gauss_sigma,
+                disp_gauss_sigma,
+                pixel_threshold,
+                sub_pix_factor,
+                pixel_sigma_pyramid,
+                combined_use_global_avg_reference,
+                zero_fill_roll,
+            ) in values
+        ]
+
+    if strategy == "global":
+        values = product(
+            search_space.correlation_pad_widths,
+            search_space.global_thresholds,
+        )
+        return [
+            {
+                "correlation_pad_width": int(correlation_pad_width),
+                "global_threshold": float(global_threshold),
+            }
+            for correlation_pad_width, global_threshold in values
+        ]
+
+    raise ValueError(f"Unsupported strategy: {strategy}")
+
+
+def generate_coarse_candidates(
+    search_space: SweepSearchSpace, budget: Optional[int] = None
+) -> List[SweepCandidate]:
+    """Generate deterministic coarse candidates for one strategy."""
+
+    params = _coarse_param_grid(search_space)
+    params.sort(key=lambda item: json.dumps(item, sort_keys=True))
+    candidates = [_build_candidate_from_params(search_space.strategy.lower(), item) for item in params]
+    deduped: List[SweepCandidate] = []
+    seen = set()
+    for candidate in candidates:
+        sig = _candidate_signature(candidate)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        deduped.append(candidate)
+    return _limit_candidates(deduped, budget)
+
+
+def _neighbor_values(values: Sequence[object], current: object) -> List[object]:
+    if not values:
+        return [current]
+    normalized = list(values)
+    if current not in normalized:
+        return [current]
+    idx = normalized.index(current)
+    indices = sorted({max(0, idx - 1), idx, min(len(normalized) - 1, idx + 1)})
+    return [normalized[i] for i in indices]
+
+
+def generate_refined_candidates(
+    ranked_candidates: Sequence[Dict[str, object]],
+    candidate_lookup: Dict[str, SweepCandidate],
+    search_spaces: Dict[str, SweepSearchSpace],
+    top_k: int = 8,
+    budget: Optional[int] = None,
+) -> List[SweepCandidate]:
+    """Generate neighborhood refinements around Top-K coarse candidates."""
+
+    top_items = [item for item in ranked_candidates if item.get("candidate_id") in candidate_lookup][:top_k]
+    generated: List[SweepCandidate] = []
+    seen = set()
+
+    for item in top_items:
+        candidate_id = cast(str, item.get("candidate_id"))
+        coarse = candidate_lookup[candidate_id]
+        strategy = coarse.strategy
+        search_space = search_spaces[strategy]
+        params = dict(coarse.params)
+
+        base_candidate = _build_candidate_from_params(strategy, params)
+        base_sig = _candidate_signature(base_candidate)
+        if base_sig not in seen:
+            seen.add(base_sig)
+            generated.append(base_candidate)
+
+        for key in _strategy_param_keys(strategy):
+            if key not in params:
+                continue
+            values_attr = f"{key}s"
+            strategy_values: Sequence[object]
+            if key == "similarity_window_size":
+                strategy_values = list(search_space.similarity_window_sizes)
+            elif key == "refinement_window_size":
+                strategy_values = list(search_space.refinement_window_sizes)
+            elif key == "max_displacement":
+                strategy_values = list(search_space.max_displacements)
+            elif key == "gauss_sigma":
+                strategy_values = list(search_space.gauss_sigmas)
+            elif key == "disp_gauss_sigma":
+                strategy_values = list(search_space.disp_gauss_sigmas)
+            elif key == "pixel_threshold":
+                strategy_values = list(search_space.pixel_thresholds)
+            elif key == "sub_pix_factor":
+                strategy_values = list(search_space.sub_pix_factors)
+            elif key == "pixel_sigma_pyramid":
+                strategy_values = list(search_space.pixel_sigma_pyramid)
+            elif key == "zero_fill_roll":
+                strategy_values = list(search_space.zero_fill_roll)
+            elif key == "correlation_pad_width":
+                strategy_values = list(search_space.correlation_pad_widths)
+            elif key == "global_threshold":
+                strategy_values = list(search_space.global_thresholds)
+            elif key == "combined_use_global_avg_reference":
+                strategy_values = list(search_space.combined_use_global_avg_reference)
+            else:
+                strategy_values = cast(Sequence[object], getattr(search_space, values_attr, []))
+
+            for neighbor in _neighbor_values(strategy_values, params[key]):
+                if neighbor == params[key]:
+                    continue
+                variant = dict(params)
+                variant[key] = neighbor
+                candidate = _build_candidate_from_params(strategy, variant)
+                sig = _candidate_signature(candidate)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                generated.append(candidate)
+
+    generated.sort(key=lambda item: json.dumps(item.params, sort_keys=True))
+    return _limit_candidates(generated, budget)
+
+
+def _compose_run_config(
+    candidate: SweepCandidate,
+    dataset: PreparedDataset,
+) -> RectificationRunConfig:
+    config_dict = asdict(candidate.config)
+    config_dict["hdr_enabled"] = dataset.hdr_enabled
+    config_dict["hdr_exposure_times"] = dataset.hdr_exposure_times
+    config_dict["normalize_to_8bit"] = dataset.normalize_to_8bit
+    return RectificationRunConfig(**config_dict)
+
+
+def _stage_budgets(stage_spec: SweepStageSpec) -> Tuple[int, int]:
+    total = max(1, int(stage_spec.total_budget_per_dataset))
+    stage1 = int(round(total * float(stage_spec.stage1_fraction)))
+    stage1 = max(1, min(stage1, total))
+    stage2 = max(1, total - stage1)
+    return stage1, stage2
+
+
+def _parse_experiment_spec(path: Path) -> SweepExperimentSpec:
+    if not path.exists():
+        raise FileNotFoundError(f"Sweep spec file not found: {path}")
+    with path.open("r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    if not isinstance(payload, dict):
+        raise ValueError("Sweep spec must be a JSON object.")
+    return SweepExperimentSpec.from_dict(payload)
 
 
 def _save_run_artifacts(
@@ -273,6 +875,538 @@ def _generate_exposure_views(
     return exposure_views_arr, cache_path
 
 
+def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDataset:
+    dataset_dir = output_dir / "datasets" / dataset.dataset_id
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    data_sources = [
+        dataset.views_path is not None,
+        dataset.source_image is not None,
+        dataset.source_image_dir is not None,
+    ]
+    if sum(data_sources) != 1:
+        raise ValueError(
+            f"Dataset '{dataset.dataset_id}' must provide exactly one source: "
+            "'views_path', 'source_image', or 'source_image_dir'."
+        )
+
+    if dataset.views_path is not None:
+        views_path = Path(dataset.views_path)
+        views_arr = _load_views(views_path)
+        inferred_hdr = views_arr.ndim == 5
+        hdr_enabled = inferred_hdr if dataset.hdr_enabled is None else dataset.hdr_enabled
+        if hdr_enabled and views_arr.ndim != 5:
+            raise ValueError(
+                f"Dataset '{dataset.dataset_id}' has non-HDR views but hdr_enabled=True."
+            )
+        if not hdr_enabled and views_arr.ndim == 5:
+            raise ValueError(
+                f"Dataset '{dataset.dataset_id}' has exposure stack views; enable HDR for this dataset."
+            )
+        if dataset.hdr_exposure_times is not None and hdr_enabled and len(dataset.hdr_exposure_times) != views_arr.shape[0]:
+            raise ValueError(
+                f"Dataset '{dataset.dataset_id}' exposure time count does not match exposure axis."
+            )
+        return PreparedDataset(
+            dataset_id=dataset.dataset_id,
+            views_path=views_path,
+            hdr_enabled=bool(hdr_enabled),
+            hdr_exposure_times=dataset.hdr_exposure_times,
+            normalize_to_8bit=dataset.normalize_to_8bit,
+        )
+
+    if dataset.source_image is not None:
+        missing = [
+            name
+            for name, present in [
+                ("center_x", dataset.center_x),
+                ("center_y", dataset.center_y),
+                ("view_radius", dataset.view_radius),
+            ]
+            if present is None
+        ]
+        if missing:
+            raise ValueError(
+                f"Dataset '{dataset.dataset_id}' source_image requires fields: {', '.join(missing)}"
+            )
+        views_arr, views_path = _generate_views(
+            image_path=Path(dataset.source_image),
+            center_x=int(dataset.center_x),
+            center_y=int(dataset.center_y),
+            radius=int(dataset.view_radius),
+            grid_size=int(dataset.view_grid_size),
+            view_distance=dataset.view_distance,
+            cache_dir=dataset_dir,
+            normalize_to_8bit=dataset.normalize_to_8bit,
+        )
+        if dataset.hdr_enabled:
+            raise ValueError(
+                f"Dataset '{dataset.dataset_id}' uses a single source image and cannot enable HDR."
+            )
+        return PreparedDataset(
+            dataset_id=dataset.dataset_id,
+            views_path=views_path,
+            hdr_enabled=False,
+            hdr_exposure_times=None,
+            normalize_to_8bit=dataset.normalize_to_8bit,
+        )
+
+    # source_image_dir branch
+    missing = [
+        name
+        for name, present in [
+            ("center_x", dataset.center_x),
+            ("center_y", dataset.center_y),
+            ("view_radius", dataset.view_radius),
+        ]
+        if present is None
+    ]
+    if missing:
+        raise ValueError(
+            f"Dataset '{dataset.dataset_id}' source_image_dir requires fields: {', '.join(missing)}"
+        )
+    views_arr, views_path = _generate_exposure_views(
+        image_dir=Path(cast(str, dataset.source_image_dir)),
+        center_x=int(dataset.center_x),
+        center_y=int(dataset.center_y),
+        radius=int(dataset.view_radius),
+        grid_size=int(dataset.view_grid_size),
+        view_distance=dataset.view_distance,
+        cache_dir=dataset_dir,
+        normalize_to_8bit=dataset.normalize_to_8bit,
+    )
+    hdr_enabled = True if dataset.hdr_enabled is None else dataset.hdr_enabled
+    if not hdr_enabled:
+        raise ValueError(
+            f"Dataset '{dataset.dataset_id}' uses source_image_dir but HDR is disabled."
+        )
+    if dataset.hdr_exposure_times is not None and len(dataset.hdr_exposure_times) != views_arr.shape[0]:
+        raise ValueError(
+            f"Dataset '{dataset.dataset_id}' exposure time count does not match exposure stack."
+        )
+    return PreparedDataset(
+        dataset_id=dataset.dataset_id,
+        views_path=views_path,
+        hdr_enabled=True,
+        hdr_exposure_times=dataset.hdr_exposure_times,
+        normalize_to_8bit=dataset.normalize_to_8bit,
+    )
+
+
+def _prepare_datasets(spec: SweepExperimentSpec, output_dir: Path) -> List[PreparedDataset]:
+    seen: set[str] = set()
+    prepared: List[PreparedDataset] = []
+    for dataset in spec.datasets:
+        if dataset.dataset_id in seen:
+            raise ValueError(f"Duplicate dataset id '{dataset.dataset_id}' in experiment spec.")
+        seen.add(dataset.dataset_id)
+        prepared.append(_prepare_dataset(dataset, output_dir=output_dir))
+    prepared.sort(key=lambda item: item.dataset_id)
+    return prepared
+
+
+def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
+    run_uid = str(task["run_uid"])
+    stage = str(task["stage"])
+    candidate_id = str(task["candidate_id"])
+    dataset_id = str(task["dataset_id"])
+    strategy = str(task["strategy"])
+    started = time.perf_counter()
+    try:
+        views = _load_views(Path(cast(str, task["views_path"])))
+        config = RectificationRunConfig(**cast(Dict[str, object], task["config"]))
+        result = rectify_views_from_config(views, config)
+        output_dir = Path(cast(str, task["run_parent_dir"]))
+        run_name = str(task["run_name"])
+        _save_run_artifacts(output_dir, run_name, result)
+        if bool(task.get("save_figures", False)):
+            figures = generate_rectification_figures(result)
+            _persist_figures(figures, output_dir / run_name / "figures")
+        metric_record = build_metric_record(run_uid, config, result)
+        elapsed = time.perf_counter() - started
+        return {
+            "status": "ok",
+            "stage": stage,
+            "candidate_id": candidate_id,
+            "dataset_id": dataset_id,
+            "strategy": strategy,
+            "run_uid": run_uid,
+            "run_dir": str(output_dir / run_name),
+            "runtime_seconds": float(elapsed),
+            "config": asdict(config),
+            "params": task["params"],
+            "metric_record": metric_record,
+        }
+    except Exception as exc:  # noqa: BLE001 - preserve failed run details
+        elapsed = time.perf_counter() - started
+        return {
+            "status": "failed",
+            "stage": stage,
+            "candidate_id": candidate_id,
+            "dataset_id": dataset_id,
+            "strategy": strategy,
+            "run_uid": run_uid,
+            "runtime_seconds": float(elapsed),
+            "config": task["config"],
+            "params": task["params"],
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+
+
+def _default_max_workers(explicit: Optional[int]) -> int:
+    if explicit is not None:
+        return max(1, int(explicit))
+    cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count - 1)
+
+
+def _evaluate_stage(
+    stage_name: str,
+    candidates: Sequence[SweepCandidate],
+    datasets: Sequence[PreparedDataset],
+    output_dir: Path,
+    save_figures_flag: bool,
+    max_workers: int,
+) -> List[Dict[str, object]]:
+    tasks: List[Dict[str, object]] = []
+    for candidate in candidates:
+        candidate_root = output_dir / "runs" / stage_name / candidate.candidate_id
+        for dataset in datasets:
+            config = _compose_run_config(candidate, dataset)
+            run_name = dataset.dataset_id
+            run_uid = f"{stage_name}_{candidate.candidate_id}_{dataset.dataset_id}"
+            tasks.append(
+                {
+                    "stage": stage_name,
+                    "candidate_id": candidate.candidate_id,
+                    "dataset_id": dataset.dataset_id,
+                    "strategy": candidate.strategy,
+                    "run_uid": run_uid,
+                    "run_name": run_name,
+                    "run_parent_dir": str(candidate_root),
+                    "views_path": str(dataset.views_path),
+                    "config": asdict(config),
+                    "params": dict(candidate.params),
+                    "save_figures": save_figures_flag,
+                }
+            )
+    tasks.sort(key=lambda item: (str(item["candidate_id"]), str(item["dataset_id"])))
+    for idx, task in enumerate(tasks):
+        task["task_index"] = idx
+
+    if not tasks:
+        return []
+
+    stage_results: List[Dict[str, object]] = []
+    progress_desc = f"Evaluating {stage_name}"
+    if max_workers <= 1:
+        for task in tqdm(tasks, desc=progress_desc, unit="run"):
+            result = _evaluate_candidate_task(task)
+            result["task_index"] = task["task_index"]
+            stage_results.append(result)
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(_evaluate_candidate_task, task): task for task in tasks
+            }
+            for future in tqdm(as_completed(future_map), total=len(future_map), desc=progress_desc, unit="run"):
+                task = future_map[future]
+                result = future.result()
+                result["task_index"] = task["task_index"]
+                stage_results.append(result)
+
+    stage_results.sort(key=lambda item: int(item.get("task_index", 0)))
+    return stage_results
+
+
+def _normalize_score(value: float, min_value: float, max_value: float) -> float:
+    if not math.isfinite(value):
+        return 0.0
+    if not math.isfinite(min_value) or not math.isfinite(max_value):
+        return 0.0
+    if abs(max_value - min_value) <= 1e-12:
+        return 0.5
+    return float((value - min_value) / (max_value - min_value))
+
+
+def score_and_rank_runs(
+    run_results: Sequence[Dict[str, object]],
+    scoring: SweepScoringSpec,
+    dataset_ids: Sequence[str],
+) -> List[Dict[str, object]]:
+    """Score and rank candidates from one stage using normalized composite metrics."""
+
+    successful = [record for record in run_results if record.get("status") == "ok"]
+    if not successful:
+        return []
+
+    metric_weights = dict(scoring.metric_weights)
+    if not metric_weights:
+        raise ValueError("At least one metric weight must be configured.")
+    weight_sum = float(sum(metric_weights.values()))
+    if weight_sum <= 0:
+        raise ValueError("Metric weights must sum to a positive value.")
+
+    dataset_metric_values: Dict[str, Dict[str, List[float]]] = {
+        dataset_id: {metric: [] for metric in metric_weights.keys()} for dataset_id in dataset_ids
+    }
+    dataset_runtime_values: Dict[str, List[float]] = {dataset_id: [] for dataset_id in dataset_ids}
+    for record in successful:
+        dataset_id = str(record["dataset_id"])
+        metrics = cast(Dict[str, float], cast(Dict[str, object], record["metric_record"]).get(scoring.metric_scope))
+        if not isinstance(metrics, dict):
+            metrics = cast(
+                Dict[str, float],
+                cast(Dict[str, object], record["metric_record"]).get("global_and_local_metrics", {}),
+            )
+        for metric in metric_weights.keys():
+            if metric in metrics:
+                dataset_metric_values[dataset_id][metric].append(float(metrics[metric]))
+        dataset_runtime_values[dataset_id].append(float(record.get("runtime_seconds", 0.0)))
+
+    dataset_bounds: Dict[str, Dict[str, Tuple[float, float]]] = {}
+    for dataset_id, metric_map in dataset_metric_values.items():
+        dataset_bounds[dataset_id] = {}
+        for metric, values in metric_map.items():
+            if not values:
+                dataset_bounds[dataset_id][metric] = (0.0, 0.0)
+            else:
+                dataset_bounds[dataset_id][metric] = (float(np.min(values)), float(np.max(values)))
+    runtime_bounds: Dict[str, Tuple[float, float]] = {}
+    for dataset_id, runtimes in dataset_runtime_values.items():
+        if not runtimes:
+            runtime_bounds[dataset_id] = (0.0, 0.0)
+        else:
+            runtime_bounds[dataset_id] = (float(np.min(runtimes)), float(np.max(runtimes)))
+
+    grouped: Dict[str, Dict[str, object]] = {}
+    for record in successful:
+        candidate_id = str(record["candidate_id"])
+        dataset_id = str(record["dataset_id"])
+        metrics = cast(Dict[str, float], cast(Dict[str, object], record["metric_record"]).get(scoring.metric_scope))
+        if not isinstance(metrics, dict):
+            metrics = cast(
+                Dict[str, float],
+                cast(Dict[str, object], record["metric_record"]).get("global_and_local_metrics", {}),
+            )
+
+        weighted_sum = 0.0
+        for metric, weight in metric_weights.items():
+            metric_value = float(metrics.get(metric, float("nan")))
+            min_val, max_val = dataset_bounds[dataset_id][metric]
+            normalized = _normalize_score(metric_value, min_val, max_val)
+            weighted_sum += float(weight) * normalized
+        dataset_score = weighted_sum / weight_sum
+
+        runtime = float(record.get("runtime_seconds", 0.0))
+        if scoring.runtime_penalty_weight > 0:
+            rt_min, rt_max = runtime_bounds[dataset_id]
+            runtime_norm = _normalize_score(runtime, rt_min, rt_max)
+            dataset_score -= float(scoring.runtime_penalty_weight) * runtime_norm
+
+        slot = grouped.setdefault(
+            candidate_id,
+            {
+                "candidate_id": candidate_id,
+                "strategy": record["strategy"],
+                "config": record["config"],
+                "params": record["params"],
+                "dataset_scores": {},
+                "dataset_metrics": {},
+                "runtime_seconds": {},
+            },
+        )
+        cast(Dict[str, float], slot["dataset_scores"])[dataset_id] = float(dataset_score)
+        cast(Dict[str, Dict[str, float]], slot["dataset_metrics"])[dataset_id] = metrics
+        cast(Dict[str, float], slot["runtime_seconds"])[dataset_id] = runtime
+
+    rankings: List[Dict[str, object]] = []
+    expected_datasets = list(dataset_ids)
+    for slot in grouped.values():
+        dataset_scores_map = cast(Dict[str, float], slot["dataset_scores"])
+        present_scores = [dataset_scores_map[dataset_id] for dataset_id in expected_datasets if dataset_id in dataset_scores_map]
+        missing = [dataset_id for dataset_id in expected_datasets if dataset_id not in dataset_scores_map]
+        if present_scores:
+            mean_score = float(np.mean(present_scores))
+            std_score = float(np.std(present_scores))
+        else:
+            mean_score = -float("inf")
+            std_score = 0.0
+        robust = mean_score - float(scoring.robustness_lambda) * std_score
+        robust -= float(scoring.missing_dataset_penalty) * len(missing)
+        rankings.append(
+            {
+                "candidate_id": slot["candidate_id"],
+                "strategy": slot["strategy"],
+                "config": slot["config"],
+                "params": slot["params"],
+                "score": float(robust),
+                "mean_dataset_score": float(mean_score),
+                "std_dataset_score": float(std_score),
+                "missing_datasets": missing,
+                "dataset_scores": slot["dataset_scores"],
+                "runtime_seconds": slot["runtime_seconds"],
+                "dataset_metrics": slot["dataset_metrics"],
+            }
+        )
+
+    rankings.sort(key=lambda item: float(item["score"]), reverse=True)
+    for idx, item in enumerate(rankings, start=1):
+        item["rank"] = idx
+    return rankings
+
+
+def _write_leaderboard_csv(rows: Sequence[Dict[str, object]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=[
+                "rank",
+                "candidate_id",
+                "strategy",
+                "score",
+                "mean_dataset_score",
+                "std_dataset_score",
+                "missing_datasets",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "rank": row.get("rank"),
+                    "candidate_id": row.get("candidate_id"),
+                    "strategy": row.get("strategy"),
+                    "score": row.get("score"),
+                    "mean_dataset_score": row.get("mean_dataset_score"),
+                    "std_dataset_score": row.get("std_dataset_score"),
+                    "missing_datasets": ",".join(cast(List[str], row.get("missing_datasets", []))),
+                }
+            )
+
+
+def _write_stage_outputs(
+    stage_name: str,
+    stage_results: Sequence[Dict[str, object]],
+    rankings: Sequence[Dict[str, object]],
+    output_dir: Path,
+) -> None:
+    successful = [record for record in stage_results if record.get("status") == "ok"]
+    failed = [record for record in stage_results if record.get("status") != "ok"]
+    payload = {
+        "stage": stage_name,
+        "num_runs": len(stage_results),
+        "num_successful": len(successful),
+        "num_failed": len(failed),
+        "rankings": list(rankings),
+        "failed_runs": failed,
+        "runs": list(stage_results),
+    }
+    summary_path = output_dir / f"{stage_name}_summary.json"
+    with summary_path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, indent=2)
+
+
+def _best_configs_payload(rankings: Sequence[Dict[str, object]]) -> Dict[str, object]:
+    best_by_strategy: Dict[str, Dict[str, object]] = {}
+    for row in rankings:
+        strategy = str(row["strategy"])
+        if strategy not in best_by_strategy:
+            best_by_strategy[strategy] = dict(row)
+    return {
+        "overall_best": dict(rankings[0]) if rankings else None,
+        "best_by_strategy": best_by_strategy,
+    }
+
+
+def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] = None) -> Path:
+    """Run a full two-stage, multi-dataset sweep experiment."""
+
+    resolved_output_dir = (
+        output_dir
+        if output_dir is not None
+        else (
+            Path(spec.output_dir)
+            if spec.output_dir
+            else Path("sweep_runs") / datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+    )
+    resolved_output_dir.mkdir(parents=True, exist_ok=True)
+
+    prepared_datasets = _prepare_datasets(spec, resolved_output_dir)
+    dataset_ids = [dataset.dataset_id for dataset in prepared_datasets]
+
+    stage1_budget, stage2_budget = _stage_budgets(spec.stages)
+
+    coarse_candidates: List[SweepCandidate] = []
+    for strategy in spec.strategies:
+        search_space = spec.search_spaces[strategy]
+        coarse_candidates.extend(generate_coarse_candidates(search_space, budget=None))
+    coarse_candidates = _limit_candidates(coarse_candidates, stage1_budget)
+    coarse_candidates = _assign_candidate_ids(coarse_candidates, "s1c")
+    coarse_lookup = {candidate.candidate_id: candidate for candidate in coarse_candidates}
+
+    max_workers = _default_max_workers(spec.stages.max_workers)
+
+    stage1_results = _evaluate_stage(
+        stage_name="stage1",
+        candidates=coarse_candidates,
+        datasets=prepared_datasets,
+        output_dir=resolved_output_dir,
+        save_figures_flag=spec.save_figures,
+        max_workers=max_workers,
+    )
+    stage1_rankings = score_and_rank_runs(stage1_results, spec.scoring, dataset_ids=dataset_ids)
+    _write_stage_outputs("stage1", stage1_results, stage1_rankings, resolved_output_dir)
+
+    refined_candidates = generate_refined_candidates(
+        ranked_candidates=stage1_rankings,
+        candidate_lookup=coarse_lookup,
+        search_spaces=spec.search_spaces,
+        top_k=spec.stages.top_k,
+        budget=stage2_budget,
+    )
+    if not refined_candidates and stage1_rankings:
+        # Fallback: keep exploring with the best stage-1 candidate if refinement is empty.
+        best_id = str(stage1_rankings[0]["candidate_id"])
+        refined_candidates = [coarse_lookup[best_id]]
+    refined_candidates = _assign_candidate_ids(refined_candidates, "s2c")
+
+    stage2_results = _evaluate_stage(
+        stage_name="stage2",
+        candidates=refined_candidates,
+        datasets=prepared_datasets,
+        output_dir=resolved_output_dir,
+        save_figures_flag=spec.save_figures,
+        max_workers=max_workers,
+    )
+    stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
+    _write_stage_outputs("stage2", stage2_results, stage2_rankings, resolved_output_dir)
+
+    final_rankings = stage2_rankings if stage2_rankings else stage1_rankings
+    with (resolved_output_dir / "leaderboard.json").open("w", encoding="utf-8") as fp:
+        json.dump(final_rankings, fp, indent=2)
+    _write_leaderboard_csv(final_rankings, resolved_output_dir / "leaderboard.csv")
+
+    with (resolved_output_dir / "best_configs.json").open("w", encoding="utf-8") as fp:
+        json.dump(_best_configs_payload(final_rankings), fp, indent=2)
+
+    all_metric_records: List[Dict[str, object]] = []
+    for stage_result in (stage1_results + stage2_results):
+        if stage_result.get("status") == "ok":
+            all_metric_records.append(cast(Dict[str, object], stage_result["metric_record"]))
+    with (resolved_output_dir / "summary.json").open("w", encoding="utf-8") as fp:
+        json.dump(all_metric_records, fp, indent=2)
+
+    if spec.analyze and all_metric_records:
+        analysis = analyze_summary_data(all_metric_records)
+        save_analysis(analysis, resolved_output_dir / "analysis.json")
+
+    return resolved_output_dir
+
+
 def sweep_parameters(
     views: np.ndarray,
     output_dir: Path,
@@ -398,6 +1532,18 @@ def sweep_parameters(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sweep im_process rectification parameters")
     parser.add_argument(
+        "--spec",
+        help=(
+            "Path to a JSON experiment spec for the two-stage multi-dataset sweep "
+            "(recommended path for new workflows)."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Override parallel worker count in --spec mode.",
+    )
+    parser.add_argument(
         "--views",
         help="Path to a precomputed (N, N, H, W) or (E, N, N, H, W) numpy array of views",
     )
@@ -522,6 +1668,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _run_from_namespace(args: argparse.Namespace) -> Path:
+    spec_path = getattr(args, "spec", None)
+    if spec_path:
+        spec = _parse_experiment_spec(Path(spec_path))
+        if args.output_dir is not None:
+            spec.output_dir = args.output_dir
+        workers_override = getattr(args, "workers", None)
+        if workers_override is not None:
+            spec.stages.max_workers = int(workers_override)
+        return run_sweep_experiment(spec)
+
     if args.save_figures and not args.live_plot:
         plt.switch_backend("Agg")
     output_dir = (

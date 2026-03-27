@@ -1,0 +1,115 @@
+{
+  "output_dir": "sweep_runs/spec_example",
+  "strategies": [
+    "pixel",
+    "combined"
+  ],
+  "datasets": [
+    {
+      "id": "dataset_a",
+      "views": "path/to/views_a.npy",
+      "normalize_to_8bit": false
+    },
+    {
+      "id": "dataset_b",
+      "views": "path/to/views_b.npy",
+      "normalize_to_8bit": false
+    }
+  ],
+  "search_spaces": {
+    "pixel": {
+      "similarity_window_sizes": [
+        15,
+        25,
+        35
+      ],
+      "max_displacements": [
+        5,
+        15
+      ],
+      "gauss_sigmas": [
+        3.0,
+        5.0
+      ],
+      "disp_gauss_sigmas": [
+        0.0,
+        1.0
+      ],
+      "pixel_thresholds": [
+        0.05
+      ],
+      "sub_pix_factors": [
+        1,
+        2
+      ],
+      "pixel_sigma_pyramid": [
+        false,
+        true
+      ],
+      "zero_fill_roll": [
+        true
+      ]
+    },
+    "combined": {
+      "correlation_pad_widths": [
+        54
+      ],
+      "global_thresholds": [
+        0.1,
+        0.15
+      ],
+      "refinement_window_sizes": [
+        15,
+        25
+      ],
+      "max_displacements": [
+        5,
+        15
+      ],
+      "gauss_sigmas": [
+        3.0,
+        5.0
+      ],
+      "disp_gauss_sigmas": [
+        0.0,
+        1.0
+      ],
+      "pixel_thresholds": [
+        0.05
+      ],
+      "sub_pix_factors": [
+        1,
+        2
+      ],
+      "pixel_sigma_pyramid": [
+        false,
+        true
+      ],
+      "combined_use_global_avg_reference": [
+        true
+      ],
+      "zero_fill_roll": [
+        true
+      ]
+    }
+  },
+  "stages": {
+    "total_budget_per_dataset": 320,
+    "stage1_fraction": 0.6,
+    "top_k": 8,
+    "max_workers": 4
+  },
+  "scoring": {
+    "metric_weights": {
+      "laplacian_variance": 0.25,
+      "dwt_level2_hv_energy": 0.25,
+      "sum_squared_gradient": 0.25,
+      "total_variation": 0.25
+    },
+    "runtime_penalty_weight": 0.0,
+    "robustness_lambda": 0.5,
+    "missing_dataset_penalty": 1.0
+  },
+  "save_figures": false,
+  "analyze": true
+}

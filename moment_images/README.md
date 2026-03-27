@@ -34,7 +34,13 @@ python -m moment_images.im_process
 
 ### Parameter sweep (CLI)
 
-Use a precomputed view grid (or an HDR stack) to run a sweep non-interactively:
+Use a JSON experiment spec (recommended) for two-stage coarse-to-fine, multi-dataset exploration:
+
+```bash
+python -m moment_images.parameter_sweep --spec moment_images/sweep_experiment_spec_example.json
+```
+
+Legacy single-dataset CLI flags are still supported:
 
 ```bash
 python -m moment_images.parameter_sweep --views path/to/views.npy
@@ -197,34 +203,52 @@ For scripted or swept runs, `rectify_views_from_config()` provides a single entr
 
 ## Parameter sweeping (`parameter_sweep.py`)
 
-The sweep runner lets you explore parameter combinations offline and save results for comparison.
+The sweep runner supports two modes:
+
+- **Spec mode (recommended):** two-stage coarse-to-fine, multi-dataset, strategy-aware exploration.
+- **Legacy mode:** single-pass cartesian sweep via individual CLI flags.
+
+Run spec mode with:
+
+```bash
+python -m moment_images.parameter_sweep --spec path/to/spec.json
+```
+
+A complete template is included in `sweep_experiment_spec_example.json`.
 
 ### Inputs and view generation
 
-The sweep expects either:
+Each dataset in the spec can use either:
 
-- `--views` pointing to a precomputed NumPy array shaped `(N, N, H, W)` or `(E, N, N, H, W)`.
-- Or a **source image** + center coordinates + radius so it can generate the view grid once and cache it as `generated_views.npy`.
-- Or a **source image directory** (with `--hdr-assemble`) to build an exposure stack and cache it as `generated_exposure_views.npy`.
+- `views` pointing to a precomputed NumPy array shaped `(N, N, H, W)` or `(E, N, N, H, W)`.
+- Or a **source image** + center coordinates + radius so the runner can generate and cache `generated_views.npy`.
+- Or a **source image directory** to build an exposure stack and cache `generated_exposure_views.npy`.
 
-### Sweep dimensions
+### Sweep dimensions (spec mode)
 
-The grid is built from:
+Search spaces are strategy-aware:
 
-- Window sizes (`--window-start/stop/step`)
-- Max displacements (`--max-disp-start/stop/step`)
-- Gaussian smoothing (`--gauss-sigma-*`)
-- Displacement smoothing (`--disp-gauss-*`)
-- Thresholds:
-  - **Global thresholds** (`--global-thresh-*`) apply to global correlation masking.
-  - **Pixel thresholds** (`--pixel-thresh-*`) apply to pixelwise reference thresholding.
+- `pixel`: window size, max displacement, Gaussian sigmas, pixel threshold, sub-pixel factor, sigma pyramid flag, zero-fill roll.
+- `combined`: global pad/threshold plus pixel refinement controls, including global-average reference toggle.
+- `global`: optional baseline mode using global-only knobs.
+
+The runner uses stage-1 coarse candidates, ranks them with normalized composite metrics, then refines around Top-K candidates in stage 2.
 
 ### Live plotting and figures
 
 - `--live-plot` shows a real-time matplotlib view of tracked metrics after each run.
 - `--save-figures` saves the same figures as the interactive workflow under each run folder.
 
-### Outputs
+### Outputs (spec mode)
+
+Top-level outputs include:
+
+- `stage1_summary.json` — coarse-stage run details, failures, and rankings.
+- `stage2_summary.json` — refinement-stage run details, failures, and rankings.
+- `leaderboard.json` and `leaderboard.csv` — final ranked configurations.
+- `best_configs.json` — overall best and best-per-strategy configurations.
+- `summary.json` — flattened metric records for successful runs.
+- `analysis.json` and `analysis.csv` — aggregate metric summaries (when enabled).
 
 Each run creates a folder with:
 
@@ -233,11 +257,6 @@ Each run creates a folder with:
 - `workspace.npz` — workspace-style compressed archive containing `rectified_views`, `average_rectified_image`, and stage diagnostics.
 - `workspace.mat` — MATLAB companion export of the same workspace variables.
 - `config.json` — the configuration used for this run.
-
-The sweep writes a top-level `summary.json` with metrics for each run. When `--analyze` is enabled it also writes:
-
-- `analysis.json` — min/max/mean summaries by metric.
-- `analysis.csv` — tabular view of the same summaries.
 
 ---
 
