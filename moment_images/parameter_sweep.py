@@ -26,10 +26,12 @@ from matplotlib.figure import Figure
 
 from moment_images.im_process import (
     RectificationRunConfig,
+    RectificationResult,
     generate_rectification_figures,
     min_max_normalize,
     rectify_views_from_config,
     save_figures,
+    save_workspace_variables,
     extract_views,
     VIEW_DISTANCE_SCALE_FACTOR,
 )
@@ -120,25 +122,53 @@ def _build_float_range(start: float, stop: float, step: float) -> List[float]:
 def _save_run_artifacts(
     output_dir: Path,
     run_name: str,
-    avg_image: np.ndarray,
-    rectified_views: np.ndarray,
-    config: RectificationRunConfig,
+    result: RectificationResult,
 ) -> None:
+    config = result.config
     run_dir = output_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     avg_img_path = run_dir / "avg_rectified.png"
-    avg_preview = np.asarray(min_max_normalize(avg_image), dtype=np.uint8)
+    avg_preview = np.asarray(min_max_normalize(result.avg_image), dtype=np.uint8)
     Image.fromarray(avg_preview).save(avg_img_path)
 
-    np.save(run_dir / "rectified_views.npy", rectified_views)
-    np.savez_compressed(
-        run_dir / "rectified_views.npz",
-        rectified_views=rectified_views,
-        average_rectified_image=avg_image,
-    )
+    np.save(run_dir / "rectified_views.npy", result.rectified_views)
+
+    pixel_displacements_x = None
+    pixel_displacements_y = None
+    if result.pixel_similarity is not None:
+        pixel_displacements_x = getattr(result.pixel_similarity, "disps_x", None)
+        pixel_displacements_y = getattr(result.pixel_similarity, "disps_y", None)
+
+    config_dict = asdict(config)
+    strategy_code = {"global": 1, "pixel": 2, "combined": 3}.get(config.strategy.lower(), 0)
+    workspace_data: Dict[str, object] = {
+        "rectified_views": result.rectified_views,
+        "average_rectified_image": result.avg_image,
+        "global_rectification_matrix": result.global_similarity,
+        "global_rectified_views": result.global_rectified_views,
+        "average_rectified_global_image": result.global_avg_image,
+        "pixel_rectified_views": (
+            result.rectified_views if config.strategy.lower() in {"pixel", "combined"} else None
+        ),
+        "pixel_displacements_x": pixel_displacements_x,
+        "pixel_displacements_y": pixel_displacements_y,
+        "reference_view_index": np.array(result.ref_view_index),
+        "rectification_strategy": np.array(strategy_code),
+        "hdr_enabled": np.array(config.hdr_enabled),
+        "hdr_exposure_times": (
+            np.asarray(config.hdr_exposure_times, dtype=np.float64)
+            if config.hdr_exposure_times is not None
+            else None
+        ),
+        "normalize_to_8bit": np.array(config.normalize_to_8bit),
+        "run_name": np.array(run_name),
+        "config_json": np.array(json.dumps(config_dict, sort_keys=True)),
+    }
+    save_workspace_variables(str(run_dir / "workspace.npz"), workspace_data)
+
     with (run_dir / "config.json").open("w", encoding="utf-8") as fp:
-        json.dump(asdict(config), fp, indent=2)
+        json.dump(config_dict, fp, indent=2)
 
 
 def _persist_figures(figures: Dict[str, List[Figure]], base_dir: Path) -> None:
@@ -340,7 +370,7 @@ def sweep_parameters(
         if strategy in {"pixel", "combined"}:
             run_name_parts.append(f"pt{pixel_thresh}")
         run_name = "_".join(run_name_parts)
-        _save_run_artifacts(output_dir, run_name, result.avg_image, result.rectified_views, config)
+        _save_run_artifacts(output_dir, run_name, result)
 
         if save_figures_flag:
             figures = generate_rectification_figures(result)  # pass full result so we can save global/pixel maps, originals, overlays, averages

@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 from matplotlib import pyplot as plt
 from PIL import Image
@@ -39,7 +41,27 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
 
     run_dir = output_dir / "win1_disp0_g1.0_dg0.0_pt0.05"
     sweep_rectified = np.load(run_dir / "rectified_views.npy")
-    sweep_rectified_npz = np.load(run_dir / "rectified_views.npz")["rectified_views"]
+    with np.load(run_dir / "workspace.npz") as workspace:
+        sweep_rectified_workspace = workspace["rectified_views"]
+        sweep_avg_workspace = workspace["average_rectified_image"]
+        assert "pixel_displacements_x" in workspace.files
+        assert "pixel_displacements_y" in workspace.files
+        assert "reference_view_index" in workspace.files
+        assert "rectification_strategy" in workspace.files
+        assert "run_name" in workspace.files
+        assert "config_json" in workspace.files
+        assert "coordinates" not in workspace.files
+        assert "scores" not in workspace.files
+        assert workspace["reference_view_index"].shape == (2,)
+        assert workspace["pixel_displacements_x"].ndim == 4
+        assert workspace["pixel_displacements_y"].ndim == 4
+        assert int(np.asarray(workspace["rectification_strategy"]).item()) == 2
+        assert (
+            str(np.asarray(workspace["run_name"]).item())
+            == "win1_disp0_g1.0_dg0.0_pt0.05"
+        )
+        parsed_config = json.loads(str(np.asarray(workspace["config_json"]).item()))
+        assert parsed_config["strategy"] == "pixel"
 
     direct_config = RectificationRunConfig(
         strategy="pixel",
@@ -56,8 +78,11 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
     direct_result = rectify_views_from_config(views, direct_config)
 
     np.testing.assert_allclose(sweep_rectified, direct_result.rectified_views)
-    np.testing.assert_allclose(sweep_rectified_npz, direct_result.rectified_views)
+    np.testing.assert_allclose(sweep_rectified_workspace, direct_result.rectified_views)
+    np.testing.assert_allclose(sweep_avg_workspace, direct_result.avg_image)
     np.testing.assert_allclose(sweep_rectified.mean(axis=(0, 1)), direct_result.avg_image)
+    assert (run_dir / "workspace.mat").exists()
+    assert not (run_dir / "rectified_views.npz").exists()
 
 
 def test_live_metrics_plotter_tracks_metrics():

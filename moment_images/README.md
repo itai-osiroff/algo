@@ -230,7 +230,8 @@ Each run creates a folder with:
 
 - `avg_rectified.png` — averaged rectified output.
 - `rectified_views.npy` — full rectified stack (legacy-compatible output).
-- `rectified_views.npz` — compressed rectified stack plus `average_rectified_image` for downstream tools.
+- `workspace.npz` — workspace-style compressed archive containing `rectified_views`, `average_rectified_image`, and stage diagnostics.
+- `workspace.mat` — MATLAB companion export of the same workspace variables.
 - `config.json` — the configuration used for this run.
 
 The sweep writes a top-level `summary.json` with metrics for each run. When `--analyze` is enabled it also writes:
@@ -282,7 +283,7 @@ The guide covers:
    ```bash
    python -m moment_images.validate_rectification
    ```
-2. Select either an `im_process` workspace (`.npz`) or a sweep output (`rectified_views.npy` or `rectified_views.npz`).
+2. Select either an `im_process` workspace (`.npz`) or a sweep output (`workspace.npz` or `rectified_views.npy`).
 3. Select the Validation Camera image and Thorcam image when prompted.
 4. Edit each image in the GUI and click `Done`.
 5. Inspect the generated comparison figures.
