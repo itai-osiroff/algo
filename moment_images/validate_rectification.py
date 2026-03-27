@@ -266,6 +266,25 @@ def _apply_intensity_window(image: np.ndarray, min_val: float, max_val: float) -
     return np.clip(arr, lo, hi)
 
 
+def _gaussian_downsample_kernel_1d(downsample_factor: float) -> np.ndarray:
+    """Build a 1D Gaussian anti-alias kernel with area-compensating gain."""
+    safe_downsample = max(float(downsample_factor), 1e-12)
+    if safe_downsample >= 1.0:
+        return np.array([1.0], dtype=np.float32)
+
+    sigma = (1.0 / safe_downsample) / 2.0
+    radius = max(1, int(np.ceil(3.0 * sigma)))
+    coords = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-(coords * coords) / (2.0 * sigma * sigma))
+    kernel_sum = float(np.sum(kernel))
+    if not np.isfinite(kernel_sum) or kernel_sum <= 0.0:
+        return np.array([1.0 / safe_downsample], dtype=np.float32)
+
+    kernel = kernel / kernel_sum
+    kernel = kernel * (1.0 / safe_downsample)
+    return np.asarray(kernel, dtype=np.float32)
+
+
 def _scale_image(
     src_img: np.ndarray,
     scale_x: float,
@@ -274,30 +293,36 @@ def _scale_image(
     preblur_before_resize: bool = False,
     preserve_flux_sum: bool = False,
 ) -> np.ndarray:
-    src_h, src_w = src_img.shape[:2]
+    src_arr = np.asarray(src_img, dtype=np.float32)
+    src_h, src_w = src_arr.shape[:2]
     scaled_w = max(1, int(round(src_w * float(scale_x))))
     scaled_h = max(1, int(round(src_h * float(scale_y))))
 
-    resize_source = src_img
+    resize_source = src_arr
     if preblur_before_resize:
         safe_scale_x = max(float(scale_x), 1e-12)
         safe_scale_y = max(float(scale_y), 1e-12)
-        kernel_w = max(1, int(np.ceil(1.0 / safe_scale_x)))
-        kernel_h = max(1, int(np.ceil(1.0 / safe_scale_y)))
-        kernel_w = min(kernel_w, src_w)
-        kernel_h = min(kernel_h, src_h)
-        if kernel_w > 1 or kernel_h > 1:
-            resize_source = cv.blur(src_img, (kernel_w, kernel_h))
+        downsample_x = safe_scale_x if safe_scale_x < 1.0 else 1.0
+        downsample_y = safe_scale_y if safe_scale_y < 1.0 else 1.0
+        if downsample_x < 1.0 or downsample_y < 1.0:
+            kernel_x = _gaussian_downsample_kernel_1d(downsample_x)
+            kernel_y = _gaussian_downsample_kernel_1d(downsample_y)
+            resize_source = cv.sepFilter2D(
+                src_arr,
+                ddepth=-1,
+                kernelX=kernel_x,
+                kernelY=kernel_y,
+                borderType=cv.BORDER_REFLECT_101,
+            )
 
     resized = np.asarray(cv.resize(resize_source, (scaled_w, scaled_h), interpolation=cv.INTER_LINEAR), dtype=np.float32)
 
     did_downsample = scaled_w < src_w or scaled_h < src_h
     if preserve_flux_sum and did_downsample:
-        source_arr = np.asarray(src_img, dtype=np.float32)
-        source_finite = np.isfinite(source_arr)
+        source_finite = np.isfinite(src_arr)
         resized_finite = np.isfinite(resized)
         if np.any(source_finite) and np.any(resized_finite):
-            source_sum = float(np.sum(source_arr[source_finite], dtype=np.float64))
+            source_sum = float(np.sum(src_arr[source_finite], dtype=np.float64))
             resized_sum = float(np.sum(resized[resized_finite], dtype=np.float64))
             if np.isfinite(source_sum) and np.isfinite(resized_sum) and abs(resized_sum) > 1e-12:
                 resized = resized * np.float32(source_sum / resized_sum)
@@ -556,10 +581,10 @@ def auto_align_images(
         tgt_h, tgt_w = target.shape[:2]
 
         if opts.mode == VALIDATION_MODE_FIT:
-            target_resized = target if (tgt_h, tgt_w) == (ref_h, ref_w) else cv.resize(
-                target, (ref_w, ref_h), interpolation=cv.INTER_LINEAR
+            ref_resized = ref if (tgt_h, tgt_w) == (ref_h, ref_w) else cv.resize(
+                ref, (tgt_w, tgt_h), interpolation=cv.INTER_LINEAR
             )
-            aligned_img, cc, warp = _ecc_align_same_size(ref, target_resized)
+            aligned_img, cc, warp = _ecc_align_same_size(ref_resized, target)
             return AlignmentResult(
                 aligned_image=aligned_img,
                 status="aligned_fit_reference",
@@ -567,8 +592,8 @@ def auto_align_images(
                 match_found=True,
                 ecc_score=cc,
                 warp_matrix=warp,
-                roi_reference=(0, 0, ref_w, ref_h),
-                roi_input=(0, 0, ref_w, ref_h),
+                roi_reference=(0, 0, tgt_w, tgt_h),
+                roi_input=(0, 0, tgt_w, tgt_h),
             )
 
         if (tgt_h, tgt_w) == (ref_h, ref_w):
@@ -688,10 +713,12 @@ def prepare_images_for_comparison(
             ecc_score = alignment_result.ecc_score
             match_found = alignment_result.match_found
         else:
-            reg_input = cv.resize(target, (ref.shape[1], ref.shape[0]), interpolation=cv.INTER_LINEAR)
-            status = "fit_reference_resized_without_alignment"
+            reg_input = target
+            status = "fit_reference_reference_resized_to_input_without_alignment"
             match_found = True
-        reg_ref = ref
+        reg_ref = ref if ref.shape == reg_input.shape else cv.resize(
+            ref, (reg_input.shape[1], reg_input.shape[0]), interpolation=cv.INTER_LINEAR
+        )
     else:
         aligned_target = _to_gray_float32(alignment_result.aligned_image) if alignment_result is not None else target
         if alignment_result is not None:

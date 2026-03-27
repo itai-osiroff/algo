@@ -78,8 +78,22 @@ def test_fit_reference_mode_resizes_deterministically():
 
     comp = prepare_images_for_comparison(ref, target, options=options)
 
-    assert comp.registered_input.shape == ref.shape
-    assert comp.registered_reference.shape == ref.shape
+    assert comp.as_is_input.shape == target.shape
+    assert comp.registered_input.shape == target.shape
+    assert comp.registered_reference.shape == target.shape
+
+
+def test_fit_reference_alignment_preserves_processed_input_geometry():
+    ref = _synthetic_reference()
+    target = cv.resize(ref, (72, 48), interpolation=cv.INTER_LINEAR)
+    options = ValidationOptions(mode=VALIDATION_MODE_FIT, auto_align=True)
+
+    aligned = auto_align_images(ref, target, options=options)
+
+    assert aligned.status == "aligned_fit_reference"
+    assert aligned.aligned_image.shape == target.shape
+    assert aligned.roi_reference == (0, 0, target.shape[1], target.shape[0])
+    assert aligned.roi_input == (0, 0, target.shape[1], target.shape[0])
 
 
 def test_joint_normalization_diff_exposes_offset():
@@ -174,6 +188,23 @@ def _expected_scale_image(
     preblur_before_resize: bool,
     preserve_flux_sum: bool = False,
 ) -> np.ndarray:
+    def _expected_gaussian_downsample_kernel_1d(downsample_factor: float) -> np.ndarray:
+        safe_downsample = max(float(downsample_factor), 1e-12)
+        if safe_downsample >= 1.0:
+            return np.array([1.0], dtype=np.float32)
+
+        sigma = (1.0 / safe_downsample) / 2.0
+        radius = max(1, int(np.ceil(3.0 * sigma)))
+        coords = np.arange(-radius, radius + 1, dtype=np.float64)
+        kernel = np.exp(-(coords * coords) / (2.0 * sigma * sigma))
+        kernel_sum = float(np.sum(kernel))
+        if not np.isfinite(kernel_sum) or kernel_sum <= 0.0:
+            return np.array([1.0 / safe_downsample], dtype=np.float32)
+
+        kernel = kernel / kernel_sum
+        kernel = kernel * (1.0 / safe_downsample)
+        return np.asarray(kernel, dtype=np.float32)
+
     src_arr = np.asarray(src, dtype=np.float32)
     src_h, src_w = src_arr.shape[:2]
     scaled_w = max(1, int(round(src_w * float(scale_x))))
@@ -183,12 +214,18 @@ def _expected_scale_image(
     if preblur_before_resize:
         safe_scale_x = max(float(scale_x), 1e-12)
         safe_scale_y = max(float(scale_y), 1e-12)
-        kernel_w = max(1, int(np.ceil(1.0 / safe_scale_x)))
-        kernel_h = max(1, int(np.ceil(1.0 / safe_scale_y)))
-        kernel_w = min(kernel_w, src_w)
-        kernel_h = min(kernel_h, src_h)
-        if kernel_w > 1 or kernel_h > 1:
-            resize_source = cv.blur(src_arr, (kernel_w, kernel_h))
+        downsample_x = safe_scale_x if safe_scale_x < 1.0 else 1.0
+        downsample_y = safe_scale_y if safe_scale_y < 1.0 else 1.0
+        if downsample_x < 1.0 or downsample_y < 1.0:
+            kernel_x = _expected_gaussian_downsample_kernel_1d(downsample_x)
+            kernel_y = _expected_gaussian_downsample_kernel_1d(downsample_y)
+            resize_source = cv.sepFilter2D(
+                src_arr,
+                ddepth=-1,
+                kernelX=kernel_x,
+                kernelY=kernel_y,
+                borderType=cv.BORDER_REFLECT_101,
+            )
 
     expected = np.asarray(cv.resize(resize_source, (scaled_w, scaled_h), interpolation=cv.INTER_LINEAR), dtype=np.float32)
 
@@ -213,7 +250,7 @@ def test_scale_image_without_preblur_matches_cv_resize():
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
 
-def test_scale_image_preblur_downscale_isotropic_matches_blur_then_resize():
+def test_scale_image_preblur_downscale_isotropic_matches_gaussian_then_resize():
     src = np.linspace(-11.0, 31.0, 48, dtype=np.float32).reshape(8, 6)
     actual = _scale_image(src, 0.5, 0.5, preblur_before_resize=True)
     expected = _expected_scale_image(src, 0.5, 0.5, preblur_before_resize=True)
@@ -222,7 +259,7 @@ def test_scale_image_preblur_downscale_isotropic_matches_blur_then_resize():
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
 
-def test_scale_image_preblur_downscale_anisotropic_matches_blur_then_resize():
+def test_scale_image_preblur_downscale_anisotropic_matches_gaussian_then_resize():
     src = np.linspace(4.0, 104.0, 80, dtype=np.float32).reshape(8, 10)
     actual = _scale_image(src, 0.5, 0.25, preblur_before_resize=True)
     expected = _expected_scale_image(src, 0.5, 0.25, preblur_before_resize=True)
@@ -238,6 +275,36 @@ def test_scale_image_preblur_upscale_matches_cv_resize():
 
     assert actual.shape == (12, 12)
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
+
+
+def test_scale_image_preblur_downsample_isotropic_without_flux_preserves_sum():
+    src = np.full((20, 20), 4.0, dtype=np.float32)
+    actual = _scale_image(src, 0.5, 0.5, preblur_before_resize=True, preserve_flux_sum=False)
+    expected = _expected_scale_image(src, 0.5, 0.5, preblur_before_resize=True, preserve_flux_sum=False)
+
+    assert actual.shape == (10, 10)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
+    np.testing.assert_allclose(
+        np.sum(actual, dtype=np.float64),
+        np.sum(src, dtype=np.float64),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_scale_image_preblur_downsample_anisotropic_without_flux_preserves_sum():
+    src = np.full((20, 16), 2.0, dtype=np.float32)
+    actual = _scale_image(src, 0.5, 0.25, preblur_before_resize=True, preserve_flux_sum=False)
+    expected = _expected_scale_image(src, 0.5, 0.25, preblur_before_resize=True, preserve_flux_sum=False)
+
+    assert actual.shape == (5, 8)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
+    np.testing.assert_allclose(
+        np.sum(actual, dtype=np.float64),
+        np.sum(src, dtype=np.float64),
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_scale_image_identity_matches_cv_resize_with_nan():

@@ -80,17 +80,18 @@ Crop details:
 
 - `X`: horizontal scale factor
 - `Y`: vertical scale factor
-- `Pre-blur before resize`: apply a normalized box blur before scaling (default: on)
+- `Pre-blur before resize`: apply a Gaussian anti-aliasing blur before scaling (default: on)
 - Valid range is shown in the GUI: `[0.001, 8.000]`
 
 Scale behavior:
 
 - Numeric validation happens as you type.
 - Invalid values are rejected on commit and reverted to last valid values.
-- When pre-blur is enabled, a uniform energy-conserving kernel is applied before resize:
-  - `kx = ceil(1 / X)`
-  - `ky = ceil(1 / Y)`
-  - (with minimum kernel size `1` per axis)
+- When pre-blur is enabled and an axis is downsampled (`scale < 1`), a Gaussian is applied before resize:
+  - `sigma_x = (1 / X) / 2` for downsampled X (otherwise no X blur)
+  - `sigma_y = (1 / Y) / 2` for downsampled Y (otherwise no Y blur)
+  - The separable kernel is gain-normalized so the effective 2D kernel sum is
+    `(1 / dx) * (1 / dy)`, where `dx = min(X, 1)` and `dy = min(Y, 1)`.
 - After resize, values stay in native units from the blur/resize pipeline
   (no post-resize min/max remap).
 - Scale changes invalidate previous alignment results.
@@ -108,7 +109,7 @@ Scale behavior:
 Mode behavior:
 
 - `preserve_scale`: keeps edited image dimensions; matching/ROI logic handles containment.
-- `fit_reference`: resizes input to reference size before alignment/comparison.
+- `fit_reference`: keeps the edited input geometry and resizes the reference to input size for alignment/comparison outputs.
 
 ### Intensity
 
@@ -202,7 +203,7 @@ Run `Run Alignment` to refresh alignment with current edits.
 3. Set scale factors (`X`, `Y`) if needed.
 4. Choose `Mode`:
    - start with `preserve_scale` if you care about manual scale factors
-   - use `fit_reference` if you want direct same-size comparison
+   - use `fit_reference` if you want direct same-size comparison in the edited input geometry
 5. Click `Run Alignment`.
 6. Review `Registered ROI`, `Diff (Native)`, `Diff (Norm)`, `Overlay (Native)`, and `Overlay (Norm)`.
 7. Click `Done`.

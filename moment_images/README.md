@@ -261,7 +261,8 @@ Metrics include:
 ## Validation tool (`validate_rectification.py`)
 
 This tool allows you to validate your rectification results by comparing the rectified workspace output against new images from other cameras (e.g., Validation Camera, Thorcam).
-The editor's manual `X/Y` scaling controls support an optional pre-blur anti-aliasing mode (uniform box filter before bilinear resize, enabled by default).
+The editor's manual `X/Y` scaling controls support an optional pre-blur anti-aliasing mode (Gaussian prefilter before bilinear resize, enabled by default) with sigma tied to per-axis downsampling.
+In `fit_reference` mode, comparison overlays/diffs are generated in the processed input geometry (reference is resized to the edited input).
 
 ### Full GUI Guide
 

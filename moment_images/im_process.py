@@ -1189,6 +1189,12 @@ def main():
     views = np.squeeze(views)
 
 # Debug mode
+    # Image relevant for this : C:\Users\user\OneDrive - Technion\office computer files\images_output\17_3_26\algo_run\dense\beads_2um_dense_4d6kus
+    # roi_i_start = 96
+    # roi_i_end = 104
+    # roi_j_start = 140
+    # roi_j_end = 146
+    # offset = 4
     # debug_views = np.zeros_like(views)
     # _, (center_i, center_j) = resolve_reference_view(views)
     # debug_views[center_i, center_j] = views[center_i, center_j]
@@ -1196,12 +1202,12 @@ def main():
     # for i in range(view_grid_size):
     #     for j in range(view_grid_size):
     #         for i_im in range(views[0, 0].shape[0]):
-    #             for j_im in range(views[0, 0].shape[0]):
+    #             for j_im in range(views[0, 0].shape[0]):x
     #                 if i == center_i and j == center_j:
     #                      continue
-    #                 if i_im > 115 and i_im <118 and j_im >114 and j_im < 119:
-    #                     debug_views[i, j, i_im-4, j_im-4] = views[center_i, center_j, i_im, j_im]
-    #                 elif i_im > 115+4 and i_im < 118+4 and j_im > 114+4 and j_im < 119+4:
+    #                 if i_im > roi_i_start and i_im <roi_i_end and j_im >roi_j_start and j_im < roi_j_end:
+    #                     debug_views[i, j, i_im-offset, j_im-offset] = views[center_i, center_j, i_im, j_im]
+    #                 elif i_im > roi_i_start+offset and i_im < roi_i_end+offset and j_im > roi_j_start+offset and j_im < roi_j_end+offset:
     #                     debug_views[i, j, i_im, j_im] = 0
     #                 else:
     #                     debug_views[i, j, i_im, j_im] = views[center_i, center_j, i_im, j_im]
