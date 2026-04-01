@@ -1,10 +1,14 @@
 import json
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 
+import moment_images.parameter_sweep as parameter_sweep
 from moment_images.im_process import RectificationRunConfig, rectify_views_from_config
 from moment_images.parameter_sweep import (
+    PreparedDataset,
     SweepDatasetSpec,
+    SweepCandidate,
     SweepExperimentSpec,
     SweepScoringSpec,
     SweepSearchSpace,
@@ -44,6 +48,26 @@ def _metric_record(laplacian_variance: float) -> dict:
             "dwt_level2_hv_energy": 0.0,
         },
     }
+
+
+def _build_eval_result(task: dict, status: str = "ok") -> dict:
+    payload = {
+        "status": status,
+        "stage": task["stage"],
+        "candidate_id": task["candidate_id"],
+        "dataset_id": task["dataset_id"],
+        "strategy": task["strategy"],
+        "run_uid": task["run_uid"],
+        "runtime_seconds": 0.01,
+        "config": task["config"],
+        "params": task["params"],
+        "task_index": task["task_index"],
+    }
+    if status == "ok":
+        payload["metric_record"] = _metric_record(1.0)
+    else:
+        payload["error"] = "worker crashed"
+    return payload
 
 
 def test_generate_coarse_candidates_global_ignores_pixel_only_dimensions():
@@ -191,6 +215,150 @@ def test_score_and_rank_runs_applies_missing_dataset_penalty():
     assert by_id["C"]["score"] < by_id["B"]["score"]
 
 
+def test_select_stage_worker_count_respects_memory_cap():
+    tasks = [
+        {"estimated_peak_bytes": 200},
+        {"estimated_peak_bytes": 200},
+        {"estimated_peak_bytes": 200},
+        {"estimated_peak_bytes": 200},
+        {"estimated_peak_bytes": 200},
+    ]
+
+    selection = parameter_sweep._select_stage_worker_count(
+        tasks=tasks,
+        requested_workers=8,
+        available_memory_bytes=1000,
+    )
+
+    assert selection["memory_cap_workers"] == 3
+    assert selection["selected_workers"] == 3
+    assert selection["requested_workers"] == 8
+    assert selection["max_task_peak_bytes"] == 200
+
+
+def test_evaluate_stage_degrades_worker_count_and_continues(monkeypatch, tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    datasets = [
+        PreparedDataset(
+            dataset_id="d1",
+            views_path=views_path,
+            hdr_enabled=False,
+            hdr_exposure_times=None,
+            normalize_to_8bit=False,
+            views_shape=tuple(int(dim) for dim in views.shape),
+            views_dtype=str(views.dtype),
+            views_itemsize=int(views.dtype.itemsize),
+        ),
+        PreparedDataset(
+            dataset_id="d2",
+            views_path=views_path,
+            hdr_enabled=False,
+            hdr_exposure_times=None,
+            normalize_to_8bit=False,
+            views_shape=tuple(int(dim) for dim in views.shape),
+            views_dtype=str(views.dtype),
+            views_itemsize=int(views.dtype.itemsize),
+        ),
+    ]
+    candidates = [
+        SweepCandidate(
+            strategy="pixel",
+            params={"similarity_window_size": 1},
+            config=RectificationRunConfig(strategy="pixel", similarity_window_size=1, max_displacement=0),
+            candidate_id="c0",
+        ),
+        SweepCandidate(
+            strategy="pixel",
+            params={"similarity_window_size": 3},
+            config=RectificationRunConfig(strategy="pixel", similarity_window_size=3, max_displacement=0),
+            candidate_id="c1",
+        ),
+    ]
+
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 10**12)
+
+    call_state = {"count": 0}
+
+    def fake_execute_pool_batch(tasks, workers):
+        call_state["count"] += 1
+        assert workers in {2, 4}
+        if call_state["count"] == 1:
+            completed = [_build_eval_result(tasks[0], status="ok")]
+            pending = list(tasks[1:])
+            return completed, pending, BrokenProcessPool("pool crashed")
+        completed = [_build_eval_result(task, status="ok") for task in tasks]
+        return completed, [], None
+
+    monkeypatch.setattr(parameter_sweep, "_execute_pool_batch", fake_execute_pool_batch)
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: (_build_eval_result(task, status="ok"), False),
+    )
+
+    evaluation = parameter_sweep._evaluate_stage(
+        stage_name="stage1",
+        candidates=candidates,
+        datasets=datasets,
+        output_dir=tmp_path,
+        save_figures_flag=False,
+        requested_workers=4,
+    )
+
+    assert len(evaluation.stage_results) == 4
+    assert evaluation.execution["pool_crash_count"] == 1
+    assert evaluation.execution["degrade_events"][0]["workers_before"] == 4
+    assert evaluation.execution["degrade_events"][0]["workers_after"] == 2
+    assert call_state["count"] == 2
+
+
+def test_evaluate_stage_records_failed_isolated_worker(monkeypatch, tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    dataset = PreparedDataset(
+        dataset_id="d1",
+        views_path=views_path,
+        hdr_enabled=False,
+        hdr_exposure_times=None,
+        normalize_to_8bit=False,
+        views_shape=tuple(int(dim) for dim in views.shape),
+        views_dtype=str(views.dtype),
+        views_itemsize=int(views.dtype.itemsize),
+    )
+    candidate = SweepCandidate(
+        strategy="pixel",
+        params={"similarity_window_size": 1},
+        config=RectificationRunConfig(strategy="pixel", similarity_window_size=1, max_displacement=0),
+        candidate_id="c0",
+    )
+
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 10**12)
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: (_build_eval_result(task, status="failed"), True),
+    )
+
+    evaluation = parameter_sweep._evaluate_stage(
+        stage_name="stage1",
+        candidates=[candidate],
+        datasets=[dataset],
+        output_dir=tmp_path,
+        save_figures_flag=False,
+        requested_workers=1,
+    )
+
+    assert len(evaluation.stage_results) == 1
+    assert evaluation.stage_results[0]["status"] == "failed"
+    assert evaluation.execution["isolated_crash_count"] == 1
+    assert evaluation.execution["used_isolated_mode"] is True
+
+
 def test_run_sweep_experiment_writes_stage_and_leaderboard_outputs(tmp_path):
     views_a = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
     views_b = (np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4) + 1.0) * 1.1
@@ -230,6 +398,9 @@ def test_run_sweep_experiment_writes_stage_and_leaderboard_outputs(tmp_path):
     assert (output_dir / "leaderboard.json").exists()
     assert (output_dir / "leaderboard.csv").exists()
     assert (output_dir / "best_configs.json").exists()
+    stage1_summary = json.loads((output_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    assert "execution" in stage1_summary
+    assert "selected_workers" in stage1_summary["execution"]
 
     stage1_run = output_dir / "runs" / "stage1" / "s1c0000" / "d1"
     assert (stage1_run / "workspace.npz").exists()

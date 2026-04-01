@@ -4,6 +4,11 @@ Batch GUI for processing validation images without comparison views.
 This script applies the same geometric/intensity/scale pipeline used by
 ``validate_rectification.py`` across all supported images in one folder and
 saves outputs with a ``_processed`` suffix.
+
+To match ``validate_rectification.py`` as the golden standard, processed
+outputs are persisted as ``float32`` arrays (no cast-back to the source dtype).
+When the source format does not support float TIFF-style storage (for example
+PNG/JPEG/BMP), output files are saved as TIFF to preserve values exactly.
 """
 
 from __future__ import annotations
@@ -46,6 +51,8 @@ else:
 
 
 SUPPORTED_EXTENSIONS: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+FLOAT32_SAFE_EXTENSIONS: tuple[str, ...] = (".tif", ".tiff")
+FLOAT32_OUTPUT_EXTENSION = ".tiff"
 
 
 @dataclass(frozen=True)
@@ -132,10 +139,21 @@ def list_supported_images(input_dir: str | Path) -> list[Path]:
 
 
 def build_output_path(input_path: str | Path, output_dir: str | Path) -> Path:
-    """Create output path using ``<stem>_processed<suffix>`` naming."""
+    """
+    Create output path using ``<stem>_processed<suffix>`` naming.
+
+    Non-TIFF inputs are redirected to ``.tiff`` so processed ``float32`` values
+    can be saved without normalization/quantization.
+    """
     source = Path(input_path)
     destination_dir = Path(output_dir)
-    return destination_dir / f"{source.stem}_processed{source.suffix}"
+    source_suffix = source.suffix
+    output_suffix = (
+        source_suffix
+        if source_suffix.lower() in FLOAT32_SAFE_EXTENSIONS
+        else FLOAT32_OUTPUT_EXTENSION
+    )
+    return destination_dir / f"{source.stem}_processed{output_suffix}"
 
 
 def apply_processing_pipeline(image_array: np.ndarray, options: BatchProcessOptions) -> np.ndarray:
@@ -166,30 +184,11 @@ def apply_processing_pipeline(image_array: np.ndarray, options: BatchProcessOpti
     return np.asarray(processed, dtype=np.float32)
 
 
-def cast_processed_to_dtype(processed_image: np.ndarray, target_dtype: np.dtype | type[np.generic]) -> np.ndarray:
-    """Cast processed float image back to input dtype using safe clipping."""
-    arr = np.asarray(processed_image)
-    dtype = np.dtype(target_dtype)
-
-    if np.issubdtype(dtype, np.integer):
-        info = np.iinfo(dtype)
-        clipped = np.clip(np.rint(arr), info.min, info.max)
-        return clipped.astype(dtype)
-
-    if np.issubdtype(dtype, np.floating):
-        return arr.astype(dtype)
-
-    if np.issubdtype(dtype, np.bool_):
-        return (arr > 0).astype(dtype)
-
-    raise ValueError(f"Unsupported target dtype for saving: {dtype}")
-
-
-def save_processed_image(output_path: str | Path, processed_image: np.ndarray, target_dtype: np.dtype) -> None:
-    """Save processed image with the same extension and dtype policy."""
+def save_processed_image(output_path: str | Path, processed_image: np.ndarray) -> None:
+    """Save processed image as float32 to match validate_rectification output semantics."""
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    output_array = cast_processed_to_dtype(processed_image, target_dtype)
+    output_array = np.asarray(processed_image, dtype=np.float32)
     Image.fromarray(output_array).save(out_path)
 
 
@@ -222,7 +221,7 @@ def process_single_image(
     try:
         source_array = np.asarray(loaded)
         processed = apply_processing_pipeline(source_array, options)
-        save_processed_image(dst, processed, source_array.dtype)
+        save_processed_image(dst, processed)
     except Exception as exc:  # noqa: BLE001 - batch should continue on per-file failure
         return BatchFileResult(
             input_path=src,
@@ -503,4 +502,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -14,10 +14,15 @@ import csv
 import json
 import math
 import os
+import platform
+import queue
+import subprocess
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from itertools import product
@@ -46,6 +51,16 @@ from moment_images.sweep_analysis import (
     analyze_summary_data,
     build_metric_record,
     save_analysis,
+)
+
+
+MEMORY_SAFETY_FRACTION = 0.70
+THREAD_LIMIT_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
 )
 
 
@@ -327,6 +342,17 @@ class PreparedDataset:
     hdr_enabled: bool
     hdr_exposure_times: Optional[List[float]]
     normalize_to_8bit: bool
+    views_shape: Tuple[int, ...]
+    views_dtype: str
+    views_itemsize: int
+
+
+@dataclass
+class StageEvaluationResult:
+    """Result payload for one sweep stage including execution diagnostics."""
+
+    stage_results: List[Dict[str, object]]
+    execution: Dict[str, object]
 
 
 @dataclass
@@ -913,6 +939,9 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             hdr_enabled=bool(hdr_enabled),
             hdr_exposure_times=dataset.hdr_exposure_times,
             normalize_to_8bit=dataset.normalize_to_8bit,
+            views_shape=tuple(int(dim) for dim in views_arr.shape),
+            views_dtype=str(views_arr.dtype),
+            views_itemsize=int(views_arr.dtype.itemsize),
         )
 
     if dataset.source_image is not None:
@@ -949,6 +978,9 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             hdr_enabled=False,
             hdr_exposure_times=None,
             normalize_to_8bit=dataset.normalize_to_8bit,
+            views_shape=tuple(int(dim) for dim in views_arr.shape),
+            views_dtype=str(views_arr.dtype),
+            views_itemsize=int(views_arr.dtype.itemsize),
         )
 
     # source_image_dir branch
@@ -990,6 +1022,9 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
         hdr_enabled=True,
         hdr_exposure_times=dataset.hdr_exposure_times,
         normalize_to_8bit=dataset.normalize_to_8bit,
+        views_shape=tuple(int(dim) for dim in views_arr.shape),
+        views_dtype=str(views_arr.dtype),
+        views_itemsize=int(views_arr.dtype.itemsize),
     )
 
 
@@ -1003,6 +1038,327 @@ def _prepare_datasets(spec: SweepExperimentSpec, output_dir: Path) -> List[Prepa
         prepared.append(_prepare_dataset(dataset, output_dir=output_dir))
     prepared.sort(key=lambda item: item.dataset_id)
     return prepared
+
+
+def _set_parallel_thread_limits() -> None:
+    for env_var in THREAD_LIMIT_ENV_VARS:
+        os.environ[env_var] = "1"
+
+
+def _pool_worker_initializer() -> None:
+    _set_parallel_thread_limits()
+    try:
+        import cv2 as cv  # Local import keeps startup cost inside workers.
+
+        cv.setNumThreads(1)
+    except Exception:  # noqa: BLE001 - thread cap is best-effort.
+        return
+
+
+def _get_macos_available_memory_bytes() -> Optional[int]:
+    try:
+        vm_stat_output = subprocess.check_output(["vm_stat"], text=True, stderr=subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001 - OS-level querying can fail on restricted environments.
+        return None
+
+    page_size = 4096
+    free_pages = 0
+    inactive_pages = 0
+    speculative_pages = 0
+    for line in vm_stat_output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Mach Virtual Memory Statistics:"):
+            if "page size of " in stripped and " bytes" in stripped:
+                try:
+                    token = stripped.split("page size of ", 1)[1].split(" bytes", 1)[0]
+                    page_size = int(token.replace(".", "").strip())
+                except Exception:  # noqa: BLE001
+                    page_size = 4096
+            continue
+        if ":" not in stripped:
+            continue
+        key, raw_value = stripped.split(":", 1)
+        value_token = raw_value.strip().replace(".", "")
+        try:
+            page_count = int(value_token)
+        except Exception:  # noqa: BLE001
+            continue
+        lowered = key.strip().lower()
+        if lowered == "pages free":
+            free_pages = page_count
+        elif lowered == "pages inactive":
+            inactive_pages = page_count
+        elif lowered == "pages speculative":
+            speculative_pages = page_count
+
+    total_pages = free_pages + inactive_pages + speculative_pages
+    if total_pages <= 0:
+        return None
+    return int(total_pages * page_size)
+
+
+def _get_available_memory_bytes() -> Optional[int]:
+    system_name = platform.system().lower()
+    if system_name == "windows":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            kernel32 = ctypes.windll.kernel32
+            if kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) == 0:
+                return None
+            return int(status.ullAvailPhys)
+        except Exception:  # noqa: BLE001
+            return None
+
+    try:
+        page_count = int(os.sysconf("SC_AVPHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        if page_count > 0 and page_size > 0:
+            return int(page_count * page_size)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if system_name == "darwin":
+        return _get_macos_available_memory_bytes()
+    return None
+
+
+def _task_view_geometry(task: Dict[str, object]) -> Tuple[int, int, int, int, int]:
+    shape = tuple(int(dim) for dim in cast(Sequence[int], task["views_shape"]))
+    if len(shape) == 4:
+        grid_n = int(shape[0])
+        height = int(shape[2])
+        width = int(shape[3])
+        exposures = 1
+        return exposures, grid_n, height, width, int(np.prod(shape, dtype=np.int64))
+    if len(shape) == 5:
+        exposures = int(shape[0])
+        grid_n = int(shape[1])
+        height = int(shape[3])
+        width = int(shape[4])
+        return exposures, grid_n, height, width, int(np.prod(shape, dtype=np.int64))
+    raise ValueError(f"Unsupported view shape in task: {shape}")
+
+
+def _estimate_global_peak_bytes(task: Dict[str, object]) -> int:
+    exposures, grid_n, height, width, total_elements = _task_view_geometry(task)
+    grid_views = grid_n * grid_n
+    float64_bytes = 8
+    input_itemsize = max(1, int(task.get("views_itemsize", 8)))
+
+    loaded_input_bytes = total_elements * input_itemsize
+    base_views_bytes = grid_views * height * width * float64_bytes
+    similarity_bytes = (grid_n**4) * 2 * float64_bytes
+    rectified_bytes = grid_views * height * width * float64_bytes
+    hdr_rectified_stack_bytes = exposures * grid_views * height * width * float64_bytes if exposures > 1 else 0
+    avg_image_bytes = height * width * float64_bytes
+    return int(
+        loaded_input_bytes
+        + base_views_bytes
+        + similarity_bytes
+        + rectified_bytes
+        + hdr_rectified_stack_bytes
+        + avg_image_bytes
+    )
+
+
+def _estimate_pixel_peak_bytes(task: Dict[str, object]) -> int:
+    config = cast(Dict[str, object], task["config"])
+    exposures, grid_n, height, width, total_elements = _task_view_geometry(task)
+    grid_views = grid_n * grid_n
+    float64_bytes = 8
+    float32_bytes = 4
+    input_itemsize = max(1, int(task.get("views_itemsize", 8)))
+
+    sub_pix_factor = max(1, int(config.get("sub_pix_factor", 1)))
+    window_size = int(config.get("similarity_window_size", config.get("refinement_window_size", 41)))
+    max_disp_raw = config.get("max_displacement")
+    if max_disp_raw is None:
+        max_disp = max(1, window_size // 2)
+    else:
+        max_disp = max(0, int(max_disp_raw))
+    max_disp_scaled = max_disp * sub_pix_factor
+    displacement_volume = max(1, 2 * max_disp_scaled + 1)
+
+    scaled_height = height * sub_pix_factor
+    scaled_width = width * sub_pix_factor
+
+    loaded_input_bytes = total_elements * input_itemsize
+    base_views_bytes = grid_views * height * width * float64_bytes
+    scaled_views_bytes = grid_views * scaled_height * scaled_width * float64_bytes
+    corr_buffers_bytes = (
+        scaled_height
+        * scaled_width
+        * displacement_volume
+        * displacement_volume
+        * float32_bytes
+        * 2
+    )
+    per_pixel_similarity_bytes = (2 * float32_bytes) + float64_bytes + (2 * float32_bytes)
+    similarity_scaled_bytes = scaled_height * scaled_width * grid_views * per_pixel_similarity_bytes
+    similarity_resized_bytes = (
+        height * width * grid_views * per_pixel_similarity_bytes if sub_pix_factor > 1 else 0
+    )
+    rectified_bytes = grid_views * height * width * float64_bytes
+    hdr_rectified_stack_bytes = exposures * grid_views * height * width * float64_bytes if exposures > 1 else 0
+    avg_image_bytes = height * width * float64_bytes
+
+    return int(
+        loaded_input_bytes
+        + base_views_bytes
+        + scaled_views_bytes
+        + corr_buffers_bytes
+        + similarity_scaled_bytes
+        + similarity_resized_bytes
+        + rectified_bytes
+        + hdr_rectified_stack_bytes
+        + avg_image_bytes
+    )
+
+
+def _estimate_task_peak_bytes(task: Dict[str, object]) -> int:
+    strategy = str(task["strategy"]).lower()
+    if strategy == "global":
+        return _estimate_global_peak_bytes(task)
+    if strategy == "pixel":
+        return _estimate_pixel_peak_bytes(task)
+    if strategy == "combined":
+        return _estimate_global_peak_bytes(task) + _estimate_pixel_peak_bytes(task)
+    return _estimate_global_peak_bytes(task)
+
+
+def _select_stage_worker_count(
+    tasks: Sequence[Dict[str, object]],
+    requested_workers: int,
+    available_memory_bytes: Optional[int],
+) -> Dict[str, object]:
+    if not tasks:
+        return {
+            "requested_workers": int(max(1, requested_workers)),
+            "available_memory_bytes": available_memory_bytes,
+            "max_task_peak_bytes": 0,
+            "memory_cap_workers": None,
+            "selected_workers": 1,
+            "safety_fraction": MEMORY_SAFETY_FRACTION,
+        }
+
+    max_task_peak_bytes = max(int(task["estimated_peak_bytes"]) for task in tasks)
+    memory_cap_workers: Optional[int] = None
+    if available_memory_bytes is not None and max_task_peak_bytes > 0:
+        capped = int(math.floor((float(available_memory_bytes) * MEMORY_SAFETY_FRACTION) / float(max_task_peak_bytes)))
+        memory_cap_workers = max(1, capped)
+
+    selected_workers = max(1, min(int(requested_workers), len(tasks)))
+    if memory_cap_workers is not None:
+        selected_workers = max(1, min(selected_workers, memory_cap_workers))
+
+    return {
+        "requested_workers": int(max(1, requested_workers)),
+        "available_memory_bytes": available_memory_bytes,
+        "max_task_peak_bytes": int(max_task_peak_bytes),
+        "memory_cap_workers": memory_cap_workers,
+        "selected_workers": int(selected_workers),
+        "safety_fraction": MEMORY_SAFETY_FRACTION,
+    }
+
+
+def _build_worker_crash_result(
+    task: Dict[str, object],
+    elapsed_seconds: float,
+    exc: BaseException,
+) -> Dict[str, object]:
+    return {
+        "status": "failed",
+        "stage": str(task["stage"]),
+        "candidate_id": str(task["candidate_id"]),
+        "dataset_id": str(task["dataset_id"]),
+        "strategy": str(task["strategy"]),
+        "run_uid": str(task["run_uid"]),
+        "runtime_seconds": float(elapsed_seconds),
+        "config": task["config"],
+        "params": task["params"],
+        "error": f"Worker process terminated abruptly: {exc}",
+        "traceback": traceback.format_exc(),
+        "failure_kind": "worker_crash",
+    }
+
+
+def _run_task_isolated(task: Dict[str, object]) -> Tuple[Dict[str, object], bool]:
+    started = time.perf_counter()
+    try:
+        with ProcessPoolExecutor(
+            max_workers=1,
+            initializer=_pool_worker_initializer,
+            max_tasks_per_child=1,
+        ) as executor:
+            future = executor.submit(_evaluate_candidate_task, task)
+            result = future.result()
+        result["task_index"] = task["task_index"]
+        return result, False
+    except Exception as exc:  # noqa: BLE001 - protects sweep continuity.
+        elapsed = time.perf_counter() - started
+        failed = _build_worker_crash_result(task, elapsed, exc)
+        failed["task_index"] = task["task_index"]
+        return failed, True
+
+
+def _execute_pool_batch(
+    tasks: Sequence[Dict[str, object]],
+    workers: int,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Optional[BaseException]]:
+    completed_results: List[Dict[str, object]] = []
+    completed_indices: set[int] = set()
+    pending_tasks = list(tasks)
+    executor_exc: Optional[BaseException] = None
+
+    try:
+        with ProcessPoolExecutor(max_workers=workers, initializer=_pool_worker_initializer) as executor:
+            future_map = {
+                executor.submit(_evaluate_candidate_task, task): task for task in tasks
+            }
+            for future in as_completed(future_map):
+                task = future_map[future]
+                try:
+                    result = future.result()
+                    result["task_index"] = task["task_index"]
+                    completed_results.append(result)
+                    completed_indices.add(int(task["task_index"]))
+                except Exception as exc:  # noqa: BLE001 - recover by degrading worker count.
+                    executor_exc = exc
+                    break
+
+            if executor_exc is None:
+                pending_tasks = []
+            else:
+                pending_tasks = [
+                    task
+                    for task in tasks
+                    if int(task["task_index"]) not in completed_indices
+                ]
+    except Exception as exc:  # noqa: BLE001 - covers pool init/spawn failures.
+        executor_exc = exc
+        pending_tasks = [
+            task
+            for task in tasks
+            if int(task["task_index"]) not in completed_indices
+        ]
+
+    return completed_results, pending_tasks, executor_exc
 
 
 def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
@@ -1067,8 +1423,8 @@ def _evaluate_stage(
     datasets: Sequence[PreparedDataset],
     output_dir: Path,
     save_figures_flag: bool,
-    max_workers: int,
-) -> List[Dict[str, object]]:
+    requested_workers: int,
+) -> StageEvaluationResult:
     tasks: List[Dict[str, object]] = []
     for candidate in candidates:
         candidate_root = output_dir / "runs" / stage_name / candidate.candidate_id
@@ -1089,35 +1445,94 @@ def _evaluate_stage(
                     "config": asdict(config),
                     "params": dict(candidate.params),
                     "save_figures": save_figures_flag,
+                    "views_shape": list(dataset.views_shape),
+                    "views_dtype": dataset.views_dtype,
+                    "views_itemsize": int(dataset.views_itemsize),
                 }
             )
     tasks.sort(key=lambda item: (str(item["candidate_id"]), str(item["dataset_id"])))
     for idx, task in enumerate(tasks):
         task["task_index"] = idx
+        task["estimated_peak_bytes"] = int(_estimate_task_peak_bytes(task))
 
     if not tasks:
-        return []
+        return StageEvaluationResult(
+            stage_results=[],
+            execution={
+                "requested_workers": int(max(1, requested_workers)),
+                "selected_workers": 1,
+                "available_memory_bytes": _get_available_memory_bytes(),
+                "max_task_peak_bytes": 0,
+                "memory_cap_workers": None,
+                "safety_fraction": MEMORY_SAFETY_FRACTION,
+                "degrade_events": [],
+                "pool_crash_count": 0,
+                "isolated_crash_count": 0,
+            },
+        )
 
     stage_results: List[Dict[str, object]] = []
     progress_desc = f"Evaluating {stage_name}"
-    if max_workers <= 1:
-        for task in tqdm(tasks, desc=progress_desc, unit="run"):
-            result = _evaluate_candidate_task(task)
-            result["task_index"] = task["task_index"]
-            stage_results.append(result)
-    else:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(_evaluate_candidate_task, task): task for task in tasks
-            }
-            for future in tqdm(as_completed(future_map), total=len(future_map), desc=progress_desc, unit="run"):
-                task = future_map[future]
-                result = future.result()
-                result["task_index"] = task["task_index"]
-                stage_results.append(result)
+    _set_parallel_thread_limits()
+    available_memory_bytes = _get_available_memory_bytes()
+    worker_plan = _select_stage_worker_count(tasks, requested_workers, available_memory_bytes)
+    selected_workers = int(worker_plan["selected_workers"])
+
+    degrade_events: List[Dict[str, object]] = []
+    pool_crash_count = 0
+    isolated_crash_count = 0
+    completed_task_indices: set[int] = set()
+
+    remaining_tasks = list(tasks)
+    current_workers = selected_workers
+    with tqdm(total=len(tasks), desc=progress_desc, unit="run") as progress_bar:
+        while remaining_tasks:
+            if current_workers <= 1:
+                for task in remaining_tasks:
+                    result, crashed = _run_task_isolated(task)
+                    if crashed:
+                        isolated_crash_count += 1
+                    stage_results.append(result)
+                    completed_task_indices.add(int(task["task_index"]))
+                    progress_bar.update(1)
+                break
+
+            completed_batch, pending_batch, exec_error = _execute_pool_batch(
+                remaining_tasks,
+                workers=current_workers,
+            )
+            stage_results.extend(completed_batch)
+            completed_task_indices.update(int(item["task_index"]) for item in completed_batch)
+            if completed_batch:
+                progress_bar.update(len(completed_batch))
+
+            if exec_error is None:
+                break
+
+            pool_crash_count += 1
+            next_workers = max(1, current_workers // 2)
+            degrade_events.append(
+                {
+                    "event": "pool_failure",
+                    "error_type": type(exec_error).__name__,
+                    "error": str(exec_error),
+                    "broken_process_pool": isinstance(exec_error, BrokenProcessPool),
+                    "workers_before": int(current_workers),
+                    "workers_after": int(next_workers),
+                    "remaining_tasks": len(pending_batch),
+                }
+            )
+            remaining_tasks = pending_batch
+            current_workers = next_workers
 
     stage_results.sort(key=lambda item: int(item.get("task_index", 0)))
-    return stage_results
+    execution = dict(worker_plan)
+    execution["degrade_events"] = degrade_events
+    execution["pool_crash_count"] = int(pool_crash_count)
+    execution["isolated_crash_count"] = int(isolated_crash_count)
+    execution["completed_runs"] = len(stage_results)
+    execution["used_isolated_mode"] = bool(isolated_crash_count > 0 or current_workers == 1)
+    return StageEvaluationResult(stage_results=stage_results, execution=execution)
 
 
 def _normalize_score(value: float, min_value: float, max_value: float) -> float:
@@ -1292,6 +1707,7 @@ def _write_stage_outputs(
     stage_results: Sequence[Dict[str, object]],
     rankings: Sequence[Dict[str, object]],
     output_dir: Path,
+    execution: Optional[Dict[str, object]] = None,
 ) -> None:
     successful = [record for record in stage_results if record.get("status") == "ok"]
     failed = [record for record in stage_results if record.get("status") != "ok"]
@@ -1303,6 +1719,7 @@ def _write_stage_outputs(
         "rankings": list(rankings),
         "failed_runs": failed,
         "runs": list(stage_results),
+        "execution": dict(execution or {}),
     }
     summary_path = output_dir / f"{stage_name}_summary.json"
     with summary_path.open("w", encoding="utf-8") as fp:
@@ -1348,18 +1765,25 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
     coarse_candidates = _assign_candidate_ids(coarse_candidates, "s1c")
     coarse_lookup = {candidate.candidate_id: candidate for candidate in coarse_candidates}
 
-    max_workers = _default_max_workers(spec.stages.max_workers)
+    requested_workers = _default_max_workers(spec.stages.max_workers)
 
-    stage1_results = _evaluate_stage(
+    stage1_eval = _evaluate_stage(
         stage_name="stage1",
         candidates=coarse_candidates,
         datasets=prepared_datasets,
         output_dir=resolved_output_dir,
         save_figures_flag=spec.save_figures,
-        max_workers=max_workers,
+        requested_workers=requested_workers,
     )
+    stage1_results = stage1_eval.stage_results
     stage1_rankings = score_and_rank_runs(stage1_results, spec.scoring, dataset_ids=dataset_ids)
-    _write_stage_outputs("stage1", stage1_results, stage1_rankings, resolved_output_dir)
+    _write_stage_outputs(
+        "stage1",
+        stage1_results,
+        stage1_rankings,
+        resolved_output_dir,
+        execution=stage1_eval.execution,
+    )
 
     refined_candidates = generate_refined_candidates(
         ranked_candidates=stage1_rankings,
@@ -1374,16 +1798,23 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         refined_candidates = [coarse_lookup[best_id]]
     refined_candidates = _assign_candidate_ids(refined_candidates, "s2c")
 
-    stage2_results = _evaluate_stage(
+    stage2_eval = _evaluate_stage(
         stage_name="stage2",
         candidates=refined_candidates,
         datasets=prepared_datasets,
         output_dir=resolved_output_dir,
         save_figures_flag=spec.save_figures,
-        max_workers=max_workers,
+        requested_workers=requested_workers,
     )
+    stage2_results = stage2_eval.stage_results
     stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
-    _write_stage_outputs("stage2", stage2_results, stage2_rankings, resolved_output_dir)
+    _write_stage_outputs(
+        "stage2",
+        stage2_results,
+        stage2_rankings,
+        resolved_output_dir,
+        execution=stage2_eval.execution,
+    )
 
     final_rankings = stage2_rankings if stage2_rankings else stage1_rankings
     with (resolved_output_dir / "leaderboard.json").open("w", encoding="utf-8") as fp:
@@ -1816,7 +2247,1295 @@ def _parse_float_list(value: str | None) -> list[float] | None:
     return [float(item.strip()) for item in cleaned.split(",") if item.strip()]
 
 
-def _launch_gui() -> None:
+@dataclass
+class SpecGuiDatasetState:
+    dataset_id: str = ""
+    source_type: str = "views"
+    source_path: str = ""
+    center_x: str = ""
+    center_y: str = ""
+    view_radius: str = ""
+    view_grid_size: str = "3"
+    view_distance: str = ""
+    hdr_enabled: bool = False
+    hdr_exposure_times: str = ""
+    normalize_to_8bit: bool = False
+
+
+@dataclass
+class SpecGuiState:
+    output_dir: str = ""
+    strategy_pixel: bool = True
+    strategy_combined: bool = True
+    strategy_global: bool = False
+    total_budget_per_dataset: str = "320"
+    stage1_fraction: str = "0.6"
+    top_k: str = "8"
+    max_workers: str = ""
+    analyze: bool = True
+    save_figures: bool = False
+    pixel_similarity_window_sizes: str = "15,25,35"
+    pixel_max_displacements: str = "5,15"
+    pixel_gauss_sigmas: str = "3.0,5.0"
+    pixel_disp_gauss_sigmas: str = "0.0,1.0"
+    pixel_thresholds: str = "0.05"
+    combined_refinement_window_sizes: str = "15,25"
+    combined_max_displacements: str = "5,15"
+    combined_gauss_sigmas: str = "3.0,5.0"
+    combined_disp_gauss_sigmas: str = "0.0,1.0"
+    combined_pixel_thresholds: str = "0.05"
+    combined_global_thresholds: str = "0.1,0.15"
+    combined_correlation_pad_widths: str = str(RectificationRunConfig().correlation_pad_width)
+    pixel_sub_pix_factors: str = "1,2"
+    pixel_sigma_pyramid: str = "false,true"
+    pixel_zero_fill_roll: str = "true"
+    combined_sub_pix_factors: str = "1,2"
+    combined_sigma_pyramid: str = "false,true"
+    combined_zero_fill_roll: str = "true"
+    combined_use_global_avg_reference: str = "true"
+    global_thresholds: str = "0.15"
+    global_correlation_pad_widths: str = str(RectificationRunConfig().correlation_pad_width)
+    weight_laplacian_variance: str = "0.25"
+    weight_dwt_level2_hv_energy: str = "0.25"
+    weight_sum_squared_gradient: str = "0.25"
+    weight_total_variation: str = "0.25"
+    runtime_penalty_weight: str = "0.0"
+    robustness_lambda: str = "0.5"
+    missing_dataset_penalty: str = "1.0"
+    datasets: List[SpecGuiDatasetState] = field(
+        default_factory=lambda: [SpecGuiDatasetState(dataset_id="dataset_a")]
+    )
+    json_preview: str = ""
+
+
+def _parse_int_list_csv(value: str, field_name: str) -> List[int]:
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} cannot be empty.")
+    try:
+        result = [int(item.strip()) for item in cleaned.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must contain comma-separated integers.") from exc
+    if not result:
+        raise ValueError(f"{field_name} cannot be empty.")
+    return result
+
+
+def _parse_float_list_csv(value: str, field_name: str) -> List[float]:
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} cannot be empty.")
+    try:
+        result = [float(item.strip()) for item in cleaned.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must contain comma-separated numbers.") from exc
+    if not result:
+        raise ValueError(f"{field_name} cannot be empty.")
+    return result
+
+
+def _parse_bool_list_csv(value: str, field_name: str) -> List[bool]:
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} cannot be empty.")
+    mapping = {
+        "true": True,
+        "false": False,
+        "1": True,
+        "0": False,
+        "yes": True,
+        "no": False,
+    }
+    result: List[bool] = []
+    for item in cleaned.split(","):
+        token = item.strip().lower()
+        if not token:
+            continue
+        if token not in mapping:
+            raise ValueError(
+                f"{field_name} must contain comma-separated booleans (true/false)."
+            )
+        result.append(mapping[token])
+    if not result:
+        raise ValueError(f"{field_name} cannot be empty.")
+    return result
+
+
+def _list_to_csv(values: Sequence[object]) -> str:
+    return ",".join(str(value) for value in values)
+
+
+def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
+    """Convert GUI state into canonical JSON payload for SweepExperimentSpec."""
+    strategies: List[str] = []
+    if state.strategy_pixel:
+        strategies.append("pixel")
+    if state.strategy_combined:
+        strategies.append("combined")
+    if state.strategy_global:
+        strategies.append("global")
+    if not strategies:
+        strategies = ["pixel", "combined"]
+
+    datasets: List[Dict[str, object]] = []
+    for row in state.datasets:
+        entry: Dict[str, object] = {"id": row.dataset_id.strip()}
+        path = row.source_path.strip()
+        if row.source_type == "views":
+            entry["views"] = path
+        elif row.source_type == "source_image":
+            entry["source_image"] = path
+        elif row.source_type == "source_image_dir":
+            entry["source_image_dir"] = path
+        else:
+            entry["views"] = path
+
+        if row.center_x.strip():
+            entry["center_x"] = int(row.center_x.strip())
+        if row.center_y.strip():
+            entry["center_y"] = int(row.center_y.strip())
+        if row.view_radius.strip():
+            entry["view_radius"] = int(row.view_radius.strip())
+        if row.view_grid_size.strip():
+            entry["view_grid_size"] = int(row.view_grid_size.strip())
+        if row.view_distance.strip():
+            entry["view_distance"] = int(row.view_distance.strip())
+        entry["hdr_enabled"] = bool(row.hdr_enabled)
+        if row.hdr_exposure_times.strip():
+            entry["hdr_exposure_times"] = _parse_float_list_csv(
+                row.hdr_exposure_times, f"dataset '{row.dataset_id}' exposure times"
+            )
+        entry["normalize_to_8bit"] = bool(row.normalize_to_8bit)
+        datasets.append(entry)
+
+    search_spaces: Dict[str, Dict[str, object]] = {}
+    if "pixel" in strategies:
+        search_spaces["pixel"] = {
+            "similarity_window_sizes": _parse_int_list_csv(
+                state.pixel_similarity_window_sizes, "pixel window sizes"
+            ),
+            "max_displacements": _parse_int_list_csv(
+                state.pixel_max_displacements, "pixel max displacements"
+            ),
+            "gauss_sigmas": _parse_float_list_csv(
+                state.pixel_gauss_sigmas, "pixel gauss sigmas"
+            ),
+            "disp_gauss_sigmas": _parse_float_list_csv(
+                state.pixel_disp_gauss_sigmas, "pixel displacement gauss sigmas"
+            ),
+            "pixel_thresholds": _parse_float_list_csv(
+                state.pixel_thresholds, "pixel thresholds"
+            ),
+            "sub_pix_factors": _parse_int_list_csv(
+                state.pixel_sub_pix_factors, "pixel sub-pixel factors"
+            ),
+            "pixel_sigma_pyramid": _parse_bool_list_csv(
+                state.pixel_sigma_pyramid, "pixel sigma pyramid"
+            ),
+            "zero_fill_roll": _parse_bool_list_csv(
+                state.pixel_zero_fill_roll, "pixel zero fill roll"
+            ),
+        }
+    if "combined" in strategies:
+        search_spaces["combined"] = {
+            "refinement_window_sizes": _parse_int_list_csv(
+                state.combined_refinement_window_sizes, "combined refinement window sizes"
+            ),
+            "max_displacements": _parse_int_list_csv(
+                state.combined_max_displacements, "combined max displacements"
+            ),
+            "gauss_sigmas": _parse_float_list_csv(
+                state.combined_gauss_sigmas, "combined gauss sigmas"
+            ),
+            "disp_gauss_sigmas": _parse_float_list_csv(
+                state.combined_disp_gauss_sigmas, "combined displacement gauss sigmas"
+            ),
+            "pixel_thresholds": _parse_float_list_csv(
+                state.combined_pixel_thresholds, "combined pixel thresholds"
+            ),
+            "global_thresholds": _parse_float_list_csv(
+                state.combined_global_thresholds, "combined global thresholds"
+            ),
+            "correlation_pad_widths": _parse_int_list_csv(
+                state.combined_correlation_pad_widths, "combined correlation pad widths"
+            ),
+            "sub_pix_factors": _parse_int_list_csv(
+                state.combined_sub_pix_factors, "combined sub-pixel factors"
+            ),
+            "pixel_sigma_pyramid": _parse_bool_list_csv(
+                state.combined_sigma_pyramid, "combined sigma pyramid"
+            ),
+            "zero_fill_roll": _parse_bool_list_csv(
+                state.combined_zero_fill_roll, "combined zero fill roll"
+            ),
+            "combined_use_global_avg_reference": _parse_bool_list_csv(
+                state.combined_use_global_avg_reference,
+                "combined use global average reference",
+            ),
+        }
+    if "global" in strategies:
+        search_spaces["global"] = {
+            "global_thresholds": _parse_float_list_csv(
+                state.global_thresholds, "global thresholds"
+            ),
+            "correlation_pad_widths": _parse_int_list_csv(
+                state.global_correlation_pad_widths, "global correlation pad widths"
+            ),
+        }
+
+    return {
+        "output_dir": state.output_dir.strip() or None,
+        "strategies": strategies,
+        "datasets": datasets,
+        "search_spaces": search_spaces,
+        "stages": {
+            "total_budget_per_dataset": int(state.total_budget_per_dataset.strip()),
+            "stage1_fraction": float(state.stage1_fraction.strip()),
+            "top_k": int(state.top_k.strip()),
+            "max_workers": (
+                int(state.max_workers.strip()) if state.max_workers.strip() else None
+            ),
+        },
+        "scoring": {
+            "metric_weights": {
+                "laplacian_variance": float(state.weight_laplacian_variance.strip()),
+                "dwt_level2_hv_energy": float(
+                    state.weight_dwt_level2_hv_energy.strip()
+                ),
+                "sum_squared_gradient": float(
+                    state.weight_sum_squared_gradient.strip()
+                ),
+                "total_variation": float(state.weight_total_variation.strip()),
+            },
+            "runtime_penalty_weight": float(state.runtime_penalty_weight.strip()),
+            "robustness_lambda": float(state.robustness_lambda.strip()),
+            "missing_dataset_penalty": float(state.missing_dataset_penalty.strip()),
+        },
+        "save_figures": bool(state.save_figures),
+        "analyze": bool(state.analyze),
+    }
+
+
+def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
+    """Convert JSON payload into GUI state using tolerant defaults."""
+    state = SpecGuiState()
+    state.output_dir = str(payload.get("output_dir") or "")
+
+    strategies = [str(item).lower() for item in cast(List[object], payload.get("strategies", []))]
+    state.strategy_pixel = "pixel" in strategies or not strategies
+    state.strategy_combined = "combined" in strategies or not strategies
+    state.strategy_global = "global" in strategies
+
+    stages = cast(Dict[str, object], payload.get("stages", {}))
+    state.total_budget_per_dataset = str(
+        stages.get("total_budget_per_dataset", state.total_budget_per_dataset)
+    )
+    state.stage1_fraction = str(stages.get("stage1_fraction", state.stage1_fraction))
+    state.top_k = str(stages.get("top_k", state.top_k))
+    state.max_workers = (
+        "" if stages.get("max_workers") is None else str(stages.get("max_workers"))
+    )
+    state.save_figures = bool(payload.get("save_figures", state.save_figures))
+    state.analyze = bool(payload.get("analyze", state.analyze))
+
+    search_spaces = cast(Dict[str, Dict[str, object]], payload.get("search_spaces", {}))
+    pixel_space = cast(Dict[str, object], search_spaces.get("pixel", {}))
+    if pixel_space:
+        state.pixel_similarity_window_sizes = _list_to_csv(
+            cast(List[object], pixel_space.get("similarity_window_sizes", []))
+        ) or state.pixel_similarity_window_sizes
+        state.pixel_max_displacements = _list_to_csv(
+            cast(List[object], pixel_space.get("max_displacements", []))
+        ) or state.pixel_max_displacements
+        state.pixel_gauss_sigmas = _list_to_csv(
+            cast(List[object], pixel_space.get("gauss_sigmas", []))
+        ) or state.pixel_gauss_sigmas
+        state.pixel_disp_gauss_sigmas = _list_to_csv(
+            cast(List[object], pixel_space.get("disp_gauss_sigmas", []))
+        ) or state.pixel_disp_gauss_sigmas
+        state.pixel_thresholds = _list_to_csv(
+            cast(List[object], pixel_space.get("pixel_thresholds", []))
+        ) or state.pixel_thresholds
+        state.pixel_sub_pix_factors = _list_to_csv(
+            cast(List[object], pixel_space.get("sub_pix_factors", []))
+        ) or state.pixel_sub_pix_factors
+        state.pixel_sigma_pyramid = _list_to_csv(
+            cast(List[object], pixel_space.get("pixel_sigma_pyramid", []))
+        ) or state.pixel_sigma_pyramid
+        state.pixel_zero_fill_roll = _list_to_csv(
+            cast(List[object], pixel_space.get("zero_fill_roll", []))
+        ) or state.pixel_zero_fill_roll
+
+    combined_space = cast(Dict[str, object], search_spaces.get("combined", {}))
+    if combined_space:
+        state.combined_refinement_window_sizes = _list_to_csv(
+            cast(List[object], combined_space.get("refinement_window_sizes", []))
+        ) or state.combined_refinement_window_sizes
+        state.combined_max_displacements = _list_to_csv(
+            cast(List[object], combined_space.get("max_displacements", []))
+        ) or state.combined_max_displacements
+        state.combined_gauss_sigmas = _list_to_csv(
+            cast(List[object], combined_space.get("gauss_sigmas", []))
+        ) or state.combined_gauss_sigmas
+        state.combined_disp_gauss_sigmas = _list_to_csv(
+            cast(List[object], combined_space.get("disp_gauss_sigmas", []))
+        ) or state.combined_disp_gauss_sigmas
+        state.combined_pixel_thresholds = _list_to_csv(
+            cast(List[object], combined_space.get("pixel_thresholds", []))
+        ) or state.combined_pixel_thresholds
+        state.combined_global_thresholds = _list_to_csv(
+            cast(List[object], combined_space.get("global_thresholds", []))
+        ) or state.combined_global_thresholds
+        state.combined_correlation_pad_widths = _list_to_csv(
+            cast(List[object], combined_space.get("correlation_pad_widths", []))
+        ) or state.combined_correlation_pad_widths
+        state.combined_sub_pix_factors = _list_to_csv(
+            cast(List[object], combined_space.get("sub_pix_factors", []))
+        ) or state.combined_sub_pix_factors
+        state.combined_sigma_pyramid = _list_to_csv(
+            cast(List[object], combined_space.get("pixel_sigma_pyramid", []))
+        ) or state.combined_sigma_pyramid
+        state.combined_zero_fill_roll = _list_to_csv(
+            cast(List[object], combined_space.get("zero_fill_roll", []))
+        ) or state.combined_zero_fill_roll
+        state.combined_use_global_avg_reference = _list_to_csv(
+            cast(List[object], combined_space.get("combined_use_global_avg_reference", []))
+        ) or state.combined_use_global_avg_reference
+
+    global_space = cast(Dict[str, object], search_spaces.get("global", {}))
+    if global_space:
+        state.global_thresholds = _list_to_csv(
+            cast(List[object], global_space.get("global_thresholds", []))
+        ) or state.global_thresholds
+        state.global_correlation_pad_widths = _list_to_csv(
+            cast(List[object], global_space.get("correlation_pad_widths", []))
+        ) or state.global_correlation_pad_widths
+
+    scoring = cast(Dict[str, object], payload.get("scoring", {}))
+    metric_weights = cast(Dict[str, object], scoring.get("metric_weights", {}))
+    if metric_weights:
+        state.weight_laplacian_variance = str(
+            metric_weights.get("laplacian_variance", state.weight_laplacian_variance)
+        )
+        state.weight_dwt_level2_hv_energy = str(
+            metric_weights.get("dwt_level2_hv_energy", state.weight_dwt_level2_hv_energy)
+        )
+        state.weight_sum_squared_gradient = str(
+            metric_weights.get("sum_squared_gradient", state.weight_sum_squared_gradient)
+        )
+        state.weight_total_variation = str(
+            metric_weights.get("total_variation", state.weight_total_variation)
+        )
+    state.runtime_penalty_weight = str(
+        scoring.get("runtime_penalty_weight", state.runtime_penalty_weight)
+    )
+    state.robustness_lambda = str(scoring.get("robustness_lambda", state.robustness_lambda))
+    state.missing_dataset_penalty = str(
+        scoring.get("missing_dataset_penalty", state.missing_dataset_penalty)
+    )
+
+    datasets_payload = cast(List[Dict[str, object]], payload.get("datasets", []))
+    datasets: List[SpecGuiDatasetState] = []
+    for entry in datasets_payload:
+        source_type = "views"
+        source_path = ""
+        if entry.get("source_image") is not None:
+            source_type = "source_image"
+            source_path = str(entry.get("source_image") or "")
+        elif entry.get("source_image_dir") is not None:
+            source_type = "source_image_dir"
+            source_path = str(entry.get("source_image_dir") or "")
+        else:
+            source_path = str(entry.get("views") or entry.get("views_path") or "")
+        row = SpecGuiDatasetState(
+            dataset_id=str(entry.get("id") or entry.get("dataset_id") or ""),
+            source_type=source_type,
+            source_path=source_path,
+            center_x="" if entry.get("center_x") is None else str(entry.get("center_x")),
+            center_y="" if entry.get("center_y") is None else str(entry.get("center_y")),
+            view_radius=""
+            if entry.get("view_radius") is None
+            else str(entry.get("view_radius")),
+            view_grid_size=str(entry.get("view_grid_size", 3)),
+            view_distance=""
+            if entry.get("view_distance") is None
+            else str(entry.get("view_distance")),
+            hdr_enabled=bool(entry.get("hdr_enabled", False)),
+            hdr_exposure_times=_list_to_csv(
+                cast(List[object], entry.get("hdr_exposure_times", []))
+            ),
+            normalize_to_8bit=bool(entry.get("normalize_to_8bit", False)),
+        )
+        datasets.append(row)
+    if datasets:
+        state.datasets = datasets
+    state.json_preview = json.dumps(payload, indent=2)
+    return state
+
+
+def validate_state(state: SpecGuiState) -> List[str]:
+    """Validate GUI state before save/run and return list of issues."""
+    issues: List[str] = []
+    strategies = [
+        strategy
+        for strategy, enabled in [
+            ("pixel", state.strategy_pixel),
+            ("combined", state.strategy_combined),
+            ("global", state.strategy_global),
+        ]
+        if enabled
+    ]
+    if not strategies:
+        issues.append("Select at least one strategy.")
+
+    try:
+        if int(state.total_budget_per_dataset.strip()) < 1:
+            issues.append("Total budget per dataset must be >= 1.")
+    except Exception:
+        issues.append("Total budget per dataset must be an integer.")
+
+    try:
+        fraction = float(state.stage1_fraction.strip())
+        if not (0.0 < fraction < 1.0):
+            issues.append("Stage1 fraction must be between 0 and 1.")
+    except Exception:
+        issues.append("Stage1 fraction must be numeric.")
+
+    try:
+        if int(state.top_k.strip()) < 1:
+            issues.append("Top-k must be >= 1.")
+    except Exception:
+        issues.append("Top-k must be an integer.")
+
+    if state.max_workers.strip():
+        try:
+            if int(state.max_workers.strip()) < 1:
+                issues.append("Max workers must be >= 1 when provided.")
+        except Exception:
+            issues.append("Max workers must be an integer when provided.")
+
+    if not state.datasets:
+        issues.append("At least one dataset row is required.")
+    ids = [row.dataset_id.strip() for row in state.datasets if row.dataset_id.strip()]
+    if len(ids) != len(set(ids)):
+        issues.append("Dataset IDs must be unique.")
+
+    for idx, row in enumerate(state.datasets, start=1):
+        prefix = f"Dataset row {idx}"
+        if not row.dataset_id.strip():
+            issues.append(f"{prefix}: dataset id is required.")
+        if row.source_type not in {"views", "source_image", "source_image_dir"}:
+            issues.append(f"{prefix}: invalid source type '{row.source_type}'.")
+        if not row.source_path.strip():
+            issues.append(f"{prefix}: source path is required.")
+        if row.source_type in {"source_image", "source_image_dir"}:
+            for field_name, value in [
+                ("center_x", row.center_x),
+                ("center_y", row.center_y),
+                ("view_radius", row.view_radius),
+            ]:
+                if not value.strip():
+                    issues.append(
+                        f"{prefix}: {field_name} is required for {row.source_type}."
+                    )
+                else:
+                    try:
+                        int(value.strip())
+                    except Exception:
+                        issues.append(f"{prefix}: {field_name} must be an integer.")
+        if row.view_grid_size.strip():
+            try:
+                if int(row.view_grid_size.strip()) < 1:
+                    issues.append(f"{prefix}: view_grid_size must be >= 1.")
+            except Exception:
+                issues.append(f"{prefix}: view_grid_size must be an integer.")
+        if row.view_distance.strip():
+            try:
+                int(row.view_distance.strip())
+            except Exception:
+                issues.append(f"{prefix}: view_distance must be an integer.")
+        if row.hdr_exposure_times.strip():
+            try:
+                _parse_float_list_csv(
+                    row.hdr_exposure_times, f"{prefix} hdr_exposure_times"
+                )
+            except ValueError as exc:
+                issues.append(str(exc))
+
+    parser_checks: List[Tuple[str, str, str]] = []
+    if state.strategy_pixel:
+        parser_checks.extend(
+            [
+                ("pixel window sizes", state.pixel_similarity_window_sizes, "int"),
+                ("pixel max displacements", state.pixel_max_displacements, "int"),
+                ("pixel gauss sigmas", state.pixel_gauss_sigmas, "float"),
+                ("pixel disp gauss sigmas", state.pixel_disp_gauss_sigmas, "float"),
+                ("pixel thresholds", state.pixel_thresholds, "float"),
+                ("pixel sub-pixel factors", state.pixel_sub_pix_factors, "int"),
+                ("pixel sigma pyramid", state.pixel_sigma_pyramid, "bool"),
+                ("pixel zero fill roll", state.pixel_zero_fill_roll, "bool"),
+            ]
+        )
+    if state.strategy_combined:
+        parser_checks.extend(
+            [
+                ("combined refinement windows", state.combined_refinement_window_sizes, "int"),
+                ("combined max displacements", state.combined_max_displacements, "int"),
+                ("combined gauss sigmas", state.combined_gauss_sigmas, "float"),
+                ("combined disp gauss sigmas", state.combined_disp_gauss_sigmas, "float"),
+                ("combined pixel thresholds", state.combined_pixel_thresholds, "float"),
+                ("combined global thresholds", state.combined_global_thresholds, "float"),
+                ("combined correlation pad widths", state.combined_correlation_pad_widths, "int"),
+                ("combined sub-pixel factors", state.combined_sub_pix_factors, "int"),
+                ("combined sigma pyramid", state.combined_sigma_pyramid, "bool"),
+                ("combined zero fill roll", state.combined_zero_fill_roll, "bool"),
+                ("combined global avg reference", state.combined_use_global_avg_reference, "bool"),
+            ]
+        )
+    if state.strategy_global:
+        parser_checks.extend(
+            [
+                ("global thresholds", state.global_thresholds, "float"),
+                ("global correlation pad widths", state.global_correlation_pad_widths, "int"),
+            ]
+        )
+    for field_name, value, field_type in parser_checks:
+        try:
+            if field_type == "int":
+                _parse_int_list_csv(value, field_name)
+            elif field_type == "float":
+                _parse_float_list_csv(value, field_name)
+            else:
+                _parse_bool_list_csv(value, field_name)
+        except ValueError as exc:
+            issues.append(str(exc))
+
+    try:
+        weights = [
+            float(state.weight_laplacian_variance.strip()),
+            float(state.weight_dwt_level2_hv_energy.strip()),
+            float(state.weight_sum_squared_gradient.strip()),
+            float(state.weight_total_variation.strip()),
+        ]
+        if sum(weights) <= 0:
+            issues.append("Metric weights must sum to a positive value.")
+    except Exception:
+        issues.append("Metric weights must be numeric.")
+
+    for label, raw in [
+        ("runtime penalty weight", state.runtime_penalty_weight),
+        ("robustness lambda", state.robustness_lambda),
+        ("missing dataset penalty", state.missing_dataset_penalty),
+    ]:
+        try:
+            float(raw.strip())
+        except Exception:
+            issues.append(f"{label} must be numeric.")
+
+    return issues
+
+
+def _save_spec_payload(path: Path, payload: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, indent=2)
+
+
+def _load_spec_payload(path: Path) -> Dict[str, object]:
+    with path.open("r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    if not isinstance(payload, dict):
+        raise ValueError("Spec file must contain a JSON object.")
+    return cast(Dict[str, object], payload)
+
+
+def _open_with_system(path: Path) -> Tuple[bool, Optional[str]]:
+    try:
+        target = str(path)
+        if platform.system().lower().startswith("win"):
+            os.startfile(target)  # type: ignore[attr-defined]
+            return True, None
+        if platform.system().lower() == "darwin":
+            subprocess.run(["open", target], check=False)
+            return True, None
+        subprocess.run(["xdg-open", target], check=False)
+        return True, None
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+
+class SpecGuiApp:
+    def __init__(self, root: Any):
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.root = root
+        self.tk = tk
+        self.ttk = ttk
+        self.filedialog = __import__("tkinter.filedialog", fromlist=["filedialog"])
+        self.messagebox = __import__("tkinter.messagebox", fromlist=["messagebox"])
+        self.state = SpecGuiState()
+        self.dataset_rows: List[Dict[str, Any]] = []
+        self.editable_widgets: List[Any] = []
+        self.log_queue: "queue.Queue[Dict[str, object]]" = queue.Queue()
+        self.run_thread: Optional[threading.Thread] = None
+        self._is_running = False
+        self.status_var = tk.StringVar(value="Idle")
+        self.show_advanced_var = tk.BooleanVar(value=False)
+
+        self.root.title("Moment Images Sweep (Spec Mode)")
+        self.root.geometry("1280x900")
+        self._build_ui()
+        self._set_state(self.state)
+        self._poll_logs()
+
+    def _register_editable(self, widget: Any) -> None:
+        self.editable_widgets.append(widget)
+
+    def _set_editable_enabled(self, enabled: bool) -> None:
+        desired = "normal" if enabled else "disabled"
+        for widget in self.editable_widgets:
+            try:
+                widget.configure(state=desired)
+            except Exception:
+                pass
+
+    def _append_log(self, message: str) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.insert(self.tk.END, message + "\n")
+        self.log_text.see(self.tk.END)
+        self.log_text.configure(state="disabled")
+
+    def _build_labeled_entry(
+        self, parent: Any, row: int, label_text: str, default_value: str, width: int = 22
+    ) -> Any:
+        self.ttk.Label(parent, text=label_text).grid(
+            row=row, column=0, sticky="w", padx=4, pady=2
+        )
+        entry = self.ttk.Entry(parent, width=width)
+        entry.insert(0, default_value)
+        entry.grid(row=row, column=1, sticky="w", padx=4, pady=2)
+        self._register_editable(entry)
+        return entry
+
+    def _build_ui(self) -> None:
+        top_actions = self.ttk.Frame(self.root)
+        top_actions.pack(fill="x", padx=8, pady=6)
+
+        self.load_spec_btn = self.ttk.Button(
+            top_actions, text="Load Spec...", command=self._on_load_spec
+        )
+        self.load_spec_btn.pack(side="left", padx=3)
+        self._register_editable(self.load_spec_btn)
+        self.save_spec_btn = self.ttk.Button(
+            top_actions, text="Save Spec...", command=self._on_save_spec
+        )
+        self.save_spec_btn.pack(side="left", padx=3)
+        self._register_editable(self.save_spec_btn)
+        self.save_template_btn = self.ttk.Button(
+            top_actions,
+            text="Save Spec As Template...",
+            command=lambda: self._on_save_spec(template=True),
+        )
+        self.save_template_btn.pack(side="left", padx=3)
+        self._register_editable(self.save_template_btn)
+        self.refresh_json_btn = self.ttk.Button(
+            top_actions, text="Refresh JSON Preview", command=self._on_refresh_json_preview
+        )
+        self.refresh_json_btn.pack(side="left", padx=3)
+        self._register_editable(self.refresh_json_btn)
+        self.apply_json_btn = self.ttk.Button(
+            top_actions, text="Apply JSON Preview", command=self._on_apply_json_preview
+        )
+        self.apply_json_btn.pack(side="left", padx=3)
+        self._register_editable(self.apply_json_btn)
+
+        self.run_btn = self.ttk.Button(top_actions, text="Run Sweep", command=self._on_run)
+        self.run_btn.pack(side="right", padx=3)
+        self._register_editable(self.run_btn)
+        self.status_label = self.ttk.Label(top_actions, textvariable=self.status_var)
+        self.status_label.pack(side="right", padx=12)
+
+        main_container = self.ttk.Frame(self.root)
+        main_container.pack(fill="both", expand=True, padx=8, pady=4)
+
+        scroll_canvas = self.tk.Canvas(main_container)
+        scrollbar = self.ttk.Scrollbar(
+            main_container, orient="vertical", command=scroll_canvas.yview
+        )
+        self.content_frame = self.ttk.Frame(scroll_canvas)
+        self.content_frame.bind(
+            "<Configure>",
+            lambda _evt: scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all")),
+        )
+        scroll_canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
+        scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        scroll_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        basic_frame = self.ttk.LabelFrame(self.content_frame, text="Basic Settings")
+        basic_frame.pack(fill="x", pady=6)
+        self.output_dir_entry = self._build_labeled_entry(
+            basic_frame, 0, "Output Directory", ""
+        )
+        browse_output_btn = self.ttk.Button(
+            basic_frame, text="Browse...", command=self._on_browse_output_dir
+        )
+        browse_output_btn.grid(row=0, column=2, sticky="w", padx=4, pady=2)
+        self._register_editable(browse_output_btn)
+
+        strat_frame = self.ttk.Frame(basic_frame)
+        strat_frame.grid(row=1, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        self.ttk.Label(strat_frame, text="Strategies:").pack(side="left")
+        self.strategy_pixel_var = self.tk.BooleanVar(value=True)
+        self.strategy_combined_var = self.tk.BooleanVar(value=True)
+        self.strategy_global_var = self.tk.BooleanVar(value=False)
+        for text, var in [
+            ("Pixel", self.strategy_pixel_var),
+            ("Combined", self.strategy_combined_var),
+            ("Global", self.strategy_global_var),
+        ]:
+            chk = self.ttk.Checkbutton(strat_frame, text=text, variable=var)
+            chk.pack(side="left", padx=5)
+            self._register_editable(chk)
+
+        stage_frame = self.ttk.Frame(basic_frame)
+        stage_frame.grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        self.ttk.Label(stage_frame, text="Total budget").grid(row=0, column=0, sticky="w")
+        self.total_budget_entry = self.ttk.Entry(stage_frame, width=8)
+        self.total_budget_entry.grid(row=0, column=1, padx=4)
+        self._register_editable(self.total_budget_entry)
+        self.ttk.Label(stage_frame, text="Stage1 fraction").grid(row=0, column=2, sticky="w")
+        self.stage1_fraction_entry = self.ttk.Entry(stage_frame, width=6)
+        self.stage1_fraction_entry.grid(row=0, column=3, padx=4)
+        self._register_editable(self.stage1_fraction_entry)
+        self.ttk.Label(stage_frame, text="Top-K").grid(row=0, column=4, sticky="w")
+        self.top_k_entry = self.ttk.Entry(stage_frame, width=6)
+        self.top_k_entry.grid(row=0, column=5, padx=4)
+        self._register_editable(self.top_k_entry)
+        self.ttk.Label(stage_frame, text="Max workers").grid(row=0, column=6, sticky="w")
+        self.max_workers_entry = self.ttk.Entry(stage_frame, width=8)
+        self.max_workers_entry.grid(row=0, column=7, padx=4)
+        self._register_editable(self.max_workers_entry)
+
+        toggles_frame = self.ttk.Frame(basic_frame)
+        toggles_frame.grid(row=3, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        self.analyze_var = self.tk.BooleanVar(value=True)
+        self.save_figures_var = self.tk.BooleanVar(value=False)
+        analyze_chk = self.ttk.Checkbutton(toggles_frame, text="Analyze", variable=self.analyze_var)
+        analyze_chk.pack(side="left", padx=5)
+        self._register_editable(analyze_chk)
+        save_fig_chk = self.ttk.Checkbutton(
+            toggles_frame, text="Save Figures", variable=self.save_figures_var
+        )
+        save_fig_chk.pack(side="left", padx=5)
+        self._register_editable(save_fig_chk)
+
+        search_frame = self.ttk.LabelFrame(self.content_frame, text="Search Space (Core Lists)")
+        search_frame.pack(fill="x", pady=6)
+        left = self.ttk.Frame(search_frame)
+        left.pack(side="left", fill="x", expand=True, padx=4, pady=4)
+        right = self.ttk.Frame(search_frame)
+        right.pack(side="left", fill="x", expand=True, padx=4, pady=4)
+        self.pixel_window_entry = self._build_labeled_entry(left, 0, "Pixel window sizes", "15,25,35")
+        self.pixel_disp_entry = self._build_labeled_entry(left, 1, "Pixel max displacements", "5,15")
+        self.pixel_gauss_entry = self._build_labeled_entry(left, 2, "Pixel gauss sigmas", "3.0,5.0")
+        self.pixel_disp_gauss_entry = self._build_labeled_entry(left, 3, "Pixel disp gauss sigmas", "0.0,1.0")
+        self.pixel_thresh_entry = self._build_labeled_entry(left, 4, "Pixel thresholds", "0.05")
+
+        self.comb_window_entry = self._build_labeled_entry(right, 0, "Combined refinement windows", "15,25")
+        self.comb_disp_entry = self._build_labeled_entry(right, 1, "Combined max displacements", "5,15")
+        self.comb_gauss_entry = self._build_labeled_entry(right, 2, "Combined gauss sigmas", "3.0,5.0")
+        self.comb_disp_gauss_entry = self._build_labeled_entry(right, 3, "Combined disp gauss sigmas", "0.0,1.0")
+        self.comb_thresh_entry = self._build_labeled_entry(right, 4, "Combined pixel thresholds", "0.05")
+        self.comb_global_thresh_entry = self._build_labeled_entry(right, 5, "Combined global thresholds", "0.1,0.15")
+        self.comb_corr_pad_entry = self._build_labeled_entry(
+            right, 6, "Combined correlation pad widths", str(RectificationRunConfig().correlation_pad_width)
+        )
+
+        dataset_frame = self.ttk.LabelFrame(self.content_frame, text="Datasets")
+        dataset_frame.pack(fill="x", pady=6)
+        dataset_btns = self.ttk.Frame(dataset_frame)
+        dataset_btns.pack(fill="x", padx=4, pady=4)
+        add_dataset_btn = self.ttk.Button(dataset_btns, text="Add Dataset", command=self._add_dataset_row)
+        add_dataset_btn.pack(side="left", padx=2)
+        self._register_editable(add_dataset_btn)
+        self.dataset_rows_frame = self.ttk.Frame(dataset_frame)
+        self.dataset_rows_frame.pack(fill="x", padx=4, pady=4)
+
+        advanced_container = self.ttk.LabelFrame(self.content_frame, text="Advanced Settings")
+        advanced_container.pack(fill="x", pady=6)
+        toggle_btn = self.ttk.Checkbutton(
+            advanced_container,
+            text="Show advanced controls",
+            variable=self.show_advanced_var,
+            command=self._toggle_advanced,
+        )
+        toggle_btn.pack(anchor="w", padx=4, pady=2)
+        self._register_editable(toggle_btn)
+
+        self.advanced_frame = self.ttk.Frame(advanced_container)
+        adv_left = self.ttk.Frame(self.advanced_frame)
+        adv_left.pack(side="left", fill="x", expand=True, padx=4, pady=4)
+        adv_right = self.ttk.Frame(self.advanced_frame)
+        adv_right.pack(side="left", fill="x", expand=True, padx=4, pady=4)
+        self.pixel_subpix_entry = self._build_labeled_entry(adv_left, 0, "Pixel sub-pixel factors", "1,2")
+        self.pixel_pyramid_entry = self._build_labeled_entry(adv_left, 1, "Pixel sigma pyramid", "false,true")
+        self.pixel_zfill_entry = self._build_labeled_entry(adv_left, 2, "Pixel zero fill roll", "true")
+        self.comb_subpix_entry = self._build_labeled_entry(adv_left, 3, "Combined sub-pixel factors", "1,2")
+        self.comb_pyramid_entry = self._build_labeled_entry(adv_left, 4, "Combined sigma pyramid", "false,true")
+        self.comb_zfill_entry = self._build_labeled_entry(adv_left, 5, "Combined zero fill roll", "true")
+        self.comb_use_global_ref_entry = self._build_labeled_entry(adv_left, 6, "Combined use global avg ref", "true")
+        self.global_thresholds_entry = self._build_labeled_entry(adv_left, 7, "Global thresholds", "0.15")
+        self.global_corr_pad_entry = self._build_labeled_entry(
+            adv_left, 8, "Global correlation pad widths", str(RectificationRunConfig().correlation_pad_width)
+        )
+        self.weight_lap_entry = self._build_labeled_entry(adv_right, 0, "Weight laplacian_variance", "0.25")
+        self.weight_dwt_entry = self._build_labeled_entry(adv_right, 1, "Weight dwt_level2_hv_energy", "0.25")
+        self.weight_grad_entry = self._build_labeled_entry(adv_right, 2, "Weight sum_squared_gradient", "0.25")
+        self.weight_tv_entry = self._build_labeled_entry(adv_right, 3, "Weight total_variation", "0.25")
+        self.runtime_penalty_entry = self._build_labeled_entry(adv_right, 4, "Runtime penalty weight", "0.0")
+        self.robustness_entry = self._build_labeled_entry(adv_right, 5, "Robustness lambda", "0.5")
+        self.missing_penalty_entry = self._build_labeled_entry(adv_right, 6, "Missing dataset penalty", "1.0")
+
+        json_frame = self.ttk.LabelFrame(self.content_frame, text="JSON Preview / Editor (Optional)")
+        json_frame.pack(fill="both", expand=True, pady=6)
+        self.json_text = self.tk.Text(json_frame, height=12, wrap="none")
+        self.json_text.pack(fill="both", expand=True, padx=4, pady=4)
+        self._register_editable(self.json_text)
+
+        log_frame = self.ttk.LabelFrame(self.content_frame, text="Run Log")
+        log_frame.pack(fill="both", expand=True, pady=6)
+        self.log_text = self.tk.Text(log_frame, height=10, state="disabled")
+        self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
+
+    def _toggle_advanced(self) -> None:
+        if self.show_advanced_var.get():
+            self.advanced_frame.pack(fill="x", padx=4, pady=4)
+        else:
+            self.advanced_frame.pack_forget()
+
+    def _clear_dataset_rows(self) -> None:
+        for row in self.dataset_rows:
+            row["frame"].destroy()
+        self.dataset_rows = []
+
+    def _add_dataset_row(self, initial: Optional[SpecGuiDatasetState] = None) -> None:
+        initial_state = initial or SpecGuiDatasetState(dataset_id=f"dataset_{len(self.dataset_rows)+1}")
+        row_frame = self.ttk.Frame(self.dataset_rows_frame)
+        row_frame.pack(fill="x", pady=2)
+        id_var = self.tk.StringVar(value=initial_state.dataset_id)
+        source_type_var = self.tk.StringVar(value=initial_state.source_type)
+        source_path_var = self.tk.StringVar(value=initial_state.source_path)
+        center_x_var = self.tk.StringVar(value=initial_state.center_x)
+        center_y_var = self.tk.StringVar(value=initial_state.center_y)
+        radius_var = self.tk.StringVar(value=initial_state.view_radius)
+        grid_var = self.tk.StringVar(value=initial_state.view_grid_size)
+        dist_var = self.tk.StringVar(value=initial_state.view_distance)
+        hdr_enabled_var = self.tk.BooleanVar(value=initial_state.hdr_enabled)
+        exposure_var = self.tk.StringVar(value=initial_state.hdr_exposure_times)
+        normalize_var = self.tk.BooleanVar(value=initial_state.normalize_to_8bit)
+
+        self.ttk.Label(row_frame, text="ID").pack(side="left")
+        id_entry = self.ttk.Entry(row_frame, textvariable=id_var, width=10)
+        id_entry.pack(side="left", padx=2)
+        self._register_editable(id_entry)
+        self.ttk.Label(row_frame, text="Source").pack(side="left")
+        source_menu = self.ttk.OptionMenu(
+            row_frame, source_type_var, source_type_var.get(), "views", "source_image", "source_image_dir"
+        )
+        source_menu.pack(side="left", padx=2)
+        self._register_editable(source_menu)
+        path_entry = self.ttk.Entry(row_frame, textvariable=source_path_var, width=28)
+        path_entry.pack(side="left", padx=2)
+        self._register_editable(path_entry)
+        browse_btn = self.ttk.Button(
+            row_frame,
+            text="Browse",
+            command=lambda st=source_type_var, sp=source_path_var: self._browse_dataset_path(st, sp),
+        )
+        browse_btn.pack(side="left", padx=2)
+        self._register_editable(browse_btn)
+
+        for label, var, width in [("cx", center_x_var, 4), ("cy", center_y_var, 4), ("r", radius_var, 4), ("grid", grid_var, 4), ("dist", dist_var, 4)]:
+            self.ttk.Label(row_frame, text=label).pack(side="left")
+            entry = self.ttk.Entry(row_frame, textvariable=var, width=width)
+            entry.pack(side="left", padx=2)
+            self._register_editable(entry)
+
+        hdr_chk = self.ttk.Checkbutton(row_frame, text="HDR", variable=hdr_enabled_var)
+        hdr_chk.pack(side="left", padx=2)
+        self._register_editable(hdr_chk)
+        self.ttk.Label(row_frame, text="exp").pack(side="left")
+        exp_entry = self.ttk.Entry(row_frame, textvariable=exposure_var, width=10)
+        exp_entry.pack(side="left", padx=2)
+        self._register_editable(exp_entry)
+        norm_chk = self.ttk.Checkbutton(row_frame, text="8-bit", variable=normalize_var)
+        norm_chk.pack(side="left", padx=2)
+        self._register_editable(norm_chk)
+        remove_btn = self.ttk.Button(
+            row_frame, text="Remove", command=lambda frame=row_frame: self._remove_dataset_row(frame)
+        )
+        remove_btn.pack(side="left", padx=2)
+        self._register_editable(remove_btn)
+
+        self.dataset_rows.append(
+            {
+                "frame": row_frame,
+                "id_var": id_var,
+                "source_type_var": source_type_var,
+                "source_path_var": source_path_var,
+                "center_x_var": center_x_var,
+                "center_y_var": center_y_var,
+                "radius_var": radius_var,
+                "grid_var": grid_var,
+                "dist_var": dist_var,
+                "hdr_enabled_var": hdr_enabled_var,
+                "exposure_var": exposure_var,
+                "normalize_var": normalize_var,
+            }
+        )
+
+    def _remove_dataset_row(self, frame: Any) -> None:
+        if len(self.dataset_rows) <= 1:
+            self.messagebox.showwarning("Dataset", "At least one dataset is required.")
+            return
+        for idx, row in enumerate(self.dataset_rows):
+            if row["frame"] == frame:
+                row["frame"].destroy()
+                del self.dataset_rows[idx]
+                break
+
+    def _browse_dataset_path(self, source_type_var: Any, path_var: Any) -> None:
+        source_type = source_type_var.get()
+        if source_type == "views":
+            selected = self.filedialog.askopenfilename(filetypes=[("NumPy arrays", "*.npy")])
+        elif source_type == "source_image":
+            selected = self.filedialog.askopenfilename(
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tiff *.tif")]
+            )
+        else:
+            selected = self.filedialog.askdirectory()
+        if selected:
+            path_var.set(selected)
+
+    def _on_browse_output_dir(self) -> None:
+        selected = self.filedialog.askdirectory()
+        if selected:
+            self.output_dir_entry.delete(0, self.tk.END)
+            self.output_dir_entry.insert(0, selected)
+
+    def _get_state(self) -> SpecGuiState:
+        datasets: List[SpecGuiDatasetState] = []
+        for row in self.dataset_rows:
+            datasets.append(
+                SpecGuiDatasetState(
+                    dataset_id=row["id_var"].get().strip(),
+                    source_type=row["source_type_var"].get().strip(),
+                    source_path=row["source_path_var"].get().strip(),
+                    center_x=row["center_x_var"].get().strip(),
+                    center_y=row["center_y_var"].get().strip(),
+                    view_radius=row["radius_var"].get().strip(),
+                    view_grid_size=row["grid_var"].get().strip() or "3",
+                    view_distance=row["dist_var"].get().strip(),
+                    hdr_enabled=bool(row["hdr_enabled_var"].get()),
+                    hdr_exposure_times=row["exposure_var"].get().strip(),
+                    normalize_to_8bit=bool(row["normalize_var"].get()),
+                )
+            )
+
+        return SpecGuiState(
+            output_dir=self.output_dir_entry.get().strip(),
+            strategy_pixel=bool(self.strategy_pixel_var.get()),
+            strategy_combined=bool(self.strategy_combined_var.get()),
+            strategy_global=bool(self.strategy_global_var.get()),
+            total_budget_per_dataset=self.total_budget_entry.get().strip(),
+            stage1_fraction=self.stage1_fraction_entry.get().strip(),
+            top_k=self.top_k_entry.get().strip(),
+            max_workers=self.max_workers_entry.get().strip(),
+            analyze=bool(self.analyze_var.get()),
+            save_figures=bool(self.save_figures_var.get()),
+            pixel_similarity_window_sizes=self.pixel_window_entry.get().strip(),
+            pixel_max_displacements=self.pixel_disp_entry.get().strip(),
+            pixel_gauss_sigmas=self.pixel_gauss_entry.get().strip(),
+            pixel_disp_gauss_sigmas=self.pixel_disp_gauss_entry.get().strip(),
+            pixel_thresholds=self.pixel_thresh_entry.get().strip(),
+            combined_refinement_window_sizes=self.comb_window_entry.get().strip(),
+            combined_max_displacements=self.comb_disp_entry.get().strip(),
+            combined_gauss_sigmas=self.comb_gauss_entry.get().strip(),
+            combined_disp_gauss_sigmas=self.comb_disp_gauss_entry.get().strip(),
+            combined_pixel_thresholds=self.comb_thresh_entry.get().strip(),
+            combined_global_thresholds=self.comb_global_thresh_entry.get().strip(),
+            combined_correlation_pad_widths=self.comb_corr_pad_entry.get().strip(),
+            pixel_sub_pix_factors=self.pixel_subpix_entry.get().strip(),
+            pixel_sigma_pyramid=self.pixel_pyramid_entry.get().strip(),
+            pixel_zero_fill_roll=self.pixel_zfill_entry.get().strip(),
+            combined_sub_pix_factors=self.comb_subpix_entry.get().strip(),
+            combined_sigma_pyramid=self.comb_pyramid_entry.get().strip(),
+            combined_zero_fill_roll=self.comb_zfill_entry.get().strip(),
+            combined_use_global_avg_reference=self.comb_use_global_ref_entry.get().strip(),
+            global_thresholds=self.global_thresholds_entry.get().strip(),
+            global_correlation_pad_widths=self.global_corr_pad_entry.get().strip(),
+            weight_laplacian_variance=self.weight_lap_entry.get().strip(),
+            weight_dwt_level2_hv_energy=self.weight_dwt_entry.get().strip(),
+            weight_sum_squared_gradient=self.weight_grad_entry.get().strip(),
+            weight_total_variation=self.weight_tv_entry.get().strip(),
+            runtime_penalty_weight=self.runtime_penalty_entry.get().strip(),
+            robustness_lambda=self.robustness_entry.get().strip(),
+            missing_dataset_penalty=self.missing_penalty_entry.get().strip(),
+            datasets=datasets,
+            json_preview=self.json_text.get("1.0", self.tk.END).strip(),
+        )
+
+    def _set_state(self, state: SpecGuiState) -> None:
+        self.output_dir_entry.delete(0, self.tk.END)
+        self.output_dir_entry.insert(0, state.output_dir)
+        self.strategy_pixel_var.set(state.strategy_pixel)
+        self.strategy_combined_var.set(state.strategy_combined)
+        self.strategy_global_var.set(state.strategy_global)
+        self.total_budget_entry.delete(0, self.tk.END)
+        self.total_budget_entry.insert(0, state.total_budget_per_dataset)
+        self.stage1_fraction_entry.delete(0, self.tk.END)
+        self.stage1_fraction_entry.insert(0, state.stage1_fraction)
+        self.top_k_entry.delete(0, self.tk.END)
+        self.top_k_entry.insert(0, state.top_k)
+        self.max_workers_entry.delete(0, self.tk.END)
+        self.max_workers_entry.insert(0, state.max_workers)
+        self.analyze_var.set(state.analyze)
+        self.save_figures_var.set(state.save_figures)
+
+        field_mapping = [
+            (self.pixel_window_entry, state.pixel_similarity_window_sizes),
+            (self.pixel_disp_entry, state.pixel_max_displacements),
+            (self.pixel_gauss_entry, state.pixel_gauss_sigmas),
+            (self.pixel_disp_gauss_entry, state.pixel_disp_gauss_sigmas),
+            (self.pixel_thresh_entry, state.pixel_thresholds),
+            (self.comb_window_entry, state.combined_refinement_window_sizes),
+            (self.comb_disp_entry, state.combined_max_displacements),
+            (self.comb_gauss_entry, state.combined_gauss_sigmas),
+            (self.comb_disp_gauss_entry, state.combined_disp_gauss_sigmas),
+            (self.comb_thresh_entry, state.combined_pixel_thresholds),
+            (self.comb_global_thresh_entry, state.combined_global_thresholds),
+            (self.comb_corr_pad_entry, state.combined_correlation_pad_widths),
+            (self.pixel_subpix_entry, state.pixel_sub_pix_factors),
+            (self.pixel_pyramid_entry, state.pixel_sigma_pyramid),
+            (self.pixel_zfill_entry, state.pixel_zero_fill_roll),
+            (self.comb_subpix_entry, state.combined_sub_pix_factors),
+            (self.comb_pyramid_entry, state.combined_sigma_pyramid),
+            (self.comb_zfill_entry, state.combined_zero_fill_roll),
+            (self.comb_use_global_ref_entry, state.combined_use_global_avg_reference),
+            (self.global_thresholds_entry, state.global_thresholds),
+            (self.global_corr_pad_entry, state.global_correlation_pad_widths),
+            (self.weight_lap_entry, state.weight_laplacian_variance),
+            (self.weight_dwt_entry, state.weight_dwt_level2_hv_energy),
+            (self.weight_grad_entry, state.weight_sum_squared_gradient),
+            (self.weight_tv_entry, state.weight_total_variation),
+            (self.runtime_penalty_entry, state.runtime_penalty_weight),
+            (self.robustness_entry, state.robustness_lambda),
+            (self.missing_penalty_entry, state.missing_dataset_penalty),
+        ]
+        for widget, value in field_mapping:
+            widget.delete(0, self.tk.END)
+            widget.insert(0, value)
+
+        self._clear_dataset_rows()
+        for dataset in state.datasets:
+            self._add_dataset_row(dataset)
+
+        self.json_text.delete("1.0", self.tk.END)
+        if state.json_preview:
+            self.json_text.insert(self.tk.END, state.json_preview)
+
+    def _on_refresh_json_preview(self) -> None:
+        try:
+            payload = state_to_spec_dict(self._get_state())
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("JSON Preview", str(exc))
+            return
+        self.json_text.delete("1.0", self.tk.END)
+        self.json_text.insert(self.tk.END, json.dumps(payload, indent=2))
+
+    def _on_apply_json_preview(self) -> None:
+        raw = self.json_text.get("1.0", self.tk.END).strip()
+        if not raw:
+            self.messagebox.showwarning("JSON Preview", "JSON preview is empty.")
+            return
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("JSON must be an object.")
+            state = spec_dict_to_state(cast(Dict[str, object], payload))
+            self._set_state(state)
+            issues = validate_state(state)
+            if issues:
+                self.messagebox.showwarning(
+                    "Spec Loaded with Warnings",
+                    "\n".join(issues[:10]),
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("JSON Preview", str(exc))
+
+    def _on_load_spec(self) -> None:
+        selected = self.filedialog.askopenfilename(
+            filetypes=[("JSON", "*.json"), ("All Files", "*.*")]
+        )
+        if not selected:
+            return
+        try:
+            payload = _load_spec_payload(Path(selected))
+            state = spec_dict_to_state(payload)
+            self._set_state(state)
+            issues = validate_state(state)
+            if issues:
+                self.messagebox.showwarning(
+                    "Spec Loaded with Warnings",
+                    "\n".join(issues[:10]),
+                )
+            self._append_log(f"Loaded spec: {selected}")
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("Load Spec", str(exc))
+
+    def _on_save_spec(self, template: bool = False) -> None:
+        state = self._get_state()
+        issues = validate_state(state)
+        if issues:
+            self.messagebox.showerror("Save Spec", "\n".join(issues[:10]))
+            return
+        try:
+            payload = state_to_spec_dict(state)
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("Save Spec", str(exc))
+            return
+        default_name = "sweep_spec_template.json" if template else "sweep_spec.json"
+        selected = self.filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON", "*.json"), ("All Files", "*.*")],
+        )
+        if not selected:
+            return
+        _save_spec_payload(Path(selected), payload)
+        self._append_log(f"Saved spec: {selected}")
+
+    def _run_worker(self, payload: Dict[str, object]) -> None:
+        self.log_queue.put({"type": "log", "message": "Preparing experiment spec..."})
+        try:
+            spec = SweepExperimentSpec.from_dict(payload)
+            self.log_queue.put({"type": "log", "message": f"Running sweep with {len(spec.datasets)} dataset(s)..."} )
+            output_dir = run_sweep_experiment(spec)
+            self.log_queue.put(
+                {"type": "done", "output_dir": str(output_dir), "message": "Sweep completed successfully."}
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log_queue.put(
+                {
+                    "type": "error",
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+
+    def _on_run(self) -> None:
+        if self._is_running:
+            return
+        state = self._get_state()
+        issues = validate_state(state)
+        if issues:
+            self.messagebox.showerror("Run Sweep", "\n".join(issues[:12]))
+            return
+        try:
+            payload = state_to_spec_dict(state)
+            SweepExperimentSpec.from_dict(payload)
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("Run Sweep", str(exc))
+            return
+        self.status_var.set("Running...")
+        self._is_running = True
+        self._set_editable_enabled(False)
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", self.tk.END)
+        self.log_text.configure(state="disabled")
+        self._append_log("Starting background sweep run...")
+        self.run_thread = threading.Thread(target=self._run_worker, args=(payload,), daemon=True)
+        self.run_thread.start()
+
+    def _on_run_done(self, output_dir: str, message: str) -> None:
+        self.status_var.set("Completed")
+        self._set_editable_enabled(True)
+        self._is_running = False
+        self._append_log(message)
+        self._show_completion_dialog(Path(output_dir))
+
+    def _on_run_error(self, message: str, trace_text: str) -> None:
+        self.status_var.set("Failed")
+        self._set_editable_enabled(True)
+        self._is_running = False
+        self._append_log("Sweep failed.")
+        self._append_log(message)
+        self.messagebox.showerror("Sweep Failed", f"{message}\n\n{trace_text}")
+
+    def _poll_logs(self) -> None:
+        while True:
+            try:
+                event = self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+            event_type = str(event.get("type", "log"))
+            if event_type == "log":
+                self._append_log(str(event.get("message", "")))
+            elif event_type == "done":
+                self._on_run_done(
+                    str(event.get("output_dir", "")),
+                    str(event.get("message", "Sweep completed.")),
+                )
+            elif event_type == "error":
+                self._on_run_error(
+                    str(event.get("message", "Unknown error")),
+                    str(event.get("traceback", "")),
+                )
+        self.root.after(150, self._poll_logs)
+
+    def _show_completion_dialog(self, output_dir: Path) -> None:
+        dialog = self.tk.Toplevel(self.root)
+        dialog.title("Sweep Complete")
+        dialog.geometry("540x180")
+        self.ttk.Label(
+            dialog, text=f"Artifacts written to:\n{output_dir}", wraplength=520
+        ).pack(padx=10, pady=10, anchor="w")
+        button_frame = self.ttk.Frame(dialog)
+        button_frame.pack(fill="x", padx=10, pady=10)
+
+        def open_output() -> None:
+            ok, err = _open_with_system(output_dir)
+            if not ok:
+                self.messagebox.showerror("Open Output Folder", err or "Failed to open folder.")
+
+        def open_leaderboard() -> None:
+            leaderboard = output_dir / "leaderboard.json"
+            if not leaderboard.exists():
+                self.messagebox.showwarning("Open Leaderboard", f"File not found: {leaderboard}")
+                return
+            ok, err = _open_with_system(leaderboard)
+            if not ok:
+                self.messagebox.showerror("Open Leaderboard", err or "Failed to open file.")
+
+        self.ttk.Button(button_frame, text="Open Output Folder", command=open_output).pack(side="left", padx=4)
+        self.ttk.Button(button_frame, text="Open leaderboard.json", command=open_leaderboard).pack(side="left", padx=4)
+        self.ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side="right", padx=4)
+
+
+def launch_spec_gui() -> None:
+    import tkinter as tk
+
+    root = tk.Tk()
+    SpecGuiApp(root)
+    root.mainloop()
+
+
+def _legacy_launch_gui_unused() -> None:
+    launch_spec_gui()
+    return
+
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
@@ -1992,6 +3711,11 @@ def _launch_gui() -> None:
     )
 
     root.mainloop()
+
+
+def _launch_gui() -> None:
+    """Launch the spec-based sweep GUI."""
+    launch_spec_gui()
 
 
 def main(argv: Sequence[str] | None = None) -> None:

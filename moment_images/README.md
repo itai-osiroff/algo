@@ -48,11 +48,17 @@ python -m moment_images.parameter_sweep --views path/to/views.npy
 
 ### Parameter sweep (GUI)
 
-Launch the GUI to configure the sweep without CLI flags:
+Launch the spec-based GUI to configure and run the new two-stage sweep without manually editing JSON:
 
 ```bash
 python -m moment_images.parameter_sweep --gui
 ```
+
+GUI highlights:
+
+- Add/remove multiple datasets (`views`, `source_image`, or `source_image_dir`).
+- Edit basic search ranges plus advanced scoring/search toggles.
+- Save/load spec JSON and run in background with live logs.
 
 ### System gain calibration (CLI + GUI)
 

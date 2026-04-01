@@ -9,7 +9,6 @@ from moment_images.batch_process_validation_images import (
     BatchProcessOptions,
     apply_processing_pipeline,
     build_output_path,
-    cast_processed_to_dtype,
     list_supported_images,
     process_folder,
 )
@@ -86,6 +85,13 @@ def test_build_output_path_adds_processed_suffix(tmp_path: Path):
     assert output == output_dir / "frame_001_processed.tif"
 
 
+def test_build_output_path_converts_non_tiff_inputs_to_tiff(tmp_path: Path):
+    source = tmp_path / "frame_001.png"
+    output_dir = tmp_path / "out"
+    output = build_output_path(source, output_dir)
+    assert output == output_dir / "frame_001_processed.tiff"
+
+
 def test_process_folder_skips_existing_outputs(tmp_path: Path):
     input_dir = tmp_path / "inputs"
     output_dir = tmp_path / "outputs"
@@ -93,7 +99,7 @@ def test_process_folder_skips_existing_outputs(tmp_path: Path):
     output_dir.mkdir()
 
     _save_u8_image(input_dir / "sample.png", np.full((8, 8), 125, dtype=np.uint8))
-    _save_u8_image(output_dir / "sample_processed.png", np.full((8, 8), 5, dtype=np.uint8))
+    _save_u8_image(output_dir / "sample_processed.tiff", np.full((8, 8), 5, dtype=np.uint8))
 
     summary = process_folder(input_dir, output_dir, BatchProcessOptions())
 
@@ -117,22 +123,11 @@ def test_process_folder_continues_after_failure(tmp_path: Path):
     assert len(summary.processed) == 1
     assert len(summary.failed) == 1
     assert len(summary.skipped) == 0
-    assert (output_dir / "good_processed.png").exists()
+    assert (output_dir / "good_processed.tiff").exists()
     assert summary.failed[0].input_path.name == "bad.png"
 
 
-def test_cast_processed_to_dtype_integer_and_float():
-    src = np.array([[-5.4, 11.2, 299.9]], dtype=np.float32)
-
-    cast_u8 = cast_processed_to_dtype(src, np.uint8)
-    np.testing.assert_array_equal(cast_u8, np.array([[0, 11, 255]], dtype=np.uint8))
-
-    cast_f32 = cast_processed_to_dtype(src, np.float32)
-    assert cast_f32.dtype == np.float32
-    np.testing.assert_allclose(cast_f32, src)
-
-
-def test_process_folder_preserves_input_dtype_for_saved_output(tmp_path: Path):
+def test_process_folder_saves_float32_output_even_for_uint16_input(tmp_path: Path):
     input_dir = tmp_path / "inputs"
     output_dir = tmp_path / "outputs"
     input_dir.mkdir()
@@ -146,5 +141,4 @@ def test_process_folder_preserves_input_dtype_for_saved_output(tmp_path: Path):
     assert len(summary.failed) == 0
 
     output = np.asarray(Image.open(output_dir / "raw_processed.tiff"))
-    assert output.dtype == np.uint16
-
+    assert output.dtype == np.float32
