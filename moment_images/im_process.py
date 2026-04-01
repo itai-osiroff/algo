@@ -2,6 +2,7 @@ import os
 import sys
 import PIL
 from dataclasses import dataclass
+from pathlib import Path
 from PIL import Image
 import numpy as np
 import cv2 as cv
@@ -19,6 +20,7 @@ if __package__ is None or __package__ == "":
         PixelwisePatchRectificationStrategy,
         resolve_reference_view,
     )
+    from reliable_io import write_npz_atomic
 else:
     # Imported as a module within the package
     from .rectification_strategy import (
@@ -26,6 +28,7 @@ else:
         PixelwisePatchRectificationStrategy,
         resolve_reference_view,
     )
+    from .reliable_io import write_npz_atomic
 
 # --- Constants ---
 DEFAULT_IMAGE_DIR = 'moment_images/images'
@@ -66,9 +69,45 @@ class RectificationRunConfig:
     zero_fill_roll: bool = True
     sub_pix_factor: int = 2
     combined_use_global_avg_reference: bool = True
+    displacement_metric_family: str = "ncc_gradient"
+    displacement_alpha: float = 0.5
+    displacement_component_weights: Optional[Dict[str, float]] = None
+    metric_formulation_id: str = "default_ncc_gradient_a0p5"
     hdr_enabled: bool = False
     hdr_exposure_times: Optional[List[float]] = None
     normalize_to_8bit: bool = False
+
+    def __post_init__(self) -> None:
+        alpha = float(self.displacement_alpha)
+        if not np.isfinite(alpha):
+            raise ValueError("displacement_alpha must be finite.")
+        if alpha < 0.0 or alpha > 1.0:
+            raise ValueError("displacement_alpha must be between 0 and 1.")
+        self.displacement_alpha = alpha
+
+        family = str(self.displacement_metric_family).strip().lower()
+        if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
+            raise ValueError(
+                "displacement_metric_family must be one of "
+                "'ncc_gradient', 'ncc_laplacian', or 'composite'."
+            )
+        self.displacement_metric_family = family
+
+        if self.displacement_component_weights is not None:
+            normalized_weights: Dict[str, float] = {}
+            for key, raw_value in self.displacement_component_weights.items():
+                parsed = float(raw_value)
+                if not np.isfinite(parsed):
+                    raise ValueError("displacement_component_weights values must be finite.")
+                if parsed < 0.0:
+                    raise ValueError("displacement_component_weights values must be non-negative.")
+                normalized_weights[str(key)] = parsed
+            self.displacement_component_weights = normalized_weights
+
+        formulation_id = str(self.metric_formulation_id).strip()
+        if not formulation_id:
+            raise ValueError("metric_formulation_id must be non-empty.")
+        self.metric_formulation_id = formulation_id
 
 
 @dataclass
@@ -258,6 +297,9 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             thresh=config.pixel_threshold,
             sub_pix_factor=config.sub_pix_factor,
             use_sigma_pyramid=config.pixel_sigma_pyramid,
+            metric_family=config.displacement_metric_family,
+            alpha=config.displacement_alpha,
+            component_weights=config.displacement_component_weights,
         )
         if exposure_views is not None:
             rectified_view_stack = []
@@ -326,6 +368,9 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             sub_pix_factor=config.sub_pix_factor,
             reference_view=reference_view,
             use_sigma_pyramid=config.pixel_sigma_pyramid,
+            metric_family=config.displacement_metric_family,
+            alpha=config.displacement_alpha,
+            component_weights=config.displacement_component_weights,
         )
         avg_image, rectified_views = rectification_strategy_pixel.rectify(
             global_rectified_views, pixel_similarity, ref_view_idx
@@ -1030,9 +1075,10 @@ def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
     if not filtered:
         print("No workspace variables available to save.")
         return
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    target_path = Path(save_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        np.savez_compressed(os.path.join(save_path), **filtered)
+        write_npz_atomic(target_path, filtered, compressed=True, create_backup=True)
         print(f"Saved .npy workspace variables to: {save_path}")
     except Exception as exc:
         print(f"Failed to save .npy workspace variables: {exc}")

@@ -10,7 +10,7 @@ interactive ``main`` workflow.
 from __future__ import annotations
 
 import argparse
-import csv
+import hashlib
 import json
 import math
 import os
@@ -24,7 +24,7 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, cast
@@ -47,9 +47,19 @@ from moment_images.im_process import (
     extract_views,
     VIEW_DISTANCE_SCALE_FACTOR,
 )
+from moment_images.reliable_io import (
+    FirstValidReadError,
+    read_json_first_valid,
+    read_npy_first_valid,
+    read_npz_first_valid,
+    write_csv_atomic,
+    write_json_atomic,
+    write_npy_atomic,
+)
 from moment_images.sweep_analysis import (
     analyze_summary_data,
     build_metric_record,
+    generate_alpha_report,
     save_analysis,
 )
 
@@ -264,6 +274,71 @@ class SweepScoringSpec:
 
 
 @dataclass
+class MetricFormulationSpec:
+    """Displacement metric family definition used as a sweep dimension."""
+
+    formulation_id: str
+    family: str = "ncc_gradient"
+    alphas: List[float] = field(default_factory=lambda: [0.5])
+    component_weights: Optional[Dict[str, float]] = None
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, object], default_idx: int) -> "MetricFormulationSpec":
+        raw_id = str(payload.get("id") or payload.get("formulation_id") or "").strip()
+        formulation_id = raw_id or f"formulation_{default_idx:02d}"
+
+        family = str(payload.get("family", "ncc_gradient")).strip().lower()
+        if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
+            raise ValueError(
+                "metric_formulations[].family must be one of "
+                "'ncc_gradient', 'ncc_laplacian', or 'composite'."
+            )
+
+        alphas_raw = cast(Optional[List[object]], payload.get("alphas"))
+        if alphas_raw is None:
+            alpha_single = payload.get("alpha")
+            if alpha_single is None:
+                alphas = [0.5]
+            else:
+                alphas = [float(alpha_single)]
+        else:
+            if not alphas_raw:
+                raise ValueError("metric_formulations[].alphas cannot be empty.")
+            alphas = [float(item) for item in alphas_raw]
+        for alpha in alphas:
+            if not np.isfinite(alpha) or alpha < 0.0 or alpha > 1.0:
+                raise ValueError("metric_formulations alpha values must be finite and in [0, 1].")
+
+        raw_weights_payload = cast(Optional[Dict[str, object]], payload.get("component_weights"))
+        parsed_weights: Optional[Dict[str, float]] = None
+        if raw_weights_payload is not None:
+            parsed_weights = {}
+            for key, raw_value in raw_weights_payload.items():
+                numeric = float(raw_value)
+                if not np.isfinite(numeric):
+                    raise ValueError("component_weights values must be finite.")
+                if numeric < 0.0:
+                    raise ValueError("component_weights values must be non-negative.")
+                parsed_weights[str(key)] = numeric
+
+        return cls(
+            formulation_id=formulation_id,
+            family=family,
+            alphas=alphas,
+            component_weights=parsed_weights,
+        )
+
+
+@dataclass
+class SweepReportingSpec:
+    """Controls alpha/family report generation after the experiment."""
+
+    primary_metric: str = "laplacian_variance"
+    tolerate_partial_outputs: bool = True
+    generate_alpha_report: bool = True
+
+
+@dataclass
 class SweepExperimentSpec:
     """Top-level experiment definition loaded from ``--spec`` JSON."""
 
@@ -272,6 +347,17 @@ class SweepExperimentSpec:
     strategies: List[str] = field(default_factory=lambda: ["pixel", "combined"])
     stages: SweepStageSpec = field(default_factory=SweepStageSpec)
     scoring: SweepScoringSpec = field(default_factory=SweepScoringSpec)
+    metric_formulations: List[MetricFormulationSpec] = field(
+        default_factory=lambda: [
+            MetricFormulationSpec(
+                formulation_id="default_ncc_gradient",
+                family="ncc_gradient",
+                alphas=[0.5],
+                component_weights=None,
+            )
+        ]
+    )
+    reporting: SweepReportingSpec = field(default_factory=SweepReportingSpec)
     output_dir: Optional[str] = None
     save_figures: bool = False
     analyze: bool = True
@@ -319,12 +405,42 @@ class SweepExperimentSpec:
             metric_scope=str(scoring_raw.get("metric_scope", "global_and_local_metrics")),
         )
 
+        formulations_raw = cast(
+            Optional[List[Dict[str, object]]], payload.get("metric_formulations")
+        )
+        if not formulations_raw:
+            metric_formulations = [
+                MetricFormulationSpec(
+                    formulation_id="default_ncc_gradient",
+                    family="ncc_gradient",
+                    alphas=[0.5],
+                    component_weights=None,
+                )
+            ]
+        else:
+            metric_formulations = [
+                MetricFormulationSpec.from_dict(item, idx + 1)
+                for idx, item in enumerate(formulations_raw)
+            ]
+            formulation_ids = [item.formulation_id for item in metric_formulations]
+            if len(formulation_ids) != len(set(formulation_ids)):
+                raise ValueError("metric_formulations IDs must be unique.")
+
+        reporting_raw = cast(Dict[str, object], payload.get("reporting", {}))
+        reporting = SweepReportingSpec(
+            primary_metric=str(reporting_raw.get("primary_metric", "laplacian_variance")),
+            tolerate_partial_outputs=bool(reporting_raw.get("tolerate_partial_outputs", True)),
+            generate_alpha_report=bool(reporting_raw.get("generate_alpha_report", True)),
+        )
+
         return cls(
             datasets=datasets,
             search_spaces=search_spaces,
             strategies=strategies,
             stages=stages,
             scoring=scoring,
+            metric_formulations=metric_formulations,
+            reporting=reporting,
             output_dir=cast(Optional[str], payload.get("output_dir")),
             save_figures=bool(payload.get("save_figures", False)),
             analyze=bool(payload.get("analyze", True)),
@@ -345,6 +461,9 @@ class PreparedDataset:
     views_shape: Tuple[int, ...]
     views_dtype: str
     views_itemsize: int
+    resolved_views_path: Optional[str] = None
+    views_file_size_bytes: Optional[int] = None
+    views_file_mtime_ns: Optional[int] = None
 
 
 @dataclass
@@ -450,8 +569,54 @@ def _assign_candidate_ids(candidates: Sequence[SweepCandidate], prefix: str) -> 
     return assigned
 
 
+def _metric_formulation_from_params(
+    params: Dict[str, object],
+) -> Tuple[str, float, Optional[Dict[str, float]], str]:
+    family = str(params.get("displacement_metric_family", "ncc_gradient")).strip().lower()
+    alpha = float(params.get("displacement_alpha", 0.5))
+    raw_weights_obj = params.get("displacement_component_weights")
+    parsed_weights: Optional[Dict[str, float]] = None
+    if raw_weights_obj is not None:
+        parsed_weights = {
+            str(key): float(value)
+            for key, value in cast(Dict[str, object], raw_weights_obj).items()
+        }
+    formulation_id = str(params.get("metric_formulation_id", "default_ncc_gradient_a0p5")).strip()
+    if not formulation_id:
+        formulation_id = "default_ncc_gradient_a0p5"
+    return family, alpha, parsed_weights, formulation_id
+
+
+def _expand_candidates_with_metric_formulations(
+    candidates: Sequence[SweepCandidate],
+    metric_formulations: Sequence[MetricFormulationSpec],
+) -> List[SweepCandidate]:
+    expanded: List[SweepCandidate] = []
+    for candidate in candidates:
+        for formulation in metric_formulations:
+            for alpha in formulation.alphas:
+                params = dict(candidate.params)
+                params["displacement_metric_family"] = formulation.family
+                params["displacement_alpha"] = float(alpha)
+                params["metric_formulation_id"] = formulation.formulation_id
+                params["displacement_component_weights"] = (
+                    None
+                    if formulation.component_weights is None
+                    else dict(formulation.component_weights)
+                )
+                expanded.append(_build_candidate_from_params(candidate.strategy, params))
+    expanded.sort(key=lambda item: json.dumps(item.params, sort_keys=True))
+    return expanded
+
+
 def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> SweepCandidate:
     defaults = RectificationRunConfig()
+    (
+        displacement_metric_family,
+        displacement_alpha,
+        displacement_component_weights,
+        metric_formulation_id,
+    ) = _metric_formulation_from_params(params)
     if strategy == "pixel":
         window = _normalize_window_size(int(params["similarity_window_size"]))
         gauss_sigma = float(params["gauss_sigma"])
@@ -472,6 +637,10 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             pixel_sigma_pyramid=bool(params["pixel_sigma_pyramid"]),
             zero_fill_roll=bool(params["zero_fill_roll"]),
             sub_pix_factor=int(params["sub_pix_factor"]),
+            displacement_metric_family=displacement_metric_family,
+            displacement_alpha=displacement_alpha,
+            displacement_component_weights=displacement_component_weights,
+            metric_formulation_id=metric_formulation_id,
         )
         normalized_params = dict(params)
         normalized_params["similarity_window_size"] = window
@@ -501,6 +670,10 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             zero_fill_roll=bool(params["zero_fill_roll"]),
             sub_pix_factor=int(params["sub_pix_factor"]),
             combined_use_global_avg_reference=bool(params["combined_use_global_avg_reference"]),
+            displacement_metric_family=displacement_metric_family,
+            displacement_alpha=displacement_alpha,
+            displacement_component_weights=displacement_component_weights,
+            metric_formulation_id=metric_formulation_id,
         )
         normalized_params = dict(params)
         normalized_params["refinement_window_size"] = window
@@ -513,6 +686,10 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             strategy="global",
             correlation_pad_width=int(params["correlation_pad_width"]),
             global_threshold=float(params["global_threshold"]),
+            displacement_metric_family=displacement_metric_family,
+            displacement_alpha=displacement_alpha,
+            displacement_component_weights=displacement_component_weights,
+            metric_formulation_id=metric_formulation_id,
         )
         return SweepCandidate(strategy="global", params=dict(params), config=config)
 
@@ -738,10 +915,9 @@ def _stage_budgets(stage_spec: SweepStageSpec) -> Tuple[int, int]:
 
 
 def _parse_experiment_spec(path: Path) -> SweepExperimentSpec:
-    if not path.exists():
+    if not path.exists() and not Path(f"{path}.bak").exists():
         raise FileNotFoundError(f"Sweep spec file not found: {path}")
-    with path.open("r", encoding="utf-8") as fp:
-        payload = json.load(fp)
+    payload, _, _ = read_json_first_valid(path, validator=lambda obj: isinstance(obj, dict))
     if not isinstance(payload, dict):
         raise ValueError("Sweep spec must be a JSON object.")
     return SweepExperimentSpec.from_dict(payload)
@@ -751,6 +927,7 @@ def _save_run_artifacts(
     output_dir: Path,
     run_name: str,
     result: RectificationResult,
+    metric_record: Optional[Dict[str, object]] = None,
 ) -> None:
     config = result.config
     run_dir = output_dir / run_name
@@ -760,13 +937,25 @@ def _save_run_artifacts(
     avg_preview = np.asarray(min_max_normalize(result.avg_image), dtype=np.uint8)
     Image.fromarray(avg_preview).save(avg_img_path)
 
-    np.save(run_dir / "rectified_views.npy", result.rectified_views)
+    write_npy_atomic(
+        run_dir / "rectified_views.npy",
+        result.rectified_views,
+        allow_pickle=False,
+        create_backup=True,
+    )
 
     pixel_displacements_x = None
     pixel_displacements_y = None
+    pixel_blended_scores = None
+    pixel_component_scores: Dict[str, np.ndarray] = {}
     if result.pixel_similarity is not None:
         pixel_displacements_x = getattr(result.pixel_similarity, "disps_x", None)
         pixel_displacements_y = getattr(result.pixel_similarity, "disps_y", None)
+        pixel_blended_scores = getattr(result.pixel_similarity, "blended_score_maps", None)
+        component_scores = getattr(result.pixel_similarity, "component_score_maps", None)
+        if isinstance(component_scores, dict):
+            for key, value in component_scores.items():
+                pixel_component_scores[str(key)] = np.asarray(value)
 
     config_dict = asdict(config)
     strategy_code = {"global": 1, "pixel": 2, "combined": 3}.get(config.strategy.lower(), 0)
@@ -781,6 +970,7 @@ def _save_run_artifacts(
         ),
         "pixel_displacements_x": pixel_displacements_x,
         "pixel_displacements_y": pixel_displacements_y,
+        "pixel_blended_scores": pixel_blended_scores,
         "reference_view_index": np.array(result.ref_view_index),
         "rectification_strategy": np.array(strategy_code),
         "hdr_enabled": np.array(config.hdr_enabled),
@@ -792,11 +982,23 @@ def _save_run_artifacts(
         "normalize_to_8bit": np.array(config.normalize_to_8bit),
         "run_name": np.array(run_name),
         "config_json": np.array(json.dumps(config_dict, sort_keys=True)),
+        "displacement_metric_family": np.array(config.displacement_metric_family),
+        "displacement_alpha": np.array(config.displacement_alpha, dtype=np.float64),
+        "metric_formulation_id": np.array(config.metric_formulation_id),
     }
+    for component_name, component_values in pixel_component_scores.items():
+        workspace_data[f"pixel_component_score_{component_name}"] = component_values
     save_workspace_variables(str(run_dir / "workspace.npz"), workspace_data)
 
-    with (run_dir / "config.json").open("w", encoding="utf-8") as fp:
-        json.dump(config_dict, fp, indent=2)
+    write_json_atomic(run_dir / "config.json", config_dict, indent=2, sort_keys=True, create_backup=True)
+    if metric_record is not None:
+        write_json_atomic(
+            run_dir / "metric_record.json",
+            metric_record,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
+        )
 
 
 def _persist_figures(figures: Dict[str, List[Figure]], base_dir: Path) -> None:
@@ -808,9 +1010,10 @@ def _persist_figures(figures: Dict[str, List[Figure]], base_dir: Path) -> None:
 
 
 def _load_views(path: Path) -> np.ndarray:
-    if not path.exists():
-        raise FileNotFoundError(f"Views file not found: {path}")
-    views = np.load(path)
+    try:
+        views, _, _ = read_npy_first_valid(path, allow_pickle=False)
+    except FirstValidReadError as exc:
+        raise FileNotFoundError(f"Views file not found or unreadable: {path}") from exc
     if views.ndim == 4:
         if views.shape[0] != views.shape[1]:
             raise ValueError("views must have shape (N, N, H, W)")
@@ -850,7 +1053,7 @@ def _generate_views(
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / "generated_views.npy"
-    np.save(cache_path, views)
+    write_npy_atomic(cache_path, views, allow_pickle=False, create_backup=True)
     return views, cache_path
 
 
@@ -897,7 +1100,7 @@ def _generate_exposure_views(
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / "generated_exposure_views.npy"
     exposure_views_arr = np.asarray(exposure_views)
-    np.save(cache_path, exposure_views_arr)
+    write_npy_atomic(cache_path, exposure_views_arr, allow_pickle=False, create_backup=True)
     return exposure_views_arr, cache_path
 
 
@@ -933,6 +1136,7 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             raise ValueError(
                 f"Dataset '{dataset.dataset_id}' exposure time count does not match exposure axis."
             )
+        stat = views_path.stat()
         return PreparedDataset(
             dataset_id=dataset.dataset_id,
             views_path=views_path,
@@ -942,6 +1146,9 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             views_shape=tuple(int(dim) for dim in views_arr.shape),
             views_dtype=str(views_arr.dtype),
             views_itemsize=int(views_arr.dtype.itemsize),
+            resolved_views_path=str(views_path.resolve()),
+            views_file_size_bytes=int(stat.st_size),
+            views_file_mtime_ns=int(stat.st_mtime_ns),
         )
 
     if dataset.source_image is not None:
@@ -972,6 +1179,7 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             raise ValueError(
                 f"Dataset '{dataset.dataset_id}' uses a single source image and cannot enable HDR."
             )
+        stat = views_path.stat()
         return PreparedDataset(
             dataset_id=dataset.dataset_id,
             views_path=views_path,
@@ -981,6 +1189,9 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             views_shape=tuple(int(dim) for dim in views_arr.shape),
             views_dtype=str(views_arr.dtype),
             views_itemsize=int(views_arr.dtype.itemsize),
+            resolved_views_path=str(views_path.resolve()),
+            views_file_size_bytes=int(stat.st_size),
+            views_file_mtime_ns=int(stat.st_mtime_ns),
         )
 
     # source_image_dir branch
@@ -1016,6 +1227,7 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
         raise ValueError(
             f"Dataset '{dataset.dataset_id}' exposure time count does not match exposure stack."
         )
+    stat = views_path.stat()
     return PreparedDataset(
         dataset_id=dataset.dataset_id,
         views_path=views_path,
@@ -1025,6 +1237,9 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
         views_shape=tuple(int(dim) for dim in views_arr.shape),
         views_dtype=str(views_arr.dtype),
         views_itemsize=int(views_arr.dtype.itemsize),
+        resolved_views_path=str(views_path.resolve()),
+        views_file_size_bytes=int(stat.st_size),
+        views_file_mtime_ns=int(stat.st_mtime_ns),
     )
 
 
@@ -1038,6 +1253,177 @@ def _prepare_datasets(spec: SweepExperimentSpec, output_dir: Path) -> List[Prepa
         prepared.append(_prepare_dataset(dataset, output_dir=output_dir))
     prepared.sort(key=lambda item: item.dataset_id)
     return prepared
+
+
+RUN_STATE_FILENAME = "run_state.json"
+RUN_STATE_SCHEMA_VERSION = 1
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _dataset_identity_payload(dataset: PreparedDataset) -> Dict[str, object]:
+    return {
+        "dataset_id": dataset.dataset_id,
+        "resolved_views_path": dataset.resolved_views_path or str(dataset.views_path.resolve()),
+        "views_shape": list(dataset.views_shape),
+        "views_dtype": dataset.views_dtype,
+        "views_itemsize": int(dataset.views_itemsize),
+        "views_file_size_bytes": dataset.views_file_size_bytes,
+        "views_file_mtime_ns": dataset.views_file_mtime_ns,
+    }
+
+
+def _build_experiment_fingerprint_payload(
+    spec: SweepExperimentSpec,
+    prepared_datasets: Sequence[PreparedDataset],
+    output_dir: Path,
+) -> Dict[str, object]:
+    spec_snapshot = asdict(spec)
+    spec_snapshot["output_dir"] = str(output_dir.resolve())
+    datasets_payload = sorted(
+        [_dataset_identity_payload(dataset) for dataset in prepared_datasets],
+        key=lambda item: str(item["dataset_id"]),
+    )
+    return {
+        "schema_version": RUN_STATE_SCHEMA_VERSION,
+        "output_dir": str(output_dir.resolve()),
+        "spec": spec_snapshot,
+        "datasets": datasets_payload,
+    }
+
+
+def _compute_experiment_fingerprint(payload: Dict[str, object]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _persist_run_state(state_path: Path, state: Dict[str, object]) -> None:
+    state["updated_at"] = _utc_now_iso()
+    write_json_atomic(state_path, state, indent=2, sort_keys=False, create_backup=True)
+
+
+def _load_or_initialize_run_state(
+    output_dir: Path,
+    fingerprint_payload: Dict[str, object],
+) -> Tuple[Dict[str, object], Path]:
+    state_path = output_dir / RUN_STATE_FILENAME
+    fingerprint = _compute_experiment_fingerprint(fingerprint_payload)
+    if state_path.exists() or Path(f"{state_path}.bak").exists():
+        loaded, _, _ = read_json_first_valid(
+            state_path,
+            validator=lambda obj: isinstance(obj, dict),
+        )
+        state = cast(Dict[str, object], loaded)
+        existing_fingerprint = str(state.get("experiment_fingerprint", ""))
+        if existing_fingerprint != fingerprint:
+            raise ValueError(
+                "Output directory contains run_state.json with a different experiment "
+                "fingerprint. Refusing to resume with mismatched spec/dataset/path."
+            )
+        existing_output_dir = str(cast(Dict[str, object], state.get("path_compatibility", {})).get("output_dir", ""))
+        current_output_dir = str(output_dir.resolve())
+        if existing_output_dir and existing_output_dir != current_output_dir:
+            raise ValueError(
+                "run_state.json output path mismatch detected. "
+                f"state={existing_output_dir}, current={current_output_dir}"
+            )
+        return state, state_path
+
+    state: Dict[str, object] = {
+        "schema_version": RUN_STATE_SCHEMA_VERSION,
+        "created_at": _utc_now_iso(),
+        "updated_at": _utc_now_iso(),
+        "experiment_fingerprint": fingerprint,
+        "path_compatibility": {
+            "output_dir": str(output_dir.resolve()),
+        },
+        "fingerprint_payload": fingerprint_payload,
+        "stages": {},
+        "runs": {},
+    }
+    _persist_run_state(state_path, state)
+    return state, state_path
+
+
+def _validate_run_artifacts(run_dir: Path) -> Dict[str, object]:
+    diagnostics: Dict[str, object] = {
+        "run_dir": str(run_dir),
+        "valid": False,
+        "missing": [],
+        "corrupt": [],
+    }
+    required_paths = {
+        "config": run_dir / "config.json",
+        "metric_record": run_dir / "metric_record.json",
+        "rectified_views": run_dir / "rectified_views.npy",
+        "workspace": run_dir / "workspace.npz",
+        "avg_rectified": run_dir / "avg_rectified.png",
+    }
+    missing = cast(List[str], diagnostics["missing"])
+    corrupt = cast(List[str], diagnostics["corrupt"])
+    for key, path in required_paths.items():
+        if not path.exists() and not Path(f"{path}.bak").exists():
+            missing.append(f"{key}:{path.name}")
+
+    if missing:
+        diagnostics["valid"] = False
+        return diagnostics
+
+    try:
+        read_json_first_valid(required_paths["config"], validator=lambda obj: isinstance(obj, dict))
+    except Exception as exc:  # noqa: BLE001
+        corrupt.append(f"config:{type(exc).__name__}")
+    try:
+        read_json_first_valid(
+            required_paths["metric_record"],
+            validator=lambda obj: isinstance(obj, dict) and "global_and_local_metrics" in cast(Dict[str, object], obj),
+        )
+    except Exception as exc:  # noqa: BLE001
+        corrupt.append(f"metric_record:{type(exc).__name__}")
+    try:
+        read_npy_first_valid(required_paths["rectified_views"], allow_pickle=False)
+    except Exception as exc:  # noqa: BLE001
+        corrupt.append(f"rectified_views:{type(exc).__name__}")
+    try:
+        read_npz_first_valid(
+            required_paths["workspace"],
+            allow_pickle=True,
+            validator=lambda obj: "rectified_views" in obj and "average_rectified_image" in obj,
+        )
+    except Exception as exc:  # noqa: BLE001
+        corrupt.append(f"workspace:{type(exc).__name__}")
+    if not required_paths["avg_rectified"].exists() and not Path(f"{required_paths['avg_rectified']}.bak").exists():
+        corrupt.append("avg_rectified:missing")
+
+    diagnostics["valid"] = not corrupt and not missing
+    return diagnostics
+
+
+def _load_cached_stage_result(task: Dict[str, object], run_dir: Path) -> Dict[str, object]:
+    config_payload, _, _ = read_json_first_valid(
+        run_dir / "config.json",
+        validator=lambda obj: isinstance(obj, dict),
+    )
+    metric_record, _, _ = read_json_first_valid(
+        run_dir / "metric_record.json",
+        validator=lambda obj: isinstance(obj, dict),
+    )
+    return {
+        "status": "ok",
+        "stage": str(task["stage"]),
+        "candidate_id": str(task["candidate_id"]),
+        "dataset_id": str(task["dataset_id"]),
+        "strategy": str(task["strategy"]),
+        "run_uid": str(task["run_uid"]),
+        "run_dir": str(run_dir),
+        "runtime_seconds": float(0.0),
+        "config": config_payload,
+        "params": task["params"],
+        "metric_record": metric_record,
+        "reused_artifacts": True,
+    }
 
 
 def _set_parallel_thread_limits() -> None:
@@ -1374,11 +1760,11 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
         result = rectify_views_from_config(views, config)
         output_dir = Path(cast(str, task["run_parent_dir"]))
         run_name = str(task["run_name"])
-        _save_run_artifacts(output_dir, run_name, result)
+        metric_record = build_metric_record(run_uid, config, result)
+        _save_run_artifacts(output_dir, run_name, result, metric_record=metric_record)
         if bool(task.get("save_figures", False)):
             figures = generate_rectification_figures(result)
             _persist_figures(figures, output_dir / run_name / "figures")
-        metric_record = build_metric_record(run_uid, config, result)
         elapsed = time.perf_counter() - started
         return {
             "status": "ok",
@@ -1424,6 +1810,8 @@ def _evaluate_stage(
     output_dir: Path,
     save_figures_flag: bool,
     requested_workers: int,
+    run_state: Optional[Dict[str, object]] = None,
+    run_state_path: Optional[Path] = None,
 ) -> StageEvaluationResult:
     tasks: List[Dict[str, object]] = []
     for candidate in candidates:
@@ -1454,6 +1842,7 @@ def _evaluate_stage(
     for idx, task in enumerate(tasks):
         task["task_index"] = idx
         task["estimated_peak_bytes"] = int(_estimate_task_peak_bytes(task))
+        task["run_dir"] = str(Path(cast(str, task["run_parent_dir"])) / str(task["run_name"]))
 
     if not tasks:
         return StageEvaluationResult(
@@ -1468,14 +1857,81 @@ def _evaluate_stage(
                 "degrade_events": [],
                 "pool_crash_count": 0,
                 "isolated_crash_count": 0,
+                "skipped_valid_count": 0,
+                "recomputed_count": 0,
             },
         )
 
     stage_results: List[Dict[str, object]] = []
+    tasks_to_execute: List[Dict[str, object]] = []
+    skipped_valid_count = 0
+    recomputed_count = 0
+    state_runs = (
+        cast(Dict[str, Dict[str, object]], run_state.setdefault("runs", {}))
+        if run_state is not None
+        else {}
+    )
+    if run_state is not None:
+        stages_state = cast(Dict[str, Dict[str, object]], run_state.setdefault("stages", {}))
+        stage_slot = cast(Dict[str, object], stages_state.setdefault(stage_name, {}))
+        stage_slot["planned_runs"] = len(tasks)
+        stage_slot["last_started_at"] = _utc_now_iso()
+        if run_state_path is not None:
+            _persist_run_state(run_state_path, run_state)
+
+    for task in tasks:
+        run_uid = str(task["run_uid"])
+        run_dir = Path(cast(str, task["run_dir"]))
+        entry = state_runs.get(run_uid)
+        if entry is None and run_state is not None:
+            entry = {
+                "run_uid": run_uid,
+                "stage": str(task["stage"]),
+                "candidate_id": str(task["candidate_id"]),
+                "dataset_id": str(task["dataset_id"]),
+                "status": "pending",
+                "run_dir": str(run_dir),
+                "attempts": [],
+                "artifact_validation": {},
+            }
+            state_runs[run_uid] = entry
+        previous_status = str(entry.get("status", "pending")) if entry is not None else "pending"
+        artifact_validation = _validate_run_artifacts(run_dir)
+        if entry is not None:
+            entry["artifact_validation"] = artifact_validation
+
+        if bool(artifact_validation.get("valid", False)):
+            try:
+                cached_result = _load_cached_stage_result(task, run_dir)
+            except Exception:
+                task["_recompute_after_invalid"] = previous_status in {"ok", "recomputed", "skipped_valid"}
+                tasks_to_execute.append(task)
+                continue
+            cached_result["task_index"] = task["task_index"]
+            stage_results.append(cached_result)
+            skipped_valid_count += 1
+            if entry is not None:
+                attempts = cast(List[Dict[str, object]], entry.setdefault("attempts", []))
+                attempts.append(
+                    {
+                        "timestamp": _utc_now_iso(),
+                        "status": "skipped_valid",
+                        "reason": "artifacts_valid",
+                    }
+                )
+                entry["status"] = "skipped_valid"
+            continue
+
+        task["_recompute_after_invalid"] = previous_status in {"ok", "recomputed", "skipped_valid"}
+        tasks_to_execute.append(task)
+
+    if run_state is not None and run_state_path is not None:
+        _persist_run_state(run_state_path, run_state)
+
     progress_desc = f"Evaluating {stage_name}"
     _set_parallel_thread_limits()
     available_memory_bytes = _get_available_memory_bytes()
-    worker_plan = _select_stage_worker_count(tasks, requested_workers, available_memory_bytes)
+    worker_plan = _select_stage_worker_count(tasks_to_execute, requested_workers, available_memory_bytes)
     selected_workers = int(worker_plan["selected_workers"])
 
     degrade_events: List[Dict[str, object]] = []
@@ -1483,10 +1939,24 @@ def _evaluate_stage(
     isolated_crash_count = 0
     completed_task_indices: set[int] = set()
 
-    remaining_tasks = list(tasks)
+    remaining_tasks = list(tasks_to_execute)
     current_workers = selected_workers
     with tqdm(total=len(tasks), desc=progress_desc, unit="run") as progress_bar:
+        if stage_results:
+            completed_task_indices.update(int(item["task_index"]) for item in stage_results)
+            progress_bar.update(len(stage_results))
         while remaining_tasks:
+            if run_state is not None:
+                for task in remaining_tasks:
+                    run_uid = str(task["run_uid"])
+                    entry = state_runs.get(run_uid)
+                    if entry is None:
+                        continue
+                    entry["status"] = "running"
+                    entry["last_started_at"] = _utc_now_iso()
+                if run_state_path is not None:
+                    _persist_run_state(run_state_path, run_state)
+
             if current_workers <= 1:
                 for task in remaining_tasks:
                     result, crashed = _run_task_isolated(task)
@@ -1495,6 +1965,29 @@ def _evaluate_stage(
                     stage_results.append(result)
                     completed_task_indices.add(int(task["task_index"]))
                     progress_bar.update(1)
+                    if run_state is not None:
+                        entry = state_runs.get(str(task["run_uid"]))
+                        if entry is not None:
+                            attempts = cast(List[Dict[str, object]], entry.setdefault("attempts", []))
+                            attempts.append(
+                                {
+                                    "timestamp": _utc_now_iso(),
+                                    "status": result.get("status"),
+                                    "runtime_seconds": float(result.get("runtime_seconds", 0.0)),
+                                    "error": result.get("error"),
+                                }
+                            )
+                            if result.get("status") == "ok":
+                                if bool(task.get("_recompute_after_invalid", False)):
+                                    entry["status"] = "recomputed"
+                                    recomputed_count += 1
+                                else:
+                                    entry["status"] = "ok"
+                            else:
+                                entry["status"] = "failed"
+                            entry["artifact_validation"] = _validate_run_artifacts(Path(cast(str, task["run_dir"])))
+                            if run_state_path is not None:
+                                _persist_run_state(run_state_path, run_state)
                 break
 
             completed_batch, pending_batch, exec_error = _execute_pool_batch(
@@ -1505,6 +1998,34 @@ def _evaluate_stage(
             completed_task_indices.update(int(item["task_index"]) for item in completed_batch)
             if completed_batch:
                 progress_bar.update(len(completed_batch))
+                if run_state is not None:
+                    by_uid = {str(task["run_uid"]): task for task in remaining_tasks}
+                    for result in completed_batch:
+                        run_uid = str(result["run_uid"])
+                        task = by_uid.get(run_uid)
+                        entry = state_runs.get(run_uid)
+                        if task is None or entry is None:
+                            continue
+                        attempts = cast(List[Dict[str, object]], entry.setdefault("attempts", []))
+                        attempts.append(
+                            {
+                                "timestamp": _utc_now_iso(),
+                                "status": result.get("status"),
+                                "runtime_seconds": float(result.get("runtime_seconds", 0.0)),
+                                "error": result.get("error"),
+                            }
+                        )
+                        if result.get("status") == "ok":
+                            if bool(task.get("_recompute_after_invalid", False)):
+                                entry["status"] = "recomputed"
+                                recomputed_count += 1
+                            else:
+                                entry["status"] = "ok"
+                        else:
+                            entry["status"] = "failed"
+                        entry["artifact_validation"] = _validate_run_artifacts(Path(cast(str, task["run_dir"])))
+                    if run_state_path is not None:
+                        _persist_run_state(run_state_path, run_state)
 
             if exec_error is None:
                 break
@@ -1531,7 +2052,18 @@ def _evaluate_stage(
     execution["pool_crash_count"] = int(pool_crash_count)
     execution["isolated_crash_count"] = int(isolated_crash_count)
     execution["completed_runs"] = len(stage_results)
+    execution["skipped_valid_count"] = int(skipped_valid_count)
+    execution["recomputed_count"] = int(recomputed_count)
     execution["used_isolated_mode"] = bool(isolated_crash_count > 0 or current_workers == 1)
+    if run_state is not None:
+        stages_state = cast(Dict[str, Dict[str, object]], run_state.setdefault("stages", {}))
+        stage_slot = cast(Dict[str, object], stages_state.setdefault(stage_name, {}))
+        stage_slot["completed_runs"] = len(stage_results)
+        stage_slot["skipped_valid_count"] = int(skipped_valid_count)
+        stage_slot["recomputed_count"] = int(recomputed_count)
+        stage_slot["last_completed_at"] = _utc_now_iso()
+        if run_state_path is not None:
+            _persist_run_state(run_state_path, run_state)
     return StageEvaluationResult(stage_results=stage_results, execution=execution)
 
 
@@ -1673,33 +2205,28 @@ def score_and_rank_runs(
 
 
 def _write_leaderboard_csv(rows: Sequence[Dict[str, object]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(
-            fp,
-            fieldnames=[
-                "rank",
-                "candidate_id",
-                "strategy",
-                "score",
-                "mean_dataset_score",
-                "std_dataset_score",
-                "missing_datasets",
-            ],
-        )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {
-                    "rank": row.get("rank"),
-                    "candidate_id": row.get("candidate_id"),
-                    "strategy": row.get("strategy"),
-                    "score": row.get("score"),
-                    "mean_dataset_score": row.get("mean_dataset_score"),
-                    "std_dataset_score": row.get("std_dataset_score"),
-                    "missing_datasets": ",".join(cast(List[str], row.get("missing_datasets", []))),
-                }
-            )
+    fieldnames = [
+        "rank",
+        "candidate_id",
+        "strategy",
+        "score",
+        "mean_dataset_score",
+        "std_dataset_score",
+        "missing_datasets",
+    ]
+    csv_rows = [
+        {
+            "rank": row.get("rank"),
+            "candidate_id": row.get("candidate_id"),
+            "strategy": row.get("strategy"),
+            "score": row.get("score"),
+            "mean_dataset_score": row.get("mean_dataset_score"),
+            "std_dataset_score": row.get("std_dataset_score"),
+            "missing_datasets": ",".join(cast(List[str], row.get("missing_datasets", []))),
+        }
+        for row in rows
+    ]
+    write_csv_atomic(path, fieldnames, csv_rows, create_backup=True)
 
 
 def _write_stage_outputs(
@@ -1722,8 +2249,7 @@ def _write_stage_outputs(
         "execution": dict(execution or {}),
     }
     summary_path = output_dir / f"{stage_name}_summary.json"
-    with summary_path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2)
+    write_json_atomic(summary_path, payload, indent=2, sort_keys=False, create_backup=True)
 
 
 def _best_configs_payload(rankings: Sequence[Dict[str, object]]) -> Dict[str, object]:
@@ -1754,13 +2280,43 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
 
     prepared_datasets = _prepare_datasets(spec, resolved_output_dir)
     dataset_ids = [dataset.dataset_id for dataset in prepared_datasets]
+    fingerprint_payload = _build_experiment_fingerprint_payload(
+        spec=spec,
+        prepared_datasets=prepared_datasets,
+        output_dir=resolved_output_dir,
+    )
+    run_state, run_state_path = _load_or_initialize_run_state(
+        output_dir=resolved_output_dir,
+        fingerprint_payload=fingerprint_payload,
+    )
+    write_json_atomic(
+        resolved_output_dir / "experiment_manifest.json",
+        {
+            "generated_at": _utc_now_iso(),
+            "output_dir": str(resolved_output_dir.resolve()),
+            "strategies": list(spec.strategies),
+            "metric_formulations": [asdict(item) for item in spec.metric_formulations],
+            "datasets": [_dataset_identity_payload(dataset) for dataset in prepared_datasets],
+            "stages": asdict(spec.stages),
+            "scoring": asdict(spec.scoring),
+            "reporting": asdict(spec.reporting),
+            "run_state_path": str(run_state_path),
+        },
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
 
     stage1_budget, stage2_budget = _stage_budgets(spec.stages)
 
-    coarse_candidates: List[SweepCandidate] = []
+    coarse_candidates_base: List[SweepCandidate] = []
     for strategy in spec.strategies:
         search_space = spec.search_spaces[strategy]
-        coarse_candidates.extend(generate_coarse_candidates(search_space, budget=None))
+        coarse_candidates_base.extend(generate_coarse_candidates(search_space, budget=None))
+    coarse_candidates = _expand_candidates_with_metric_formulations(
+        coarse_candidates_base,
+        spec.metric_formulations,
+    )
     coarse_candidates = _limit_candidates(coarse_candidates, stage1_budget)
     coarse_candidates = _assign_candidate_ids(coarse_candidates, "s1c")
     coarse_lookup = {candidate.candidate_id: candidate for candidate in coarse_candidates}
@@ -1774,6 +2330,8 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         output_dir=resolved_output_dir,
         save_figures_flag=spec.save_figures,
         requested_workers=requested_workers,
+        run_state=run_state,
+        run_state_path=run_state_path,
     )
     stage1_results = stage1_eval.stage_results
     stage1_rankings = score_and_rank_runs(stage1_results, spec.scoring, dataset_ids=dataset_ids)
@@ -1805,6 +2363,8 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         output_dir=resolved_output_dir,
         save_figures_flag=spec.save_figures,
         requested_workers=requested_workers,
+        run_state=run_state,
+        run_state_path=run_state_path,
     )
     stage2_results = stage2_eval.stage_results
     stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
@@ -1817,24 +2377,46 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
     )
 
     final_rankings = stage2_rankings if stage2_rankings else stage1_rankings
-    with (resolved_output_dir / "leaderboard.json").open("w", encoding="utf-8") as fp:
-        json.dump(final_rankings, fp, indent=2)
+    write_json_atomic(
+        resolved_output_dir / "leaderboard.json",
+        final_rankings,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
     _write_leaderboard_csv(final_rankings, resolved_output_dir / "leaderboard.csv")
 
-    with (resolved_output_dir / "best_configs.json").open("w", encoding="utf-8") as fp:
-        json.dump(_best_configs_payload(final_rankings), fp, indent=2)
+    write_json_atomic(
+        resolved_output_dir / "best_configs.json",
+        _best_configs_payload(final_rankings),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
 
     all_metric_records: List[Dict[str, object]] = []
     for stage_result in (stage1_results + stage2_results):
         if stage_result.get("status") == "ok":
             all_metric_records.append(cast(Dict[str, object], stage_result["metric_record"]))
-    with (resolved_output_dir / "summary.json").open("w", encoding="utf-8") as fp:
-        json.dump(all_metric_records, fp, indent=2)
+    write_json_atomic(
+        resolved_output_dir / "summary.json",
+        all_metric_records,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
 
     if spec.analyze and all_metric_records:
         analysis = analyze_summary_data(all_metric_records)
         save_analysis(analysis, resolved_output_dir / "analysis.json")
+    if spec.reporting.generate_alpha_report:
+        generate_alpha_report(
+            output_dir=resolved_output_dir,
+            primary_metric=spec.reporting.primary_metric,
+            tolerate_partial_outputs=spec.reporting.tolerate_partial_outputs,
+        )
 
+    _persist_run_state(run_state_path, run_state)
     return resolved_output_dir
 
 
@@ -1935,14 +2517,14 @@ def sweep_parameters(
         if strategy in {"pixel", "combined"}:
             run_name_parts.append(f"pt{pixel_thresh}")
         run_name = "_".join(run_name_parts)
-        _save_run_artifacts(output_dir, run_name, result)
+        record = build_metric_record(run_name, config, result)
+        _save_run_artifacts(output_dir, run_name, result, metric_record=record)
 
         if save_figures_flag:
             figures = generate_rectification_figures(result)  # pass full result so we can save global/pixel maps, originals, overlays, averages
             figures_dir = output_dir / run_name / "figures"
             _persist_figures(figures, figures_dir)
 
-        record = build_metric_record(run_name, config, result)
         summary.append(record)
 
         if live_plot:
@@ -1952,8 +2534,13 @@ def sweep_parameters(
                 plotter = LiveMetricsPlotter(metric_keys)
             plotter.update(run_name, record)
 
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as fp:
-        json.dump(summary, fp, indent=2)
+    write_json_atomic(
+        output_dir / "summary.json",
+        summary,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
 
     if analyze:
         analysis = analyze_summary_data(summary)
@@ -2836,14 +3423,11 @@ def validate_state(state: SpecGuiState) -> List[str]:
 
 
 def _save_spec_payload(path: Path, payload: Dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2)
+    write_json_atomic(path, payload, indent=2, sort_keys=False, create_backup=True)
 
 
 def _load_spec_payload(path: Path) -> Dict[str, object]:
-    with path.open("r", encoding="utf-8") as fp:
-        payload = json.load(fp)
+    payload, _, _ = read_json_first_valid(path, validator=lambda obj: isinstance(obj, dict))
     if not isinstance(payload, dict):
         raise ValueError("Spec file must contain a JSON object.")
     return cast(Dict[str, object], payload)

@@ -2,10 +2,12 @@ import json
 from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
+import pytest
 
 import moment_images.parameter_sweep as parameter_sweep
 from moment_images.im_process import RectificationRunConfig, rectify_views_from_config
 from moment_images.parameter_sweep import (
+    MetricFormulationSpec,
     PreparedDataset,
     SweepDatasetSpec,
     SweepCandidate,
@@ -466,3 +468,151 @@ def test_parallel_and_serial_runs_have_identical_leaderboard_order(tmp_path):
     serial_configs = [row["config"] for row in leaderboard_serial]
     parallel_configs = [row["config"] for row in leaderboard_parallel]
     assert serial_configs == parallel_configs
+
+
+def test_metric_formulations_expand_candidates_with_alpha_dimension():
+    base_candidates = generate_coarse_candidates(
+        _pixel_space(
+            similarity_window_sizes=[1],
+            max_displacements=[0],
+            gauss_sigmas=[1.0],
+            disp_gauss_sigmas=[0.0],
+            pixel_thresholds=[0.05],
+            sub_pix_factors=[1],
+            pixel_sigma_pyramid=[False],
+            zero_fill_roll=[True],
+        )
+    )
+    formulations = [
+        MetricFormulationSpec(formulation_id="f_grad", family="ncc_gradient", alphas=[0.0, 0.5, 1.0]),
+        MetricFormulationSpec(formulation_id="f_lap", family="ncc_laplacian", alphas=[0.5]),
+    ]
+    expanded = parameter_sweep._expand_candidates_with_metric_formulations(base_candidates, formulations)
+
+    assert len(expanded) == 4
+    families = {candidate.config.displacement_metric_family for candidate in expanded}
+    alphas = {candidate.config.displacement_alpha for candidate in expanded}
+    assert families == {"ncc_gradient", "ncc_laplacian"}
+    assert alphas == {0.0, 0.5, 1.0}
+
+
+def test_run_sweep_experiment_writes_run_state_and_alpha_report(tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        metric_formulations=[
+            MetricFormulationSpec(formulation_id="grad_alpha", family="ncc_gradient", alphas=[0.5])
+        ],
+        output_dir=str(tmp_path / "state_alpha"),
+        save_figures=False,
+        analyze=True,
+    )
+
+    out_dir = run_sweep_experiment(spec)
+    assert (out_dir / "run_state.json").exists()
+    assert (out_dir / "alpha_report.json").exists()
+    assert (out_dir / "alpha_report.csv").exists()
+    assert (out_dir / "experiment_manifest.json").exists()
+
+    state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert state["schema_version"] == 1
+    assert state["runs"]
+
+
+def test_run_sweep_resume_skips_recompute_for_valid_artifacts(monkeypatch, tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        metric_formulations=[MetricFormulationSpec(formulation_id="grad_alpha", family="ncc_gradient", alphas=[0.5])],
+        output_dir=str(tmp_path / "resume_ok"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(spec)
+
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: (_build_eval_result(task, status="failed"), True),
+    )
+    run_sweep_experiment(spec, output_dir=out_dir)
+
+    state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    statuses = {entry["status"] for entry in state["runs"].values()}
+    assert "skipped_valid" in statuses
+
+
+def test_run_sweep_recomputes_when_metric_record_is_corrupted(tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        metric_formulations=[MetricFormulationSpec(formulation_id="grad_alpha", family="ncc_gradient", alphas=[0.5])],
+        output_dir=str(tmp_path / "resume_recompute"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(spec)
+
+    metric_record_paths = sorted(out_dir.glob("runs/*/*/*/metric_record.json"))
+    assert metric_record_paths
+    metric_record_paths[0].write_text("{corrupted", encoding="utf-8")
+
+    run_sweep_experiment(spec, output_dir=out_dir)
+    state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    statuses = {entry["status"] for entry in state["runs"].values()}
+    assert "recomputed" in statuses
+
+
+def test_run_sweep_blocks_mismatched_fingerprint(tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    base_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        metric_formulations=[MetricFormulationSpec(formulation_id="grad_alpha", family="ncc_gradient", alphas=[0.5])],
+        output_dir=str(tmp_path / "fingerprint"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(base_spec)
+
+    changed_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[3], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        metric_formulations=[MetricFormulationSpec(formulation_id="grad_alpha", family="ncc_gradient", alphas=[0.5])],
+        output_dir=str(tmp_path / "fingerprint"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        run_sweep_experiment(changed_spec, output_dir=out_dir)

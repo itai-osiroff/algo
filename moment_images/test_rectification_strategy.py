@@ -164,6 +164,45 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
             # 4 -> 2 -> 1
             self.assertEqual(mock_compute.call_count, 3)
 
+    def test_blend_normalized_components_respects_alpha_semantics(self) -> None:
+        intensity = np.array([[[[0.9, 0.1]]]], dtype=np.float32)
+        gradient = np.array([[[[0.2, 0.8]]]], dtype=np.float32)
+        stacks = {"intensity": intensity, "gradient": gradient}
+
+        blended_intensity_only = self.strategy._blend_normalized_components(
+            component_stacks_norm=stacks,
+            alpha=1.0,
+            normalized_component_weights={"gradient": 1.0},
+        )
+        blended_secondary_only = self.strategy._blend_normalized_components(
+            component_stacks_norm=stacks,
+            alpha=0.0,
+            normalized_component_weights={"gradient": 1.0},
+        )
+
+        np.testing.assert_allclose(blended_intensity_only, intensity)
+        np.testing.assert_allclose(blended_secondary_only, gradient)
+
+    def test_composite_requires_non_intensity_mass_when_alpha_below_one(self) -> None:
+        with self.assertRaises(ValueError):
+            self.strategy._resolve_non_intensity_component_weights(
+                metric_family="composite",
+                component_weights=None,
+                alpha=0.5,
+            )
+
+    def test_composite_weights_are_normalized(self) -> None:
+        raw, normalized = self.strategy._resolve_non_intensity_component_weights(
+            metric_family="composite",
+            component_weights={"gradient": 2.0, "laplacian": 6.0},
+            alpha=0.2,
+        )
+        self.assertEqual(raw["gradient"], 2.0)
+        self.assertEqual(raw["laplacian"], 6.0)
+        self.assertAlmostEqual(sum(normalized.values()), 1.0)
+        self.assertAlmostEqual(normalized["gradient"], 0.25)
+        self.assertAlmostEqual(normalized["laplacian"], 0.75)
+
 
 if __name__ == "__main__":
     unittest.main()

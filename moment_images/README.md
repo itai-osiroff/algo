@@ -1,11 +1,11 @@
-# Moment Images Utilities
+﻿# Moment Images Utilities
 
 This package focuses on rectifying light-field view grids extracted from grayscale images. It includes:
 
 - **Interactive workflows** in `im_process.py` for selecting viewpoints, rectifying a grid, and inspecting figures.
 - **Automated rectification** via the `rectify_views_from_config` helper so external tools can run the same pipeline.
-- **Parameter sweeping** with `parameter_sweep.py` to explore trade-offs across window sizes, displacement bounds, and Gaussian filters.
-- **Sweep analysis** utilities in `sweep_analysis.py` for summarizing metrics across many rectification runs.
+- **Reliability-first parameter sweeping** with `parameter_sweep.py` to compare displacement-selection metric families and alpha weighting under one execution protocol.
+- **Sweep analysis/reporting** utilities in `sweep_analysis.py` for metric summaries and alpha-centric comparison reports across many runs.
 
 > All file paths and commands in this README are relative to the `moment_images/` package directory.
 
@@ -13,12 +13,12 @@ This package focuses on rectifying light-field view grids extracted from graysca
 
 ## Repository map
 
-- `im_process.py` — Interactive rectification workflow and reusable rectification helpers.
-- `rectification_strategy.py` — Core algorithms for global translation and pixelwise patch rectification.
-- `parameter_sweep.py` — CLI/GUI runner that drives rectification over a parameter grid.
-- `sweep_analysis.py` — Metric computation and aggregation for sweep outputs.
-- `unpack_workspace.py` — GUI helper for unpacking `.npz` workspace archives saved by `im_process.py`.
-- `validate_rectification.py` — Tool to validate rectification results against new images from other cameras.
+- `im_process.py` - Interactive rectification workflow and reusable rectification helpers.
+- `rectification_strategy.py` - Core algorithms for global translation and pixelwise patch rectification.
+- `parameter_sweep.py` - CLI/GUI runner for two-stage sweeps, alpha-weighted metric formulations, resumable execution, and ranking.
+- `sweep_analysis.py` - Metric computation, aggregate analysis, and alpha/family report generation.
+- `unpack_workspace.py` - GUI helper for unpacking `.npz` workspace archives saved by `im_process.py`.
+- `validate_rectification.py` - Tool to validate rectification results against new images from other cameras.
 
 ---
 
@@ -105,7 +105,7 @@ The interactive workflow is organized around a set of core stages. Understanding
 ### 1) Load and normalize images
 
 - **Image selection** happens in `get_image_paths()`. Users can pick a directory, mark it as HDR, and optionally select a single image by number or name.
-- **Normalization** uses `min_max_normalize()` to scale each grayscale image to 0–255 for consistent downstream processing.
+- **Normalization** uses `min_max_normalize()` to scale each grayscale image to 0-255 for consistent downstream processing.
 - If the directory is HDR-capable, you can either assemble HDR immediately with `assemble_HDR()` or delay HDR assembly until after global rectification.
 
 ### 2) Viewpoint selection
@@ -125,7 +125,7 @@ The interactive workflow is organized around a set of core stages. Understanding
 
 Once the base circle is chosen, `extract_views()` slices a square grid of patches:
 
-- The grid size is user-selected (e.g., 3×3).
+- The grid size is user-selected (e.g., 3x3).
 - Each patch is centered at a fixed distance from its neighbors (`view_dist`).
 - Any patch that would fall outside the image bounds is skipped and left as zeros.
 
@@ -238,7 +238,35 @@ Search spaces are strategy-aware:
 - `combined`: global pad/threshold plus pixel refinement controls, including global-average reference toggle.
 - `global`: optional baseline mode using global-only knobs.
 
-The runner uses stage-1 coarse candidates, ranks them with normalized composite metrics, then refines around Top-K candidates in stage 2.
+The sweep also supports a top-level `metric_formulations` section. Each formulation defines:
+
+- `id`: stable formulation identifier for reporting and traceability.
+- `family`: `ncc_gradient`, `ncc_laplacian`, or `composite`.
+- `alphas`: one or more alpha values to evaluate.
+- `component_weights` (composite only): non-intensity component weights (validated and normalized internally).
+
+Candidate generation in spec mode is the cross-product of:
+
+- strategy search-space parameters
+- metric formulation family/weights
+- alpha values
+
+This keeps the experiment narrative explicit: **global pre-alignment -> pixelwise displacement scoring with alpha-weighted metric terms -> reconstruction -> diagnostics/quality metrics -> side-by-side alpha/family comparison**.
+
+### Alpha semantics (pixelwise displacement score)
+
+For pair families (`ncc_gradient`, `ncc_laplacian`):
+
+- `alpha` directly weights the intensity agreement term:
+  `score = alpha * I + (1 - alpha) * S`
+
+For `composite`:
+
+- `W_intensity = alpha`
+- non-intensity terms are normalized to sum to 1
+- each non-intensity term gets `W_k = (1 - alpha) * normalized_k`
+
+`alpha=1` is intensity-only scoring. `alpha=0` is non-intensity-only scoring.
 
 ### Live plotting and figures
 
@@ -249,26 +277,65 @@ The runner uses stage-1 coarse candidates, ranks them with normalized composite 
 
 Top-level outputs include:
 
-- `stage1_summary.json` — coarse-stage run details, failures, and rankings.
-- `stage2_summary.json` — refinement-stage run details, failures, and rankings.
-- `leaderboard.json` and `leaderboard.csv` — final ranked configurations.
-- `best_configs.json` — overall best and best-per-strategy configurations.
-- `summary.json` — flattened metric records for successful runs.
-- `analysis.json` and `analysis.csv` — aggregate metric summaries (when enabled).
+- `stage1_summary.json` - coarse-stage run details, failures, and rankings.
+- `stage2_summary.json` - refinement-stage run details, failures, and rankings.
+- `leaderboard.json` and `leaderboard.csv` - final ranked configurations.
+- `best_configs.json` - overall best and best-per-strategy configurations.
+- `summary.json` - flattened metric records for successful runs.
+- `analysis.json` and `analysis.csv` - aggregate metric summaries (when enabled).
+- `alpha_report.json` and `alpha_report.csv` - alpha/family-centric ranking and aggregated comparisons.
+- `alpha_report_warnings.json` - explicit warnings for missing/corrupt/partial artifacts consumed during report generation.
+- `run_state.json` - durable resumable execution state (attempt history, statuses, artifact validation).
+- `experiment_manifest.json` - deterministic manifest of datasets, formulations, scoring, reporting, and run-state location.
 
 Each run creates a folder with:
 
-- `avg_rectified.png` — averaged rectified output.
-- `rectified_views.npy` — full rectified stack (legacy-compatible output).
-- `workspace.npz` — workspace-style compressed archive containing `rectified_views`, `average_rectified_image`, and stage diagnostics.
-- `workspace.mat` — MATLAB companion export of the same workspace variables.
-- `config.json` — the configuration used for this run.
+- `avg_rectified.png` - averaged rectified output.
+- `rectified_views.npy` - full rectified stack (legacy-compatible output).
+- `workspace.npz` - workspace-style compressed archive containing `rectified_views`, `average_rectified_image`, and stage diagnostics.
+- `workspace.mat` - MATLAB companion export of the same workspace variables.
+- `config.json` - the configuration used for this run.
+- `metric_record.json` - per-run metric payload used for resume skipping and partial-report reconstruction.
+
+### Resume and compatibility checks
+
+- Every spec run writes `run_state.json` atomically.
+- Restarting in the same output directory resumes only when the stored fingerprint and path-compatibility keys match the current experiment.
+- A mismatch is a hard failure (no partial overwrite of incompatible results).
+- Completed runs are skipped only when required artifacts still validate; missing/corrupt artifacts trigger recompute for that run only.
+- Failure history is append-only: retries add attempts without deleting prior error records.
+
+### Schema reference (additive fields)
+
+- `RectificationRunConfig` (`config.json` per run):
+  - `displacement_metric_family`
+  - `displacement_alpha`
+  - `displacement_component_weights`
+  - `metric_formulation_id`
+- Stage summaries (`stage1_summary.json`, `stage2_summary.json`):
+  - candidate params include metric formulation id/family/alpha/weights
+  - per-run statuses include `pending`, `running`, `ok`, `failed`, `skipped_valid`, `recomputed`
+  - artifact-validation details and failure metadata are retained for resume
+- `run_state.json`:
+  - `schema_version`
+  - experiment fingerprint payload
+  - resolved dataset identities (path, shape, size, mtime)
+  - per-run status, attempts, error history, and artifact validation state
+- `metric_record.json` / `summary.json` rows:
+  - `metric_formulation` metadata
+  - displacement-field metrics
+  - inter-view consistency metrics
+  - displacement score diagnostics (blended and component-level)
+- `alpha_report.json`:
+  - ranking by configured primary metric with fallback chain
+  - alpha-vs-quality/displacement/consistency aggregates by family
+  - warning list for skipped/missing/corrupt artifacts (also saved as `alpha_report_warnings.json`)
 
 ---
 
 ## Sweep analysis (`sweep_analysis.py`)
 
-`build_metric_record()` and `compute_image_metrics()` measure quality for each run using both **global-only** and **global+local** averages (when applicable).
+`build_metric_record()` and `compute_image_metrics()` measure quality for each run using both **global-only** and **global+local** averages (when applicable). `build_metric_record()` also captures formulation metadata and displacement diagnostics used for alpha-centered comparisons.
 
 Metrics include:
 
@@ -280,6 +347,18 @@ Metrics include:
 - **Level-2 Haar DWT HV energy**: sum of squared coefficients from level-2 horizontal and vertical detail subbands.
 
 `analyze_summary_data()` aggregates these across all runs and records minima, maxima, and means, which are then saved by `save_analysis()`.
+
+`generate_alpha_report()` provides robust reporting for completed or partial experiments:
+
+- loads final summaries when present, then falls back to stage summaries and per-run metrics
+- uses first-valid loading (`primary`, then `.bak`) for supported artifacts
+- records warnings for missing/corrupt artifacts and continues with valid subsets
+- ranks by configurable primary metric (`laplacian_variance` default) with deterministic fallback metrics
+- writes:
+  - `alpha_report.json`
+  - `alpha_report.csv`
+  - `alpha_report_warnings.json`
+  - alpha-trend plots for quality, displacement statistics, and consistency
 
 ---
 
@@ -329,3 +408,5 @@ The guide covers:
 ## References
 
 For deeper implementation details, review the docstrings in `im_process.py` and `rectification_strategy.py`, which mirror the flow described above.
+
+

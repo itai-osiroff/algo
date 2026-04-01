@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2 as cv
 import numpy as np
@@ -22,6 +22,44 @@ from scipy.ndimage import gaussian_filter
 
 
 DEFAULT_CORRELATION_PAD_WIDTH = int(125 * 0.45)
+DEFAULT_DISPLACEMENT_METRIC_FAMILY = "ncc_gradient"
+DEFAULT_DISPLACEMENT_ALPHA = 0.5
+SUPPORTED_DISPLACEMENT_METRIC_FAMILIES = {
+    "ncc_gradient",
+    "ncc_laplacian",
+    "composite",
+}
+
+
+def _normalize_component_stack(component_stack: np.ndarray) -> np.ndarray:
+    """Normalize one ``(H, W, D, D)`` component stack per pixel over displacements."""
+
+    height, width = component_stack.shape[:2]
+    flat = component_stack.reshape((height, width, -1))
+    min_vals = np.min(flat, axis=2, keepdims=True)
+    max_vals = np.max(flat, axis=2, keepdims=True)
+    denom = max_vals - min_vals
+    safe_denom = np.where(denom <= 1e-12, 1.0, denom)
+    normalized = (flat - min_vals) / safe_denom
+    tie_mask = denom <= 1e-12
+    if np.any(tie_mask):
+        normalized = np.where(tie_mask, 0.5, normalized)
+    return normalized.reshape(component_stack.shape)
+
+
+def _summarize_view_score_maps(score_maps: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
+    """Return global summary statistics for selected score maps."""
+
+    summary: Dict[str, Dict[str, float]] = {}
+    for key, values in score_maps.items():
+        arr = np.asarray(values, dtype=np.float64)
+        summary[key] = {
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr)),
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+        }
+    return summary
 
 
 def resolve_reference_view(
@@ -67,6 +105,14 @@ class PixelwiseSimilarityResult:
     disps_x: np.ndarray
     sub_pix_factor: int = 2
     reference_is_external: bool = False
+    blended_score_maps: Optional[np.ndarray] = None
+    component_score_maps: Optional[Dict[str, np.ndarray]] = None
+    component_score_maps_raw: Optional[Dict[str, np.ndarray]] = None
+    view_score_summary: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None
+    metric_family: str = DEFAULT_DISPLACEMENT_METRIC_FAMILY
+    alpha: float = DEFAULT_DISPLACEMENT_ALPHA
+    component_weights_raw: Optional[Dict[str, float]] = None
+    component_weights_normalized: Optional[Dict[str, float]] = None
 
 
 class RectificationStrategy(ABC):
@@ -300,6 +346,79 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         _, _, _, center_i, center_j = self._default_reference_view(views)
         return center_i, center_j
 
+    @staticmethod
+    def _resolve_metric_family(metric_family: Optional[str]) -> str:
+        family = (
+            DEFAULT_DISPLACEMENT_METRIC_FAMILY
+            if metric_family is None
+            else str(metric_family).strip().lower()
+        )
+        if family not in SUPPORTED_DISPLACEMENT_METRIC_FAMILIES:
+            raise ValueError(
+                "metric_family must be one of "
+                "'ncc_gradient', 'ncc_laplacian', or 'composite'."
+            )
+        return family
+
+    @staticmethod
+    def _resolve_non_intensity_component_weights(
+        metric_family: str,
+        component_weights: Optional[Dict[str, float]],
+        alpha: float,
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        allowed_components = {"gradient", "laplacian"}
+
+        if metric_family == "ncc_gradient":
+            return {"gradient": 1.0}, {"gradient": 1.0}
+        if metric_family == "ncc_laplacian":
+            return {"laplacian": 1.0}, {"laplacian": 1.0}
+
+        parsed: Dict[str, float] = {}
+        if component_weights is not None:
+            for key, value in component_weights.items():
+                name = str(key).strip().lower()
+                if name not in allowed_components:
+                    raise ValueError(
+                        "Composite displacement component weights only support: "
+                        "'gradient', 'laplacian'."
+                    )
+                parsed_value = float(value)
+                if not np.isfinite(parsed_value):
+                    raise ValueError("Composite displacement weights must be finite.")
+                if parsed_value < 0.0:
+                    raise ValueError("Composite displacement weights must be non-negative.")
+                parsed[name] = parsed_value
+
+        weight_mass = float(sum(parsed.values()))
+        if alpha < 1.0 and weight_mass <= 0.0:
+            raise ValueError(
+                "Composite metric requires positive non-intensity component "
+                "weights when displacement_alpha < 1."
+            )
+        if weight_mass <= 0.0:
+            return parsed, {}
+
+        normalized = {
+            key: float(value / weight_mass)
+            for key, value in parsed.items()
+            if value > 0.0
+        }
+        return parsed, normalized
+
+    @staticmethod
+    def _blend_normalized_components(
+        component_stacks_norm: Dict[str, np.ndarray],
+        alpha: float,
+        normalized_component_weights: Dict[str, float],
+    ) -> np.ndarray:
+        blended_stack = float(alpha) * component_stacks_norm["intensity"]
+        if normalized_component_weights:
+            secondary_blend = np.zeros_like(blended_stack)
+            for component_name, component_weight in normalized_component_weights.items():
+                secondary_blend = secondary_blend + float(component_weight) * component_stacks_norm[component_name]
+            blended_stack = blended_stack + (1.0 - float(alpha)) * secondary_blend
+        return blended_stack
+
     def compute_similarity_matrices(
         self, views: np.ndarray, ref_view_idx: Tuple[int, int], max_disp: Optional[int] = None,
         gauss_sigma: Optional[float] = None, gauss_size: Optional[int] = None,
@@ -308,6 +427,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         sub_pix_factor: int = 2,
         reference_view: Optional[np.ndarray] = None,
         use_sigma_pyramid: bool = False,
+        metric_family: str = DEFAULT_DISPLACEMENT_METRIC_FAMILY,
+        alpha: float = DEFAULT_DISPLACEMENT_ALPHA,
+        component_weights: Optional[Dict[str, float]] = None,
     ) -> PixelwiseSimilarityResult:
         """
         Perform per-pixel patch correlation between each view and the reference.
@@ -352,6 +474,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 normalized_conv=normalized_conv,
                 sub_pix_factor=sub_pix_factor,
                 reference_view=reference_view,
+                metric_family=metric_family,
+                alpha=alpha,
+                component_weights=component_weights,
             )
 
         base_sigma = 7 if gauss_sigma is None else gauss_sigma
@@ -368,6 +493,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             normalized_conv=normalized_conv,
             sub_pix_factor=sub_pix_factor,
             reference_view=reference_view,
+            metric_family=metric_family,
+            alpha=alpha,
+            component_weights=component_weights,
         )
 
         current_sigma = int(base_sigma)
@@ -390,6 +518,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 sub_pix_factor=sub_pix_factor,
                 reference_view=reference_view,
                 prev_result=current_result,
+                metric_family=metric_family,
+                alpha=alpha,
+                component_weights=component_weights,
             )
 
             current_sigma = next_sigma
@@ -404,6 +535,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         sub_pix_factor: int = 2,
         reference_view: Optional[np.ndarray] = None,
         prev_result: Optional[PixelwiseSimilarityResult] = None,
+        metric_family: str = DEFAULT_DISPLACEMENT_METRIC_FAMILY,
+        alpha: float = DEFAULT_DISPLACEMENT_ALPHA,
+        component_weights: Optional[Dict[str, float]] = None,
     ) -> PixelwiseSimilarityResult:
         """Compute pixelwise similarity matrices for a single Gaussian sigma."""
         if sub_pix_factor < 1:
@@ -424,6 +558,16 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             gauss_size = int(gauss_sigma * 5)
         if disp_gauss_sigma is None:
             disp_gauss_sigma = 0.0
+        if not np.isfinite(alpha):
+            raise ValueError("alpha must be finite.")
+        if alpha < 0.0 or alpha > 1.0:
+            raise ValueError("alpha must be between 0 and 1.")
+        resolved_metric_family = self._resolve_metric_family(metric_family)
+        raw_component_weights, normalized_component_weights = (
+            self._resolve_non_intensity_component_weights(
+                resolved_metric_family, component_weights, float(alpha)
+            )
+        )
 
         if views_arr.ndim != 4:
             raise ValueError("views must have shape (N, N, H, W)")
@@ -489,9 +633,24 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.float32)
         scores = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
+        blended_score_maps = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
         disps_y = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float32)
         disps_x = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float32)
+        component_keys: List[str] = ["intensity", *list(normalized_component_weights.keys())]
+        component_score_maps = {
+            key: np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
+            for key in component_keys
+        }
+        component_score_maps_raw = {
+            key: np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
+            for key in component_keys
+        }
         base_coords = np.stack(np.meshgrid(np.arange(height), np.arange(width), indexing="ij"), -1)
+        ref_grad_y = ref_grad_x = ref_laplacian = None
+        if "gradient" in normalized_component_weights:
+            ref_grad_y, ref_grad_x = np.gradient(ref_view)
+        if "laplacian" in normalized_component_weights:
+            ref_laplacian = cv.Laplacian(ref_view, cv.CV_32F)
         if normalized_conv:
             ref_view_blurred = gaussian_filter(
                                                 ref_view,
@@ -518,7 +677,10 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
                     limit = 2.0 * sub_pix_factor
 
-                corr_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
+                component_stacks_raw: Dict[str, np.ndarray] = {
+                    key: np.zeros((height, width, D, D), dtype=np.float32)
+                    for key in component_keys
+                }
                 norm_mat_view = None
                 if normalized_conv:
                     norm_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
@@ -531,20 +693,42 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         shifted_view = self._roll_with_fill(
                             view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
                         )
-                        corr = gaussian_filter(
+                        intensity_corr = gaussian_filter(
                             ref_view * shifted_view,
                             sigma=gauss_sigma,
                             truncate=(gauss_size/ gauss_sigma),
                             mode="constant",
                         )
+                        component_stacks_raw["intensity"][:, :, s_y_ind, s_x_ind] = intensity_corr
+
+                        if "gradient" in normalized_component_weights and ref_grad_x is not None and ref_grad_y is not None:
+                            shift_grad_y, shift_grad_x = np.gradient(shifted_view)
+                            gradient_corr = gaussian_filter(
+                                ref_grad_x * shift_grad_x + ref_grad_y * shift_grad_y,
+                                sigma=gauss_sigma,
+                                truncate=(gauss_size / gauss_sigma),
+                                mode="constant",
+                            )
+                            component_stacks_raw["gradient"][:, :, s_y_ind, s_x_ind] = gradient_corr
+
+                        if "laplacian" in normalized_component_weights and ref_laplacian is not None:
+                            shifted_laplacian = cv.Laplacian(shifted_view, cv.CV_32F)
+                            laplacian_corr = gaussian_filter(
+                                ref_laplacian * shifted_laplacian,
+                                sigma=gauss_sigma,
+                                truncate=(gauss_size / gauss_sigma),
+                                mode="constant",
+                            )
+                            component_stacks_raw["laplacian"][:, :, s_y_ind, s_x_ind] = laplacian_corr
 
                         if p_dy is not None:
                             current_dy = disp_arr[s_y_ind]
                             current_dx = disp_arr[s_x_ind]
                             mask = (np.abs(p_dy - current_dy) <= limit) & (np.abs(p_dx - current_dx) <= limit)
-                            corr[~mask] = 0.0
-
-                        corr_mat_view[:, :, s_y_ind, s_x_ind] = corr
+                            for component_name in component_stacks_raw.keys():
+                                component_slice = component_stacks_raw[component_name][:, :, s_y_ind, s_x_ind]
+                                component_slice[~mask] = 0.0
+                                component_stacks_raw[component_name][:, :, s_y_ind, s_x_ind] = component_slice
 
                         if normalized_conv:
                             norm_shifted_view = shifted_view.copy()
@@ -556,18 +740,39 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 if normalized_conv:
                     norm_mat_view = np.sqrt(norm_mat_view * ref_view_blurred[:, :, None, None])
                     norm_mat_view = norm_mat_view + 0.1 * np.max(norm_mat_view)
-                    corr_mat_view = corr_mat_view / norm_mat_view
+                    component_stacks_raw["intensity"] = component_stacks_raw["intensity"] / norm_mat_view
 
-                corr_stack = corr_mat_view  # shape (H, W, D, D)
-                max_val = np.max(corr_stack, axis=(2, 3))
+                component_stacks_norm: Dict[str, np.ndarray] = {
+                    key: _normalize_component_stack(stack)
+                    for key, stack in component_stacks_raw.items()
+                }
+                blended_stack = self._blend_normalized_components(
+                    component_stacks_norm=component_stacks_norm,
+                    alpha=float(alpha),
+                    normalized_component_weights=normalized_component_weights,
+                )
+
+                max_val = np.max(blended_stack, axis=(2, 3))
                 scores[:, :, i, j] = max_val
+                blended_score_maps[:, :, i, j] = max_val
 
-                flat = corr_stack.reshape((height, width, D * D))
+                flat = blended_stack.reshape((height, width, D * D))
                 argmax_flat = np.argmax(flat, axis=2)
                 idx_y, idx_x = np.unravel_index(argmax_flat, (D, D))
+                gather_index = argmax_flat[:, :, None]
+                for component_name in component_keys:
+                    flat_norm = component_stacks_norm[component_name].reshape((height, width, D * D))
+                    flat_raw = component_stacks_raw[component_name].reshape((height, width, D * D))
+                    component_score_maps[component_name][:, :, i, j] = np.take_along_axis(
+                        flat_norm, gather_index, axis=2
+                    ).squeeze(axis=2)
+                    component_score_maps_raw[component_name][:, :, i, j] = np.take_along_axis(
+                        flat_raw, gather_index, axis=2
+                    ).squeeze(axis=2)
 
-                # ensure pixels with zero max score keep zero displacement (center index)
-                zero_mask = (max_val == 0)
+                # Preserve the original "no signal => zero displacement" behavior.
+                raw_intensity_max = np.max(np.abs(component_stacks_raw["intensity"]), axis=(2, 3))
+                zero_mask = raw_intensity_max <= 1e-12
                 if np.any(zero_mask):
                     idx_y = idx_y.copy()
                     idx_x = idx_x.copy()
@@ -581,17 +786,31 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 else:
                     disps_y[:, :, i, j] = gaussian_filter(disp_arr[idx_y], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_y]
                     disps_x[:, :, i, j] = gaussian_filter(disp_arr[idx_x], sigma=disp_gauss_sigma, truncate=(((disp_gauss_size - 1) / 2) / disp_gauss_sigma), mode="constant") if disp_gauss_sigma is not None else disp_arr[idx_x]
-                coordinates[:, :, i, j, 0] = base_coords[:, :, 0] - disp_arr[idx_y]
-                coordinates[:, :, i, j, 1] = base_coords[:, :, 1] - disp_arr[idx_x]
+                coordinates[:, :, i, j, 0] = base_coords[:, :, 0] - disps_y[:, :, i, j]
+                coordinates[:, :, i, j, 1] = base_coords[:, :, 1] - disps_x[:, :, i, j]
 
         if sub_pix_factor > 1:
             resized_scores = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
+            resized_blended = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
             resized_disps_y = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float32)
             resized_disps_x = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float32)
+            resized_component_score_maps = {
+                key: np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
+                for key in component_keys
+            }
+            resized_component_score_maps_raw = {
+                key: np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
+                for key in component_keys
+            }
             for i in range(grid_rows):
                 for j in range(grid_cols):
                     resized_scores[:, :, i, j] = cv.resize(
                         scores[:, :, i, j],
+                        (original_width, original_height),
+                        interpolation=cv.INTER_LINEAR,
+                    )
+                    resized_blended[:, :, i, j] = cv.resize(
+                        blended_score_maps[:, :, i, j],
                         (original_width, original_height),
                         interpolation=cv.INTER_LINEAR,
                     )
@@ -605,9 +824,23 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         (original_width, original_height),
                         interpolation=cv.INTER_LINEAR,
                     )
+                    for component_name in component_keys:
+                        resized_component_score_maps[component_name][:, :, i, j] = cv.resize(
+                            component_score_maps[component_name][:, :, i, j],
+                            (original_width, original_height),
+                            interpolation=cv.INTER_LINEAR,
+                        )
+                        resized_component_score_maps_raw[component_name][:, :, i, j] = cv.resize(
+                            component_score_maps_raw[component_name][:, :, i, j],
+                            (original_width, original_height),
+                            interpolation=cv.INTER_LINEAR,
+                        )
             scores = resized_scores
+            blended_score_maps = resized_blended
             disps_y = resized_disps_y / sub_pix_factor
             disps_x = resized_disps_x / sub_pix_factor
+            component_score_maps = resized_component_score_maps
+            component_score_maps_raw = resized_component_score_maps_raw
             base_coords = np.stack(
                 np.meshgrid(np.arange(original_height), np.arange(original_width), indexing="ij"),
                 -1,
@@ -616,6 +849,18 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             coordinates[:, :, :, :, 0] = base_coords[:, :, 0][..., None, None] - disps_y
             coordinates[:, :, :, :, 1] = base_coords[:, :, 1][..., None, None] - disps_x
 
+        view_score_summary: Dict[str, Dict[str, Dict[str, float]]] = {}
+        for i in range(grid_rows):
+            for j in range(grid_cols):
+                if not reference_is_external and i == ref_i and j == ref_j:
+                    continue
+                summary_inputs = {
+                    "blended": blended_score_maps[:, :, i, j],
+                }
+                for component_name in component_keys:
+                    summary_inputs[component_name] = component_score_maps[component_name][:, :, i, j]
+                view_score_summary[f"view_{i}_{j}"] = _summarize_view_score_maps(summary_inputs)
+
         return PixelwiseSimilarityResult(
             coordinates=coordinates,
             scores=scores,
@@ -623,6 +868,14 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             disps_x=disps_x,
             sub_pix_factor=sub_pix_factor,
             reference_is_external=reference_is_external,
+            blended_score_maps=blended_score_maps,
+            component_score_maps=component_score_maps,
+            component_score_maps_raw=component_score_maps_raw,
+            view_score_summary=view_score_summary,
+            metric_family=resolved_metric_family,
+            alpha=float(alpha),
+            component_weights_raw=raw_component_weights,
+            component_weights_normalized=normalized_component_weights,
         )
 
     def rectify(
