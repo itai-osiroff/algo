@@ -238,17 +238,23 @@ Search spaces are strategy-aware:
 - `combined`: global pad/threshold plus pixel refinement controls, including global-average reference toggle.
 - `global`: optional baseline mode using global-only knobs.
 
-The sweep also supports a top-level `metric_formulations` section. Each formulation defines:
+Optional metric experiments are configured under `experimental_metric_sweep`. This second phase runs **after** baseline ranking and only expands metric formulations for shortlisted pixel/combined candidates.
+
+Each formulation defines:
 
 - `id`: stable formulation identifier for reporting and traceability.
 - `family`: `ncc_gradient`, `ncc_laplacian`, or `composite`.
 - `alphas`: one or more alpha values to evaluate.
 - `component_weights` (composite only): non-intensity component weights (validated and normalized internally).
 
-Candidate generation in spec mode is the cross-product of:
+Baseline candidate generation is the cross-product of:
 
 - strategy search-space parameters
-- metric formulation family/weights
+
+Optional metric-experiment candidate generation is the cross-product of:
+
+- shortlisted baseline candidates
+- formulation family/weights
 - alpha values
 
 This keeps the experiment narrative explicit: **global pre-alignment -> pixelwise displacement scoring with alpha-weighted metric terms -> reconstruction -> diagnostics/quality metrics -> side-by-side alpha/family comparison**.
@@ -288,6 +294,13 @@ Top-level outputs include:
 - `run_state.json` - durable resumable execution state (attempt history, statuses, artifact validation).
 - `experiment_manifest.json` - deterministic manifest of datasets, formulations, scoring, reporting, and run-state location.
 
+When `experimental_metric_sweep.enabled=true`, additional artifacts are written under `metric_experiments/`:
+
+- `metric_phase_summary.json`
+- `leaderboard.json` and `leaderboard.csv`
+- `summary.json`
+- `alpha_report.json`, `alpha_report.csv`, and `alpha_report_warnings.json`
+
 Each run creates a folder with:
 
 - `avg_rectified.png` - averaged rectified output.
@@ -313,9 +326,11 @@ Each run creates a folder with:
   - `displacement_component_weights`
   - `metric_formulation_id`
 - Stage summaries (`stage1_summary.json`, `stage2_summary.json`):
-  - candidate params include metric formulation id/family/alpha/weights
+  - baseline candidates use fixed metric formulation (`ncc_gradient`, `alpha=0.5`)
   - per-run statuses include `pending`, `running`, `ok`, `failed`, `skipped_valid`, `recomputed`
   - artifact-validation details and failure metadata are retained for resume
+- Metric experiment summary (`metric_experiments/metric_phase_summary.json`):
+  - shortlisted baseline candidates expanded across configured formulation/alpha settings
 - `run_state.json`:
   - `schema_version`
   - experiment fingerprint payload

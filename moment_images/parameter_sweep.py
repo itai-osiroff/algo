@@ -338,6 +338,75 @@ class SweepReportingSpec:
     generate_alpha_report: bool = True
 
 
+def _clone_metric_formulation(spec: MetricFormulationSpec) -> MetricFormulationSpec:
+    return MetricFormulationSpec(
+        formulation_id=str(spec.formulation_id),
+        family=str(spec.family),
+        alphas=[float(alpha) for alpha in spec.alphas],
+        component_weights=(
+            None if spec.component_weights is None else dict(spec.component_weights)
+        ),
+    )
+
+
+def _parse_metric_formulations_payload(
+    formulations_raw: Optional[List[Dict[str, object]]],
+    *,
+    field_name: str,
+) -> List[MetricFormulationSpec]:
+    if formulations_raw is None:
+        return []
+    if not isinstance(formulations_raw, list):
+        raise ValueError(f"{field_name} must be a list.")
+    for idx, item in enumerate(formulations_raw, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"{field_name}[{idx}] must be an object.")
+    formulations = [
+        MetricFormulationSpec.from_dict(cast(Dict[str, object], item), idx + 1)
+        for idx, item in enumerate(formulations_raw)
+    ]
+    formulation_ids = [item.formulation_id for item in formulations]
+    if len(formulation_ids) != len(set(formulation_ids)):
+        raise ValueError(f"{field_name} IDs must be unique.")
+    return formulations
+
+
+@dataclass
+class ExperimentalMetricSweepSpec:
+    """Optional second-phase sweep over displacement metric formulations."""
+
+    enabled: bool = False
+    shortlist_top_k: int = 8
+    formulations: List[MetricFormulationSpec] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(
+        cls, payload: Dict[str, object], *, default_shortlist_top_k: int
+    ) -> "ExperimentalMetricSweepSpec":
+        enabled = bool(payload.get("enabled", False))
+        shortlist_raw = payload.get("shortlist_top_k")
+        shortlist_top_k = int(
+            default_shortlist_top_k if shortlist_raw is None else shortlist_raw
+        )
+        if shortlist_top_k < 1:
+            raise ValueError(
+                "experimental_metric_sweep.shortlist_top_k must be >= 1."
+            )
+        formulations = _parse_metric_formulations_payload(
+            cast(Optional[List[Dict[str, object]]], payload.get("formulations")),
+            field_name="experimental_metric_sweep.formulations",
+        )
+        if enabled and not formulations:
+            raise ValueError(
+                "experimental_metric_sweep.formulations cannot be empty when enabled."
+            )
+        return cls(
+            enabled=enabled,
+            shortlist_top_k=shortlist_top_k,
+            formulations=formulations,
+        )
+
+
 @dataclass
 class SweepExperimentSpec:
     """Top-level experiment definition loaded from ``--spec`` JSON."""
@@ -347,22 +416,71 @@ class SweepExperimentSpec:
     strategies: List[str] = field(default_factory=lambda: ["pixel", "combined"])
     stages: SweepStageSpec = field(default_factory=SweepStageSpec)
     scoring: SweepScoringSpec = field(default_factory=SweepScoringSpec)
-    metric_formulations: List[MetricFormulationSpec] = field(
-        default_factory=lambda: [
-            MetricFormulationSpec(
-                formulation_id="default_ncc_gradient",
-                family="ncc_gradient",
-                alphas=[0.5],
-                component_weights=None,
-            )
-        ]
-    )
+    experimental_metric_sweep: Optional[ExperimentalMetricSweepSpec] = None
+    metric_formulations: Optional[List[MetricFormulationSpec]] = None
     reporting: SweepReportingSpec = field(default_factory=SweepReportingSpec)
     output_dir: Optional[str] = None
     save_figures: bool = False
     analyze: bool = True
     keep_all_run_artifacts: bool = True
     random_seed: int = 0
+
+    def __post_init__(self) -> None:
+        stage_top_k = max(1, int(self.stages.top_k))
+
+        experimental = self.experimental_metric_sweep
+        if experimental is None:
+            experimental = ExperimentalMetricSweepSpec(
+                enabled=False,
+                shortlist_top_k=stage_top_k,
+                formulations=[],
+            )
+
+        legacy_formulations = (
+            [_clone_metric_formulation(item) for item in self.metric_formulations]
+            if self.metric_formulations is not None
+            else []
+        )
+        if legacy_formulations and not experimental.formulations:
+            experimental = ExperimentalMetricSweepSpec(
+                enabled=True,
+                shortlist_top_k=experimental.shortlist_top_k,
+                formulations=legacy_formulations,
+            )
+
+        if int(experimental.shortlist_top_k) < 1:
+            raise ValueError(
+                "experimental_metric_sweep.shortlist_top_k must be >= 1."
+            )
+        if experimental.enabled and not experimental.formulations:
+            raise ValueError(
+                "experimental_metric_sweep requires at least one formulation when enabled."
+            )
+        if experimental.enabled and not any(
+            strategy in {"pixel", "combined"} for strategy in self.strategies
+        ):
+            raise ValueError(
+                "experimental_metric_sweep requires at least one pixel/combined strategy."
+            )
+
+        cloned_formulations = [
+            _clone_metric_formulation(item) for item in experimental.formulations
+        ]
+        formulation_ids = [item.formulation_id for item in cloned_formulations]
+        if len(formulation_ids) != len(set(formulation_ids)):
+            raise ValueError(
+                "experimental_metric_sweep.formulations IDs must be unique."
+            )
+
+        self.experimental_metric_sweep = ExperimentalMetricSweepSpec(
+            enabled=bool(experimental.enabled),
+            shortlist_top_k=int(experimental.shortlist_top_k),
+            formulations=cloned_formulations,
+        )
+        self.metric_formulations = [
+            _clone_metric_formulation(item)
+            for item in self.experimental_metric_sweep.formulations
+        ]
 
     @classmethod
     def from_dict(cls, payload: Dict[str, object]) -> "SweepExperimentSpec":
@@ -405,26 +523,38 @@ class SweepExperimentSpec:
             metric_scope=str(scoring_raw.get("metric_scope", "global_and_local_metrics")),
         )
 
-        formulations_raw = cast(
-            Optional[List[Dict[str, object]]], payload.get("metric_formulations")
+        has_legacy_formulations = "metric_formulations" in payload
+        legacy_formulations = (
+            _parse_metric_formulations_payload(
+                cast(Optional[List[Dict[str, object]]], payload.get("metric_formulations")),
+                field_name="metric_formulations",
+            )
+            if has_legacy_formulations
+            else None
         )
-        if not formulations_raw:
-            metric_formulations = [
-                MetricFormulationSpec(
-                    formulation_id="default_ncc_gradient",
-                    family="ncc_gradient",
-                    alphas=[0.5],
-                    component_weights=None,
-                )
-            ]
+
+        experimental_raw = cast(
+            Optional[Dict[str, object]], payload.get("experimental_metric_sweep")
+        )
+        if experimental_raw is not None:
+            if not isinstance(experimental_raw, dict):
+                raise ValueError("experimental_metric_sweep must be an object.")
+            experimental_metric_sweep = ExperimentalMetricSweepSpec.from_dict(
+                experimental_raw,
+                default_shortlist_top_k=stages.top_k,
+            )
+        elif legacy_formulations is not None:
+            experimental_metric_sweep = ExperimentalMetricSweepSpec(
+                enabled=bool(legacy_formulations),
+                shortlist_top_k=stages.top_k,
+                formulations=legacy_formulations,
+            )
         else:
-            metric_formulations = [
-                MetricFormulationSpec.from_dict(item, idx + 1)
-                for idx, item in enumerate(formulations_raw)
-            ]
-            formulation_ids = [item.formulation_id for item in metric_formulations]
-            if len(formulation_ids) != len(set(formulation_ids)):
-                raise ValueError("metric_formulations IDs must be unique.")
+            experimental_metric_sweep = ExperimentalMetricSweepSpec(
+                enabled=False,
+                shortlist_top_k=stages.top_k,
+                formulations=[],
+            )
 
         reporting_raw = cast(Dict[str, object], payload.get("reporting", {}))
         reporting = SweepReportingSpec(
@@ -439,7 +569,8 @@ class SweepExperimentSpec:
             strategies=strategies,
             stages=stages,
             scoring=scoring,
-            metric_formulations=metric_formulations,
+            experimental_metric_sweep=experimental_metric_sweep,
+            metric_formulations=legacy_formulations,
             reporting=reporting,
             output_dir=cast(Optional[str], payload.get("output_dir")),
             save_figures=bool(payload.get("save_figures", False)),
@@ -607,6 +738,29 @@ def _expand_candidates_with_metric_formulations(
                 expanded.append(_build_candidate_from_params(candidate.strategy, params))
     expanded.sort(key=lambda item: json.dumps(item.params, sort_keys=True))
     return expanded
+
+
+def _dedupe_candidates(candidates: Sequence[SweepCandidate]) -> List[SweepCandidate]:
+    deduped: List[SweepCandidate] = []
+    seen = set()
+    for candidate in candidates:
+        signature = _candidate_signature(candidate)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(candidate)
+    return deduped
+
+
+def _baseline_metric_formulations() -> List[MetricFormulationSpec]:
+    return [
+        MetricFormulationSpec(
+            formulation_id="baseline_ncc_gradient_a0p5",
+            family="ncc_gradient",
+            alphas=[0.5],
+            component_weights=None,
+        )
+    ]
 
 
 def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> SweepCandidate:
@@ -2264,6 +2418,109 @@ def _best_configs_payload(rankings: Sequence[Dict[str, object]]) -> Dict[str, ob
     }
 
 
+def _candidate_without_metric_axes(candidate: SweepCandidate) -> SweepCandidate:
+    metric_keys = {
+        "displacement_metric_family",
+        "displacement_alpha",
+        "metric_formulation_id",
+        "displacement_component_weights",
+    }
+    params = {
+        key: value for key, value in dict(candidate.params).items() if key not in metric_keys
+    }
+    return _build_candidate_from_params(candidate.strategy, params)
+
+
+def _collect_metric_experiment_candidates(
+    final_rankings: Sequence[Dict[str, object]],
+    baseline_candidate_lookup: Dict[str, SweepCandidate],
+    experimental_spec: ExperimentalMetricSweepSpec,
+) -> List[SweepCandidate]:
+    shortlisted_candidates: List[SweepCandidate] = []
+    seen_shortlist = set()
+    for row in final_rankings:
+        candidate_id = str(row.get("candidate_id", ""))
+        if candidate_id in seen_shortlist:
+            continue
+        candidate = baseline_candidate_lookup.get(candidate_id)
+        if candidate is None:
+            continue
+        if candidate.strategy not in {"pixel", "combined"}:
+            continue
+        shortlisted_candidates.append(candidate)
+        seen_shortlist.add(candidate_id)
+        if len(shortlisted_candidates) >= int(experimental_spec.shortlist_top_k):
+            break
+
+    if not shortlisted_candidates:
+        return []
+
+    base_candidates = _dedupe_candidates(
+        [_candidate_without_metric_axes(candidate) for candidate in shortlisted_candidates]
+    )
+    metric_candidates = _expand_candidates_with_metric_formulations(
+        base_candidates,
+        experimental_spec.formulations,
+    )
+    return _dedupe_candidates(metric_candidates)
+
+
+def _write_phase_summary_artifacts(
+    *,
+    output_dir: Path,
+    stage_name: str,
+    stage_results: Sequence[Dict[str, object]],
+    rankings: Sequence[Dict[str, object]],
+    execution: Optional[Dict[str, object]],
+    reporting: SweepReportingSpec,
+    analyze: bool,
+) -> None:
+    _write_stage_outputs(
+        stage_name,
+        stage_results,
+        rankings,
+        output_dir,
+        execution=execution,
+    )
+    write_json_atomic(
+        output_dir / "leaderboard.json",
+        list(rankings),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+    _write_leaderboard_csv(rankings, output_dir / "leaderboard.csv")
+    write_json_atomic(
+        output_dir / "best_configs.json",
+        _best_configs_payload(rankings),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+
+    all_metric_records: List[Dict[str, object]] = []
+    for stage_result in stage_results:
+        if stage_result.get("status") == "ok":
+            all_metric_records.append(cast(Dict[str, object], stage_result["metric_record"]))
+    write_json_atomic(
+        output_dir / "summary.json",
+        all_metric_records,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+
+    if analyze and all_metric_records:
+        analysis = analyze_summary_data(all_metric_records)
+        save_analysis(analysis, output_dir / "analysis.json")
+    if reporting.generate_alpha_report:
+        generate_alpha_report(
+            output_dir=output_dir,
+            primary_metric=reporting.primary_metric,
+            tolerate_partial_outputs=reporting.tolerate_partial_outputs,
+        )
+
+
 def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] = None) -> Path:
     """Run a full two-stage, multi-dataset sweep experiment."""
 
@@ -2289,25 +2546,9 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         output_dir=resolved_output_dir,
         fingerprint_payload=fingerprint_payload,
     )
-    write_json_atomic(
-        resolved_output_dir / "experiment_manifest.json",
-        {
-            "generated_at": _utc_now_iso(),
-            "output_dir": str(resolved_output_dir.resolve()),
-            "strategies": list(spec.strategies),
-            "metric_formulations": [asdict(item) for item in spec.metric_formulations],
-            "datasets": [_dataset_identity_payload(dataset) for dataset in prepared_datasets],
-            "stages": asdict(spec.stages),
-            "scoring": asdict(spec.scoring),
-            "reporting": asdict(spec.reporting),
-            "run_state_path": str(run_state_path),
-        },
-        indent=2,
-        sort_keys=False,
-        create_backup=True,
-    )
 
     stage1_budget, stage2_budget = _stage_budgets(spec.stages)
+    baseline_metric_formulations = _baseline_metric_formulations()
 
     coarse_candidates_base: List[SweepCandidate] = []
     for strategy in spec.strategies:
@@ -2315,8 +2556,9 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         coarse_candidates_base.extend(generate_coarse_candidates(search_space, budget=None))
     coarse_candidates = _expand_candidates_with_metric_formulations(
         coarse_candidates_base,
-        spec.metric_formulations,
+        baseline_metric_formulations,
     )
+    coarse_candidates = _dedupe_candidates(coarse_candidates)
     coarse_candidates = _limit_candidates(coarse_candidates, stage1_budget)
     coarse_candidates = _assign_candidate_ids(coarse_candidates, "s1c")
     coarse_lookup = {candidate.candidate_id: candidate for candidate in coarse_candidates}
@@ -2354,7 +2596,9 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         # Fallback: keep exploring with the best stage-1 candidate if refinement is empty.
         best_id = str(stage1_rankings[0]["candidate_id"])
         refined_candidates = [coarse_lookup[best_id]]
+    refined_candidates = _dedupe_candidates(refined_candidates)
     refined_candidates = _assign_candidate_ids(refined_candidates, "s2c")
+    refined_lookup = {candidate.candidate_id: candidate for candidate in refined_candidates}
 
     stage2_eval = _evaluate_stage(
         stage_name="stage2",
@@ -2377,6 +2621,7 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
     )
 
     final_rankings = stage2_rankings if stage2_rankings else stage1_rankings
+
     write_json_atomic(
         resolved_output_dir / "leaderboard.json",
         final_rankings,
@@ -2415,6 +2660,92 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
             primary_metric=spec.reporting.primary_metric,
             tolerate_partial_outputs=spec.reporting.tolerate_partial_outputs,
         )
+
+    metric_phase_manifest: Dict[str, object] = {
+        "enabled": bool(spec.experimental_metric_sweep and spec.experimental_metric_sweep.enabled),
+        "output_dir": None,
+        "status": "disabled",
+    }
+    experimental_metric_spec = (
+        spec.experimental_metric_sweep
+        if spec.experimental_metric_sweep is not None
+        else ExperimentalMetricSweepSpec(
+            enabled=False,
+            shortlist_top_k=spec.stages.top_k,
+            formulations=[],
+        )
+    )
+    if experimental_metric_spec.enabled:
+        metric_output_dir = resolved_output_dir / "metric_experiments"
+        metric_output_dir.mkdir(parents=True, exist_ok=True)
+        baseline_candidate_lookup = dict(coarse_lookup)
+        baseline_candidate_lookup.update(refined_lookup)
+        metric_candidates = _collect_metric_experiment_candidates(
+            final_rankings=final_rankings,
+            baseline_candidate_lookup=baseline_candidate_lookup,
+            experimental_spec=experimental_metric_spec,
+        )
+        metric_candidates = _assign_candidate_ids(metric_candidates, "m1c")
+
+        metric_eval = _evaluate_stage(
+            stage_name="metric_phase",
+            candidates=metric_candidates,
+            datasets=prepared_datasets,
+            output_dir=metric_output_dir,
+            save_figures_flag=spec.save_figures,
+            requested_workers=requested_workers,
+            run_state=run_state,
+            run_state_path=run_state_path,
+        )
+        metric_results = metric_eval.stage_results
+        metric_rankings = score_and_rank_runs(
+            metric_results, spec.scoring, dataset_ids=dataset_ids
+        )
+        _write_phase_summary_artifacts(
+            output_dir=metric_output_dir,
+            stage_name="metric_phase",
+            stage_results=metric_results,
+            rankings=metric_rankings,
+            execution=metric_eval.execution,
+            reporting=spec.reporting,
+            analyze=spec.analyze,
+        )
+        metric_phase_manifest = {
+            "enabled": True,
+            "output_dir": str(metric_output_dir.resolve()),
+            "status": "completed",
+            "shortlist_top_k": int(experimental_metric_spec.shortlist_top_k),
+            "num_formulations": len(experimental_metric_spec.formulations),
+            "num_candidates": len(metric_candidates),
+            "num_runs": len(metric_results),
+            "num_ranked": len(metric_rankings),
+        }
+
+    write_json_atomic(
+        resolved_output_dir / "experiment_manifest.json",
+        {
+            "generated_at": _utc_now_iso(),
+            "output_dir": str(resolved_output_dir.resolve()),
+            "strategies": list(spec.strategies),
+            "baseline_metric_formulations": [
+                asdict(item) for item in baseline_metric_formulations
+            ],
+            "experimental_metric_sweep": (
+                None
+                if spec.experimental_metric_sweep is None
+                else asdict(spec.experimental_metric_sweep)
+            ),
+            "metric_experiments": metric_phase_manifest,
+            "datasets": [_dataset_identity_payload(dataset) for dataset in prepared_datasets],
+            "stages": asdict(spec.stages),
+            "scoring": asdict(spec.scoring),
+            "reporting": asdict(spec.reporting),
+            "run_state_path": str(run_state_path),
+        },
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
 
     _persist_run_state(run_state_path, run_state)
     return resolved_output_dir
@@ -2850,6 +3181,15 @@ class SpecGuiDatasetState:
 
 
 @dataclass
+class SpecGuiMetricExperimentRowState:
+    formulation_id: str = "exp_grad_alpha"
+    family: str = "ncc_gradient"
+    alphas: str = "0.0,0.5,1.0"
+    gradient_weight: str = "0.5"
+    laplacian_weight: str = "0.5"
+
+
+@dataclass
 class SpecGuiState:
     output_dir: str = ""
     strategy_pixel: bool = True
@@ -2889,6 +3229,11 @@ class SpecGuiState:
     runtime_penalty_weight: str = "0.0"
     robustness_lambda: str = "0.5"
     missing_dataset_penalty: str = "1.0"
+    metric_experiments_enabled: bool = False
+    metric_experiments_shortlist_top_k: str = "8"
+    metric_experiment_rows: List[SpecGuiMetricExperimentRowState] = field(
+        default_factory=lambda: [SpecGuiMetricExperimentRowState()]
+    )
     datasets: List[SpecGuiDatasetState] = field(
         default_factory=lambda: [SpecGuiDatasetState(dataset_id="dataset_a")]
     )
@@ -2950,6 +3295,75 @@ def _parse_bool_list_csv(value: str, field_name: str) -> List[bool]:
 
 def _list_to_csv(values: Sequence[object]) -> str:
     return ",".join(str(value) for value in values)
+
+
+def _state_metric_row_to_spec(
+    row: SpecGuiMetricExperimentRowState, row_index: int
+) -> Dict[str, object]:
+    formulation_id = row.formulation_id.strip()
+    if not formulation_id:
+        raise ValueError(
+            f"metric experiment row {row_index} formulation id is required."
+        )
+    family = row.family.strip().lower()
+    if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
+        raise ValueError(
+            f"metric experiment row {row_index} family must be one of "
+            "'ncc_gradient', 'ncc_laplacian', 'composite'."
+        )
+    alphas = _parse_float_list_csv(
+        row.alphas, f"metric experiment row {row_index} alphas"
+    )
+    for alpha in alphas:
+        if alpha < 0.0 or alpha > 1.0 or not np.isfinite(alpha):
+            raise ValueError(
+                f"metric experiment row {row_index} alphas must be finite and within [0, 1]."
+            )
+
+    formulation_payload: Dict[str, object] = {
+        "id": formulation_id,
+        "family": family,
+        "alphas": alphas,
+    }
+    if family == "composite":
+        gradient_weight = float(row.gradient_weight.strip())
+        laplacian_weight = float(row.laplacian_weight.strip())
+        if not np.isfinite(gradient_weight) or not np.isfinite(laplacian_weight):
+            raise ValueError(
+                f"metric experiment row {row_index} composite weights must be finite."
+            )
+        if gradient_weight < 0.0 or laplacian_weight < 0.0:
+            raise ValueError(
+                f"metric experiment row {row_index} composite weights must be non-negative."
+            )
+        if any(float(alpha) < 1.0 for alpha in alphas) and (gradient_weight + laplacian_weight <= 0.0):
+            raise ValueError(
+                f"metric experiment row {row_index} composite weights must sum to a positive value when alpha < 1."
+            )
+        formulation_payload["component_weights"] = {
+            "gradient": gradient_weight,
+            "laplacian": laplacian_weight,
+        }
+    return formulation_payload
+
+
+def _metric_formulation_payload_to_state_row(
+    payload: Dict[str, object], default_idx: int
+) -> SpecGuiMetricExperimentRowState:
+    family = str(payload.get("family", "ncc_gradient")).strip().lower()
+    component_weights = cast(Optional[Dict[str, object]], payload.get("component_weights"))
+    gradient_weight = "0.5"
+    laplacian_weight = "0.5"
+    if component_weights is not None:
+        gradient_weight = str(component_weights.get("gradient", 0.0))
+        laplacian_weight = str(component_weights.get("laplacian", 0.0))
+    return SpecGuiMetricExperimentRowState(
+        formulation_id=str(payload.get("id") or payload.get("formulation_id") or f"formulation_{default_idx:02d}"),
+        family=family,
+        alphas=_list_to_csv(cast(List[object], payload.get("alphas", []))) or "0.5",
+        gradient_weight=gradient_weight,
+        laplacian_weight=laplacian_weight,
+    )
 
 
 def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
@@ -3070,7 +3484,7 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             ),
         }
 
-    return {
+    payload: Dict[str, object] = {
         "output_dir": state.output_dir.strip() or None,
         "strategies": strategies,
         "datasets": datasets,
@@ -3101,6 +3515,20 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
         "save_figures": bool(state.save_figures),
         "analyze": bool(state.analyze),
     }
+    if state.metric_experiments_enabled:
+        if not state.metric_experiment_rows:
+            raise ValueError(
+                "At least one metric experiment formulation row is required when enabled."
+            )
+        payload["experimental_metric_sweep"] = {
+            "enabled": True,
+            "shortlist_top_k": int(state.metric_experiments_shortlist_top_k.strip()),
+            "formulations": [
+                _state_metric_row_to_spec(row, idx + 1)
+                for idx, row in enumerate(state.metric_experiment_rows)
+            ],
+        }
+    return payload
 
 
 def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
@@ -3220,6 +3648,41 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
     state.missing_dataset_penalty = str(
         scoring.get("missing_dataset_penalty", state.missing_dataset_penalty)
     )
+
+    experimental_payload = cast(
+        Optional[Dict[str, object]], payload.get("experimental_metric_sweep")
+    )
+    formulations_payload: List[Dict[str, object]] = []
+    if experimental_payload is not None:
+        state.metric_experiments_enabled = bool(experimental_payload.get("enabled", False))
+        shortlist_top_k = experimental_payload.get("shortlist_top_k")
+        if shortlist_top_k is None:
+            shortlist_top_k = stages.get("top_k", state.metric_experiments_shortlist_top_k)
+        state.metric_experiments_shortlist_top_k = str(shortlist_top_k)
+        raw_formulations = cast(
+            List[object], experimental_payload.get("formulations", [])
+        )
+        formulations_payload = [
+            cast(Dict[str, object], item) for item in raw_formulations if isinstance(item, dict)
+        ]
+    elif "metric_formulations" in payload:
+        raw_formulations = cast(List[object], payload.get("metric_formulations", []))
+        formulations_payload = [
+            cast(Dict[str, object], item) for item in raw_formulations if isinstance(item, dict)
+        ]
+        state.metric_experiments_enabled = bool(formulations_payload)
+        state.metric_experiments_shortlist_top_k = str(stages.get("top_k", state.top_k))
+    else:
+        state.metric_experiments_enabled = False
+        state.metric_experiments_shortlist_top_k = str(stages.get("top_k", state.top_k))
+
+    if formulations_payload:
+        state.metric_experiment_rows = [
+            _metric_formulation_payload_to_state_row(item, idx + 1)
+            for idx, item in enumerate(formulations_payload)
+        ]
+    else:
+        state.metric_experiment_rows = [SpecGuiMetricExperimentRowState()]
 
     datasets_payload = cast(List[Dict[str, object]], payload.get("datasets", []))
     datasets: List[SpecGuiDatasetState] = []
@@ -3419,6 +3882,77 @@ def validate_state(state: SpecGuiState) -> List[str]:
         except Exception:
             issues.append(f"{label} must be numeric.")
 
+    if state.metric_experiments_enabled:
+        if not state.strategy_pixel and not state.strategy_combined:
+            issues.append(
+                "Experimental metrics require at least one pixel/combined strategy."
+            )
+        try:
+            if int(state.metric_experiments_shortlist_top_k.strip()) < 1:
+                issues.append(
+                    "Metric experiment shortlist top-k must be >= 1."
+                )
+        except Exception:
+            issues.append("Metric experiment shortlist top-k must be an integer.")
+
+        if not state.metric_experiment_rows:
+            issues.append(
+                "At least one metric experiment formulation row is required when enabled."
+            )
+        formulation_ids: List[str] = []
+        for idx, row in enumerate(state.metric_experiment_rows, start=1):
+            formulation_id = row.formulation_id.strip()
+            if not formulation_id:
+                issues.append(f"Metric experiment row {idx}: id is required.")
+            else:
+                formulation_ids.append(formulation_id)
+
+            family = row.family.strip().lower()
+            if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
+                issues.append(
+                    f"Metric experiment row {idx}: invalid family '{row.family}'."
+                )
+                continue
+            try:
+                alphas = _parse_float_list_csv(
+                    row.alphas, f"Metric experiment row {idx} alphas"
+                )
+                if any(
+                    (not np.isfinite(alpha)) or alpha < 0.0 or alpha > 1.0
+                    for alpha in alphas
+                ):
+                    issues.append(
+                        f"Metric experiment row {idx}: alphas must be finite and within [0, 1]."
+                    )
+            except ValueError as exc:
+                issues.append(str(exc))
+                continue
+
+            if family == "composite":
+                try:
+                    gradient_weight = float(row.gradient_weight.strip())
+                    laplacian_weight = float(row.laplacian_weight.strip())
+                except Exception:
+                    issues.append(
+                        f"Metric experiment row {idx}: composite weights must be numeric."
+                    )
+                    continue
+                if not np.isfinite(gradient_weight) or not np.isfinite(laplacian_weight):
+                    issues.append(
+                        f"Metric experiment row {idx}: composite weights must be finite."
+                    )
+                if gradient_weight < 0.0 or laplacian_weight < 0.0:
+                    issues.append(
+                        f"Metric experiment row {idx}: composite weights must be non-negative."
+                    )
+                if any(alpha < 1.0 for alpha in alphas) and (gradient_weight + laplacian_weight <= 0.0):
+                    issues.append(
+                        f"Metric experiment row {idx}: composite weights must sum to a positive value when alpha < 1."
+                    )
+
+        if len(formulation_ids) != len(set(formulation_ids)):
+            issues.append("Metric experiment formulation IDs must be unique.")
+
     return issues
 
 
@@ -3460,6 +3994,7 @@ class SpecGuiApp:
         self.messagebox = __import__("tkinter.messagebox", fromlist=["messagebox"])
         self.state = SpecGuiState()
         self.dataset_rows: List[Dict[str, Any]] = []
+        self.metric_experiment_rows: List[Dict[str, Any]] = []
         self.editable_widgets: List[Any] = []
         self.log_queue: "queue.Queue[Dict[str, object]]" = queue.Queue()
         self.run_thread: Optional[threading.Thread] = None
@@ -3483,6 +4018,8 @@ class SpecGuiApp:
                 widget.configure(state=desired)
             except Exception:
                 pass
+        if enabled and hasattr(self, "metric_experiments_enabled_var"):
+            self._toggle_metric_experiment_controls()
 
     def _append_log(self, message: str) -> None:
         self.log_text.configure(state="normal")
@@ -3682,6 +4219,48 @@ class SpecGuiApp:
         self.robustness_entry = self._build_labeled_entry(adv_right, 5, "Robustness lambda", "0.5")
         self.missing_penalty_entry = self._build_labeled_entry(adv_right, 6, "Missing dataset penalty", "1.0")
 
+        metric_exp_container = self.ttk.LabelFrame(
+            self.advanced_frame, text="Experimental Metrics (Optional)"
+        )
+        metric_exp_container.pack(fill="x", padx=4, pady=6)
+        metric_exp_controls = self.ttk.Frame(metric_exp_container)
+        metric_exp_controls.pack(fill="x", padx=4, pady=2)
+        self.metric_experiments_enabled_var = self.tk.BooleanVar(value=False)
+        metric_enabled_chk = self.ttk.Checkbutton(
+            metric_exp_controls,
+            text="Enable experimental metric sweep",
+            variable=self.metric_experiments_enabled_var,
+            command=self._toggle_metric_experiment_controls,
+        )
+        metric_enabled_chk.pack(side="left", padx=4)
+        self._register_editable(metric_enabled_chk)
+        self.ttk.Label(metric_exp_controls, text="Shortlist top-k").pack(
+            side="left", padx=(12, 2)
+        )
+        self.metric_shortlist_entry = self.ttk.Entry(metric_exp_controls, width=8)
+        self.metric_shortlist_entry.insert(0, "8")
+        self.metric_shortlist_entry.pack(side="left", padx=2)
+        self._register_editable(self.metric_shortlist_entry)
+        self.metric_add_row_btn = self.ttk.Button(
+            metric_exp_controls,
+            text="Add Formulation",
+            command=self._add_metric_experiment_row,
+        )
+        self.metric_add_row_btn.pack(side="left", padx=8)
+        self._register_editable(self.metric_add_row_btn)
+
+        self.metric_exp_headers = self.ttk.Frame(metric_exp_container)
+        self.metric_exp_headers.pack(fill="x", padx=4, pady=(2, 0))
+        self.ttk.Label(self.metric_exp_headers, text="id", width=18).pack(side="left")
+        self.ttk.Label(self.metric_exp_headers, text="family", width=14).pack(side="left")
+        self.ttk.Label(self.metric_exp_headers, text="alphas", width=20).pack(side="left")
+        self.ttk.Label(self.metric_exp_headers, text="grad w", width=10).pack(side="left")
+        self.ttk.Label(self.metric_exp_headers, text="lap w", width=10).pack(side="left")
+
+        self.metric_experiment_rows_frame = self.ttk.Frame(metric_exp_container)
+        self.metric_experiment_rows_frame.pack(fill="x", padx=4, pady=2)
+        self._toggle_metric_experiment_controls()
+
         json_frame = self.ttk.LabelFrame(self.content_frame, text="JSON Preview / Editor (Optional)")
         json_frame.pack(fill="both", expand=True, pady=6)
         self.json_text = self.tk.Text(json_frame, height=12, wrap="none")
@@ -3698,6 +4277,19 @@ class SpecGuiApp:
             self.advanced_frame.pack(fill="x", padx=4, pady=4)
         else:
             self.advanced_frame.pack_forget()
+
+    def _toggle_metric_experiment_controls(self) -> None:
+        enabled = bool(self.metric_experiments_enabled_var.get())
+        if enabled:
+            self.metric_exp_headers.pack(fill="x", padx=4, pady=(2, 0))
+            self.metric_experiment_rows_frame.pack(fill="x", padx=4, pady=2)
+            self.metric_shortlist_entry.configure(state="normal")
+            self.metric_add_row_btn.configure(state="normal")
+        else:
+            self.metric_exp_headers.pack_forget()
+            self.metric_experiment_rows_frame.pack_forget()
+            self.metric_shortlist_entry.configure(state="disabled")
+            self.metric_add_row_btn.configure(state="disabled")
 
     def _clear_dataset_rows(self) -> None:
         for row in self.dataset_rows:
@@ -3790,6 +4382,79 @@ class SpecGuiApp:
                 del self.dataset_rows[idx]
                 break
 
+    def _clear_metric_experiment_rows(self) -> None:
+        for row in self.metric_experiment_rows:
+            row["frame"].destroy()
+        self.metric_experiment_rows = []
+
+    def _add_metric_experiment_row(
+        self, initial: Optional[SpecGuiMetricExperimentRowState] = None
+    ) -> None:
+        initial_state = initial or SpecGuiMetricExperimentRowState(
+            formulation_id=f"exp_formulation_{len(self.metric_experiment_rows) + 1}"
+        )
+        row_frame = self.ttk.Frame(self.metric_experiment_rows_frame)
+        row_frame.pack(fill="x", pady=1)
+
+        id_var = self.tk.StringVar(value=initial_state.formulation_id)
+        family_var = self.tk.StringVar(value=initial_state.family)
+        alphas_var = self.tk.StringVar(value=initial_state.alphas)
+        gradient_weight_var = self.tk.StringVar(value=initial_state.gradient_weight)
+        laplacian_weight_var = self.tk.StringVar(value=initial_state.laplacian_weight)
+
+        id_entry = self.ttk.Entry(row_frame, textvariable=id_var, width=22)
+        id_entry.pack(side="left", padx=2)
+        self._register_editable(id_entry)
+        family_menu = self.ttk.OptionMenu(
+            row_frame,
+            family_var,
+            family_var.get(),
+            "ncc_gradient",
+            "ncc_laplacian",
+            "composite",
+        )
+        family_menu.pack(side="left", padx=2)
+        self._register_editable(family_menu)
+        alphas_entry = self.ttk.Entry(row_frame, textvariable=alphas_var, width=24)
+        alphas_entry.pack(side="left", padx=2)
+        self._register_editable(alphas_entry)
+        gradient_entry = self.ttk.Entry(row_frame, textvariable=gradient_weight_var, width=10)
+        gradient_entry.pack(side="left", padx=2)
+        self._register_editable(gradient_entry)
+        laplacian_entry = self.ttk.Entry(row_frame, textvariable=laplacian_weight_var, width=10)
+        laplacian_entry.pack(side="left", padx=2)
+        self._register_editable(laplacian_entry)
+        remove_btn = self.ttk.Button(
+            row_frame,
+            text="Remove",
+            command=lambda frame=row_frame: self._remove_metric_experiment_row(frame),
+        )
+        remove_btn.pack(side="left", padx=4)
+        self._register_editable(remove_btn)
+
+        self.metric_experiment_rows.append(
+            {
+                "frame": row_frame,
+                "id_var": id_var,
+                "family_var": family_var,
+                "alphas_var": alphas_var,
+                "gradient_weight_var": gradient_weight_var,
+                "laplacian_weight_var": laplacian_weight_var,
+            }
+        )
+
+    def _remove_metric_experiment_row(self, frame: Any) -> None:
+        if len(self.metric_experiment_rows) <= 1:
+            self.messagebox.showwarning(
+                "Metric Experiments", "At least one formulation row is required."
+            )
+            return
+        for idx, row in enumerate(self.metric_experiment_rows):
+            if row["frame"] == frame:
+                row["frame"].destroy()
+                del self.metric_experiment_rows[idx]
+                break
+
     def _browse_dataset_path(self, source_type_var: Any, path_var: Any) -> None:
         source_type = source_type_var.get()
         if source_type == "views":
@@ -3825,6 +4490,18 @@ class SpecGuiApp:
                     hdr_enabled=bool(row["hdr_enabled_var"].get()),
                     hdr_exposure_times=row["exposure_var"].get().strip(),
                     normalize_to_8bit=bool(row["normalize_var"].get()),
+                )
+            )
+
+        metric_rows: List[SpecGuiMetricExperimentRowState] = []
+        for row in self.metric_experiment_rows:
+            metric_rows.append(
+                SpecGuiMetricExperimentRowState(
+                    formulation_id=row["id_var"].get().strip(),
+                    family=row["family_var"].get().strip(),
+                    alphas=row["alphas_var"].get().strip(),
+                    gradient_weight=row["gradient_weight_var"].get().strip(),
+                    laplacian_weight=row["laplacian_weight_var"].get().strip(),
                 )
             )
 
@@ -3867,6 +4544,9 @@ class SpecGuiApp:
             runtime_penalty_weight=self.runtime_penalty_entry.get().strip(),
             robustness_lambda=self.robustness_entry.get().strip(),
             missing_dataset_penalty=self.missing_penalty_entry.get().strip(),
+            metric_experiments_enabled=bool(self.metric_experiments_enabled_var.get()),
+            metric_experiments_shortlist_top_k=self.metric_shortlist_entry.get().strip(),
+            metric_experiment_rows=metric_rows,
             datasets=datasets,
             json_preview=self.json_text.get("1.0", self.tk.END).strip(),
         )
@@ -3887,6 +4567,9 @@ class SpecGuiApp:
         self.max_workers_entry.insert(0, state.max_workers)
         self.analyze_var.set(state.analyze)
         self.save_figures_var.set(state.save_figures)
+        self.metric_experiments_enabled_var.set(state.metric_experiments_enabled)
+        self.metric_shortlist_entry.delete(0, self.tk.END)
+        self.metric_shortlist_entry.insert(0, state.metric_experiments_shortlist_top_k)
 
         field_mapping = [
             (self.pixel_window_entry, state.pixel_similarity_window_sizes),
@@ -3925,6 +4608,12 @@ class SpecGuiApp:
         self._clear_dataset_rows()
         for dataset in state.datasets:
             self._add_dataset_row(dataset)
+        self._clear_metric_experiment_rows()
+        for metric_row in state.metric_experiment_rows:
+            self._add_metric_experiment_row(metric_row)
+        if not self.metric_experiment_rows:
+            self._add_metric_experiment_row()
+        self._toggle_metric_experiment_controls()
 
         self.json_text.delete("1.0", self.tk.END)
         if state.json_preview:
