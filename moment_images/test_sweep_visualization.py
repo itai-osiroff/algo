@@ -1,0 +1,434 @@
+import json
+import time
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import numpy as np
+import pytest
+from PIL import Image
+
+from moment_images.sweep_visualization import (
+    SweepVisualizationApp,
+    export_sweep_visualization_bundle,
+    load_sweep_visualization_model,
+)
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _write_preview(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.full((16, 16), 127, dtype=np.uint8)).save(path)
+
+
+def _metrics(base: float) -> dict:
+    return {
+        "average_intensity": base,
+        "maximum_intensity": base + 1.0,
+        "total_variation": base + 2.0,
+        "sum_squared_gradient": base + 3.0,
+        "laplacian_variance": base + 4.0,
+        "dwt_level2_hv_energy": base + 5.0,
+    }
+
+
+def _ranking(
+    candidate_id: str,
+    *,
+    score: float,
+    rank: int,
+    datasets: list[str],
+    stage: str,
+    family: str = "ncc_gradient",
+    alpha: float = 0.5,
+    strategy: str = "combined",
+    params: dict | None = None,
+) -> dict:
+    param_payload = {
+        "max_displacement": 5 + rank,
+        "gauss_sigma": 3.0,
+        "pixel_threshold": 0.05,
+        "displacement_metric_family": family,
+        "displacement_alpha": alpha,
+        "metric_formulation_id": f"{family}_{alpha:g}",
+    }
+    if params:
+        param_payload.update(params)
+    config_payload = {
+        "strategy": strategy,
+        "similarity_window_size": 21,
+        "refinement_window_size": 21,
+        "max_displacement": param_payload["max_displacement"],
+        "gauss_sigma": param_payload["gauss_sigma"],
+        "pixel_threshold": param_payload["pixel_threshold"],
+        "displacement_metric_family": family,
+        "displacement_alpha": alpha,
+        "metric_formulation_id": f"{family}_{alpha:g}",
+    }
+    dataset_scores = {dataset_id: score - 0.02 * idx for idx, dataset_id in enumerate(datasets)}
+    dataset_metrics = {
+        dataset_id: _metrics(10.0 * rank + idx)
+        for idx, dataset_id in enumerate(datasets)
+    }
+    runtimes = {dataset_id: 12.0 + rank + idx for idx, dataset_id in enumerate(datasets)}
+    return {
+        "candidate_id": candidate_id,
+        "strategy": strategy,
+        "config": config_payload,
+        "params": param_payload,
+        "score": score,
+        "mean_dataset_score": float(np.mean(list(dataset_scores.values()))),
+        "std_dataset_score": float(np.std(list(dataset_scores.values()))),
+        "missing_datasets": [],
+        "dataset_scores": dataset_scores,
+        "runtime_seconds": runtimes,
+        "dataset_metrics": dataset_metrics,
+        "rank": rank,
+    }
+
+
+def _stage_summary(stage: str, rankings: list[dict], failed_runs: list[dict] | None = None) -> dict:
+    failures = failed_runs or []
+    return {
+        "stage": stage,
+        "num_runs": len(rankings) + len(failures),
+        "num_successful": len(rankings),
+        "num_failed": len(failures),
+        "rankings": rankings,
+        "failed_runs": failures,
+        "runs": [],
+        "execution": {"selected_workers": 1, "requested_workers": 1},
+    }
+
+
+def _run_state_payload(
+    output_dir: Path,
+    datasets: list[str],
+    *,
+    include_stage2_runs: bool = True,
+    include_metric_phase: bool = False,
+) -> dict:
+    runs = {
+        "stage1_s1c0000_d1": {
+            "run_uid": "stage1_s1c0000_d1",
+            "stage": "stage1",
+            "candidate_id": "s1c0000",
+            "dataset_id": datasets[0],
+            "status": "ok",
+        }
+    }
+    if include_stage2_runs:
+        runs["stage2_s2c0000_d1"] = {
+            "run_uid": "stage2_s2c0000_d1",
+            "stage": "stage2",
+            "candidate_id": "s2c0000",
+            "dataset_id": datasets[0],
+            "status": "pending",
+        }
+        runs["stage2_s2c0000_d2"] = {
+            "run_uid": "stage2_s2c0000_d2",
+            "stage": "stage2",
+            "candidate_id": "s2c0000",
+            "dataset_id": datasets[-1],
+            "status": "running",
+        }
+    if include_metric_phase:
+        runs["metric_phase_m1c0000_d1"] = {
+            "run_uid": "metric_phase_m1c0000_d1",
+            "stage": "metric_phase",
+            "candidate_id": "m1c0000",
+            "dataset_id": datasets[0],
+            "status": "ok",
+        }
+
+    stages = {
+        "stage1": {"planned_runs": 4, "completed_runs": 4},
+        "stage2": {"planned_runs": 4, "completed_runs": 0},
+    }
+    if include_metric_phase:
+        stages["metric_phase"] = {"planned_runs": 2, "completed_runs": 2}
+
+    return {
+        "schema_version": 1,
+        "created_at": "2026-04-01T00:00:00+00:00",
+        "updated_at": "2026-04-01T01:00:00+00:00",
+        "experiment_fingerprint": "abc123",
+        "path_compatibility": {"output_dir": str(output_dir)},
+        "fingerprint_payload": {
+            "spec": {
+                "strategies": ["combined"],
+                "stages": {"top_k": 1},
+                "scoring": {"metric_weights": {"laplacian_variance": 1.0}},
+            },
+            "datasets": [{"dataset_id": dataset_id} for dataset_id in datasets],
+        },
+        "stages": stages,
+        "runs": runs,
+    }
+
+
+def _write_manifest(path: Path, datasets: list[str]) -> None:
+    _write_json(
+        path,
+        {
+            "generated_at": "2026-04-01T01:00:00+00:00",
+            "strategies": ["combined"],
+            "datasets": [{"dataset_id": dataset_id} for dataset_id in datasets],
+            "stages": {"top_k": 1},
+            "scoring": {"metric_weights": {"laplacian_variance": 1.0}},
+            "reporting": {"primary_metric": "laplacian_variance"},
+        },
+    )
+
+
+def _create_modern_fixture(base_dir: Path, *, include_stage2_summary: bool = True, include_metric_phase: bool = False) -> Path:
+    output_dir = base_dir / "modern"
+    datasets = ["d1", "d2"]
+    _write_manifest(output_dir / "experiment_manifest.json", datasets)
+    _write_json(
+        output_dir / "run_state.json",
+        _run_state_payload(
+            output_dir,
+            datasets,
+            include_stage2_runs=not include_stage2_summary,
+            include_metric_phase=include_metric_phase,
+        ),
+    )
+    stage1_rankings = [
+        _ranking("s1c0000", score=0.88, rank=1, datasets=datasets, stage="stage1"),
+        _ranking("s1c0001", score=0.63, rank=2, datasets=datasets, stage="stage1", params={"max_displacement": 9}),
+    ]
+    _write_json(output_dir / "stage1_summary.json", _stage_summary("stage1", stage1_rankings))
+    for dataset_id in datasets:
+        _write_preview(output_dir / "runs" / "stage1" / "s1c0000" / dataset_id / "avg_rectified.png")
+    if include_stage2_summary:
+        stage2_rankings = [
+            _ranking("s2c0000", score=0.91, rank=1, datasets=datasets, stage="stage2", params={"max_displacement": 7}),
+        ]
+        _write_json(output_dir / "stage2_summary.json", _stage_summary("stage2", stage2_rankings))
+        for dataset_id in datasets:
+            _write_preview(output_dir / "runs" / "stage2" / "s2c0000" / dataset_id / "avg_rectified.png")
+    summary_rows = [
+        {
+            "run": "stage1_s1c0000_d1",
+            "config": {"strategy": "combined", "displacement_metric_family": "ncc_gradient", "displacement_alpha": 0.5},
+            "metric_formulation": {"family": "ncc_gradient", "alpha": 0.5, "id": "baseline"},
+            "global_and_local_metrics": _metrics(10.0),
+        }
+    ]
+    _write_json(output_dir / "summary.json", summary_rows)
+
+    if include_metric_phase:
+        metric_dir = output_dir / "metric_experiments"
+        metric_rankings = [
+            _ranking("m1c0000", score=0.95, rank=1, datasets=datasets, stage="metric_phase", family="ncc_gradient", alpha=0.2),
+            _ranking("m1c0001", score=0.82, rank=2, datasets=datasets, stage="metric_phase", family="ncc_gradient", alpha=0.8),
+            _ranking("m1c0002", score=0.76, rank=3, datasets=datasets, stage="metric_phase", family="ncc_laplacian", alpha=0.5),
+        ]
+        _write_json(metric_dir / "metric_phase_summary.json", _stage_summary("metric_phase", metric_rankings))
+        _write_json(
+            metric_dir / "summary.json",
+            [
+                {
+                    "run": "metric_m1c0000_d1",
+                    "config": {
+                        "strategy": "combined",
+                        "displacement_metric_family": "ncc_gradient",
+                        "displacement_alpha": 0.2,
+                    },
+                    "metric_formulation": {"family": "ncc_gradient", "alpha": 0.2, "id": "grad_0p2"},
+                    "global_and_local_metrics": _metrics(20.0),
+                }
+            ],
+        )
+        for dataset_id in datasets:
+            _write_preview(metric_dir / "runs" / "metric_phase" / "m1c0000" / dataset_id / "avg_rectified.png")
+    return output_dir
+
+
+def _create_legacy_fixture(base_dir: Path, *, include_metric_axes: bool = False) -> Path:
+    output_dir = base_dir / "legacy"
+    config = {"strategy": "pixel", "similarity_window_size": 15, "max_displacement": 5}
+    if include_metric_axes:
+        config.update(
+            {
+                "displacement_metric_family": "ncc_gradient",
+                "displacement_alpha": 0.5,
+                "metric_formulation_id": "baseline",
+            }
+        )
+    summary = [
+        {
+            "run": "win15_disp5",
+            "config": config,
+            "metric_formulation": (
+                {"family": "ncc_gradient", "alpha": 0.5, "id": "baseline"} if include_metric_axes else {}
+            ),
+            "global_and_local_metrics": _metrics(5.0),
+        },
+        {
+            "run": "win25_disp9",
+            "config": {**config, "similarity_window_size": 25, "max_displacement": 9},
+            "metric_formulation": (
+                {"family": "ncc_gradient", "alpha": 0.7, "id": "variant"} if include_metric_axes else {}
+            ),
+            "global_and_local_metrics": _metrics(9.0),
+        },
+    ]
+    _write_json(output_dir / "summary.json", summary)
+    for run_name in ("win15_disp5", "win25_disp9"):
+        _write_preview(output_dir / run_name / "avg_rectified.png")
+    return output_dir
+
+
+def test_load_sweep_visualization_model_supports_legacy_outputs(tmp_path):
+    output_dir = _create_legacy_fixture(tmp_path)
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.mode == "legacy"
+    assert model.primary_stage_name == "legacy"
+    assert model.datasets == ["aggregate"]
+    assert model.stage_order == ["legacy"]
+    assert model.score_matrix.shape == (2, 1)
+    assert model.candidates[0].candidate_id == "win25_disp9"
+
+
+def test_load_sweep_visualization_model_supports_full_modern_outputs(tmp_path):
+    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True)
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.mode == "spec_full"
+    assert model.stage_order == ["stage1", "stage2"]
+    assert model.primary_stage_name == "stage2"
+    assert model.datasets == ["d1", "d2"]
+    assert model.stages["stage2"].num_successful == 1
+    assert model.score_matrix.shape[1] == 2
+    assert model.candidates[0].preview_paths
+
+
+def test_load_sweep_visualization_model_supports_partial_modern_outputs(tmp_path):
+    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=False)
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.mode == "spec_partial"
+    assert "stage2" in model.stages
+    assert model.stages["stage2"].num_runs_planned == 4
+    assert model.stages["stage2"].num_pending == 1
+    assert model.stages["stage2"].num_running == 1
+
+
+def test_load_sweep_visualization_model_supports_metric_phase_outputs(tmp_path):
+    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True, include_metric_phase=True)
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.primary_stage_name == "metric_phase"
+    assert "metric_phase" in model.stage_order
+    assert model.alpha_family_summary
+    families = {row["family"] for row in model.alpha_family_summary}
+    assert {"ncc_gradient", "ncc_laplacian"}.issubset(families)
+
+
+def test_load_sweep_visualization_model_warns_but_loads_when_optional_artifact_is_corrupt(tmp_path):
+    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True, include_metric_phase=True)
+    (output_dir / "metric_experiments" / "summary.json").write_text("{broken", encoding="utf-8")
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.mode == "spec_full"
+    assert model.warnings
+    assert any("summary.json" in warning for warning in model.warnings)
+
+
+def test_export_sweep_visualization_bundle_writes_bundle_and_plots(tmp_path):
+    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True, include_metric_phase=True)
+    model = load_sweep_visualization_model(output_dir)
+    export_dir = tmp_path / "export"
+
+    exported = export_sweep_visualization_bundle(model, export_dir)
+
+    assert exported == export_dir
+    assert (export_dir / "visualization_bundle.npz").exists()
+    assert (export_dir / "visualization_bundle.mat").exists()
+    assert (export_dir / "visualization_manifest.json").exists()
+    assert (export_dir / "overview.png").exists()
+    assert (export_dir / "coverage.png").exists()
+    assert (export_dir / "progression.png").exists()
+    assert (export_dir / "significance.png").exists()
+    with np.load(export_dir / "visualization_bundle.npz", allow_pickle=True) as bundle:
+        assert "score_matrix" in bundle.files
+        assert "metric_tensor" in bundle.files
+        assert bundle["score_matrix"].shape[1] == 2
+        assert bundle["metric_tensor"].ndim == 3
+
+
+def _can_create_tk() -> bool:
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        root.destroy()
+        return True
+    except Exception:
+        return False
+
+
+def _make_root_or_skip():
+    if not _can_create_tk():
+        pytest.skip("Tkinter UI unavailable in this environment")
+    import tkinter as tk
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        return root
+    except Exception:
+        pytest.skip("Tkinter root unavailable in this environment")
+
+
+def test_gui_loads_model_and_toggles_metric_tab(tmp_path):
+    metric_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True, include_metric_phase=True)
+    legacy_dir = _create_legacy_fixture(tmp_path, include_metric_axes=False)
+
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root)
+    app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+    app.load_from_path(metric_dir)
+    root.update()
+    tab_names = [app.notebook.tab(tab_id, "text") for tab_id in app.notebook.tabs()]
+    assert "Metric Formulations" in tab_names
+
+    app.load_from_path(legacy_dir)
+    root.update()
+    tab_names = [app.notebook.tab(tab_id, "text") for tab_id in app.notebook.tabs()]
+    assert "Metric Formulations" not in tab_names
+    root.destroy()
+
+
+def test_gui_export_writes_bundle(tmp_path):
+    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True, include_metric_phase=True)
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root, initial_path=output_dir)
+    app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+    export_dir = tmp_path / "gui_export"
+
+    exported = app.export_to(export_dir)
+
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        root.update()
+        time.sleep(0.02)
+    assert exported == export_dir
+    assert (export_dir / "visualization_bundle.npz").exists()
+    assert (export_dir / "visualization_manifest.json").exists()
+    root.destroy()
