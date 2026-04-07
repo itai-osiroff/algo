@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import platform
+import re
 import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
@@ -18,7 +19,7 @@ from matplotlib.figure import Figure
 from PIL import Image
 
 from moment_images.im_process import save_workspace_variables
-from moment_images.reliable_io import read_json_first_valid, write_json_atomic
+from moment_images.reliable_io import read_json_first_valid, read_npz_first_valid, write_json_atomic
 
 
 DEFAULT_PRIMARY_METRIC = "laplacian_variance"
@@ -59,6 +60,8 @@ class CandidateVisualizationRow:
     family: Optional[str]
     alpha: Optional[float]
     formulation_id: Optional[str]
+    displacement_field_metrics: Dict[str, float] = field(default_factory=dict)
+    inter_view_consistency_metrics: Dict[str, float] = field(default_factory=dict)
     preview_paths: Dict[str, str] = field(default_factory=dict)
 
 
@@ -82,26 +85,64 @@ class StageVisualizationSummary:
 
 
 @dataclass
+class RunMetricRecord:
+    """Per-run metric record used for dataset-specific analysis and diagnostics."""
+
+    row_id: str
+    run_name: str
+    stage: str
+    candidate_id: str
+    dataset_id: str
+    strategy: str
+    family: Optional[str]
+    alpha: Optional[float]
+    formulation_id: Optional[str]
+    params: Dict[str, object]
+    config: Dict[str, object]
+    score: Optional[float]
+    mean_dataset_score: Optional[float]
+    mean_runtime_seconds: Optional[float]
+    metric_means: Dict[str, float]
+    displacement_field_metrics: Dict[str, float]
+    inter_view_consistency_metrics: Dict[str, float]
+    displacement_score_diagnostics: Dict[str, object]
+    preview_path: Optional[str]
+    workspace_path: Optional[str]
+    metric_record_path: Optional[str]
+    ranking_metric_name: Optional[str]
+    ranking_metric_value: Optional[float]
+
+
+@dataclass
 class SweepVisualizationModel:
     """Canonical representation of legacy and modern sweep outputs."""
 
     source_dir: Path
     mode: str
+    path_scope: str
+    experiment_root: Path
+    metric_phase_dir: Optional[Path]
     primary_stage_name: str
     primary_metric: str
+    primary_metric_source: str
     datasets: List[str]
     strategies: List[str]
     metric_names: List[str]
+    displacement_metric_names: List[str]
+    consistency_metric_names: List[str]
     parameter_names: List[str]
     stage_order: List[str]
     stages: Dict[str, StageVisualizationSummary]
     stage_candidate_ids: Dict[str, List[str]]
     candidates: List[CandidateVisualizationRow]
+    run_metric_records: List[RunMetricRecord]
     scoring_weights: Dict[str, float]
     warnings: List[str]
     provenance: Dict[str, object]
     experiment_metadata: Dict[str, object]
     alpha_family_summary: List[Dict[str, object]]
+    alpha_ranked_runs: List[Dict[str, object]]
+    diagnostic_availability: Dict[str, object]
     candidate_ids: List[str]
     score_matrix: np.ndarray
     runtime_matrix: np.ndarray
@@ -209,6 +250,151 @@ def _mean_value(values: Dict[str, float]) -> Optional[float]:
     return float(np.mean(list(values.values())))
 
 
+def _mean_named_metric_maps(metric_maps: Sequence[Dict[str, float]]) -> Dict[str, float]:
+    values: Dict[str, List[float]] = {}
+    for metric_map in metric_maps:
+        for metric_name, metric_value in metric_map.items():
+            values.setdefault(metric_name, []).append(float(metric_value))
+    return {
+        metric_name: float(np.mean(metric_values))
+        for metric_name, metric_values in values.items()
+        if metric_values
+    }
+
+
+def _resolve_visualization_scope(path: Path) -> Tuple[Path, Path, Optional[Path], str]:
+    selected_path = Path(path)
+    selected_name = selected_path.name.lower()
+    metric_markers = ("metric_phase_summary.json", "alpha_report.json", "summary.json", "leaderboard.json")
+    root_markers = ("experiment_manifest.json", "run_state.json", "stage1_summary.json", "stage2_summary.json", "leaderboard.json")
+
+    if selected_name == "metric_experiments":
+        experiment_root = selected_path.parent
+        return selected_path, experiment_root, selected_path, "metric_phase_dir"
+
+    metric_here = any(_candidate_path_exists(selected_path / name) for name in metric_markers)
+    root_here = any(_candidate_path_exists(selected_path / name) for name in root_markers)
+    if metric_here and not root_here:
+        parent = selected_path.parent
+        if parent != selected_path and any(_candidate_path_exists(parent / name) for name in root_markers):
+            return selected_path, parent, selected_path, "metric_phase_dir"
+
+    metric_phase_dir = selected_path / "metric_experiments"
+    if any(_candidate_path_exists(selected_path / name) for name in root_markers):
+        return selected_path, selected_path, (metric_phase_dir if metric_phase_dir.exists() else None), "experiment_root"
+
+    return selected_path, selected_path, None, "legacy"
+
+
+def _resolve_primary_metric(
+    experiment_manifest: Optional[Dict[str, object]],
+    run_state: Optional[Dict[str, object]],
+    scoring_weights: Dict[str, float],
+) -> Tuple[str, str]:
+    if isinstance(experiment_manifest, dict):
+        reporting = cast(Dict[str, object], experiment_manifest.get("reporting", {}))
+        metric = str(reporting.get("primary_metric", "")).strip()
+        if metric:
+            return metric, "experiment_manifest.reporting.primary_metric"
+
+    if isinstance(run_state, dict):
+        fingerprint_payload = cast(Dict[str, object], run_state.get("fingerprint_payload", {}))
+        spec_payload = cast(Dict[str, object], fingerprint_payload.get("spec", {}))
+        reporting = cast(Dict[str, object], spec_payload.get("reporting", {}))
+        metric = str(reporting.get("primary_metric", "")).strip()
+        if metric:
+            return metric, "run_state.fingerprint_payload.spec.reporting.primary_metric"
+
+    if scoring_weights:
+        return next(iter(scoring_weights.keys())), "scoring.metric_weights"
+
+    return DEFAULT_PRIMARY_METRIC, "default"
+
+
+def _normalize_alpha_summary_rows(
+    payload: object,
+    primary_metric: str,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    if not isinstance(payload, dict):
+        return [], []
+
+    summary_rows: List[Dict[str, object]] = []
+    raw_summary = payload.get("alpha_family_summary")
+    if isinstance(raw_summary, list):
+        metric_key = f"{primary_metric}_mean"
+        for item in raw_summary:
+            if not isinstance(item, dict):
+                continue
+            summary_rows.append(
+                {
+                    "family": item.get("family"),
+                    "alpha": _coerce_float(item.get("alpha")),
+                    "count": int(item.get("count", 0) or 0),
+                    "mean_score": _coerce_float(item.get("mean_score")),
+                    "mean_dataset_score": _coerce_float(item.get("mean_dataset_score")),
+                    "primary_metric_mean": _coerce_float(
+                        item.get("primary_metric_mean", item.get(metric_key))
+                    ),
+                    "mean_runtime_seconds": _coerce_float(item.get("mean_runtime_seconds")),
+                    "mean_displacement_magnitude": _coerce_float(
+                        item.get(
+                            "mean_displacement_magnitude",
+                            item.get("mean_displacement_magnitude_mean"),
+                        )
+                    ),
+                    "mean_view_std": _coerce_float(
+                        item.get("mean_view_std", item.get("mean_view_std_mean"))
+                    ),
+                }
+            )
+        summary_rows = [
+            item
+            for item in summary_rows
+            if item.get("family") is not None and item.get("alpha") is not None
+        ]
+        summary_rows.sort(key=lambda item: (str(item["family"]), float(cast(float, item["alpha"]))))
+
+    ranked_runs: List[Dict[str, object]] = []
+    raw_ranked = payload.get("ranked_runs")
+    if isinstance(raw_ranked, list):
+        ranked_runs = [dict(item) for item in raw_ranked if isinstance(item, dict)]
+
+    return summary_rows, ranked_runs
+
+
+def _peek_workspace_keys(path: Optional[Path]) -> List[str]:
+    if path is None:
+        return []
+    for candidate in (path, Path(f"{path}.bak")):
+        if not candidate.exists():
+            continue
+        try:
+            with np.load(candidate, allow_pickle=True) as payload:
+                return list(payload.files)
+        except Exception:
+            continue
+    return []
+
+
+def _load_workspace_diagnostics(
+    path: Optional[Path],
+) -> Tuple[Dict[str, np.ndarray], List[str]]:
+    warnings: List[str] = []
+    if path is None:
+        return {}, ["workspace.npz unavailable"]
+    try:
+        payload, _, read_warnings = read_npz_first_valid(
+            path,
+            allow_pickle=True,
+            validator=lambda obj: isinstance(obj, dict),
+        )
+        warnings.extend(read_warnings)
+        return payload, warnings
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"Failed to read workspace.npz: {type(exc).__name__}: {exc}")
+        return {}, warnings
+
+
 def _stringify_param(value: object) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -292,6 +478,117 @@ def _discover_preview_paths(
         if preview_path.exists():
             preview_paths[dataset_id] = str(preview_path)
     return preview_paths
+
+
+def _discover_run_artifact_paths(
+    base_dir: Path,
+    stage_name: str,
+    candidate_id: str,
+    dataset_id: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    run_dir = base_dir / "runs" / stage_name / candidate_id / dataset_id
+    preview_path = run_dir / "avg_rectified.png"
+    workspace_path = run_dir / "workspace.npz"
+    metric_record_path = run_dir / "metric_record.json"
+    return (
+        str(preview_path) if preview_path.exists() else None,
+        str(workspace_path) if _candidate_path_exists(workspace_path) else None,
+        str(metric_record_path) if _candidate_path_exists(metric_record_path) else None,
+    )
+
+
+def _infer_run_identity(
+    run_name: str,
+    *,
+    stage_hint: Optional[str],
+    run_lookup: Dict[str, Dict[str, object]],
+    path_hint: Optional[Path] = None,
+) -> Tuple[str, str, str]:
+    run_state_entry = run_lookup.get(run_name)
+    if isinstance(run_state_entry, dict):
+        stage_name = str(run_state_entry.get("stage", stage_hint or "summary"))
+        candidate_id = str(run_state_entry.get("candidate_id", ""))
+        dataset_id = str(run_state_entry.get("dataset_id", ""))
+        if stage_name and candidate_id and dataset_id:
+            return stage_name, candidate_id, dataset_id
+
+    stage_name = stage_hint or "summary"
+    remainder = run_name
+    stage_match = re.match(r"^(legacy|stage1|stage2|metric_phase)_(.+)$", run_name)
+    if stage_match is not None:
+        stage_name = stage_match.group(1)
+        remainder = stage_match.group(2)
+    elif stage_name == "metric_phase" and remainder.startswith("metric_"):
+        remainder = remainder[len("metric_") :]
+
+    if "_" in remainder:
+        candidate_id, dataset_id = remainder.rsplit("_", 1)
+        if candidate_id and dataset_id:
+            return stage_name, candidate_id, dataset_id
+
+    if path_hint is not None:
+        parts = path_hint.parts
+        if len(parts) >= 3:
+            candidate_id = parts[-2]
+            dataset_id = parts[-1]
+            if len(parts) >= 5 and parts[-4] == "runs":
+                stage_name = parts[-3]
+            return stage_name, candidate_id, dataset_id
+
+    return stage_name, remainder or run_name, "aggregate"
+
+
+def _aggregate_metric_maps_from_run_records(
+    run_records: Sequence[RunMetricRecord],
+    extractor: str,
+) -> Dict[Tuple[str, str], Dict[str, float]]:
+    grouped: Dict[Tuple[str, str], List[Dict[str, float]]] = {}
+    for record in run_records:
+        metric_map = cast(Dict[str, float], getattr(record, extractor))
+        if not metric_map:
+            continue
+        grouped.setdefault((record.stage, record.candidate_id), []).append(metric_map)
+    return {
+        key: _mean_named_metric_maps(metric_maps)
+        for key, metric_maps in grouped.items()
+        if metric_maps
+    }
+
+
+def _build_diagnostic_availability(run_records: Sequence[RunMetricRecord]) -> Dict[str, object]:
+    components = set()
+    has_score_maps = False
+    has_displacement_maps = False
+    has_component_stats = False
+    checked_workspaces: Dict[Optional[str], List[str]] = {}
+
+    for record in run_records:
+        diagnostics = record.displacement_score_diagnostics
+        component_stats = diagnostics.get("component_selected_stats")
+        if isinstance(component_stats, dict) and component_stats:
+            has_component_stats = True
+            components.update(str(name) for name in component_stats.keys())
+
+        workspace_path = record.workspace_path
+        if workspace_path not in checked_workspaces:
+            checked_workspaces[workspace_path] = _peek_workspace_keys(
+                None if workspace_path is None else Path(workspace_path)
+            )
+        workspace_keys = checked_workspaces[workspace_path]
+        if "pixel_blended_scores" in workspace_keys:
+            has_score_maps = True
+        if "pixel_displacements_x" in workspace_keys and "pixel_displacements_y" in workspace_keys:
+            has_displacement_maps = True
+        for key in workspace_keys:
+            if key.startswith("pixel_component_score_"):
+                components.add(key.replace("pixel_component_score_", "", 1))
+
+    return {
+        "score_maps": has_score_maps,
+        "displacement_maps": has_displacement_maps,
+        "component_stats": has_component_stats,
+        "components": sorted(components),
+    }
 
 
 def _stage_progress_from_sources(
@@ -505,10 +802,10 @@ def _order_metric_names(metric_names: Iterable[str], scoring_weights: Dict[str, 
 
 
 def _build_alpha_family_summary(
-    rows: Sequence[CandidateVisualizationRow],
+    rows: Sequence[CandidateVisualizationRow | RunMetricRecord],
     primary_metric: str,
 ) -> List[Dict[str, object]]:
-    grouped: Dict[Tuple[str, float], List[CandidateVisualizationRow]] = {}
+    grouped: Dict[Tuple[str, float], List[CandidateVisualizationRow | RunMetricRecord]] = {}
     for row in rows:
         if row.family is None or row.alpha is None:
             continue
@@ -528,6 +825,16 @@ def _build_alpha_family_summary(
             for row in family_rows
             if primary_metric in row.metric_means
         ]
+        displacement_values = [
+            row.displacement_field_metrics.get("mean_magnitude")
+            for row in family_rows
+            if row.displacement_field_metrics.get("mean_magnitude") is not None
+        ]
+        consistency_values = [
+            row.inter_view_consistency_metrics.get("mean_view_std")
+            for row in family_rows
+            if row.inter_view_consistency_metrics.get("mean_view_std") is not None
+        ]
         summary_rows.append(
             {
                 "family": family,
@@ -543,10 +850,52 @@ def _build_alpha_family_summary(
                 "mean_runtime_seconds": (
                     float(np.mean(runtime_values)) if runtime_values else None
                 ),
+                "mean_displacement_magnitude": (
+                    float(np.mean(cast(List[float], displacement_values))) if displacement_values else None
+                ),
+                "mean_view_std": (
+                    float(np.mean(cast(List[float], consistency_values))) if consistency_values else None
+                ),
             }
         )
     summary_rows.sort(key=lambda item: (str(item["family"]), float(item["alpha"])))
     return summary_rows
+
+
+def _build_alpha_ranked_runs_from_run_records(
+    run_records: Sequence[RunMetricRecord],
+) -> List[Dict[str, object]]:
+    ranked_rows: List[Dict[str, object]] = []
+    for rank, record in enumerate(
+        sorted(
+            (
+                item
+                for item in run_records
+                if item.ranking_metric_value is not None
+                and item.family is not None
+                and item.alpha is not None
+            ),
+            key=lambda item: cast(float, item.ranking_metric_value),
+            reverse=True,
+        ),
+        start=1,
+    ):
+        ranked_rows.append(
+            {
+                "rank": rank,
+                "run": record.run_name,
+                "family": record.family,
+                "alpha": record.alpha,
+                "formulation_id": record.formulation_id,
+                "ranking_metric_name": record.ranking_metric_name,
+                "ranking_metric_value": record.ranking_metric_value,
+                "score": record.score,
+                "mean_dataset_score": record.mean_dataset_score,
+                "mean_runtime_seconds": record.mean_runtime_seconds,
+                "metric_record_path": record.metric_record_path,
+            }
+        )
+    return ranked_rows
 
 
 def _collect_metric_records_from_summary(
@@ -597,8 +946,715 @@ def _collect_metric_records_from_summary(
     return rows
 
 
+def _candidate_lookup(model_rows: Sequence[CandidateVisualizationRow]) -> Dict[Tuple[str, str], CandidateVisualizationRow]:
+    return {(row.stage, row.candidate_id): row for row in model_rows}
+
+
+def _build_run_metric_record(
+    *,
+    metric_record: Dict[str, object],
+    primary_metric: str,
+    stage_hint: Optional[str],
+    base_dir: Path,
+    run_lookup: Dict[str, Dict[str, object]],
+    candidate_lookup: Dict[Tuple[str, str], CandidateVisualizationRow],
+    metric_record_path: Optional[Path] = None,
+) -> Optional[RunMetricRecord]:
+    run_name = str(metric_record.get("run", "")).strip()
+    if not run_name:
+        return None
+
+    path_hint = metric_record_path.parent if metric_record_path is not None else None
+    stage_name, candidate_id, dataset_id = _infer_run_identity(
+        run_name,
+        stage_hint=stage_hint,
+        run_lookup=run_lookup,
+        path_hint=path_hint,
+    )
+    config = cast(Dict[str, object], metric_record.get("config", {}))
+    params = _params_from_config(config)
+    image_metrics = _mapping_to_float_dict(metric_record.get("global_and_local_metrics", {}))
+    global_only_metrics = _mapping_to_float_dict(metric_record.get("global_only_metrics", {}))
+    family, alpha, formulation_id = _extract_metric_axes(
+        config,
+        params,
+        cast(Optional[Dict[str, object]], metric_record.get("metric_formulation")),
+    )
+    ranking_metric_name, ranking_metric_value = _resolve_ranking_metric(image_metrics, primary_metric)
+    preview_path, workspace_path, discovered_metric_record_path = _discover_run_artifact_paths(
+        base_dir=base_dir,
+        stage_name=stage_name,
+        candidate_id=candidate_id,
+        dataset_id=dataset_id,
+    )
+    candidate_row = candidate_lookup.get((stage_name, candidate_id))
+    score = None
+    mean_dataset_score = None
+    mean_runtime_seconds = None
+    if candidate_row is not None:
+        score = candidate_row.dataset_scores.get(dataset_id, candidate_row.score)
+        mean_dataset_score = candidate_row.mean_dataset_score
+        mean_runtime_seconds = candidate_row.dataset_runtimes.get(
+            dataset_id,
+            candidate_row.mean_runtime_seconds,
+        )
+
+    return RunMetricRecord(
+        row_id=f"{stage_name}:{candidate_id}:{dataset_id}",
+        run_name=run_name,
+        stage=stage_name,
+        candidate_id=candidate_id,
+        dataset_id=dataset_id,
+        strategy=str(config.get("strategy", candidate_row.strategy if candidate_row is not None else "unknown")),
+        family=family,
+        alpha=alpha,
+        formulation_id=formulation_id,
+        params=params,
+        config={str(key): value for key, value in config.items()},
+        score=score,
+        mean_dataset_score=mean_dataset_score,
+        mean_runtime_seconds=mean_runtime_seconds,
+        metric_means=image_metrics or global_only_metrics,
+        displacement_field_metrics=_mapping_to_float_dict(metric_record.get("displacement_field_metrics", {})),
+        inter_view_consistency_metrics=_mapping_to_float_dict(
+            metric_record.get("inter_view_consistency_metrics", {})
+        ),
+        displacement_score_diagnostics=cast(
+            Dict[str, object],
+            metric_record.get("displacement_score_diagnostics", {}) or {},
+        ),
+        preview_path=preview_path,
+        workspace_path=workspace_path,
+        metric_record_path=(
+            str(metric_record_path)
+            if metric_record_path is not None
+            else discovered_metric_record_path
+        ),
+        ranking_metric_name=ranking_metric_name,
+        ranking_metric_value=ranking_metric_value,
+    )
+
+
+def _merge_run_metric_record(
+    existing: RunMetricRecord,
+    incoming: RunMetricRecord,
+) -> RunMetricRecord:
+    return RunMetricRecord(
+        row_id=existing.row_id,
+        run_name=existing.run_name or incoming.run_name,
+        stage=existing.stage or incoming.stage,
+        candidate_id=existing.candidate_id or incoming.candidate_id,
+        dataset_id=existing.dataset_id or incoming.dataset_id,
+        strategy=existing.strategy or incoming.strategy,
+        family=existing.family or incoming.family,
+        alpha=existing.alpha if existing.alpha is not None else incoming.alpha,
+        formulation_id=existing.formulation_id or incoming.formulation_id,
+        params=existing.params or incoming.params,
+        config=existing.config or incoming.config,
+        score=existing.score if existing.score is not None else incoming.score,
+        mean_dataset_score=(
+            existing.mean_dataset_score
+            if existing.mean_dataset_score is not None
+            else incoming.mean_dataset_score
+        ),
+        mean_runtime_seconds=(
+            existing.mean_runtime_seconds
+            if existing.mean_runtime_seconds is not None
+            else incoming.mean_runtime_seconds
+        ),
+        metric_means=existing.metric_means or incoming.metric_means,
+        displacement_field_metrics=(
+            existing.displacement_field_metrics or incoming.displacement_field_metrics
+        ),
+        inter_view_consistency_metrics=(
+            existing.inter_view_consistency_metrics or incoming.inter_view_consistency_metrics
+        ),
+        displacement_score_diagnostics=(
+            existing.displacement_score_diagnostics or incoming.displacement_score_diagnostics
+        ),
+        preview_path=existing.preview_path or incoming.preview_path,
+        workspace_path=existing.workspace_path or incoming.workspace_path,
+        metric_record_path=existing.metric_record_path or incoming.metric_record_path,
+        ranking_metric_name=existing.ranking_metric_name or incoming.ranking_metric_name,
+        ranking_metric_value=(
+            existing.ranking_metric_value
+            if existing.ranking_metric_value is not None
+            else incoming.ranking_metric_value
+        ),
+    )
+
+
+def _register_run_metric_record(
+    storage: Dict[str, RunMetricRecord],
+    record: Optional[RunMetricRecord],
+) -> None:
+    if record is None:
+        return
+    existing = storage.get(record.row_id)
+    storage[record.row_id] = record if existing is None else _merge_run_metric_record(existing, record)
+
+
+def _scan_metric_record_paths(base_dir: Path) -> List[Path]:
+    return sorted(base_dir.glob("runs/*/*/*/metric_record.json"))
+
+
+def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
+    selected_path = Path(path)
+    source_dir, experiment_root, metric_phase_dir, path_scope = _resolve_visualization_scope(selected_path)
+    warnings: List[str] = []
+    used_files: List[str] = []
+
+    experiment_manifest, manifest_path = _read_json_optional(
+        experiment_root / "experiment_manifest.json",
+        validator=lambda obj: isinstance(obj, dict),
+        warnings=warnings,
+    )
+    if manifest_path is not None:
+        used_files.append(str(manifest_path))
+    run_state, run_state_path = _read_json_optional(
+        experiment_root / "run_state.json",
+        validator=lambda obj: isinstance(obj, dict),
+        warnings=warnings,
+    )
+    if run_state_path is not None:
+        used_files.append(str(run_state_path))
+
+    modern_artifacts_present = path_scope in {"experiment_root", "metric_phase_dir"} or any(
+        _candidate_path_exists(experiment_root / filename)
+        for filename in ("stage1_summary.json", "stage2_summary.json", "leaderboard.json", "run_state.json")
+    )
+
+    scoring_weights: Dict[str, float] = {}
+    experiment_metadata: Dict[str, object] = {
+        "output_dir": str(source_dir.resolve()),
+        "experiment_root": str(experiment_root.resolve()),
+        "path_scope": path_scope,
+    }
+    datasets: List[str] = []
+    strategies: List[str] = []
+
+    if isinstance(experiment_manifest, dict):
+        experiment_metadata.update(
+            {
+                "generated_at": experiment_manifest.get("generated_at"),
+                "strategies": experiment_manifest.get("strategies"),
+                "stages": experiment_manifest.get("stages"),
+                "scoring": experiment_manifest.get("scoring"),
+                "reporting": experiment_manifest.get("reporting"),
+            }
+        )
+        strategies = [
+            str(item)
+            for item in cast(List[object], experiment_manifest.get("strategies", []))
+        ]
+        scoring = cast(Dict[str, object], experiment_manifest.get("scoring", {}))
+        scoring_weights = _mapping_to_float_dict(scoring.get("metric_weights", {}))
+        datasets = [
+            str(item.get("dataset_id"))
+            for item in cast(List[Dict[str, object]], experiment_manifest.get("datasets", []))
+            if isinstance(item, dict) and item.get("dataset_id") is not None
+        ]
+
+    if isinstance(run_state, dict):
+        experiment_metadata.update(
+            {
+                "created_at": run_state.get("created_at"),
+                "updated_at": run_state.get("updated_at"),
+                "experiment_fingerprint": run_state.get("experiment_fingerprint"),
+            }
+        )
+        fingerprint_payload = cast(Dict[str, object], run_state.get("fingerprint_payload", {}))
+        spec_payload = cast(Dict[str, object], fingerprint_payload.get("spec", {}))
+        if not scoring_weights:
+            scoring = cast(Dict[str, object], spec_payload.get("scoring", {}))
+            scoring_weights = _mapping_to_float_dict(scoring.get("metric_weights", {}))
+        if not strategies:
+            strategies = [
+                str(item) for item in cast(List[object], spec_payload.get("strategies", []))
+            ]
+        if not datasets:
+            datasets = [
+                str(item.get("dataset_id"))
+                for item in cast(List[Dict[str, object]], fingerprint_payload.get("datasets", []))
+                if isinstance(item, dict) and item.get("dataset_id") is not None
+            ]
+        if spec_payload:
+            experiment_metadata["spec"] = spec_payload
+
+    primary_metric, primary_metric_source = _resolve_primary_metric(
+        cast(Optional[Dict[str, object]], experiment_manifest),
+        cast(Optional[Dict[str, object]], run_state),
+        scoring_weights,
+    )
+    stage_summaries: Dict[str, StageVisualizationSummary] = {}
+    stage_candidate_ids: Dict[str, List[str]] = {}
+    candidate_rows: List[CandidateVisualizationRow] = []
+    alpha_rows_from_records: List[CandidateVisualizationRow] = []
+    alpha_family_summary: List[Dict[str, object]] = []
+    alpha_ranked_runs: List[Dict[str, object]] = []
+    alpha_summary_source = "none"
+    metric_alpha_report_payload: Optional[Dict[str, object]] = None
+    root_alpha_report_payload: Optional[Dict[str, object]] = None
+    run_metric_records_by_id: Dict[str, RunMetricRecord] = {}
+
+    if modern_artifacts_present:
+        summary_locations: Dict[str, Path] = {
+            "stage1": experiment_root / "stage1_summary.json",
+            "stage2": experiment_root / "stage2_summary.json",
+        }
+        if metric_phase_dir is not None:
+            summary_locations["metric_phase"] = metric_phase_dir / "metric_phase_summary.json"
+
+        summary_payloads: Dict[str, Optional[Dict[str, object]]] = {}
+        summary_paths: Dict[str, Optional[Path]] = {}
+        for stage_name, summary_path in summary_locations.items():
+            payload, used_path = _read_json_optional(
+                summary_path,
+                validator=lambda obj: isinstance(obj, dict),
+                warnings=warnings,
+            )
+            summary_payloads[stage_name] = cast(Optional[Dict[str, object]], payload)
+            summary_paths[stage_name] = used_path
+            if used_path is not None:
+                used_files.append(str(used_path))
+
+        root_summary_payload, root_summary_path = _read_json_optional(
+            experiment_root / "summary.json",
+            validator=lambda obj: isinstance(obj, list),
+            warnings=warnings,
+        )
+        if root_summary_path is not None:
+            used_files.append(str(root_summary_path))
+        alpha_rows_from_records.extend(
+            _collect_metric_records_from_summary(
+                cast(Optional[List[Dict[str, object]]], root_summary_payload),
+                primary_metric=primary_metric,
+            )
+        )
+
+        metric_summary_payload: Optional[List[Dict[str, object]]] = None
+        metric_alpha_report_path: Optional[Path] = None
+        if metric_phase_dir is not None:
+            metric_summary_raw, metric_summary_path = _read_json_optional(
+                metric_phase_dir / "summary.json",
+                validator=lambda obj: isinstance(obj, list),
+                warnings=warnings,
+            )
+            if metric_summary_path is not None:
+                used_files.append(str(metric_summary_path))
+            metric_summary_payload = cast(Optional[List[Dict[str, object]]], metric_summary_raw)
+            alpha_rows_from_records.extend(
+                _collect_metric_records_from_summary(
+                    metric_summary_payload,
+                    primary_metric=primary_metric,
+                )
+            )
+            metric_alpha_report_payload, metric_alpha_report_path = _read_json_optional(
+                metric_phase_dir / "alpha_report.json",
+                validator=lambda obj: isinstance(obj, dict),
+                warnings=warnings,
+            )
+            if metric_alpha_report_path is not None:
+                used_files.append(str(metric_alpha_report_path))
+
+        root_alpha_report_payload, root_alpha_report_path = _read_json_optional(
+            experiment_root / "alpha_report.json",
+            validator=lambda obj: isinstance(obj, dict),
+            warnings=warnings,
+        )
+        if root_alpha_report_path is not None:
+            used_files.append(str(root_alpha_report_path))
+
+        for stage_name in ("stage1", "stage2", "metric_phase"):
+            summary_payload = summary_payloads.get(stage_name)
+            if summary_payload is None and not (
+                isinstance(run_state, dict)
+                and stage_name in cast(Dict[str, object], run_state.get("stages", {}))
+            ):
+                continue
+
+            base_dir = (
+                metric_phase_dir
+                if stage_name == "metric_phase" and metric_phase_dir is not None
+                else experiment_root
+            )
+            stage_summary = _stage_progress_from_sources(
+                stage_name=stage_name,
+                summary_payload=summary_payload,
+                run_state=cast(Optional[Dict[str, object]], run_state),
+                source_path=summary_paths.get(stage_name),
+            )
+            stage_summaries[stage_name] = stage_summary
+
+            rankings: List[Dict[str, object]] = []
+            if isinstance(summary_payload, dict):
+                rankings = [
+                    cast(Dict[str, object], item)
+                    for item in cast(List[object], summary_payload.get("rankings", []))
+                    if isinstance(item, dict)
+                ]
+            stage_rows = [
+                _candidate_row_from_ranking(
+                    stage_name=stage_name,
+                    ranking=ranking,
+                    base_dir=base_dir,
+                    rank_fallback=rank,
+                    primary_metric=primary_metric,
+                )
+                for rank, ranking in enumerate(rankings, start=1)
+            ]
+            stage_rows.sort(key=lambda row: (row.rank, row.candidate_id))
+            stage_candidate_ids[stage_name] = [row.row_id for row in stage_rows]
+            candidate_rows.extend(stage_rows)
+
+        if not stage_summaries:
+            raise ValueError(
+                f"No readable stage summaries found under {source_dir}; cannot build visualization model."
+            )
+
+        candidate_lookup = _candidate_lookup(candidate_rows)
+        run_lookup = {
+            str(key): cast(Dict[str, object], value)
+            for key, value in cast(
+                Dict[str, object],
+                cast(Dict[str, object], run_state or {}).get("runs", {}),
+            ).items()
+            if isinstance(value, dict)
+        }
+        for record in cast(Optional[List[Dict[str, object]]], root_summary_payload) or []:
+            _register_run_metric_record(
+                run_metric_records_by_id,
+                _build_run_metric_record(
+                    metric_record=record,
+                    primary_metric=primary_metric,
+                    stage_hint=None,
+                    base_dir=experiment_root,
+                    run_lookup=run_lookup,
+                    candidate_lookup=candidate_lookup,
+                ),
+            )
+        for record in metric_summary_payload or []:
+            _register_run_metric_record(
+                run_metric_records_by_id,
+                _build_run_metric_record(
+                    metric_record=record,
+                    primary_metric=primary_metric,
+                    stage_hint="metric_phase",
+                    base_dir=metric_phase_dir if metric_phase_dir is not None else experiment_root,
+                    run_lookup=run_lookup,
+                    candidate_lookup=candidate_lookup,
+                ),
+            )
+
+        metric_record_paths = _scan_metric_record_paths(experiment_root)
+        if metric_phase_dir is not None:
+            metric_record_paths.extend(_scan_metric_record_paths(metric_phase_dir))
+        for metric_record_path in sorted(set(metric_record_paths)):
+            payload, used_path = _read_json_optional(
+                metric_record_path,
+                validator=lambda obj: isinstance(obj, dict),
+                warnings=warnings,
+            )
+            if used_path is not None:
+                used_files.append(str(used_path))
+            if not isinstance(payload, dict):
+                continue
+            in_metric_phase_dir = metric_phase_dir is not None and "metric_experiments" in metric_record_path.parts
+            _register_run_metric_record(
+                run_metric_records_by_id,
+                _build_run_metric_record(
+                    metric_record=payload,
+                    primary_metric=primary_metric,
+                    stage_hint="metric_phase" if in_metric_phase_dir else None,
+                    base_dir=metric_phase_dir if in_metric_phase_dir and metric_phase_dir is not None else experiment_root,
+                    run_lookup=run_lookup,
+                    candidate_lookup=candidate_lookup,
+                    metric_record_path=used_path or metric_record_path,
+                ),
+            )
+
+        stage2_present = bool(summary_payloads.get("stage2"))
+        mode = "metric_phase_dir" if path_scope == "metric_phase_dir" else ("spec_full" if stage2_present else "spec_partial")
+    else:
+        legacy_records = _load_legacy_records(source_dir, warnings)
+        if not legacy_records:
+            raise ValueError(f"No readable sweep artifacts found under {source_dir}.")
+        legacy_rows = [
+            _candidate_row_from_legacy_record(
+                output_dir=source_dir,
+                record=record,
+                rank=rank,
+                primary_metric=primary_metric,
+            )
+            for rank, record in enumerate(legacy_records, start=1)
+        ]
+        legacy_rows.sort(
+            key=lambda row: (
+                -(row.ranking_metric_value if row.ranking_metric_value is not None else float("-inf")),
+                row.candidate_id,
+            )
+        )
+        for rank, row in enumerate(legacy_rows, start=1):
+            row.rank = rank
+        candidate_rows.extend(legacy_rows)
+        stage_candidate_ids["legacy"] = [row.row_id for row in legacy_rows]
+        stage_summaries["legacy"] = StageVisualizationSummary(
+            name="legacy",
+            num_runs_planned=len(legacy_rows),
+            num_runs_recorded=len(legacy_rows),
+            num_successful=len(legacy_rows),
+            num_failed=0,
+            num_pending=0,
+            num_running=0,
+            skipped_valid_count=0,
+            recomputed_count=0,
+            rankings_count=len(legacy_rows),
+            execution={},
+            failed_runs=[],
+            source_path=str(source_dir / "summary.json"),
+        )
+        alpha_rows_from_records.extend(legacy_rows)
+        candidate_lookup = _candidate_lookup(candidate_rows)
+        for record in legacy_records:
+            _register_run_metric_record(
+                run_metric_records_by_id,
+                _build_run_metric_record(
+                    metric_record=record,
+                    primary_metric=primary_metric,
+                    stage_hint="legacy",
+                    base_dir=source_dir,
+                    run_lookup={},
+                    candidate_lookup=candidate_lookup,
+                ),
+            )
+        mode = "legacy"
+
+    run_metric_records = sorted(
+        run_metric_records_by_id.values(),
+        key=lambda item: (
+            STAGE_ORDER.index(item.stage) if item.stage in STAGE_ORDER else len(STAGE_ORDER),
+            item.candidate_id,
+            item.dataset_id,
+        ),
+    )
+    metric_phase_alpha_records = [
+        record
+        for record in run_metric_records
+        if record.stage == "metric_phase" and record.family is not None and record.alpha is not None
+    ]
+    if isinstance(metric_alpha_report_payload, dict):
+        alpha_family_summary, alpha_ranked_runs = _normalize_alpha_summary_rows(
+            metric_alpha_report_payload,
+            primary_metric=primary_metric,
+        )
+        alpha_summary_source = "metric_phase.alpha_report"
+    elif metric_phase_alpha_records:
+        alpha_family_summary = _build_alpha_family_summary(metric_phase_alpha_records, primary_metric)
+        alpha_ranked_runs = _build_alpha_ranked_runs_from_run_records(metric_phase_alpha_records)
+        alpha_summary_source = "metric_phase.run_metric_records"
+        if metric_phase_dir is not None:
+            warnings.append(
+                "Metric-phase alpha report unavailable; synthesized alpha summary from metric-phase records."
+            )
+    displacement_field_agg = _aggregate_metric_maps_from_run_records(
+        run_metric_records,
+        "displacement_field_metrics",
+    )
+    consistency_agg = _aggregate_metric_maps_from_run_records(
+        run_metric_records,
+        "inter_view_consistency_metrics",
+    )
+    for row in candidate_rows:
+        row.displacement_field_metrics = displacement_field_agg.get((row.stage, row.candidate_id), {})
+        row.inter_view_consistency_metrics = consistency_agg.get((row.stage, row.candidate_id), {})
+
+    if not datasets:
+        datasets = _sorted_unique(
+            dataset_id
+            for row in candidate_rows
+            for dataset_id in list(row.dataset_scores.keys()) + list(row.dataset_metrics.keys())
+        )
+    if not datasets:
+        datasets = _sorted_unique(record.dataset_id for record in run_metric_records)
+    if not datasets and candidate_rows:
+        datasets = ["aggregate"]
+    if not strategies:
+        strategies = _sorted_unique(
+            list(row.strategy for row in candidate_rows)
+            + [record.strategy for record in run_metric_records]
+        )
+
+    parameter_names = _sorted_unique(
+        list(param_name for row in candidate_rows for param_name in row.params.keys())
+        + [param_name for record in run_metric_records for param_name in record.params.keys()]
+    )
+    metric_names = _order_metric_names(
+        list(metric_name for row in candidate_rows for metric_name in row.metric_means.keys())
+        + [metric_name for record in run_metric_records for metric_name in record.metric_means.keys()],
+        scoring_weights=scoring_weights,
+    )
+    displacement_metric_names = _sorted_unique(
+        list(metric_name for row in candidate_rows for metric_name in row.displacement_field_metrics.keys())
+        + [
+            metric_name
+            for record in run_metric_records
+            for metric_name in record.displacement_field_metrics.keys()
+        ]
+    )
+    consistency_metric_names = _sorted_unique(
+        list(metric_name for row in candidate_rows for metric_name in row.inter_view_consistency_metrics.keys())
+        + [
+            metric_name
+            for record in run_metric_records
+            for metric_name in record.inter_view_consistency_metrics.keys()
+        ]
+    )
+    stage_order = [stage_name for stage_name in STAGE_ORDER if stage_name in stage_summaries]
+    if not stage_order:
+        stage_order = [candidate_rows[0].stage] if candidate_rows else []
+    primary_stage_name = "metric_phase" if "metric_phase" in stage_summaries else stage_order[-1]
+
+    ordered_candidate_rows: List[CandidateVisualizationRow] = []
+    for stage_name in stage_order:
+        rows = [row for row in candidate_rows if row.stage == stage_name]
+        rows.sort(key=lambda row: (row.rank, row.candidate_id))
+        ordered_candidate_rows.extend(rows)
+
+    candidate_ids = [row.row_id for row in ordered_candidate_rows]
+    dataset_index = {dataset_id: idx for idx, dataset_id in enumerate(datasets)}
+    metric_index = {metric_name: idx for idx, metric_name in enumerate(metric_names)}
+    parameter_index = {param_name: idx for idx, param_name in enumerate(parameter_names)}
+    score_matrix = np.full((len(ordered_candidate_rows), len(datasets)), np.nan, dtype=np.float64)
+    runtime_matrix = np.full_like(score_matrix, np.nan)
+    metric_tensor = np.full(
+        (len(ordered_candidate_rows), len(datasets), len(metric_names)),
+        np.nan,
+        dtype=np.float64,
+    )
+    parameter_numeric_matrix = np.full(
+        (len(ordered_candidate_rows), len(parameter_names)),
+        np.nan,
+        dtype=np.float64,
+    )
+    parameter_text_matrix = np.empty((len(ordered_candidate_rows), len(parameter_names)), dtype=object)
+    parameter_text_matrix[:] = ""
+
+    for row_idx, row in enumerate(ordered_candidate_rows):
+        for dataset_id, score in row.dataset_scores.items():
+            if dataset_id in dataset_index:
+                score_matrix[row_idx, dataset_index[dataset_id]] = float(score)
+        for dataset_id, runtime in row.dataset_runtimes.items():
+            if dataset_id in dataset_index:
+                runtime_matrix[row_idx, dataset_index[dataset_id]] = float(runtime)
+        for dataset_id, metrics in row.dataset_metrics.items():
+            if dataset_id not in dataset_index:
+                continue
+            for metric_name, metric_value in metrics.items():
+                if metric_name in metric_index:
+                    metric_tensor[row_idx, dataset_index[dataset_id], metric_index[metric_name]] = float(metric_value)
+        for param_name, param_value in row.params.items():
+            if param_name not in parameter_index:
+                continue
+            param_idx = parameter_index[param_name]
+            parameter_numeric_matrix[row_idx, param_idx] = _numeric_param(param_value)
+            parameter_text_matrix[row_idx, param_idx] = _stringify_param(param_value)
+
+    if not alpha_family_summary:
+        if metric_phase_dir is not None:
+            alpha_source_rows = [
+                row
+                for row in ordered_candidate_rows
+                if row.stage == "metric_phase" and row.family is not None and row.alpha is not None
+            ]
+            if alpha_source_rows:
+                alpha_summary_source = "metric_phase.candidate_rows"
+                warnings.append(
+                    "Metric-phase alpha report unavailable; synthesized alpha summary from metric-phase candidate rows."
+                )
+                alpha_family_summary = _build_alpha_family_summary(alpha_source_rows, primary_metric)
+            elif isinstance(root_alpha_report_payload, dict):
+                alpha_family_summary, alpha_ranked_runs = _normalize_alpha_summary_rows(
+                    root_alpha_report_payload,
+                    primary_metric=primary_metric,
+                )
+                alpha_summary_source = "experiment_root.alpha_report"
+        else:
+            alpha_source_rows = [
+                row for row in ordered_candidate_rows if row.family is not None and row.alpha is not None
+            ]
+            if not alpha_source_rows:
+                alpha_source_rows = [
+                    row for row in alpha_rows_from_records if row.family is not None and row.alpha is not None
+                ]
+                if alpha_source_rows:
+                    alpha_summary_source = "summary_records"
+            elif alpha_source_rows:
+                alpha_summary_source = "candidate_rows"
+            alpha_family_summary = _build_alpha_family_summary(alpha_source_rows, primary_metric)
+
+    diagnostic_availability = _build_diagnostic_availability(run_metric_records)
+    provenance = {
+        "source_dir": str(source_dir.resolve()),
+        "experiment_root": str(experiment_root.resolve()),
+        "metric_phase_dir": None if metric_phase_dir is None else str(metric_phase_dir.resolve()),
+        "path_scope": path_scope,
+        "used_files": sorted(dict.fromkeys(used_files)),
+        "mode": mode,
+        "primary_metric_source": primary_metric_source,
+        "alpha_summary_source": alpha_summary_source,
+    }
+    experiment_metadata.update(
+        {
+            "mode": mode,
+            "dataset_count": len(datasets),
+            "candidate_count": len(ordered_candidate_rows),
+            "run_record_count": len(run_metric_records),
+            "primary_stage_name": primary_stage_name,
+            "primary_metric": primary_metric,
+            "primary_metric_source": primary_metric_source,
+        }
+    )
+
+    return SweepVisualizationModel(
+        source_dir=source_dir,
+        mode=mode,
+        path_scope=path_scope,
+        experiment_root=experiment_root,
+        metric_phase_dir=metric_phase_dir,
+        primary_stage_name=primary_stage_name,
+        primary_metric=primary_metric,
+        primary_metric_source=primary_metric_source,
+        datasets=datasets,
+        strategies=strategies,
+        metric_names=metric_names,
+        displacement_metric_names=displacement_metric_names,
+        consistency_metric_names=consistency_metric_names,
+        parameter_names=parameter_names,
+        stage_order=stage_order,
+        stages=stage_summaries,
+        stage_candidate_ids=stage_candidate_ids,
+        candidates=ordered_candidate_rows,
+        run_metric_records=run_metric_records,
+        scoring_weights=scoring_weights,
+        warnings=warnings,
+        provenance=provenance,
+        experiment_metadata=experiment_metadata,
+        alpha_family_summary=alpha_family_summary,
+        alpha_ranked_runs=alpha_ranked_runs,
+        diagnostic_availability=diagnostic_availability,
+        candidate_ids=candidate_ids,
+        score_matrix=score_matrix,
+        runtime_matrix=runtime_matrix,
+        metric_tensor=metric_tensor,
+        parameter_numeric_matrix=parameter_numeric_matrix,
+        parameter_text_matrix=parameter_text_matrix,
+    )
+
+
 def load_sweep_visualization_model(path: Path) -> SweepVisualizationModel:
     """Load a legacy or modern sweep folder into a canonical visualization model."""
+
+    return _load_sweep_visualization_model_impl(path)
 
     output_dir = Path(path)
     if not output_dir.exists():
@@ -941,9 +1997,33 @@ def _rows_for_stage(model: SweepVisualizationModel, stage_name: Optional[str]) -
     return [row for row in model.candidates if row.stage == target_stage]
 
 
+@dataclass
+class EffectRow:
+    source_kind: str
+    stage: str
+    candidate_id: str
+    dataset_id: Optional[str]
+    strategy: str
+    family: Optional[str]
+    alpha: Optional[float]
+    params: Dict[str, object]
+    score: Optional[float]
+    mean_dataset_score: Optional[float]
+    mean_runtime_seconds: Optional[float]
+    metric_means: Dict[str, float]
+    displacement_field_metrics: Dict[str, float]
+    inter_view_consistency_metrics: Dict[str, float]
+
+
+def _alpha_filter_value(alpha: Optional[float]) -> str:
+    return "All" if alpha is None else f"{alpha:g}"
+
+
 def _value_options(model: SweepVisualizationModel) -> List[str]:
     options = ["score", "mean_dataset_score", "mean_runtime_seconds"]
     options.extend(f"metric:{metric_name}" for metric_name in model.metric_names)
+    options.extend(f"displacement:{metric_name}" for metric_name in model.displacement_metric_names)
+    options.extend(f"consistency:{metric_name}" for metric_name in model.consistency_metric_names)
     return options
 
 
@@ -956,7 +2036,131 @@ def _row_value_for_option(row: CandidateVisualizationRow, option: str) -> Option
         return row.mean_runtime_seconds
     if option.startswith("metric:"):
         return row.metric_means.get(option.split(":", 1)[1])
+    if option.startswith("displacement:"):
+        return row.displacement_field_metrics.get(option.split(":", 1)[1])
+    if option.startswith("consistency:"):
+        return row.inter_view_consistency_metrics.get(option.split(":", 1)[1])
     return None
+
+
+def _effect_row_value_for_option(row: EffectRow, option: str) -> Optional[float]:
+    if option == "score":
+        return row.score
+    if option == "mean_dataset_score":
+        return row.mean_dataset_score
+    if option == "mean_runtime_seconds":
+        return row.mean_runtime_seconds
+    if option.startswith("metric:"):
+        return row.metric_means.get(option.split(":", 1)[1])
+    if option.startswith("displacement:"):
+        return row.displacement_field_metrics.get(option.split(":", 1)[1])
+    if option.startswith("consistency:"):
+        return row.inter_view_consistency_metrics.get(option.split(":", 1)[1])
+    return None
+
+
+def _candidate_rows_to_effect_rows(rows: Sequence[CandidateVisualizationRow]) -> List[EffectRow]:
+    return [
+        EffectRow(
+            source_kind="candidate",
+            stage=row.stage,
+            candidate_id=row.candidate_id,
+            dataset_id=None,
+            strategy=row.strategy,
+            family=row.family,
+            alpha=row.alpha,
+            params=row.params,
+            score=row.score,
+            mean_dataset_score=row.mean_dataset_score,
+            mean_runtime_seconds=row.mean_runtime_seconds,
+            metric_means=row.metric_means,
+            displacement_field_metrics=row.displacement_field_metrics,
+            inter_view_consistency_metrics=row.inter_view_consistency_metrics,
+        )
+        for row in rows
+    ]
+
+
+def _run_records_to_effect_rows(records: Sequence[RunMetricRecord]) -> List[EffectRow]:
+    return [
+        EffectRow(
+            source_kind="run",
+            stage=record.stage,
+            candidate_id=record.candidate_id,
+            dataset_id=record.dataset_id,
+            strategy=record.strategy,
+            family=record.family,
+            alpha=record.alpha,
+            params=record.params,
+            score=record.score,
+            mean_dataset_score=record.mean_dataset_score,
+            mean_runtime_seconds=record.mean_runtime_seconds,
+            metric_means=record.metric_means,
+            displacement_field_metrics=record.displacement_field_metrics,
+            inter_view_consistency_metrics=record.inter_view_consistency_metrics,
+        )
+        for record in records
+    ]
+
+
+def _filter_effect_rows(
+    rows: Sequence[EffectRow],
+    *,
+    stage_name: Optional[str],
+    strategy: str,
+    family: str,
+    alpha: str,
+    dataset_scope: str,
+    parameter_filters: Dict[str, str],
+    ignored_params: Sequence[str] = (),
+) -> List[EffectRow]:
+    filtered: List[EffectRow] = []
+    ignored = set(ignored_params)
+    for row in rows:
+        if stage_name and stage_name != "All" and row.stage != stage_name:
+            continue
+        if strategy != "All" and row.strategy != strategy:
+            continue
+        if family != "All" and row.family != family:
+            continue
+        if alpha != "All" and _alpha_filter_value(row.alpha) != alpha:
+            continue
+        if dataset_scope != "aggregate":
+            if row.dataset_id != dataset_scope:
+                continue
+        elif row.dataset_id is not None and row.source_kind == "run":
+            continue
+        matches = True
+        for parameter_name, filter_value in parameter_filters.items():
+            if parameter_name in ignored or filter_value == "All":
+                continue
+            if _stringify_param(row.params.get(parameter_name)) != filter_value:
+                matches = False
+                break
+        if matches:
+            filtered.append(row)
+    return filtered
+
+
+def _stage_parameter_rankings(
+    model: SweepVisualizationModel,
+    stage_name: Optional[str] = None,
+) -> List[str]:
+    rows = _rows_for_stage(model, stage_name or model.primary_stage_name)
+    counts: List[Tuple[int, str]] = []
+    for parameter_name in model.parameter_names:
+        distinct_values = {
+            _stringify_param(row.params.get(parameter_name))
+            for row in rows
+            if parameter_name in row.params
+        }
+        if len(distinct_values) > 1:
+            counts.append((len(distinct_values), parameter_name))
+    counts.sort(key=lambda item: (-item[0], item[1]))
+    ordered = [parameter_name for _, parameter_name in counts]
+    if ordered:
+        return ordered
+    return list(model.parameter_names)
 
 
 def _plot_progress_bars(ax: Any, model: SweepVisualizationModel) -> None:
@@ -994,6 +2198,157 @@ def create_overview_figure(model: SweepVisualizationModel) -> Figure:
     return fig
 
 
+def create_effects_figure(
+    model: SweepVisualizationModel,
+    *,
+    mode: str = "1D Trend",
+    stage_name: Optional[str] = None,
+    dataset_scope: str = "aggregate",
+    x_parameter_name: Optional[str] = None,
+    y_parameter_name: Optional[str] = None,
+    value_option: Optional[str] = None,
+    strategy_filter: str = "All",
+    family_filter: str = "All",
+    alpha_filter: str = "All",
+    parameter_filters: Optional[Dict[str, str]] = None,
+) -> Figure:
+    preferred_params = _stage_parameter_rankings(model, stage_name or model.primary_stage_name)
+    x_parameter = x_parameter_name or (preferred_params[0] if preferred_params else None)
+    y_parameter = y_parameter_name or (
+        preferred_params[1] if len(preferred_params) > 1 else (preferred_params[0] if preferred_params else None)
+    )
+    option = value_option or ("score" if "score" in _value_options(model) else _value_options(model)[0])
+    filters = dict(parameter_filters or {})
+
+    base_rows = (
+        _candidate_rows_to_effect_rows(model.candidates)
+        if dataset_scope == "aggregate"
+        else _run_records_to_effect_rows(model.run_metric_records)
+    )
+    filtered_rows = _filter_effect_rows(
+        base_rows,
+        stage_name=stage_name or model.primary_stage_name,
+        strategy=strategy_filter,
+        family=family_filter,
+        alpha=alpha_filter,
+        dataset_scope=dataset_scope,
+        parameter_filters=filters,
+        ignored_params=[param for param in (x_parameter, y_parameter) if param],
+    )
+
+    fig = Figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+    if not filtered_rows:
+        ax.text(0.5, 0.5, "No rows match the current effects filters.", ha="center", va="center")
+        ax.axis("off")
+        return fig
+    if x_parameter is None:
+        ax.text(0.5, 0.5, "No parameter metadata available.", ha="center", va="center")
+        ax.axis("off")
+        return fig
+
+    if mode == "2D Heatmap":
+        if y_parameter is None:
+            ax.text(0.5, 0.5, "Choose two parameters for the heatmap view.", ha="center", va="center")
+            ax.axis("off")
+            return fig
+        cell_values: Dict[Tuple[str, str], List[float]] = {}
+        x_numeric: Dict[str, float] = {}
+        y_numeric: Dict[str, float] = {}
+        for row in filtered_rows:
+            value = _effect_row_value_for_option(row, option)
+            if value is None or not math.isfinite(value):
+                continue
+            x_label = _stringify_param(row.params.get(x_parameter))
+            y_label = _stringify_param(row.params.get(y_parameter))
+            cell_values.setdefault((x_label, y_label), []).append(float(value))
+            x_numeric[x_label] = _numeric_param(row.params.get(x_parameter))
+            y_numeric[y_label] = _numeric_param(row.params.get(y_parameter))
+        if not cell_values:
+            ax.text(0.5, 0.5, f"No finite values for '{option}'.", ha="center", va="center")
+            ax.axis("off")
+            return fig
+        x_labels = sorted(cell_values.keys(), key=lambda item: (item[0], item[1]))
+        unique_x = sorted(
+            {item[0] for item in x_labels},
+            key=lambda label: (not math.isfinite(x_numeric.get(label, float("nan"))), x_numeric.get(label, float("nan")), label),
+        )
+        unique_y = sorted(
+            {item[1] for item in x_labels},
+            key=lambda label: (not math.isfinite(y_numeric.get(label, float("nan"))), y_numeric.get(label, float("nan")), label),
+        )
+        matrix = np.full((len(unique_y), len(unique_x)), np.nan, dtype=np.float64)
+        counts = np.zeros_like(matrix, dtype=np.int32)
+        x_lookup = {label: idx for idx, label in enumerate(unique_x)}
+        y_lookup = {label: idx for idx, label in enumerate(unique_y)}
+        for (x_label, y_label), values in cell_values.items():
+            matrix[y_lookup[y_label], x_lookup[x_label]] = float(np.mean(values))
+            counts[y_lookup[y_label], x_lookup[x_label]] = len(values)
+        image = ax.imshow(matrix, aspect="auto", cmap="viridis")
+        ax.set_xticks(range(len(unique_x)))
+        ax.set_xticklabels(unique_x, rotation=25, ha="right")
+        ax.set_yticks(range(len(unique_y)))
+        ax.set_yticklabels(unique_y)
+        ax.set_xlabel(x_parameter)
+        ax.set_ylabel(y_parameter)
+        ax.set_title(f"{dataset_scope}: {option} heatmap")
+        for y_idx in range(len(unique_y)):
+            for x_idx in range(len(unique_x)):
+                if counts[y_idx, x_idx] > 0:
+                    ax.text(x_idx, y_idx, str(int(counts[y_idx, x_idx])), ha="center", va="center", color="white", fontsize=8)
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        return fig
+
+    grouped_values: Dict[str, List[float]] = {}
+    grouped_numeric: Dict[str, float] = {}
+    for row in filtered_rows:
+        value = _effect_row_value_for_option(row, option)
+        if value is None or not math.isfinite(value):
+            continue
+        label = _stringify_param(row.params.get(x_parameter))
+        grouped_values.setdefault(label, []).append(float(value))
+        grouped_numeric[label] = _numeric_param(row.params.get(x_parameter))
+    if not grouped_values:
+        ax.text(0.5, 0.5, f"No finite values for '{option}'.", ha="center", va="center")
+        ax.axis("off")
+        return fig
+
+    labels = sorted(
+        grouped_values.keys(),
+        key=lambda label: (
+            not math.isfinite(grouped_numeric.get(label, float("nan"))),
+            grouped_numeric.get(label, float("nan")),
+            label,
+        ),
+    )
+    means = np.asarray([float(np.mean(grouped_values[label])) for label in labels], dtype=np.float64)
+    mins = np.asarray([float(np.min(grouped_values[label])) for label in labels], dtype=np.float64)
+    maxs = np.asarray([float(np.max(grouped_values[label])) for label in labels], dtype=np.float64)
+    counts = np.asarray([len(grouped_values[label]) for label in labels], dtype=np.int32)
+    x_numeric = np.asarray([grouped_numeric[label] for label in labels], dtype=np.float64)
+
+    if np.all(np.isfinite(x_numeric)):
+        ax.plot(x_numeric, means, marker="o", color="#2a6f97")
+        ax.fill_between(x_numeric, mins, maxs, color="#2a6f97", alpha=0.18)
+        ax.set_xticks(x_numeric)
+    else:
+        x_positions = np.arange(len(labels))
+        ax.plot(x_positions, means, marker="o", color="#2a6f97")
+        ax.fill_between(x_positions, mins, maxs, color="#2a6f97", alpha=0.18)
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(labels, rotation=25, ha="right")
+    for idx, count in enumerate(counts):
+        x_value = x_numeric[idx] if np.all(np.isfinite(x_numeric)) else idx
+        ax.annotate(f"n={int(count)}", (x_value, means[idx]), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=8)
+    ax.set_xlabel(x_parameter)
+    ax.set_ylabel(option.replace("metric:", "").replace("displacement:", "").replace("consistency:", ""))
+    ax.set_title(f"{dataset_scope}: {option} vs {x_parameter}")
+    ax.grid(True, linestyle=":", alpha=0.4)
+    fig.tight_layout()
+    return fig
+
+
 def create_coverage_figure(
     model: SweepVisualizationModel,
     *,
@@ -1001,59 +2356,18 @@ def create_coverage_figure(
     parameter_name: Optional[str] = None,
     value_option: Optional[str] = None,
 ) -> Figure:
-    rows = _rows_for_stage(model, stage_name)
-    fig = Figure(figsize=(10, 5))
-    ax = fig.add_subplot(111)
-    if not rows:
-        ax.text(0.5, 0.5, "No candidate rows available for coverage plotting.", ha="center", va="center")
-        ax.axis("off")
-        return fig
-
-    parameter = parameter_name or (model.parameter_names[0] if model.parameter_names else None)
-    option = value_option or ("score" if any(row.score is not None for row in rows) else _value_options(model)[-1])
-    if parameter is None:
-        ax.text(0.5, 0.5, "No parameter metadata available.", ha="center", va="center")
-        ax.axis("off")
-        return fig
-
-    numeric_values = np.asarray(
-        [_numeric_param(row.params.get(parameter)) for row in rows],
-        dtype=np.float64,
+    return create_effects_figure(
+        model,
+        mode="1D Trend",
+        stage_name=stage_name,
+        dataset_scope="aggregate",
+        x_parameter_name=parameter_name,
+        value_option=value_option,
+        strategy_filter="All",
+        family_filter="All",
+        alpha_filter="All",
+        parameter_filters={},
     )
-    text_values = [_stringify_param(row.params.get(parameter)) for row in rows]
-    y_values = np.asarray(
-        [
-            _row_value_for_option(row, option)
-            if _row_value_for_option(row, option) is not None
-            else np.nan
-            for row in rows
-        ],
-        dtype=np.float64,
-    )
-    valid_mask = np.isfinite(y_values)
-    if not np.any(valid_mask):
-        ax.text(0.5, 0.5, f"No finite values for '{option}'.", ha="center", va="center")
-        ax.axis("off")
-        return fig
-
-    if np.all(np.isfinite(numeric_values)):
-        ax.scatter(numeric_values[valid_mask], y_values[valid_mask], c="#2a6f97", alpha=0.8)
-        ax.set_xlabel(parameter)
-        ax.set_xticks(sorted(set(numeric_values[valid_mask])))
-    else:
-        categories = sorted(dict.fromkeys(text_values))
-        x_lookup = {label: idx for idx, label in enumerate(categories)}
-        x_values = np.asarray([x_lookup[label] for label in text_values], dtype=np.float64)
-        ax.scatter(x_values[valid_mask], y_values[valid_mask], c="#2a6f97", alpha=0.8)
-        ax.set_xlabel(parameter)
-        ax.set_xticks(range(len(categories)))
-        ax.set_xticklabels(categories, rotation=30, ha="right")
-
-    ax.set_ylabel(option.replace("metric:", ""))
-    ax.set_title(f"{stage_name or model.primary_stage_name}: {parameter} vs {option}")
-    ax.grid(True, linestyle=":", alpha=0.4)
-    fig.tight_layout()
-    return fig
 
 
 def _progression_summary_lines(model: SweepVisualizationModel) -> List[str]:
@@ -1284,9 +2598,11 @@ def create_metric_formulation_figure(model: SweepVisualizationModel) -> Optional
     if not model.alpha_family_summary:
         return None
 
-    fig = Figure(figsize=(10, 5))
-    quality_ax = fig.add_subplot(121)
-    runtime_ax = fig.add_subplot(122)
+    fig = Figure(figsize=(12, 8))
+    quality_ax = fig.add_subplot(221)
+    runtime_ax = fig.add_subplot(222)
+    displacement_ax = fig.add_subplot(223)
+    consistency_ax = fig.add_subplot(224)
     grouped: Dict[str, List[Dict[str, object]]] = {}
     for row in model.alpha_family_summary:
         grouped.setdefault(str(row["family"]), []).append(dict(row))
@@ -1321,6 +2637,32 @@ def create_metric_formulation_figure(model: SweepVisualizationModel) -> Optional
         if xs_runtime:
             runtime_ax.plot(xs_runtime, ys_runtime, marker="o", label=family)
 
+        xs_displacement = [
+            float(row["alpha"])
+            for row in rows
+            if row.get("mean_displacement_magnitude") is not None
+        ]
+        ys_displacement = [
+            float(row["mean_displacement_magnitude"])
+            for row in rows
+            if row.get("mean_displacement_magnitude") is not None
+        ]
+        if xs_displacement:
+            displacement_ax.plot(xs_displacement, ys_displacement, marker="o", label=family)
+
+        xs_consistency = [
+            float(row["alpha"])
+            for row in rows
+            if row.get("mean_view_std") is not None
+        ]
+        ys_consistency = [
+            float(row["mean_view_std"])
+            for row in rows
+            if row.get("mean_view_std") is not None
+        ]
+        if xs_consistency:
+            consistency_ax.plot(xs_consistency, ys_consistency, marker="o", label=family)
+
     quality_ax.set_xlabel("alpha")
     quality_ax.set_ylabel("mean score / primary metric")
     quality_ax.set_title("Quality vs metric formulation alpha")
@@ -1335,6 +2677,99 @@ def create_metric_formulation_figure(model: SweepVisualizationModel) -> Optional
     if runtime_ax.lines:
         runtime_ax.legend()
 
+    displacement_ax.set_xlabel("alpha")
+    displacement_ax.set_ylabel("mean displacement magnitude")
+    displacement_ax.set_title("Displacement vs metric formulation alpha")
+    displacement_ax.grid(True, linestyle=":", alpha=0.4)
+    if displacement_ax.lines:
+        displacement_ax.legend()
+
+    consistency_ax.set_xlabel("alpha")
+    consistency_ax.set_ylabel("mean view std")
+    consistency_ax.set_title("Consistency vs metric formulation alpha")
+    consistency_ax.grid(True, linestyle=":", alpha=0.4)
+    if consistency_ax.lines:
+        consistency_ax.legend()
+
+    fig.tight_layout()
+    return fig
+
+
+def create_metric_diagnostics_figure(
+    record: Optional[RunMetricRecord],
+    *,
+    component_name: str = "gradient",
+) -> Optional[Figure]:
+    if record is None:
+        return None
+
+    payload, read_warnings = _load_workspace_diagnostics(
+        None if record.workspace_path is None else Path(record.workspace_path)
+    )
+    blended = cast(Optional[np.ndarray], payload.get("pixel_blended_scores"))
+    component = cast(Optional[np.ndarray], payload.get(f"pixel_component_score_{component_name}"))
+    disp_x = cast(Optional[np.ndarray], payload.get("pixel_displacements_x"))
+    disp_y = cast(Optional[np.ndarray], payload.get("pixel_displacements_y"))
+    magnitude = None
+    if isinstance(disp_x, np.ndarray) and isinstance(disp_y, np.ndarray):
+        magnitude = np.sqrt(np.square(np.asarray(disp_x, dtype=np.float64)) + np.square(np.asarray(disp_y, dtype=np.float64)))
+
+    fig = Figure(figsize=(12, 8))
+    blended_ax = fig.add_subplot(221)
+    component_ax = fig.add_subplot(222)
+    disp_ax = fig.add_subplot(223)
+    text_ax = fig.add_subplot(224)
+
+    def _draw_map(ax: Any, array: Optional[np.ndarray], title: str) -> None:
+        if not isinstance(array, np.ndarray):
+            ax.text(0.5, 0.5, "Unavailable", ha="center", va="center")
+            ax.axis("off")
+            return
+        arr = np.asarray(array, dtype=np.float64)
+        while arr.ndim > 2:
+            arr = np.nanmean(arr, axis=-1)
+        image = ax.imshow(arr, aspect="auto", cmap="viridis")
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+
+    _draw_map(blended_ax, blended, "Blended score map")
+    _draw_map(component_ax, component, f"{component_name} score map")
+    _draw_map(disp_ax, magnitude, "Displacement magnitude")
+
+    text_ax.axis("off")
+    diagnostics = record.displacement_score_diagnostics
+    lines = [
+        f"run: {record.run_name}",
+        f"stage: {record.stage}",
+        f"candidate: {record.candidate_id}",
+        f"dataset: {record.dataset_id}",
+        f"family: {record.family or 'n/a'}",
+        f"alpha: {'n/a' if record.alpha is None else f'{record.alpha:g}'}",
+        "",
+    ]
+    if read_warnings:
+        lines.extend(read_warnings[:2])
+        lines.append("")
+    if record.metric_means:
+        lines.append("image metrics:")
+        for key in sorted(record.metric_means.keys())[:4]:
+            lines.append(f"  {key}: {record.metric_means[key]:.4f}")
+    if record.displacement_field_metrics:
+        lines.append("")
+        lines.append("displacement field:")
+        for key in sorted(record.displacement_field_metrics.keys())[:4]:
+            lines.append(f"  {key}: {record.displacement_field_metrics[key]:.4f}")
+    component_stats = diagnostics.get("component_selected_stats")
+    if isinstance(component_stats, dict) and component_name in component_stats:
+        stats = cast(Dict[str, float], component_stats[component_name])
+        lines.append("")
+        lines.append(f"{component_name} selected stats:")
+        for key in ("mean", "std", "min", "max"):
+            if key in stats:
+                lines.append(f"  {key}: {float(stats[key]):.4f}")
+    text_ax.text(0.01, 0.99, "\n".join(lines[:20]), va="top", ha="left", family="monospace")
     fig.tight_layout()
     return fig
 
@@ -1363,7 +2798,69 @@ def _candidate_row_to_export_dict(row: CandidateVisualizationRow) -> Dict[str, o
         "family": row.family,
         "alpha": row.alpha,
         "formulation_id": row.formulation_id,
+        "displacement_field_metrics": row.displacement_field_metrics,
+        "inter_view_consistency_metrics": row.inter_view_consistency_metrics,
+        "preview_paths": row.preview_paths,
     }
+
+
+def _run_metric_record_to_export_dict(record: RunMetricRecord) -> Dict[str, object]:
+    return {
+        "row_id": record.row_id,
+        "run_name": record.run_name,
+        "stage": record.stage,
+        "candidate_id": record.candidate_id,
+        "dataset_id": record.dataset_id,
+        "strategy": record.strategy,
+        "family": record.family,
+        "alpha": record.alpha,
+        "formulation_id": record.formulation_id,
+        "params": record.params,
+        "config": record.config,
+        "score": record.score,
+        "mean_dataset_score": record.mean_dataset_score,
+        "mean_runtime_seconds": record.mean_runtime_seconds,
+        "metric_means": record.metric_means,
+        "displacement_field_metrics": record.displacement_field_metrics,
+        "inter_view_consistency_metrics": record.inter_view_consistency_metrics,
+        "displacement_score_diagnostics": record.displacement_score_diagnostics,
+        "preview_path": record.preview_path,
+        "workspace_path": record.workspace_path,
+        "metric_record_path": record.metric_record_path,
+        "ranking_metric_name": record.ranking_metric_name,
+        "ranking_metric_value": record.ranking_metric_value,
+    }
+
+
+def _default_export_effect_parameters(model: SweepVisualizationModel) -> Tuple[Optional[str], Optional[str]]:
+    ranked = _stage_parameter_rankings(model, model.primary_stage_name)
+    if not ranked:
+        return None, None
+    if len(ranked) == 1:
+        return ranked[0], ranked[0]
+    return ranked[0], ranked[1]
+
+
+def _default_metric_diagnostics_record(model: SweepVisualizationModel) -> Optional[RunMetricRecord]:
+    preferred_stage = "metric_phase" if any(record.stage == "metric_phase" for record in model.run_metric_records) else model.primary_stage_name
+    candidate_order = {
+        (row.stage, row.candidate_id): idx
+        for idx, row in enumerate(model.candidates)
+    }
+    eligible = [
+        record
+        for record in model.run_metric_records
+        if record.stage == preferred_stage and (record.workspace_path or record.displacement_score_diagnostics)
+    ]
+    if not eligible:
+        return None
+    eligible.sort(
+        key=lambda record: (
+            candidate_order.get((record.stage, record.candidate_id), len(candidate_order)),
+            record.dataset_id,
+        )
+    )
+    return eligible[0]
 
 
 def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir: Path) -> Path:
@@ -1372,15 +2869,54 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
     export_dir = Path(output_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
 
+    effects_x, effects_y = _default_export_effect_parameters(model)
     plots: Dict[str, Figure] = {
         "overview.png": create_overview_figure(model),
         "coverage.png": create_coverage_figure(model),
         "progression.png": create_progression_figure(model),
         "significance.png": create_significance_figure(model),
     }
+    if effects_x is not None:
+        plots["effects_trend.png"] = create_effects_figure(
+            model,
+            mode="1D Trend",
+            stage_name=model.primary_stage_name,
+            dataset_scope="aggregate",
+            x_parameter_name=effects_x,
+            value_option="score",
+            strategy_filter="All",
+            family_filter="All",
+            alpha_filter="All",
+            parameter_filters={},
+        )
+    if effects_x is not None and effects_y is not None:
+        plots["effects_heatmap.png"] = create_effects_figure(
+            model,
+            mode="2D Heatmap",
+            stage_name=model.primary_stage_name,
+            dataset_scope="aggregate",
+            x_parameter_name=effects_x,
+            y_parameter_name=effects_y,
+            value_option="score",
+            strategy_filter="All",
+            family_filter="All",
+            alpha_filter="All",
+            parameter_filters={},
+        )
     metric_fig = create_metric_formulation_figure(model)
     if metric_fig is not None:
         plots["metric_formulations.png"] = metric_fig
+    diagnostics_record = _default_metric_diagnostics_record(model)
+    diagnostics_fig = create_metric_diagnostics_figure(
+        diagnostics_record,
+        component_name=(
+            cast(List[str], model.diagnostic_availability.get("components", []))[0]
+            if cast(List[str], model.diagnostic_availability.get("components", []))
+            else "gradient"
+        ),
+    )
+    if diagnostics_fig is not None:
+        plots["metric_diagnostics.png"] = diagnostics_fig
 
     plot_files: List[str] = []
     for filename, figure in plots.items():
@@ -1450,8 +2986,16 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
             [_compact_json(item) for item in model.alpha_family_summary],
             dtype=object,
         ),
+        "alpha_ranked_runs_json": np.asarray(
+            [_compact_json(item) for item in model.alpha_ranked_runs],
+            dtype=object,
+        ),
         "candidate_table_json": np.asarray(
             [_compact_json(_candidate_row_to_export_dict(row)) for row in model.candidates],
+            dtype=object,
+        ),
+        "run_metric_records_json": np.asarray(
+            [_compact_json(_run_metric_record_to_export_dict(record)) for record in model.run_metric_records],
             dtype=object,
         ),
         "warnings": np.asarray(model.warnings, dtype=object),
@@ -1460,6 +3004,11 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
             _compact_json(model.experiment_metadata),
             dtype=object,
         ),
+        "diagnostic_availability_json": np.asarray(
+            _compact_json(model.diagnostic_availability),
+            dtype=object,
+        ),
+        "primary_metric_source": np.asarray(model.primary_metric_source, dtype=object),
     }
     save_workspace_variables(str(export_dir / "visualization_bundle.npz"), bundle_payload)
 
@@ -1469,6 +3018,7 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
         "mode": model.mode,
         "primary_stage_name": model.primary_stage_name,
         "primary_metric": model.primary_metric,
+        "primary_metric_source": model.primary_metric_source,
         "plot_files": plot_files,
         "bundle_npz": "visualization_bundle.npz",
         "bundle_mat": "visualization_bundle.mat",
@@ -1488,10 +3038,13 @@ def _format_overview_text(model: SweepVisualizationModel) -> str:
     lines = [
         f"mode: {model.mode}",
         f"source: {model.source_dir}",
+        f"scope: {model.path_scope}",
+        f"experiment root: {model.experiment_root}",
         f"datasets ({len(model.datasets)}): {', '.join(model.datasets) if model.datasets else 'n/a'}",
         f"strategies: {', '.join(model.strategies) if model.strategies else 'n/a'}",
         f"primary stage: {model.primary_stage_name}",
-        f"primary metric: {model.primary_metric}",
+        f"primary metric: {model.primary_metric} ({model.primary_metric_source})",
+        f"run metric records: {len(model.run_metric_records)}",
         "",
         "stages:",
     ]
@@ -1501,29 +3054,90 @@ def _format_overview_text(model: SweepVisualizationModel) -> str:
             f"  {stage_name}: planned={stage.num_runs_planned} successful={stage.num_successful} "
             f"failed={stage.num_failed} pending={stage.num_pending} running={stage.num_running}"
         )
+    lines.extend(
+        [
+            "",
+            "diagnostics:",
+            f"  score maps: {bool(model.diagnostic_availability.get('score_maps'))}",
+            f"  displacement maps: {bool(model.diagnostic_availability.get('displacement_maps'))}",
+            f"  component stats: {bool(model.diagnostic_availability.get('component_stats'))}",
+            "  components: "
+            + ", ".join(cast(List[str], model.diagnostic_availability.get("components", [])) or ["n/a"]),
+        ]
+    )
     if model.warnings:
         lines.extend(["", "warnings:"])
         lines.extend(f"  - {warning}" for warning in model.warnings[:12])
     return "\n".join(lines)
 
 
-def _format_coverage_text(model: SweepVisualizationModel, stage_name: str) -> str:
-    rows = _rows_for_stage(model, stage_name)
-    if not rows:
-        return "No candidate rows available."
-    lines = [f"stage: {stage_name}", ""]
+def _format_effects_text(
+    model: SweepVisualizationModel,
+    *,
+    stage_name: str,
+    dataset_scope: str,
+    mode: str,
+    x_parameter_name: Optional[str],
+    y_parameter_name: Optional[str],
+    value_option: str,
+    strategy_filter: str,
+    family_filter: str,
+    alpha_filter: str,
+    parameter_filters: Dict[str, str],
+) -> str:
+    base_rows = (
+        _candidate_rows_to_effect_rows(model.candidates)
+        if dataset_scope == "aggregate"
+        else _run_records_to_effect_rows(model.run_metric_records)
+    )
+    filtered = _filter_effect_rows(
+        base_rows,
+        stage_name=stage_name,
+        strategy=strategy_filter,
+        family=family_filter,
+        alpha=alpha_filter,
+        dataset_scope=dataset_scope,
+        parameter_filters=parameter_filters,
+        ignored_params=[param for param in (x_parameter_name, y_parameter_name) if param],
+    )
+    lines = [
+        f"stage: {stage_name}",
+        f"dataset scope: {dataset_scope}",
+        f"mode: {mode}",
+        f"value: {value_option}",
+        f"rows: {len(filtered)}",
+        f"x parameter: {x_parameter_name or 'n/a'}",
+    ]
+    if mode == "2D Heatmap":
+        lines.append(f"y parameter: {y_parameter_name or 'n/a'}")
+    lines.extend(
+        [
+            f"strategy filter: {strategy_filter}",
+            f"family filter: {family_filter}",
+            f"alpha filter: {alpha_filter}",
+        ]
+    )
+    active_filters = [
+        f"{name}={value}"
+        for name, value in sorted(parameter_filters.items(), key=lambda item: item[0])
+        if value != "All"
+    ]
+    lines.append("parameter filters: " + (", ".join(active_filters) if active_filters else "none"))
+    lines.append("")
+    lines.append("parameter coverage:")
     for parameter_name in model.parameter_names:
-        counter = Counter(
+        values = Counter(
             _stringify_param(row.params.get(parameter_name))
-            for row in rows
+            for row in filtered
             if parameter_name in row.params
         )
-        if not counter:
+        if not values:
             continue
         rendered = ", ".join(
-            f"{value} ({count})" for value, count in sorted(counter.items(), key=lambda item: item[0])
+            f"{label} ({count})"
+            for label, count in sorted(values.items(), key=lambda item: item[0])
         )
-        lines.append(f"{parameter_name}: {rendered}")
+        lines.append(f"  {parameter_name}: {rendered}")
     return "\n".join(lines)
 
 
@@ -1546,6 +3160,74 @@ def _format_significance_text(model: SweepVisualizationModel) -> str:
         for metric_name in model.metric_names[:8]:
             if metric_name in best.metric_means:
                 lines.append(f"  {metric_name}: {best.metric_means[metric_name]:.4f}")
+    return "\n".join(lines)
+
+
+def _format_metric_summary_text(model: SweepVisualizationModel) -> str:
+    lines = [
+        "family, alpha, count, mean_score, primary_metric_mean, mean_runtime_seconds, mean_displacement_magnitude, mean_view_std"
+    ]
+    lines.extend(
+        ", ".join(
+            [
+                str(item.get("family")),
+                "n/a" if item.get("alpha") is None else f"{float(item.get('alpha', 0.0)):.3f}",
+                str(item.get("count")),
+                str(item.get("mean_score")),
+                str(item.get("primary_metric_mean")),
+                str(item.get("mean_runtime_seconds")),
+                str(item.get("mean_displacement_magnitude")),
+                str(item.get("mean_view_std")),
+            ]
+        )
+        for item in model.alpha_family_summary
+    )
+    if model.alpha_ranked_runs:
+        lines.extend(["", "ranked runs:"])
+        for row in model.alpha_ranked_runs[:8]:
+            lines.append(
+                ", ".join(
+                    [
+                        str(row.get("rank", "")),
+                        str(row.get("family", "")),
+                        str(row.get("alpha", "")),
+                        str(row.get("ranking_metric_name", "")),
+                        str(row.get("ranking_metric_value", "")),
+                    ]
+                )
+            )
+    return "\n".join(lines)
+
+
+def _format_metric_diagnostics_text(record: Optional[RunMetricRecord]) -> str:
+    if record is None:
+        return "No diagnostic run record available."
+    lines = [
+        f"run: {record.run_name}",
+        f"stage: {record.stage}",
+        f"candidate: {record.candidate_id}",
+        f"dataset: {record.dataset_id}",
+        f"strategy: {record.strategy}",
+        f"family: {record.family or 'n/a'}",
+        f"alpha: {'n/a' if record.alpha is None else f'{record.alpha:g}'}",
+        f"workspace: {record.workspace_path or 'n/a'}",
+    ]
+    if record.metric_means:
+        lines.extend(["", "image metrics:"])
+        for key in sorted(record.metric_means.keys())[:6]:
+            lines.append(f"  {key}: {record.metric_means[key]:.4f}")
+    if record.displacement_field_metrics:
+        lines.extend(["", "displacement field metrics:"])
+        for key in sorted(record.displacement_field_metrics.keys())[:6]:
+            lines.append(f"  {key}: {record.displacement_field_metrics[key]:.4f}")
+    if record.inter_view_consistency_metrics:
+        lines.extend(["", "inter-view consistency:"])
+        for key in sorted(record.inter_view_consistency_metrics.keys())[:6]:
+            lines.append(f"  {key}: {record.inter_view_consistency_metrics[key]:.4f}")
+    diagnostics = record.displacement_score_diagnostics
+    if diagnostics:
+        lines.extend(["", "diagnostic keys:"])
+        lines.extend(f"  {key}" for key in sorted(diagnostics.keys()))
     return "\n".join(lines)
 
 
@@ -1572,15 +3254,27 @@ class SweepVisualizationApp:
         self._canvases: Dict[str, Any] = {}
         self._preview_image_ref: Any = None
         self._metric_tab_visible = False
+        self._effect_filter_vars: Dict[str, Any] = {}
+        self._effect_filter_combos: Dict[str, Any] = {}
 
         self.path_var = tk.StringVar(value=str(initial_path) if initial_path else "")
         self.status_var = tk.StringVar(value="Idle")
         self.coverage_stage_var = tk.StringVar(value="")
+        self.coverage_dataset_var = tk.StringVar(value="aggregate")
+        self.coverage_mode_var = tk.StringVar(value="1D Trend")
         self.coverage_param_var = tk.StringVar(value="")
+        self.coverage_y_param_var = tk.StringVar(value="")
         self.coverage_value_var = tk.StringVar(value="score")
+        self.coverage_strategy_var = tk.StringVar(value="All")
+        self.coverage_family_var = tk.StringVar(value="All")
+        self.coverage_alpha_var = tk.StringVar(value="All")
         self.preview_stage_var = tk.StringVar(value="")
         self.preview_candidate_var = tk.StringVar(value="")
         self.preview_dataset_var = tk.StringVar(value="")
+        self.diagnostic_stage_var = tk.StringVar(value="")
+        self.diagnostic_candidate_var = tk.StringVar(value="")
+        self.diagnostic_dataset_var = tk.StringVar(value="")
+        self.diagnostic_component_var = tk.StringVar(value="gradient")
 
         self._build_ui()
         if initial_path is not None:
@@ -1608,17 +3302,20 @@ class SweepVisualizationApp:
         self.progression_tab = self.ttk.Frame(self.notebook)
         self.significance_tab = self.ttk.Frame(self.notebook)
         self.metric_tab = self.ttk.Frame(self.notebook)
+        self.diagnostics_tab = self.ttk.Frame(self.notebook)
 
         self.notebook.add(self.overview_tab, text="Overview")
-        self.notebook.add(self.coverage_tab, text="Coverage")
+        self.notebook.add(self.coverage_tab, text="Effects")
         self.notebook.add(self.progression_tab, text="Progression")
         self.notebook.add(self.significance_tab, text="Significance")
+        self.notebook.add(self.diagnostics_tab, text="Metric Diagnostics")
 
         self._build_overview_tab()
         self._build_coverage_tab()
         self._build_progression_tab()
         self._build_significance_tab()
         self._build_metric_tab()
+        self._build_diagnostics_tab()
 
     def _build_overview_tab(self) -> None:
         self.overview_text = self.tk.Text(self.overview_tab, height=14, wrap="word")
@@ -1668,8 +3365,27 @@ class SweepVisualizationApp:
             width=14,
         )
         self.coverage_stage_combo.pack(side="left", padx=4)
-        self.coverage_stage_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_coverage())
-        self.ttk.Label(controls, text="Parameter").pack(side="left", padx=(8, 0))
+        self.coverage_stage_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_effects())
+        self.ttk.Label(controls, text="Dataset").pack(side="left", padx=(8, 0))
+        self.coverage_dataset_combo = self.ttk.Combobox(
+            controls,
+            textvariable=self.coverage_dataset_var,
+            state="readonly",
+            width=12,
+        )
+        self.coverage_dataset_combo.pack(side="left", padx=4)
+        self.coverage_dataset_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_effects())
+        self.ttk.Label(controls, text="Mode").pack(side="left", padx=(8, 0))
+        self.coverage_mode_combo = self.ttk.Combobox(
+            controls,
+            textvariable=self.coverage_mode_var,
+            state="readonly",
+            width=12,
+            values=["1D Trend", "2D Heatmap"],
+        )
+        self.coverage_mode_combo.pack(side="left", padx=4)
+        self.coverage_mode_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_effects())
+        self.ttk.Label(controls, text="X").pack(side="left", padx=(8, 0))
         self.coverage_param_combo = self.ttk.Combobox(
             controls,
             textvariable=self.coverage_param_var,
@@ -1677,7 +3393,16 @@ class SweepVisualizationApp:
             width=18,
         )
         self.coverage_param_combo.pack(side="left", padx=4)
-        self.coverage_param_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_coverage())
+        self.coverage_param_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_effects())
+        self.ttk.Label(controls, text="Y").pack(side="left", padx=(8, 0))
+        self.coverage_y_param_combo = self.ttk.Combobox(
+            controls,
+            textvariable=self.coverage_y_param_var,
+            state="readonly",
+            width=18,
+        )
+        self.coverage_y_param_combo.pack(side="left", padx=4)
+        self.coverage_y_param_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_effects())
         self.ttk.Label(controls, text="Value").pack(side="left", padx=(8, 0))
         self.coverage_value_combo = self.ttk.Combobox(
             controls,
@@ -1686,7 +3411,40 @@ class SweepVisualizationApp:
             width=22,
         )
         self.coverage_value_combo.pack(side="left", padx=4)
-        self.coverage_value_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_coverage())
+        self.coverage_value_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_effects())
+
+        filters = self.ttk.Frame(self.coverage_tab)
+        filters.pack(fill="x", padx=6, pady=4)
+        self.ttk.Label(filters, text="Strategy").pack(side="left")
+        self.coverage_strategy_combo = self.ttk.Combobox(
+            filters,
+            textvariable=self.coverage_strategy_var,
+            state="readonly",
+            width=12,
+        )
+        self.coverage_strategy_combo.pack(side="left", padx=4)
+        self.coverage_strategy_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_effects())
+        self.ttk.Label(filters, text="Family").pack(side="left", padx=(8, 0))
+        self.coverage_family_combo = self.ttk.Combobox(
+            filters,
+            textvariable=self.coverage_family_var,
+            state="readonly",
+            width=16,
+        )
+        self.coverage_family_combo.pack(side="left", padx=4)
+        self.coverage_family_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_effects())
+        self.ttk.Label(filters, text="Alpha").pack(side="left", padx=(8, 0))
+        self.coverage_alpha_combo = self.ttk.Combobox(
+            filters,
+            textvariable=self.coverage_alpha_var,
+            state="readonly",
+            width=10,
+        )
+        self.coverage_alpha_combo.pack(side="left", padx=4)
+        self.coverage_alpha_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_effects())
+
+        self.coverage_filter_frame = self.ttk.Frame(self.coverage_tab)
+        self.coverage_filter_frame.pack(fill="x", padx=6, pady=4)
 
         self.coverage_text = self.tk.Text(self.coverage_tab, height=12, wrap="word")
         self.coverage_text.pack(fill="x", padx=6, pady=4)
@@ -1710,6 +3468,51 @@ class SweepVisualizationApp:
         self.metric_text.pack(fill="x", padx=6, pady=6)
         self.metric_plot_frame = self.ttk.Frame(self.metric_tab)
         self.metric_plot_frame.pack(fill="both", expand=True, padx=6, pady=6)
+
+    def _build_diagnostics_tab(self) -> None:
+        controls = self.ttk.Frame(self.diagnostics_tab)
+        controls.pack(fill="x", padx=6, pady=6)
+        self.ttk.Label(controls, text="Stage").pack(side="left")
+        self.diagnostic_stage_combo = self.ttk.Combobox(
+            controls,
+            textvariable=self.diagnostic_stage_var,
+            state="readonly",
+            width=14,
+        )
+        self.diagnostic_stage_combo.pack(side="left", padx=4)
+        self.diagnostic_stage_combo.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_diagnostic_candidates())
+        self.ttk.Label(controls, text="Candidate").pack(side="left", padx=(8, 0))
+        self.diagnostic_candidate_combo = self.ttk.Combobox(
+            controls,
+            textvariable=self.diagnostic_candidate_var,
+            state="readonly",
+            width=20,
+        )
+        self.diagnostic_candidate_combo.pack(side="left", padx=4)
+        self.diagnostic_candidate_combo.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_diagnostic_datasets())
+        self.ttk.Label(controls, text="Dataset").pack(side="left", padx=(8, 0))
+        self.diagnostic_dataset_combo = self.ttk.Combobox(
+            controls,
+            textvariable=self.diagnostic_dataset_var,
+            state="readonly",
+            width=16,
+        )
+        self.diagnostic_dataset_combo.pack(side="left", padx=4)
+        self.diagnostic_dataset_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_metric_diagnostics())
+        self.ttk.Label(controls, text="Component").pack(side="left", padx=(8, 0))
+        self.diagnostic_component_combo = self.ttk.Combobox(
+            controls,
+            textvariable=self.diagnostic_component_var,
+            state="readonly",
+            width=14,
+        )
+        self.diagnostic_component_combo.pack(side="left", padx=4)
+        self.diagnostic_component_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_metric_diagnostics())
+
+        self.diagnostics_text = self.tk.Text(self.diagnostics_tab, height=12, wrap="word")
+        self.diagnostics_text.pack(fill="x", padx=6, pady=6)
+        self.diagnostics_plot_frame = self.ttk.Frame(self.diagnostics_tab)
+        self.diagnostics_plot_frame.pack(fill="both", expand=True, padx=6, pady=6)
 
     def _set_text_widget(self, widget: Any, text: str) -> None:
         widget.delete("1.0", self.tk.END)
@@ -1770,37 +3573,88 @@ class SweepVisualizationApp:
         self.status_var.set(f"Loaded {model.mode}")
         self._populate_from_model(model)
 
+    def _rebuild_effect_filter_controls(self, model: SweepVisualizationModel) -> None:
+        for widget in self.coverage_filter_frame.winfo_children():
+            widget.destroy()
+        self._effect_filter_vars = {}
+        self._effect_filter_combos = {}
+        for idx, parameter_name in enumerate(model.parameter_names):
+            row = idx // 4
+            col = (idx % 4) * 2
+            values = sorted(
+                {
+                    _stringify_param(row_item.params.get(parameter_name))
+                    for row_item in model.candidates
+                    if parameter_name in row_item.params
+                }
+                | {
+                    _stringify_param(record.params.get(parameter_name))
+                    for record in model.run_metric_records
+                    if parameter_name in record.params
+                }
+            )
+            var = self.tk.StringVar(value="All")
+            label = self.ttk.Label(self.coverage_filter_frame, text=parameter_name)
+            label.grid(row=row, column=col, sticky="w", padx=3, pady=2)
+            combo = self.ttk.Combobox(
+                self.coverage_filter_frame,
+                textvariable=var,
+                state="readonly",
+                width=16,
+                values=["All", *values],
+            )
+            combo.grid(row=row, column=col + 1, sticky="we", padx=3, pady=2)
+            combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_effects())
+            self._effect_filter_vars[parameter_name] = var
+            self._effect_filter_combos[parameter_name] = combo
+
     def _populate_from_model(self, model: SweepVisualizationModel) -> None:
         self._set_text_widget(self.overview_text, _format_overview_text(model))
         self._set_text_widget(self.progression_text, "\n".join(_progression_summary_lines(model)))
         self._set_text_widget(self.significance_text, _format_significance_text(model))
+        self._set_text_widget(self.metric_text, _format_metric_summary_text(model))
 
-        metric_lines = ["family, alpha, count, mean_score, primary_metric_mean, mean_runtime_seconds"]
-        metric_lines.extend(
-            ", ".join(
-                [
-                    str(item.get("family")),
-                    f"{float(item.get('alpha', 0.0)):.3f}",
-                    str(item.get("count")),
-                    str(item.get("mean_score")),
-                    str(item.get("primary_metric_mean")),
-                    str(item.get("mean_runtime_seconds")),
-                ]
-            )
-            for item in model.alpha_family_summary
-        )
-        self._set_text_widget(self.metric_text, "\n".join(metric_lines))
-
-        stage_values = model.stage_order
+        stage_values = ["All", *model.stage_order]
         self.coverage_stage_combo["values"] = stage_values
         self.coverage_stage_var.set(model.primary_stage_name)
-        self.coverage_param_combo["values"] = model.parameter_names
-        self.coverage_param_var.set(model.parameter_names[0] if model.parameter_names else "")
+        self.coverage_dataset_combo["values"] = ["aggregate", *model.datasets]
+        self.coverage_dataset_var.set("aggregate")
+        preferred_params = _stage_parameter_rankings(model, model.primary_stage_name)
+        parameter_values = preferred_params if preferred_params else model.parameter_names
+        self.coverage_param_combo["values"] = parameter_values
+        self.coverage_y_param_combo["values"] = parameter_values
+        self.coverage_param_var.set(parameter_values[0] if parameter_values else "")
+        self.coverage_y_param_var.set(parameter_values[1] if len(parameter_values) > 1 else (parameter_values[0] if parameter_values else ""))
         value_options = _value_options(model)
         self.coverage_value_combo["values"] = value_options
         self.coverage_value_var.set(
             "score" if "score" in value_options else (value_options[0] if value_options else "")
         )
+        self.coverage_strategy_combo["values"] = ["All", *model.strategies]
+        self.coverage_strategy_var.set("All")
+        families = _sorted_unique(
+            [row.family for row in model.candidates if row.family]
+            + [record.family for record in model.run_metric_records if record.family]
+        )
+        self.coverage_family_combo["values"] = ["All", *families]
+        self.coverage_family_var.set("All")
+        alpha_values = _sorted_unique(
+            _alpha_filter_value(row.alpha)
+            for row in model.candidates
+            if row.alpha is not None
+        )
+        alpha_values = _sorted_unique(
+            alpha_values
+            + [
+                _alpha_filter_value(record.alpha)
+                for record in model.run_metric_records
+                if record.alpha is not None
+            ]
+        )
+        self.coverage_alpha_combo["values"] = ["All", *alpha_values]
+        self.coverage_alpha_var.set("All")
+        self.coverage_mode_var.set("1D Trend")
+        self._rebuild_effect_filter_controls(model)
 
         preview_stage_values = [
             stage_name
@@ -1811,12 +3665,21 @@ class SweepVisualizationApp:
         self.preview_stage_var.set(preview_stage_values[0] if preview_stage_values else "")
         self._refresh_preview_candidates()
 
+        diagnostic_stage_values = _sorted_unique(record.stage for record in model.run_metric_records)
+        self.diagnostic_stage_combo["values"] = diagnostic_stage_values
+        self.diagnostic_stage_var.set("metric_phase" if "metric_phase" in diagnostic_stage_values else (diagnostic_stage_values[0] if diagnostic_stage_values else ""))
+        diagnostic_components = cast(List[str], model.diagnostic_availability.get("components", []))
+        self.diagnostic_component_combo["values"] = diagnostic_components or ["gradient", "laplacian", "intensity"]
+        self.diagnostic_component_var.set((diagnostic_components[0] if diagnostic_components else "gradient"))
+        self._refresh_diagnostic_candidates()
+
         self._update_metric_tab_visibility(bool(model.alpha_family_summary))
-        self.refresh_coverage()
+        self.refresh_effects()
         self._draw_figure("overview", self.overview_plot_frame, create_overview_figure(model))
         self._draw_figure("progression", self.progression_plot_frame, create_progression_figure(model))
         self._draw_figure("significance", self.significance_plot_frame, create_significance_figure(model))
         self._draw_figure("metric", self.metric_plot_frame, create_metric_formulation_figure(model))
+        self.refresh_metric_diagnostics()
 
     def _update_metric_tab_visibility(self, visible: bool) -> None:
         if visible and not self._metric_tab_visible:
@@ -1826,23 +3689,114 @@ class SweepVisualizationApp:
             self.notebook.forget(self.metric_tab)
             self._metric_tab_visible = False
 
-    def refresh_coverage(self) -> None:
+    def refresh_effects(self) -> None:
         if self.model is None:
             return
         stage_name = self.coverage_stage_var.get() or self.model.primary_stage_name
-        parameter_name = self.coverage_param_var.get() or (
-            self.model.parameter_names[0] if self.model.parameter_names else None
-        )
+        parameter_name = self.coverage_param_var.get() or (self.model.parameter_names[0] if self.model.parameter_names else None)
+        y_parameter_name = self.coverage_y_param_var.get() or parameter_name
         value_option = self.coverage_value_var.get() or "score"
-        self._set_text_widget(self.coverage_text, _format_coverage_text(self.model, stage_name))
+        dataset_scope = self.coverage_dataset_var.get() or "aggregate"
+        mode = self.coverage_mode_var.get() or "1D Trend"
+        strategy_filter = self.coverage_strategy_var.get() or "All"
+        family_filter = self.coverage_family_var.get() or "All"
+        alpha_filter = self.coverage_alpha_var.get() or "All"
+        parameter_filters = {
+            parameter_name: var.get() or "All"
+            for parameter_name, var in self._effect_filter_vars.items()
+        }
+        self._set_text_widget(
+            self.coverage_text,
+            _format_effects_text(
+                self.model,
+                stage_name=stage_name,
+                dataset_scope=dataset_scope,
+                mode=mode,
+                x_parameter_name=parameter_name,
+                y_parameter_name=y_parameter_name,
+                value_option=value_option,
+                strategy_filter=strategy_filter,
+                family_filter=family_filter,
+                alpha_filter=alpha_filter,
+                parameter_filters=parameter_filters,
+            ),
+        )
         self._draw_figure(
             "coverage",
             self.coverage_plot_frame,
-            create_coverage_figure(
+            create_effects_figure(
                 self.model,
+                mode=mode,
                 stage_name=stage_name,
-                parameter_name=parameter_name,
+                dataset_scope=dataset_scope,
+                x_parameter_name=parameter_name,
+                y_parameter_name=y_parameter_name,
                 value_option=value_option,
+                strategy_filter=strategy_filter,
+                family_filter=family_filter,
+                alpha_filter=alpha_filter,
+                parameter_filters=parameter_filters,
+            ),
+        )
+
+    def refresh_coverage(self) -> None:
+        self.refresh_effects()
+
+    def _selected_diagnostic_record(self) -> Optional[RunMetricRecord]:
+        if self.model is None:
+            return None
+        stage_name = self.diagnostic_stage_var.get()
+        candidate_id = self.diagnostic_candidate_var.get()
+        dataset_id = self.diagnostic_dataset_var.get()
+        return next(
+            (
+                record
+                for record in self.model.run_metric_records
+                if record.stage == stage_name
+                and record.candidate_id == candidate_id
+                and record.dataset_id == dataset_id
+            ),
+            None,
+        )
+
+    def _refresh_diagnostic_candidates(self) -> None:
+        if self.model is None:
+            self.diagnostic_candidate_combo["values"] = []
+            self.diagnostic_candidate_var.set("")
+            return
+        stage_name = self.diagnostic_stage_var.get()
+        candidate_values = _sorted_unique(
+            record.candidate_id for record in self.model.run_metric_records if record.stage == stage_name
+        )
+        self.diagnostic_candidate_combo["values"] = candidate_values
+        self.diagnostic_candidate_var.set(candidate_values[0] if candidate_values else "")
+        self._refresh_diagnostic_datasets()
+
+    def _refresh_diagnostic_datasets(self) -> None:
+        if self.model is None:
+            self.diagnostic_dataset_combo["values"] = []
+            self.diagnostic_dataset_var.set("")
+            return
+        stage_name = self.diagnostic_stage_var.get()
+        candidate_id = self.diagnostic_candidate_var.get()
+        dataset_values = _sorted_unique(
+            record.dataset_id
+            for record in self.model.run_metric_records
+            if record.stage == stage_name and record.candidate_id == candidate_id
+        )
+        self.diagnostic_dataset_combo["values"] = dataset_values
+        self.diagnostic_dataset_var.set(dataset_values[0] if dataset_values else "")
+        self.refresh_metric_diagnostics()
+
+    def refresh_metric_diagnostics(self) -> None:
+        record = self._selected_diagnostic_record()
+        self._set_text_widget(self.diagnostics_text, _format_metric_diagnostics_text(record))
+        self._draw_figure(
+            "diagnostics",
+            self.diagnostics_plot_frame,
+            create_metric_diagnostics_figure(
+                record,
+                component_name=self.diagnostic_component_var.get() or "gradient",
             ),
         )
 

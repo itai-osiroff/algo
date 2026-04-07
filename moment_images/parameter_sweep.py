@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from PIL import Image
@@ -1860,11 +1860,13 @@ def _run_task_isolated(task: Dict[str, object]) -> Tuple[Dict[str, object], bool
 def _execute_pool_batch(
     tasks: Sequence[Dict[str, object]],
     workers: int,
+    on_result: Optional[Callable[[Dict[str, object], Dict[str, object]], None]] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Optional[BaseException]]:
     completed_results: List[Dict[str, object]] = []
     completed_indices: set[int] = set()
     pending_tasks = list(tasks)
     executor_exc: Optional[BaseException] = None
+    callback_exc: Optional[BaseException] = None
 
     try:
         with ProcessPoolExecutor(max_workers=workers, initializer=_pool_worker_initializer) as executor:
@@ -1875,12 +1877,18 @@ def _execute_pool_batch(
                 task = future_map[future]
                 try:
                     result = future.result()
-                    result["task_index"] = task["task_index"]
-                    completed_results.append(result)
-                    completed_indices.add(int(task["task_index"]))
                 except Exception as exc:  # noqa: BLE001 - recover by degrading worker count.
                     executor_exc = exc
                     break
+                result["task_index"] = task["task_index"]
+                completed_results.append(result)
+                completed_indices.add(int(task["task_index"]))
+                if on_result is not None:
+                    try:
+                        on_result(task, result)
+                    except Exception as exc:  # noqa: BLE001 - surface callback/persistence failures unchanged.
+                        callback_exc = exc
+                        raise
 
             if executor_exc is None:
                 pending_tasks = []
@@ -1891,6 +1899,8 @@ def _execute_pool_batch(
                     if int(task["task_index"]) not in completed_indices
                 ]
     except Exception as exc:  # noqa: BLE001 - covers pool init/spawn failures.
+        if callback_exc is not None and exc is callback_exc:
+            raise
         executor_exc = exc
         pending_tasks = [
             task
@@ -1955,6 +1965,79 @@ def _default_max_workers(explicit: Optional[int]) -> int:
         return max(1, int(explicit))
     cpu_count = os.cpu_count() or 1
     return max(1, cpu_count - 1)
+
+
+def _update_stage_progress_state(
+    *,
+    run_state: Optional[Dict[str, object]],
+    stage_name: str,
+    planned_runs: int,
+    completed_runs: int,
+    skipped_valid_count: int,
+    recomputed_count: int,
+    mark_completed: bool = False,
+) -> None:
+    if run_state is None:
+        return
+    stages_state = cast(Dict[str, Dict[str, object]], run_state.setdefault("stages", {}))
+    stage_slot = cast(Dict[str, object], stages_state.setdefault(stage_name, {}))
+    stage_slot["planned_runs"] = int(planned_runs)
+    stage_slot["completed_runs"] = int(completed_runs)
+    stage_slot["skipped_valid_count"] = int(skipped_valid_count)
+    stage_slot["recomputed_count"] = int(recomputed_count)
+    if mark_completed:
+        stage_slot["last_completed_at"] = _utc_now_iso()
+
+
+def _record_stage_task_result(
+    *,
+    task: Dict[str, object],
+    result: Dict[str, object],
+    state_runs: Dict[str, Dict[str, object]],
+    run_state: Optional[Dict[str, object]],
+    run_state_path: Optional[Path],
+    stage_name: str,
+    planned_runs: int,
+    completed_runs: int,
+    skipped_valid_count: int,
+    recomputed_count: int,
+) -> int:
+    if run_state is None:
+        return recomputed_count
+
+    entry = state_runs.get(str(task["run_uid"]))
+    if entry is not None:
+        attempts = cast(List[Dict[str, object]], entry.setdefault("attempts", []))
+        attempts.append(
+            {
+                "timestamp": _utc_now_iso(),
+                "status": result.get("status"),
+                "runtime_seconds": float(result.get("runtime_seconds", 0.0)),
+                "error": result.get("error"),
+            }
+        )
+        if result.get("status") == "ok":
+            if bool(task.get("_recompute_after_invalid", False)):
+                entry["status"] = "recomputed"
+                recomputed_count += 1
+            else:
+                entry["status"] = "ok"
+        else:
+            entry["status"] = "failed"
+        entry["artifact_validation"] = _validate_run_artifacts(Path(cast(str, task["run_dir"])))
+
+    _update_stage_progress_state(
+        run_state=run_state,
+        stage_name=stage_name,
+        planned_runs=planned_runs,
+        completed_runs=completed_runs,
+        skipped_valid_count=skipped_valid_count,
+        recomputed_count=recomputed_count,
+        mark_completed=True,
+    )
+    if run_state_path is not None:
+        _persist_run_state(run_state_path, run_state)
+    return recomputed_count
 
 
 def _evaluate_stage(
@@ -2050,6 +2133,9 @@ def _evaluate_stage(
             }
             state_runs[run_uid] = entry
         previous_status = str(entry.get("status", "pending")) if entry is not None else "pending"
+        if entry is not None and previous_status == "running":
+            entry["status"] = "pending"
+            previous_status = "pending"
         artifact_validation = _validate_run_artifacts(run_dir)
         if entry is not None:
             entry["artifact_validation"] = artifact_validation
@@ -2079,6 +2165,14 @@ def _evaluate_stage(
         task["_recompute_after_invalid"] = previous_status in {"ok", "recomputed", "skipped_valid"}
         tasks_to_execute.append(task)
 
+    _update_stage_progress_state(
+        run_state=run_state,
+        stage_name=stage_name,
+        planned_runs=len(tasks),
+        completed_runs=len(stage_results),
+        skipped_valid_count=skipped_valid_count,
+        recomputed_count=recomputed_count,
+    )
     if run_state is not None and run_state_path is not None:
         _persist_run_state(run_state_path, run_state)
 
@@ -2119,67 +2213,53 @@ def _evaluate_stage(
                     stage_results.append(result)
                     completed_task_indices.add(int(task["task_index"]))
                     progress_bar.update(1)
-                    if run_state is not None:
-                        entry = state_runs.get(str(task["run_uid"]))
-                        if entry is not None:
-                            attempts = cast(List[Dict[str, object]], entry.setdefault("attempts", []))
-                            attempts.append(
-                                {
-                                    "timestamp": _utc_now_iso(),
-                                    "status": result.get("status"),
-                                    "runtime_seconds": float(result.get("runtime_seconds", 0.0)),
-                                    "error": result.get("error"),
-                                }
-                            )
-                            if result.get("status") == "ok":
-                                if bool(task.get("_recompute_after_invalid", False)):
-                                    entry["status"] = "recomputed"
-                                    recomputed_count += 1
-                                else:
-                                    entry["status"] = "ok"
-                            else:
-                                entry["status"] = "failed"
-                            entry["artifact_validation"] = _validate_run_artifacts(Path(cast(str, task["run_dir"])))
-                            if run_state_path is not None:
-                                _persist_run_state(run_state_path, run_state)
+                    recomputed_count = _record_stage_task_result(
+                        task=task,
+                        result=result,
+                        state_runs=state_runs,
+                        run_state=run_state,
+                        run_state_path=run_state_path,
+                        stage_name=stage_name,
+                        planned_runs=len(tasks),
+                        completed_runs=len(stage_results),
+                        skipped_valid_count=skipped_valid_count,
+                        recomputed_count=recomputed_count,
+                    )
                 break
+
+            def _commit_pooled_result(task: Dict[str, object], result: Dict[str, object]) -> None:
+                nonlocal recomputed_count
+                task_index = int(result["task_index"])
+                if task_index in completed_task_indices:
+                    return
+                stage_results.append(result)
+                completed_task_indices.add(task_index)
+                progress_bar.update(1)
+                recomputed_count = _record_stage_task_result(
+                    task=task,
+                    result=result,
+                    state_runs=state_runs,
+                    run_state=run_state,
+                    run_state_path=run_state_path,
+                    stage_name=stage_name,
+                    planned_runs=len(tasks),
+                    completed_runs=len(stage_results),
+                    skipped_valid_count=skipped_valid_count,
+                    recomputed_count=recomputed_count,
+                )
 
             completed_batch, pending_batch, exec_error = _execute_pool_batch(
                 remaining_tasks,
                 workers=current_workers,
+                on_result=_commit_pooled_result,
             )
-            stage_results.extend(completed_batch)
-            completed_task_indices.update(int(item["task_index"]) for item in completed_batch)
             if completed_batch:
-                progress_bar.update(len(completed_batch))
-                if run_state is not None:
-                    by_uid = {str(task["run_uid"]): task for task in remaining_tasks}
-                    for result in completed_batch:
-                        run_uid = str(result["run_uid"])
-                        task = by_uid.get(run_uid)
-                        entry = state_runs.get(run_uid)
-                        if task is None or entry is None:
-                            continue
-                        attempts = cast(List[Dict[str, object]], entry.setdefault("attempts", []))
-                        attempts.append(
-                            {
-                                "timestamp": _utc_now_iso(),
-                                "status": result.get("status"),
-                                "runtime_seconds": float(result.get("runtime_seconds", 0.0)),
-                                "error": result.get("error"),
-                            }
-                        )
-                        if result.get("status") == "ok":
-                            if bool(task.get("_recompute_after_invalid", False)):
-                                entry["status"] = "recomputed"
-                                recomputed_count += 1
-                            else:
-                                entry["status"] = "ok"
-                        else:
-                            entry["status"] = "failed"
-                        entry["artifact_validation"] = _validate_run_artifacts(Path(cast(str, task["run_dir"])))
-                    if run_state_path is not None:
-                        _persist_run_state(run_state_path, run_state)
+                by_uid = {str(task["run_uid"]): task for task in remaining_tasks}
+                for result in completed_batch:
+                    task = by_uid.get(str(result["run_uid"]))
+                    if task is None:
+                        continue
+                    _commit_pooled_result(task, result)
 
             if exec_error is None:
                 break
@@ -2209,15 +2289,17 @@ def _evaluate_stage(
     execution["skipped_valid_count"] = int(skipped_valid_count)
     execution["recomputed_count"] = int(recomputed_count)
     execution["used_isolated_mode"] = bool(isolated_crash_count > 0 or current_workers == 1)
-    if run_state is not None:
-        stages_state = cast(Dict[str, Dict[str, object]], run_state.setdefault("stages", {}))
-        stage_slot = cast(Dict[str, object], stages_state.setdefault(stage_name, {}))
-        stage_slot["completed_runs"] = len(stage_results)
-        stage_slot["skipped_valid_count"] = int(skipped_valid_count)
-        stage_slot["recomputed_count"] = int(recomputed_count)
-        stage_slot["last_completed_at"] = _utc_now_iso()
-        if run_state_path is not None:
-            _persist_run_state(run_state_path, run_state)
+    _update_stage_progress_state(
+        run_state=run_state,
+        stage_name=stage_name,
+        planned_runs=len(tasks),
+        completed_runs=len(stage_results),
+        skipped_valid_count=skipped_valid_count,
+        recomputed_count=recomputed_count,
+        mark_completed=True,
+    )
+    if run_state is not None and run_state_path is not None:
+        _persist_run_state(run_state_path, run_state)
     return StageEvaluationResult(stage_results=stage_results, execution=execution)
 
 

@@ -1,5 +1,6 @@
 import json
 from concurrent.futures.process import BrokenProcessPool
+import shutil
 
 import numpy as np
 import pytest
@@ -285,14 +286,19 @@ def test_evaluate_stage_degrades_worker_count_and_continues(monkeypatch, tmp_pat
 
     call_state = {"count": 0}
 
-    def fake_execute_pool_batch(tasks, workers):
+    def fake_execute_pool_batch(tasks, workers, on_result=None):
         call_state["count"] += 1
         assert workers in {2, 4}
         if call_state["count"] == 1:
             completed = [_build_eval_result(tasks[0], status="ok")]
+            if on_result is not None:
+                on_result(tasks[0], completed[0])
             pending = list(tasks[1:])
             return completed, pending, BrokenProcessPool("pool crashed")
         completed = [_build_eval_result(task, status="ok") for task in tasks]
+        if on_result is not None:
+            for task, result in zip(tasks, completed):
+                on_result(task, result)
         return completed, [], None
 
     monkeypatch.setattr(parameter_sweep, "_execute_pool_batch", fake_execute_pool_batch)
@@ -316,6 +322,173 @@ def test_evaluate_stage_degrades_worker_count_and_continues(monkeypatch, tmp_pat
     assert evaluation.execution["degrade_events"][0]["workers_before"] == 4
     assert evaluation.execution["degrade_events"][0]["workers_after"] == 2
     assert call_state["count"] == 2
+
+
+def test_evaluate_stage_persists_pooled_results_before_batch_retry(monkeypatch, tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    dataset = PreparedDataset(
+        dataset_id="d1",
+        views_path=views_path,
+        hdr_enabled=False,
+        hdr_exposure_times=None,
+        normalize_to_8bit=False,
+        views_shape=tuple(int(dim) for dim in views.shape),
+        views_dtype=str(views.dtype),
+        views_itemsize=int(views.dtype.itemsize),
+    )
+    candidates = [
+        SweepCandidate(
+            strategy="pixel",
+            params={"similarity_window_size": 1},
+            config=RectificationRunConfig(strategy="pixel", similarity_window_size=1, max_displacement=0),
+            candidate_id=f"c{idx}",
+        )
+        for idx in range(2)
+    ]
+    run_state = {"runs": {}, "stages": {}}
+    run_state_path = tmp_path / "run_state.json"
+    persisted: dict[str, object] = {}
+    call_state = {"count": 0}
+
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 10**12)
+
+    def fake_execute_pool_batch(tasks, workers, on_result=None):
+        call_state["count"] += 1
+        if call_state["count"] == 1:
+            completed = [_build_eval_result(tasks[0], status="ok")]
+            if on_result is not None:
+                on_result(tasks[0], completed[0])
+            state = json.loads(run_state_path.read_text(encoding="utf-8"))
+            entry = state["runs"][tasks[0]["run_uid"]]
+            persisted["status"] = entry["status"]
+            persisted["attempts"] = len(entry["attempts"])
+            persisted["completed_runs"] = state["stages"]["stage1"]["completed_runs"]
+            return completed, list(tasks[1:]), BrokenProcessPool("pool crashed")
+        completed = [_build_eval_result(task, status="ok") for task in tasks]
+        if on_result is not None:
+            for task, result in zip(tasks, completed):
+                on_result(task, result)
+        return completed, [], None
+
+    monkeypatch.setattr(parameter_sweep, "_execute_pool_batch", fake_execute_pool_batch)
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: (_build_eval_result(task, status="ok"), False),
+    )
+
+    evaluation = parameter_sweep._evaluate_stage(
+        stage_name="stage1",
+        candidates=candidates,
+        datasets=[dataset],
+        output_dir=tmp_path,
+        save_figures_flag=False,
+        requested_workers=2,
+        run_state=run_state,
+        run_state_path=run_state_path,
+    )
+
+    assert len(evaluation.stage_results) == 2
+    assert persisted == {"status": "ok", "attempts": 1, "completed_runs": 1}
+
+
+def test_evaluate_stage_surfaces_pooled_persistence_failure_without_pool_retry(monkeypatch, tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    datasets = [
+        PreparedDataset(
+            dataset_id="d1",
+            views_path=views_path,
+            hdr_enabled=False,
+            hdr_exposure_times=None,
+            normalize_to_8bit=False,
+            views_shape=tuple(int(dim) for dim in views.shape),
+            views_dtype=str(views.dtype),
+            views_itemsize=int(views.dtype.itemsize),
+        ),
+        PreparedDataset(
+            dataset_id="d2",
+            views_path=views_path,
+            hdr_enabled=False,
+            hdr_exposure_times=None,
+            normalize_to_8bit=False,
+            views_shape=tuple(int(dim) for dim in views.shape),
+            views_dtype=str(views.dtype),
+            views_itemsize=int(views.dtype.itemsize),
+        ),
+    ]
+    candidates = [
+        SweepCandidate(
+            strategy="pixel",
+            params={"similarity_window_size": 1},
+            config=RectificationRunConfig(strategy="pixel", similarity_window_size=1, max_displacement=0),
+            candidate_id="c0",
+        )
+    ]
+    run_state = {"runs": {}, "stages": {}}
+    run_state_path = tmp_path / "run_state.json"
+    executor_state = {"instances": 0, "submit_calls": 0}
+    original_persist_run_state = parameter_sweep._persist_run_state
+
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 10**12)
+
+    class FakeFuture:
+        def __init__(self, task):
+            self.task = task
+
+        def result(self):
+            return _build_eval_result(self.task, status="ok")
+
+    class FakeExecutor:
+        def __init__(self, max_workers, initializer=None):
+            executor_state["instances"] += 1
+            self.max_workers = max_workers
+            self.initializer = initializer
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, func, task):
+            executor_state["submit_calls"] += 1
+            return FakeFuture(task)
+
+    def fail_on_result_persist(state_path, state):
+        stage_state = state.get("stages", {}).get("stage1", {})
+        if int(stage_state.get("completed_runs", 0)) > 0:
+            raise RuntimeError("persist exploded")
+        original_persist_run_state(state_path, state)
+
+    monkeypatch.setattr(parameter_sweep, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(parameter_sweep, "as_completed", lambda futures: list(futures))
+    monkeypatch.setattr(parameter_sweep, "_persist_run_state", fail_on_result_persist)
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: pytest.fail("callback persistence failures must not trigger isolated retry"),
+    )
+
+    with pytest.raises(RuntimeError, match="persist exploded"):
+        parameter_sweep._evaluate_stage(
+            stage_name="stage1",
+            candidates=candidates,
+            datasets=datasets,
+            output_dir=tmp_path,
+            save_figures_flag=False,
+            requested_workers=2,
+            run_state=run_state,
+            run_state_path=run_state_path,
+        )
+
+    assert executor_state["instances"] == 1
+    assert executor_state["submit_calls"] == 2
 
 
 def test_evaluate_stage_records_failed_isolated_worker(monkeypatch, tmp_path):
@@ -773,3 +946,119 @@ def test_run_sweep_resume_recomputes_corrupt_metric_phase_artifact(tmp_path):
     run_state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
     statuses = {entry["status"] for entry in run_state["runs"].values()}
     assert "recomputed" in statuses
+
+
+def test_run_sweep_resume_normalizes_stale_running_metric_phase_entries(tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            shortlist_top_k=1,
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="exp_grad",
+                    family="ncc_gradient",
+                    alphas=[0.5],
+                )
+            ],
+        ),
+        output_dir=str(tmp_path / "metric_stale_running"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(spec)
+
+    state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    for entry in state["runs"].values():
+        if entry["stage"] == "metric_phase":
+            entry["status"] = "running"
+    (out_dir / "run_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    run_sweep_experiment(spec, output_dir=out_dir)
+
+    state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    metric_statuses = {
+        entry["status"] for entry in state["runs"].values() if entry["stage"] == "metric_phase"
+    }
+    assert "running" not in metric_statuses
+    assert "skipped_valid" in metric_statuses
+
+
+def test_run_sweep_resume_recovers_partial_metric_phase_alpha_outputs(tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            shortlist_top_k=1,
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="exp_grad",
+                    family="ncc_gradient",
+                    alphas=[0.0, 0.5, 1.0],
+                )
+            ],
+        ),
+        output_dir=str(tmp_path / "metric_partial_resume"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(spec)
+    metric_dir = out_dir / "metric_experiments"
+
+    for config_path in sorted(metric_dir.glob("runs/metric_phase/*/*/config.json")):
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if float(config["displacement_alpha"]) != 0.0:
+            shutil.rmtree(config_path.parents[1])
+
+    for artifact_name in ("metric_phase_summary.json", "leaderboard.json", "summary.json", "alpha_report.json"):
+        artifact_path = metric_dir / artifact_name
+        if artifact_path.exists():
+            artifact_path.unlink()
+
+    state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    for entry in state["runs"].values():
+        if entry["stage"] == "metric_phase":
+            entry["status"] = "running"
+    (out_dir / "run_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    run_sweep_experiment(spec, output_dir=out_dir)
+
+    assert (metric_dir / "metric_phase_summary.json").exists()
+    assert (metric_dir / "summary.json").exists()
+    assert (metric_dir / "alpha_report.json").exists()
+
+    alpha_values = {
+        float(json.loads(path.read_text(encoding="utf-8"))["displacement_alpha"])
+        for path in metric_dir.glob("runs/metric_phase/*/*/config.json")
+    }
+    assert alpha_values == {0.0, 0.5, 1.0}

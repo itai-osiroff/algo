@@ -12,6 +12,7 @@ from PIL import Image
 
 from moment_images.sweep_visualization import (
     SweepVisualizationApp,
+    create_effects_figure,
     export_sweep_visualization_bundle,
     load_sweep_visualization_model,
 )
@@ -36,6 +37,119 @@ def _metrics(base: float) -> dict:
         "laplacian_variance": base + 4.0,
         "dwt_level2_hv_energy": base + 5.0,
     }
+
+
+def _displacement_metrics(base: float) -> dict:
+    return {
+        "mean_magnitude": base,
+        "std_magnitude": base + 0.5,
+        "p95_magnitude": base + 1.0,
+        "max_magnitude": base + 1.5,
+    }
+
+
+def _consistency_metrics(base: float) -> dict:
+    return {
+        "mean_view_std": base,
+        "p95_view_std": base + 0.2,
+        "max_view_std": base + 0.4,
+    }
+
+
+def _diagnostics_payload() -> dict:
+    return {
+        "metric_family": "ncc_gradient",
+        "alpha": 0.2,
+        "component_selected_stats": {
+            "gradient": {"mean": 0.8, "std": 0.1, "min": 0.5, "max": 0.9},
+            "laplacian": {"mean": 0.6, "std": 0.2, "min": 0.2, "max": 0.8},
+        },
+    }
+
+
+def _write_workspace(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        pixel_blended_scores=np.arange(16, dtype=np.float64).reshape(4, 4),
+        pixel_component_score_gradient=np.full((4, 4), 0.75, dtype=np.float64),
+        pixel_component_score_laplacian=np.full((4, 4), 0.55, dtype=np.float64),
+        pixel_displacements_x=np.full((4, 4), 0.4, dtype=np.float64),
+        pixel_displacements_y=np.full((4, 4), 0.3, dtype=np.float64),
+    )
+
+
+def _write_alpha_report(path: Path) -> None:
+    _write_json(
+        path,
+        {
+            "primary_metric": "laplacian_variance",
+            "ranked_runs": [
+                {
+                    "rank": 1,
+                    "run": "metric_m1c0000_d1",
+                    "family": "ncc_gradient",
+                    "alpha": 0.2,
+                    "ranking_metric_name": "laplacian_variance",
+                    "ranking_metric_value": 42.0,
+                }
+            ],
+            "alpha_family_summary": [
+                {
+                    "family": "ncc_gradient",
+                    "alpha": 0.2,
+                    "count": 2,
+                    "laplacian_variance_mean": 42.0,
+                    "mean_runtime_seconds": 9.5,
+                    "mean_displacement_magnitude_mean": 1.3,
+                    "mean_view_std_mean": 0.25,
+                },
+                {
+                    "family": "ncc_laplacian",
+                    "alpha": 0.5,
+                    "count": 1,
+                    "laplacian_variance_mean": 31.0,
+                    "mean_runtime_seconds": 11.5,
+                    "mean_displacement_magnitude_mean": 1.7,
+                    "mean_view_std_mean": 0.35,
+                },
+            ],
+        },
+    )
+
+
+def _write_metric_record(
+    path: Path,
+    *,
+    run: str,
+    family: str,
+    alpha: float,
+    formulation_id: str,
+    metric_base: float,
+) -> None:
+    _write_json(
+        path,
+        {
+            "run": run,
+            "config": {
+                "strategy": "combined",
+                "displacement_metric_family": family,
+                "displacement_alpha": alpha,
+                "metric_formulation_id": formulation_id,
+                "max_displacement": 6,
+                "gauss_sigma": 3.0,
+            },
+            "metric_formulation": {
+                "family": family,
+                "alpha": alpha,
+                "id": formulation_id,
+            },
+            "global_and_local_metrics": _metrics(metric_base),
+            "displacement_field_metrics": _displacement_metrics(metric_base / 10.0),
+            "inter_view_consistency_metrics": _consistency_metrics(metric_base / 100.0),
+            "displacement_score_diagnostics": _diagnostics_payload(),
+        },
+    )
 
 
 def _ranking(
@@ -187,7 +301,14 @@ def _write_manifest(path: Path, datasets: list[str]) -> None:
     )
 
 
-def _create_modern_fixture(base_dir: Path, *, include_stage2_summary: bool = True, include_metric_phase: bool = False) -> Path:
+def _create_modern_fixture(
+    base_dir: Path,
+    *,
+    include_stage2_summary: bool = True,
+    include_metric_phase: bool = False,
+    include_alpha_report: bool = False,
+    include_workspace: bool = False,
+) -> Path:
     output_dir = base_dir / "modern"
     datasets = ["d1", "d2"]
     _write_manifest(output_dir / "experiment_manifest.json", datasets)
@@ -217,12 +338,23 @@ def _create_modern_fixture(base_dir: Path, *, include_stage2_summary: bool = Tru
     summary_rows = [
         {
             "run": "stage1_s1c0000_d1",
-            "config": {"strategy": "combined", "displacement_metric_family": "ncc_gradient", "displacement_alpha": 0.5},
+            "config": {
+                "strategy": "combined",
+                "displacement_metric_family": "ncc_gradient",
+                "displacement_alpha": 0.5,
+                "max_displacement": 6,
+                "gauss_sigma": 3.0,
+            },
             "metric_formulation": {"family": "ncc_gradient", "alpha": 0.5, "id": "baseline"},
             "global_and_local_metrics": _metrics(10.0),
+            "displacement_field_metrics": _displacement_metrics(1.0),
+            "inter_view_consistency_metrics": _consistency_metrics(0.2),
+            "displacement_score_diagnostics": _diagnostics_payload(),
         }
     ]
     _write_json(output_dir / "summary.json", summary_rows)
+    if include_workspace:
+        _write_workspace(output_dir / "runs" / "stage1" / "s1c0000" / "d1" / "workspace.npz")
 
     if include_metric_phase:
         metric_dir = output_dir / "metric_experiments"
@@ -241,14 +373,23 @@ def _create_modern_fixture(base_dir: Path, *, include_stage2_summary: bool = Tru
                         "strategy": "combined",
                         "displacement_metric_family": "ncc_gradient",
                         "displacement_alpha": 0.2,
+                        "max_displacement": 6,
+                        "gauss_sigma": 3.0,
                     },
                     "metric_formulation": {"family": "ncc_gradient", "alpha": 0.2, "id": "grad_0p2"},
                     "global_and_local_metrics": _metrics(20.0),
+                    "displacement_field_metrics": _displacement_metrics(1.4),
+                    "inter_view_consistency_metrics": _consistency_metrics(0.3),
+                    "displacement_score_diagnostics": _diagnostics_payload(),
                 }
             ],
         )
         for dataset_id in datasets:
             _write_preview(metric_dir / "runs" / "metric_phase" / "m1c0000" / dataset_id / "avg_rectified.png")
+        if include_workspace:
+            _write_workspace(metric_dir / "runs" / "metric_phase" / "m1c0000" / "d1" / "workspace.npz")
+        if include_alpha_report:
+            _write_alpha_report(metric_dir / "alpha_report.json")
     return output_dir
 
 
@@ -327,15 +468,54 @@ def test_load_sweep_visualization_model_supports_partial_modern_outputs(tmp_path
 
 
 def test_load_sweep_visualization_model_supports_metric_phase_outputs(tmp_path):
-    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True, include_metric_phase=True)
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_alpha_report=True,
+        include_workspace=True,
+    )
 
     model = load_sweep_visualization_model(output_dir)
 
     assert model.primary_stage_name == "metric_phase"
     assert "metric_phase" in model.stage_order
     assert model.alpha_family_summary
+    assert model.alpha_ranked_runs
     families = {row["family"] for row in model.alpha_family_summary}
     assert {"ncc_gradient", "ncc_laplacian"}.issubset(families)
+    assert model.diagnostic_availability["score_maps"] is True
+    assert "gradient" in model.diagnostic_availability["components"]
+
+
+def test_load_sweep_visualization_model_supports_direct_metric_phase_directory(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_alpha_report=True,
+    )
+
+    model = load_sweep_visualization_model(output_dir / "metric_experiments")
+
+    assert model.mode == "metric_phase_dir"
+    assert model.path_scope == "metric_phase_dir"
+    assert model.primary_stage_name == "metric_phase"
+    assert model.stage_order == ["stage1", "stage2", "metric_phase"]
+
+
+def test_load_sweep_visualization_model_prefers_reporting_primary_metric(tmp_path):
+    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True)
+    manifest_path = output_dir / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["scoring"]["metric_weights"] = {"sum_squared_gradient": 1.0, "laplacian_variance": 0.5}
+    manifest["reporting"]["primary_metric"] = "laplacian_variance"
+    _write_json(manifest_path, manifest)
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.primary_metric == "laplacian_variance"
+    assert model.primary_metric_source == "experiment_manifest.reporting.primary_metric"
 
 
 def test_load_sweep_visualization_model_warns_but_loads_when_optional_artifact_is_corrupt(tmp_path):
@@ -349,8 +529,89 @@ def test_load_sweep_visualization_model_warns_but_loads_when_optional_artifact_i
     assert any("summary.json" in warning for warning in model.warnings)
 
 
-def test_export_sweep_visualization_bundle_writes_bundle_and_plots(tmp_path):
+def test_load_sweep_visualization_model_synthesizes_metric_phase_alpha_summary_from_raw_records(tmp_path):
     output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True, include_metric_phase=True)
+    metric_dir = output_dir / "metric_experiments"
+    (metric_dir / "metric_phase_summary.json").unlink()
+    (metric_dir / "summary.json").unlink()
+    _write_alpha_report(output_dir / "alpha_report.json")
+    _write_metric_record(
+        metric_dir / "runs" / "metric_phase" / "m1c0000" / "d1" / "metric_record.json",
+        run="metric_phase_m1c0000_d1",
+        family="ncc_gradient",
+        alpha=0.2,
+        formulation_id="grad_0p2",
+        metric_base=20.0,
+    )
+    _write_metric_record(
+        metric_dir / "runs" / "metric_phase" / "m1c0001" / "d1" / "metric_record.json",
+        run="metric_phase_m1c0001_d1",
+        family="ncc_gradient",
+        alpha=0.8,
+        formulation_id="grad_0p8",
+        metric_base=24.0,
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.provenance["alpha_summary_source"] == "metric_phase.run_metric_records"
+    assert {float(row["alpha"]) for row in model.alpha_family_summary} == {0.2, 0.8}
+    assert all(float(row["alpha"]) != 0.5 for row in model.alpha_family_summary)
+    assert any(
+        "Metric-phase alpha report unavailable; synthesized alpha summary" in warning
+        for warning in model.warnings
+    )
+
+
+def test_load_sweep_visualization_model_falls_back_to_root_alpha_report_when_metric_phase_has_no_alpha_data(tmp_path):
+    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True, include_metric_phase=True)
+    metric_dir = output_dir / "metric_experiments"
+    (metric_dir / "metric_phase_summary.json").unlink()
+    (metric_dir / "summary.json").unlink()
+    _write_alpha_report(output_dir / "alpha_report.json")
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.provenance["alpha_summary_source"] == "experiment_root.alpha_report"
+    assert any(float(row["alpha"]) == 0.5 for row in model.alpha_family_summary)
+
+
+def test_load_sweep_visualization_model_scopes_metric_phase_candidate_alpha_fallback(tmp_path):
+    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True, include_metric_phase=True)
+    metric_dir = output_dir / "metric_experiments"
+    _write_json(
+        metric_dir / "metric_phase_summary.json",
+        _stage_summary(
+            "metric_phase",
+            [
+                _ranking("m1c0000", score=0.95, rank=1, datasets=["d1", "d2"], stage="metric_phase", family="ncc_gradient", alpha=0.2),
+                _ranking("m1c0001", score=0.82, rank=2, datasets=["d1", "d2"], stage="metric_phase", family="ncc_gradient", alpha=0.8),
+            ],
+        ),
+    )
+    (metric_dir / "summary.json").unlink()
+    _write_alpha_report(output_dir / "alpha_report.json")
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.provenance["alpha_summary_source"] == "metric_phase.candidate_rows"
+    assert {float(row["alpha"]) for row in model.alpha_family_summary} == {0.2, 0.8}
+    assert all(float(row["alpha"]) != 0.5 for row in model.alpha_family_summary)
+    assert any(
+        "Metric-phase alpha report unavailable; synthesized alpha summary from metric-phase candidate rows."
+        in warning
+        for warning in model.warnings
+    )
+
+
+def test_export_sweep_visualization_bundle_writes_bundle_and_plots(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_alpha_report=True,
+        include_workspace=True,
+    )
     model = load_sweep_visualization_model(output_dir)
     export_dir = tmp_path / "export"
 
@@ -362,13 +623,70 @@ def test_export_sweep_visualization_bundle_writes_bundle_and_plots(tmp_path):
     assert (export_dir / "visualization_manifest.json").exists()
     assert (export_dir / "overview.png").exists()
     assert (export_dir / "coverage.png").exists()
+    assert (export_dir / "effects_trend.png").exists()
+    assert (export_dir / "effects_heatmap.png").exists()
     assert (export_dir / "progression.png").exists()
     assert (export_dir / "significance.png").exists()
+    assert (export_dir / "metric_diagnostics.png").exists()
     with np.load(export_dir / "visualization_bundle.npz", allow_pickle=True) as bundle:
         assert "score_matrix" in bundle.files
         assert "metric_tensor" in bundle.files
+        assert "run_metric_records_json" in bundle.files
+        assert "diagnostic_availability_json" in bundle.files
+        assert "primary_metric_source" in bundle.files
         assert bundle["score_matrix"].shape[1] == 2
         assert bundle["metric_tensor"].ndim == 3
+
+
+def test_create_effects_figure_supports_aggregate_and_dataset_specific_grouping(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_workspace=True,
+    )
+    stage1_summary_path = output_dir / "stage1_summary.json"
+    stage1_summary = json.loads(stage1_summary_path.read_text(encoding="utf-8"))
+    rankings = stage1_summary["rankings"]
+    rankings[1]["params"]["max_displacement"] = rankings[0]["params"]["max_displacement"]
+    rankings[1]["config"]["max_displacement"] = rankings[0]["config"]["max_displacement"]
+    _write_json(stage1_summary_path, stage1_summary)
+
+    root_summary_path = output_dir / "summary.json"
+    root_summary = json.loads(root_summary_path.read_text(encoding="utf-8"))
+    duplicate = dict(root_summary[0])
+    duplicate["run"] = "stage1_s1c0001_d1"
+    duplicate["config"] = dict(duplicate["config"])
+    duplicate["config"]["gauss_sigma"] = root_summary[0]["config"]["gauss_sigma"]
+    duplicate["config"]["max_displacement"] = root_summary[0]["config"].get("max_displacement", 5)
+    root_summary.append(duplicate)
+    _write_json(root_summary_path, root_summary)
+
+    model = load_sweep_visualization_model(output_dir)
+    trend = create_effects_figure(
+        model,
+        mode="1D Trend",
+        stage_name="stage1",
+        dataset_scope="aggregate",
+        x_parameter_name="max_displacement",
+        value_option="score",
+        parameter_filters={},
+    )
+    heatmap = create_effects_figure(
+        model,
+        mode="2D Heatmap",
+        stage_name="stage1",
+        dataset_scope="d1",
+        x_parameter_name="max_displacement",
+        y_parameter_name="gauss_sigma",
+        value_option="metric:laplacian_variance",
+        parameter_filters={},
+    )
+
+    assert trend.axes[0].get_xlabel() == "max_displacement"
+    assert any(text.get_text() == "n=2" for text in trend.axes[0].texts)
+    assert "heatmap" in heatmap.axes[0].get_title().lower()
+    assert any(text.get_text() == "2" for text in heatmap.axes[0].texts)
 
 
 def _can_create_tk() -> bool:
@@ -396,7 +714,13 @@ def _make_root_or_skip():
 
 
 def test_gui_loads_model_and_toggles_metric_tab(tmp_path):
-    metric_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True, include_metric_phase=True)
+    metric_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_alpha_report=True,
+        include_workspace=True,
+    )
     legacy_dir = _create_legacy_fixture(tmp_path, include_metric_axes=False)
 
     root = _make_root_or_skip()
@@ -406,6 +730,8 @@ def test_gui_loads_model_and_toggles_metric_tab(tmp_path):
     app.load_from_path(metric_dir)
     root.update()
     tab_names = [app.notebook.tab(tab_id, "text") for tab_id in app.notebook.tabs()]
+    assert "Effects" in tab_names
+    assert "Metric Diagnostics" in tab_names
     assert "Metric Formulations" in tab_names
 
     app.load_from_path(legacy_dir)
