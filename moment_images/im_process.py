@@ -1053,12 +1053,28 @@ def save_figures(figures: List[Figure], save_dir: str, dpi: int = 1000) -> Dict[
     
     return filename_changes
 
+def _resolve_workspace_artifact_paths(save_path: str) -> Tuple[Path, Path]:
+    """
+    Resolve sibling ``.npz`` / ``.mat`` artifact paths for a workspace bundle.
+
+    ``numpy.savez`` appends ``.npz`` automatically when the caller supplies a
+    bare filename. The atomic writer operates on an already-open file handle, so
+    we must reproduce that behavior explicitly here to keep the interactive
+    workflow backward-compatible.
+    """
+    target_path = Path(save_path)
+    if target_path.suffix.lower() != ".npz":
+        target_path = target_path.with_name(f"{target_path.name}.npz")
+    return target_path, target_path.with_suffix(".mat")
+
+
 def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
     """
     Save essential workspace variables to a compressed NumPy archive.
 
     The saved ``.npz`` can be loaded later with ``numpy.load`` for reuse in
-    follow-up analysis sessions.
+    follow-up analysis sessions. If ``save_path`` has no ``.npz`` suffix, one is
+    added automatically and the MATLAB bundle is written beside it as ``.mat``.
     """
     import scipy.io
     if not variables:
@@ -1075,15 +1091,16 @@ def save_workspace_variables(save_path: str, variables: Dict[str, Any]) -> None:
     if not filtered:
         print("No workspace variables available to save.")
         return
-    target_path = Path(save_path)
+    target_path, mat_path = _resolve_workspace_artifact_paths(save_path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         write_npz_atomic(target_path, filtered, compressed=True, create_backup=True)
-        print(f"Saved .npy workspace variables to: {save_path}")
+        print(f"Saved .npz workspace variables to: {target_path}")
     except Exception as exc:
-        print(f"Failed to save .npy workspace variables: {exc}")
+        print(f"Failed to save .npz workspace variables: {exc}")
     try:
-        scipy.io.savemat(os.path.join(save_path.replace(".npz", ".mat")), filtered)
+        scipy.io.savemat(mat_path, filtered)
+        print(f"Saved .mat workspace variables to: {mat_path}")
     except Exception as e:
         print(f"Failed to save .mat file: {e}")
 
