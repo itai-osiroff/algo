@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import math
 import platform
@@ -19,7 +20,12 @@ from matplotlib.figure import Figure
 from PIL import Image
 
 from moment_images.im_process import save_workspace_variables
-from moment_images.reliable_io import read_json_first_valid, read_npz_first_valid, write_json_atomic
+from moment_images.reliable_io import (
+    read_json_first_valid,
+    read_npz_first_valid,
+    write_csv_atomic,
+    write_json_atomic,
+)
 
 
 DEFAULT_PRIMARY_METRIC = "laplacian_variance"
@@ -32,6 +38,7 @@ DEFAULT_FALLBACK_METRICS = (
 )
 STAGE_ORDER = ("legacy", "stage1", "stage2", "metric_phase")
 SUCCESS_STATUSES = {"ok", "skipped_valid", "recomputed"}
+DEFAULT_REPORT_TOP_K = 6
 
 
 @dataclass
@@ -2708,6 +2715,7 @@ def create_metric_diagnostics_figure(
     )
     blended = cast(Optional[np.ndarray], payload.get("pixel_blended_scores"))
     component = cast(Optional[np.ndarray], payload.get(f"pixel_component_score_{component_name}"))
+    preview = _load_preview_array(record.preview_path)
     disp_x = cast(Optional[np.ndarray], payload.get("pixel_displacements_x"))
     disp_y = cast(Optional[np.ndarray], payload.get("pixel_displacements_y"))
     magnitude = None
@@ -2734,7 +2742,7 @@ def create_metric_diagnostics_figure(
         ax.set_yticks([])
         fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
 
-    _draw_map(blended_ax, blended, "Blended score map")
+    _draw_map(blended_ax, blended if blended is not None else preview, "Blended score map / preview")
     _draw_map(component_ax, component, f"{component_name} score map")
     _draw_map(disp_ax, magnitude, "Displacement magnitude")
 
@@ -2863,13 +2871,746 @@ def _default_metric_diagnostics_record(model: SweepVisualizationModel) -> Option
     return eligible[0]
 
 
+def _default_component_name(model: SweepVisualizationModel) -> str:
+    components = cast(List[str], model.diagnostic_availability.get("components", []))
+    return components[0] if components else "gradient"
+
+
+def _report_slug(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip()).strip("_").lower()
+    return slug or "item"
+
+
+def _format_float(value: Optional[float], precision: int = 4) -> str:
+    if value is None or not math.isfinite(value):
+        return "n/a"
+    return f"{value:.{precision}f}"
+
+
+def _real_datasets(model: SweepVisualizationModel) -> List[str]:
+    return list(model.datasets or ["aggregate"])
+
+
+def _default_comparison_dataset(model: SweepVisualizationModel) -> str:
+    datasets = _real_datasets(model)
+    return datasets[0] if datasets else "aggregate"
+
+
+def _candidate_score_for_dataset(
+    row: CandidateVisualizationRow,
+    dataset_id: str,
+    primary_metric: str,
+) -> Optional[float]:
+    if dataset_id == "aggregate":
+        return row.score if row.score is not None else row.mean_dataset_score
+    if dataset_id in row.dataset_scores:
+        return row.dataset_scores.get(dataset_id)
+    metric_value = row.dataset_metrics.get(dataset_id, {}).get(primary_metric)
+    return metric_value if metric_value is not None else row.score
+
+
+def _candidate_runtime_for_dataset(row: CandidateVisualizationRow, dataset_id: str) -> Optional[float]:
+    if dataset_id == "aggregate":
+        return row.mean_runtime_seconds
+    return row.dataset_runtimes.get(dataset_id, row.mean_runtime_seconds)
+
+
+def _candidate_metric_value_for_dataset(
+    row: CandidateVisualizationRow,
+    dataset_id: str,
+    primary_metric: str,
+) -> Tuple[str, Optional[float]]:
+    if dataset_id == "aggregate":
+        metric_name = row.ranking_metric_name or primary_metric
+        metric_value = row.ranking_metric_value
+        if metric_value is None:
+            metric_value = row.metric_means.get(metric_name, row.metric_means.get(primary_metric))
+        return metric_name, metric_value
+
+    metric_name = primary_metric
+    metric_value = row.dataset_metrics.get(dataset_id, {}).get(primary_metric)
+    if metric_value is None:
+        metric_name = row.ranking_metric_name or primary_metric
+        metric_value = row.dataset_scores.get(dataset_id)
+    return metric_name, metric_value
+
+
+def _find_run_metric_record(
+    model: SweepVisualizationModel,
+    *,
+    stage_name: str,
+    candidate_id: str,
+    dataset_id: str,
+) -> Optional[RunMetricRecord]:
+    return next(
+        (
+            record
+            for record in model.run_metric_records
+            if record.stage == stage_name
+            and record.candidate_id == candidate_id
+            and record.dataset_id == dataset_id
+        ),
+        None,
+    )
+
+
+def _load_preview_array(path: Optional[str]) -> Optional[np.ndarray]:
+    if not path:
+        return None
+    preview_path = Path(path)
+    if not preview_path.exists():
+        return None
+    try:
+        return np.asarray(Image.open(preview_path).convert("L"), dtype=np.float64)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _collapse_image_like(array: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if not isinstance(array, np.ndarray):
+        return None
+    arr = np.asarray(array, dtype=np.float64)
+    if arr.size == 0:
+        return None
+    while arr.ndim > 2:
+        arr = np.nanmean(arr, axis=-1)
+    return arr
+
+
+def _comparison_artifacts_for_candidate(
+    model: SweepVisualizationModel,
+    row: CandidateVisualizationRow,
+    *,
+    dataset_id: str,
+    component_name: str,
+) -> Dict[str, object]:
+    record = _find_run_metric_record(
+        model,
+        stage_name=row.stage,
+        candidate_id=row.candidate_id,
+        dataset_id=dataset_id,
+    )
+    preview_path = row.preview_paths.get(dataset_id) or row.preview_paths.get("aggregate")
+    if preview_path is None and record is not None:
+        preview_path = record.preview_path
+    preview = _load_preview_array(preview_path)
+
+    payload: Dict[str, np.ndarray] = {}
+    read_warnings: List[str] = []
+    if record is not None and record.workspace_path is not None:
+        payload, read_warnings = _load_workspace_diagnostics(Path(record.workspace_path))
+
+    blended = _collapse_image_like(cast(Optional[np.ndarray], payload.get("pixel_blended_scores")))
+    component = _collapse_image_like(
+        cast(Optional[np.ndarray], payload.get(f"pixel_component_score_{component_name}"))
+    )
+    disp_x = cast(Optional[np.ndarray], payload.get("pixel_displacements_x"))
+    disp_y = cast(Optional[np.ndarray], payload.get("pixel_displacements_y"))
+    magnitude = None
+    if isinstance(disp_x, np.ndarray) and isinstance(disp_y, np.ndarray):
+        magnitude = _collapse_image_like(
+            np.sqrt(
+                np.square(np.asarray(disp_x, dtype=np.float64))
+                + np.square(np.asarray(disp_y, dtype=np.float64))
+            )
+        )
+    global_avg = _collapse_image_like(
+        cast(Optional[np.ndarray], payload.get("average_rectified_global_image"))
+    )
+    final_avg = _collapse_image_like(
+        cast(Optional[np.ndarray], payload.get("average_rectified_image"))
+    )
+    delta = None
+    if (
+        isinstance(global_avg, np.ndarray)
+        and isinstance(final_avg, np.ndarray)
+        and global_avg.shape == final_avg.shape
+    ):
+        delta = np.asarray(global_avg, dtype=np.float64) - np.asarray(final_avg, dtype=np.float64)
+
+    return {
+        "record": record,
+        "preview_path": preview_path,
+        "preview": preview,
+        "blended": blended,
+        "component": component,
+        "magnitude": magnitude,
+        "delta": delta,
+        "warnings": read_warnings,
+    }
+
+
+def _draw_image_panel(
+    fig: Figure,
+    ax: Any,
+    array: Optional[np.ndarray],
+    *,
+    title: str,
+    cmap: str = "gray",
+    unavailable_message: str = "Unavailable",
+) -> None:
+    if not isinstance(array, np.ndarray):
+        ax.text(0.5, 0.5, unavailable_message, ha="center", va="center")
+        ax.axis("off")
+        ax.set_title(title)
+        return
+    arr = np.asarray(array, dtype=np.float64)
+    if arr.ndim != 2 or arr.size == 0:
+        ax.text(0.5, 0.5, unavailable_message, ha="center", va="center")
+        ax.axis("off")
+        ax.set_title(title)
+        return
+    image = ax.imshow(arr, aspect="auto", cmap=cmap)
+    ax.set_title(title)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.03)
+
+
+def _top_candidates_for_stage(
+    model: SweepVisualizationModel,
+    stage_name: Optional[str] = None,
+    *,
+    limit: int = DEFAULT_REPORT_TOP_K,
+) -> List[CandidateVisualizationRow]:
+    rows = _rows_for_stage(model, stage_name or model.primary_stage_name)
+    return rows[: max(1, min(limit, len(rows)))] if rows else []
+
+
+def _varying_parameter_lines(rows: Sequence[CandidateVisualizationRow]) -> List[str]:
+    varying_names = [
+        name
+        for name in sorted({param for row in rows for param in row.params.keys()})
+        if len({_stringify_param(row.params.get(name)) for row in rows}) > 1
+    ]
+    if not varying_names:
+        return ["varying parameters: none"]
+
+    lines = ["varying parameters:"]
+    for name in varying_names[:12]:
+        assignments = ", ".join(
+            f"{row.candidate_id}={_stringify_param(row.params.get(name))}" for row in rows
+        )
+        lines.append(f"  {name}: {assignments}")
+    return lines
+
+
+def _format_comparison_text(
+    model: SweepVisualizationModel,
+    rows: Sequence[CandidateVisualizationRow],
+    *,
+    dataset_id: str,
+) -> str:
+    if not rows:
+        return "No candidates available for comparison."
+
+    lines = [
+        f"stage: {rows[0].stage if rows else model.primary_stage_name}",
+        f"dataset: {dataset_id}",
+        f"candidates compared: {len(rows)}",
+        "",
+    ]
+    for row in rows:
+        dataset_score = _candidate_score_for_dataset(row, dataset_id, model.primary_metric)
+        runtime = _candidate_runtime_for_dataset(row, dataset_id)
+        metric_name, metric_value = _candidate_metric_value_for_dataset(
+            row,
+            dataset_id,
+            model.primary_metric,
+        )
+        lines.append(
+            " | ".join(
+                [
+                    f"rank {row.rank}",
+                    row.candidate_id,
+                    f"strategy={row.strategy}",
+                    f"dataset_score={_format_float(dataset_score)}",
+                    f"mean_score={_format_float(row.mean_dataset_score)}",
+                    f"runtime={_format_float(runtime, precision=3)}s",
+                    f"{metric_name}={_format_float(metric_value)}",
+                    f"mean_disp={_format_float(row.displacement_field_metrics.get('mean_magnitude'))}",
+                    f"mean_view_std={_format_float(row.inter_view_consistency_metrics.get('mean_view_std'))}",
+                ]
+            )
+        )
+    lines.extend(["", *_varying_parameter_lines(rows)])
+    return "\n".join(lines)
+
+
+def create_preview_comparison_figure(
+    model: SweepVisualizationModel,
+    rows: Sequence[CandidateVisualizationRow],
+    *,
+    dataset_id: str,
+) -> Figure:
+    fig = Figure(figsize=(max(12, 3.4 * max(1, len(rows))), 4.5))
+    if not rows:
+        ax = fig.add_subplot(111)
+        ax.text(0.5, 0.5, "No candidates available.", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
+
+    axes = fig.subplots(1, len(rows), squeeze=False)
+    for col_idx, row in enumerate(rows):
+        artifact = _comparison_artifacts_for_candidate(
+            model,
+            row,
+            dataset_id=dataset_id,
+            component_name=_default_component_name(model),
+        )
+        preview = cast(Optional[np.ndarray], artifact["preview"])
+        ax = axes[0, col_idx]
+        _draw_image_panel(
+            fig,
+            ax,
+            preview,
+            title=(
+                f"{row.candidate_id}\n"
+                f"rank {row.rank} | score "
+                f"{_format_float(_candidate_score_for_dataset(row, dataset_id, model.primary_metric))}"
+            ),
+            cmap="gray",
+            unavailable_message="Preview unavailable",
+        )
+    fig.suptitle(f"Preview comparison for {dataset_id}", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return fig
+
+
+def create_comparison_figure(
+    model: SweepVisualizationModel,
+    rows: Sequence[CandidateVisualizationRow],
+    *,
+    dataset_id: str,
+    component_name: str,
+) -> Figure:
+    fig = Figure(figsize=(max(13, 3.4 * max(1, len(rows))), 13))
+    if not rows:
+        ax = fig.add_subplot(111)
+        ax.text(0.5, 0.5, "No candidates available for comparison.", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
+
+    panel_titles = [
+        "Averaged rectified preview",
+        "Displacement magnitude",
+        "Blended score map",
+        f"{component_name} score map",
+        "Global minus final average",
+    ]
+    axes = fig.subplots(len(panel_titles), len(rows), squeeze=False)
+    for col_idx, row in enumerate(rows):
+        artifact = _comparison_artifacts_for_candidate(
+            model,
+            row,
+            dataset_id=dataset_id,
+            component_name=component_name,
+        )
+        arrays = [
+            cast(Optional[np.ndarray], artifact["preview"]),
+            cast(Optional[np.ndarray], artifact["magnitude"]),
+            cast(Optional[np.ndarray], artifact["blended"]),
+            cast(Optional[np.ndarray], artifact["component"]),
+            cast(Optional[np.ndarray], artifact["delta"]),
+        ]
+        cmaps = ["gray", "viridis", "viridis", "viridis", "coolwarm"]
+        messages = [
+            "Preview unavailable",
+            "Displacement map unavailable",
+            "Blended score map unavailable",
+            f"{component_name} map unavailable",
+            "Global/final delta unavailable",
+        ]
+        for row_idx, (title, array, cmap, message) in enumerate(
+            zip(panel_titles, arrays, cmaps, messages)
+        ):
+            axis = axes[row_idx, col_idx]
+            rendered_title = title
+            if row_idx == 0:
+                rendered_title = f"{row.candidate_id} (rank {row.rank})\n{title}"
+            _draw_image_panel(
+                fig,
+                axis,
+                array,
+                title=rendered_title,
+                cmap=cmap,
+                unavailable_message=message,
+            )
+    fig.suptitle(
+        f"Candidate comparison for {dataset_id} ({component_name})",
+        fontsize=14,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+def create_candidate_robustness_figure(
+    model: SweepVisualizationModel,
+    rows: Sequence[CandidateVisualizationRow],
+) -> Figure:
+    fig = Figure(
+        figsize=(
+            max(7, 0.75 * max(1, len(model.datasets)) + 4),
+            max(4, 0.6 * max(1, len(rows)) + 3),
+        )
+    )
+    ax = fig.add_subplot(111)
+    if not rows:
+        ax.text(0.5, 0.5, "No candidates available for robustness view.", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
+
+    datasets = _real_datasets(model)
+    matrix = np.full((len(rows), len(datasets)), np.nan, dtype=np.float64)
+    for row_idx, row in enumerate(rows):
+        for dataset_idx, dataset_id in enumerate(datasets):
+            score_value = _candidate_score_for_dataset(row, dataset_id, model.primary_metric)
+            matrix[row_idx, dataset_idx] = score_value if score_value is not None else np.nan
+    if not np.any(np.isfinite(matrix)):
+        ax.text(0.5, 0.5, "No per-dataset score data available.", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
+
+    image = ax.imshow(matrix, aspect="auto", cmap="viridis")
+    ax.set_xticks(range(len(datasets)))
+    ax.set_xticklabels(datasets, rotation=25, ha="right")
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([row.candidate_id for row in rows])
+    ax.set_title("Selected candidates across datasets")
+    ax.set_xlabel("dataset")
+    ax.set_ylabel("candidate")
+    for row_idx in range(matrix.shape[0]):
+        for dataset_idx in range(matrix.shape[1]):
+            if math.isfinite(matrix[row_idx, dataset_idx]):
+                ax.text(
+                    dataset_idx,
+                    row_idx,
+                    f"{matrix[row_idx, dataset_idx]:.3f}",
+                    ha="center",
+                    va="center",
+                    color="white",
+                    fontsize=8,
+                )
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    return fig
+
+
+def _candidate_csv_rows(model: SweepVisualizationModel) -> List[Dict[str, object]]:
+    return [
+        {
+            "stage": row.stage,
+            "candidate_id": row.candidate_id,
+            "rank": row.rank,
+            "strategy": row.strategy,
+            "score": row.score,
+            "mean_dataset_score": row.mean_dataset_score,
+            "std_dataset_score": row.std_dataset_score,
+            "mean_runtime_seconds": row.mean_runtime_seconds,
+            "ranking_metric_name": row.ranking_metric_name,
+            "ranking_metric_value": row.ranking_metric_value,
+            "family": row.family,
+            "alpha": row.alpha,
+            "formulation_id": row.formulation_id,
+            "missing_datasets": "|".join(row.missing_datasets),
+            "dataset_scores_json": _compact_json(row.dataset_scores),
+            "dataset_runtimes_json": _compact_json(row.dataset_runtimes),
+            "dataset_metrics_json": _compact_json(row.dataset_metrics),
+            "params_json": _compact_json(row.params),
+            "config_json": _compact_json(row.config),
+        }
+        for row in model.candidates
+    ]
+
+
+def _run_metric_csv_rows(model: SweepVisualizationModel) -> List[Dict[str, object]]:
+    return [
+        {
+            "stage": record.stage,
+            "candidate_id": record.candidate_id,
+            "dataset_id": record.dataset_id,
+            "run_name": record.run_name,
+            "strategy": record.strategy,
+            "family": record.family,
+            "alpha": record.alpha,
+            "formulation_id": record.formulation_id,
+            "score": record.score,
+            "mean_dataset_score": record.mean_dataset_score,
+            "mean_runtime_seconds": record.mean_runtime_seconds,
+            "ranking_metric_name": record.ranking_metric_name,
+            "ranking_metric_value": record.ranking_metric_value,
+            "metric_means_json": _compact_json(record.metric_means),
+            "displacement_field_metrics_json": _compact_json(record.displacement_field_metrics),
+            "inter_view_consistency_metrics_json": _compact_json(
+                record.inter_view_consistency_metrics
+            ),
+            "params_json": _compact_json(record.params),
+            "config_json": _compact_json(record.config),
+            "preview_path": record.preview_path,
+            "workspace_path": record.workspace_path,
+            "metric_record_path": record.metric_record_path,
+        }
+        for record in model.run_metric_records
+    ]
+
+
+def _write_candidate_leaderboard_csv(model: SweepVisualizationModel, path: Path) -> None:
+    write_csv_atomic(
+        path,
+        [
+            "stage",
+            "candidate_id",
+            "rank",
+            "strategy",
+            "score",
+            "mean_dataset_score",
+            "std_dataset_score",
+            "mean_runtime_seconds",
+            "ranking_metric_name",
+            "ranking_metric_value",
+            "family",
+            "alpha",
+            "formulation_id",
+            "missing_datasets",
+            "dataset_scores_json",
+            "dataset_runtimes_json",
+            "dataset_metrics_json",
+            "params_json",
+            "config_json",
+        ],
+        _candidate_csv_rows(model),
+        create_backup=True,
+    )
+
+
+def _write_run_metric_records_csv(model: SweepVisualizationModel, path: Path) -> None:
+    write_csv_atomic(
+        path,
+        [
+            "stage",
+            "candidate_id",
+            "dataset_id",
+            "run_name",
+            "strategy",
+            "family",
+            "alpha",
+            "formulation_id",
+            "score",
+            "mean_dataset_score",
+            "mean_runtime_seconds",
+            "ranking_metric_name",
+            "ranking_metric_value",
+            "metric_means_json",
+            "displacement_field_metrics_json",
+            "inter_view_consistency_metrics_json",
+            "params_json",
+            "config_json",
+            "preview_path",
+            "workspace_path",
+            "metric_record_path",
+        ],
+        _run_metric_csv_rows(model),
+        create_backup=True,
+    )
+
+
+def _stage_status_lines(model: SweepVisualizationModel) -> List[str]:
+    return [
+        (
+            f"{stage_name}: planned={stage.num_runs_planned}, recorded={stage.num_runs_recorded}, "
+            f"successful={stage.num_successful}, failed={stage.num_failed}, "
+            f"pending={stage.num_pending}, running={stage.num_running}"
+        )
+        for stage_name, stage in ((name, model.stages[name]) for name in model.stage_order)
+    ]
+
+
+def _diagnostic_availability_lines(model: SweepVisualizationModel) -> List[str]:
+    components = cast(List[str], model.diagnostic_availability.get("components", []))
+    return [
+        f"score_maps={bool(model.diagnostic_availability.get('score_maps'))}",
+        f"displacement_maps={bool(model.diagnostic_availability.get('displacement_maps'))}",
+        f"component_stats={bool(model.diagnostic_availability.get('component_stats'))}",
+        f"components={', '.join(components) if components else 'n/a'}",
+    ]
+
+
+def _html_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    head_html = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    row_html = []
+    for row in rows:
+        cells = "".join(f"<td>{html.escape(cell)}</td>" for cell in row)
+        row_html.append(f"<tr>{cells}</tr>")
+    return (
+        "<table><thead><tr>"
+        + head_html
+        + "</tr></thead><tbody>"
+        + "".join(row_html)
+        + "</tbody></table>"
+    )
+
+
+def _build_report_html(
+    model: SweepVisualizationModel,
+    *,
+    summary_images: Sequence[str],
+    top_rows: Sequence[CandidateVisualizationRow],
+    report_stage: str,
+    report_top_k: int,
+    default_component: str,
+    table_files: Sequence[str],
+    report_assets: Sequence[str],
+    report_context_path: str,
+    dataset_assets: Dict[str, Dict[str, object]],
+    robustness_asset: Optional[str],
+) -> str:
+    top_table = _html_table(
+        ["rank", "candidate", "strategy", "score", "mean score", "runtime (s)", "family", "alpha"],
+        [
+            [
+                str(row.rank),
+                row.candidate_id,
+                row.strategy,
+                _format_float(row.score),
+                _format_float(row.mean_dataset_score),
+                _format_float(row.mean_runtime_seconds, precision=3),
+                row.family or "n/a",
+                "n/a" if row.alpha is None else f"{row.alpha:g}",
+            ]
+            for row in top_rows
+        ],
+    )
+    summary_image_html = "".join(
+        (
+            f'<figure><img src="{html.escape(path)}" alt="{html.escape(path)}">'
+            f"<figcaption>{html.escape(path)}</figcaption></figure>"
+        )
+        for path in summary_images
+    )
+    dataset_sections: List[str] = []
+    for dataset_id, assets in dataset_assets.items():
+        preview_asset = cast(Optional[str], assets.get("preview_sheet"))
+        comparison_asset = cast(Optional[str], assets.get("comparison_sheet"))
+        diagnostic_assets = cast(Dict[str, str], assets.get("diagnostic_sheets", {}))
+        section_parts = [f"<section><h2>Dataset: {html.escape(dataset_id)}</h2>"]
+        if preview_asset:
+            section_parts.append(
+                f'<figure><img src="{html.escape(preview_asset)}" alt="{html.escape(preview_asset)}">'
+                f"<figcaption>Preview comparison</figcaption></figure>"
+            )
+        if comparison_asset:
+            section_parts.append(
+                f'<figure><img src="{html.escape(comparison_asset)}" alt="{html.escape(comparison_asset)}">'
+                f"<figcaption>Main comparison using component {html.escape(default_component)}</figcaption></figure>"
+            )
+        for component_name, asset_path in diagnostic_assets.items():
+            section_parts.append(
+                f'<figure><img src="{html.escape(asset_path)}" alt="{html.escape(asset_path)}">'
+                f"<figcaption>Diagnostic comparison: {html.escape(component_name)}</figcaption></figure>"
+            )
+        section_parts.append("</section>")
+        dataset_sections.append("".join(section_parts))
+
+    warning_items = "".join(
+        f"<li>{html.escape(warning)}</li>" for warning in model.warnings[:20]
+    ) or "<li>none</li>"
+    links = "".join(
+        f'<li><a href="{html.escape(path)}">{html.escape(path)}</a></li>'
+        for path in [
+            *table_files,
+            report_context_path,
+            "visualization_bundle.npz",
+            "visualization_bundle.mat",
+            *report_assets,
+        ]
+    )
+    robustness_html = (
+        f'<figure><img src="{html.escape(robustness_asset)}" alt="{html.escape(robustness_asset)}">'
+        "<figcaption>Selected-candidate robustness heatmap</figcaption></figure>"
+        if robustness_asset
+        else ""
+    )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sweep Visualization Report</title>
+  <style>
+    body {{ font-family: Segoe UI, Arial, sans-serif; margin: 24px; line-height: 1.45; }}
+    h1, h2 {{ margin-bottom: 0.35em; }}
+    section {{ margin-top: 28px; }}
+    pre {{ background: #f4f6f8; padding: 12px; border-radius: 6px; overflow-x: auto; }}
+    table {{ border-collapse: collapse; width: 100%; margin: 12px 0; }}
+    th, td {{ border: 1px solid #d0d7de; padding: 6px 8px; text-align: left; vertical-align: top; }}
+    th {{ background: #f4f6f8; }}
+    img {{ max-width: 100%; height: auto; border: 1px solid #d0d7de; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 18px; }}
+  </style>
+</head>
+<body>
+  <h1>Sweep Visualization Report</h1>
+  <p>Stage <strong>{html.escape(report_stage)}</strong>, top {report_top_k} candidates, default diagnostic component <strong>{html.escape(default_component)}</strong>.</p>
+
+  <section>
+    <h2>Summary</h2>
+    <pre>{html.escape(chr(10).join([
+        f"mode={model.mode}",
+        f"primary_metric={model.primary_metric}",
+        f"primary_metric_source={model.primary_metric_source}",
+        f"warning_count={len(model.warnings)}",
+        f"datasets={', '.join(_real_datasets(model))}",
+    ]))}</pre>
+    <pre>{html.escape(chr(10).join(_stage_status_lines(model)))}</pre>
+    <pre>{html.escape(chr(10).join(_diagnostic_availability_lines(model)))}</pre>
+  </section>
+
+  <section>
+    <h2>Top Candidates</h2>
+    {top_table}
+  </section>
+
+  <section>
+    <h2>Summary Figures</h2>
+    <div class="grid">{summary_image_html}{robustness_html}</div>
+  </section>
+
+  {''.join(dataset_sections)}
+
+  <section>
+    <h2>Warnings</h2>
+    <ul>{warning_items}</ul>
+  </section>
+
+  <section>
+    <h2>Files</h2>
+    <ul>{links}</ul>
+  </section>
+</body>
+</html>
+"""
+
+
 def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir: Path) -> Path:
     """Export default plots plus an aggregated `.npz` / `.mat` reproducibility bundle."""
 
     export_dir = Path(output_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
+    assets_dir = export_dir / "assets"
+    tables_dir = export_dir / "tables"
+    data_dir = export_dir / "data"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     effects_x, effects_y = _default_export_effect_parameters(model)
+    report_stage = model.primary_stage_name
+    default_component = _default_component_name(model)
+    top_rows = _top_candidates_for_stage(model, report_stage, limit=DEFAULT_REPORT_TOP_K)
     plots: Dict[str, Figure] = {
         "overview.png": create_overview_figure(model),
         "coverage.png": create_coverage_figure(model),
@@ -2923,6 +3664,108 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
         figure.savefig(export_dir / filename, dpi=180)
         plot_files.append(filename)
         figure.clf()
+
+    report_assets: List[str] = []
+    topk_overview_rel = "assets/topk_overview.png"
+    create_significance_figure(model, top_n=max(1, len(top_rows))).savefig(
+        export_dir / topk_overview_rel,
+        dpi=180,
+    )
+    report_assets.append(topk_overview_rel)
+
+    dataset_assets: Dict[str, Dict[str, object]] = {}
+    diagnostic_components = cast(List[str], model.diagnostic_availability.get("components", []))
+    diagnostic_components = diagnostic_components or [default_component]
+    for dataset_id in _real_datasets(model):
+        dataset_slug = _report_slug(dataset_id)
+        preview_rel = f"assets/preview_{dataset_slug}.png"
+        create_preview_comparison_figure(model, top_rows, dataset_id=dataset_id).savefig(
+            export_dir / preview_rel,
+            dpi=180,
+        )
+        report_assets.append(preview_rel)
+
+        comparison_rel = f"assets/comparison_{dataset_slug}.png"
+        create_comparison_figure(
+            model,
+            top_rows,
+            dataset_id=dataset_id,
+            component_name=default_component,
+        ).savefig(export_dir / comparison_rel, dpi=180)
+        report_assets.append(comparison_rel)
+
+        per_component_assets: Dict[str, str] = {}
+        for component_name in diagnostic_components:
+            component_slug = _report_slug(component_name)
+            diagnostic_rel = f"assets/diagnostic_{dataset_slug}_{component_slug}.png"
+            create_comparison_figure(
+                model,
+                top_rows,
+                dataset_id=dataset_id,
+                component_name=component_name,
+            ).savefig(export_dir / diagnostic_rel, dpi=180)
+            report_assets.append(diagnostic_rel)
+            per_component_assets[component_name] = diagnostic_rel
+
+        dataset_assets[dataset_id] = {
+            "preview_sheet": preview_rel,
+            "comparison_sheet": comparison_rel,
+            "diagnostic_sheets": per_component_assets,
+        }
+
+    robustness_rel: Optional[str] = None
+    if top_rows:
+        robustness_rel = "assets/robustness_heatmap.png"
+        create_candidate_robustness_figure(model, top_rows).savefig(
+            export_dir / robustness_rel,
+            dpi=180,
+        )
+        report_assets.append(robustness_rel)
+
+    table_files = [
+        "tables/candidate_leaderboard.csv",
+        "tables/run_metric_records.csv",
+    ]
+    _write_candidate_leaderboard_csv(model, export_dir / table_files[0])
+    _write_run_metric_records_csv(model, export_dir / table_files[1])
+
+    report_context = {
+        "generated_at": _utc_now_iso(),
+        "report_stage": report_stage,
+        "report_top_k": DEFAULT_REPORT_TOP_K,
+        "default_component": default_component,
+        "summary_images": [*plot_files, topk_overview_rel],
+        "report_assets": report_assets,
+        "table_files": table_files,
+        "top_candidates": [_candidate_row_to_export_dict(row) for row in top_rows],
+        "dataset_assets": dataset_assets,
+        "warnings": model.warnings,
+    }
+    report_context_rel = "data/report_context.json"
+    write_json_atomic(
+        export_dir / report_context_rel,
+        report_context,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+    index_html_rel = "index.html"
+    (export_dir / index_html_rel).write_text(
+        _build_report_html(
+            model,
+            summary_images=[*plot_files, topk_overview_rel],
+            top_rows=top_rows,
+            report_stage=report_stage,
+            report_top_k=DEFAULT_REPORT_TOP_K,
+            default_component=default_component,
+            table_files=table_files,
+            report_assets=report_assets,
+            report_context_path=report_context_rel,
+            dataset_assets=dataset_assets,
+            robustness_asset=robustness_rel,
+        ),
+        encoding="utf-8",
+    )
 
     stage_names = model.stage_order
     bundle_payload: Dict[str, object] = {
@@ -3023,6 +3866,11 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
         "bundle_npz": "visualization_bundle.npz",
         "bundle_mat": "visualization_bundle.mat",
         "warning_count": len(model.warnings),
+        "index_html": index_html_rel,
+        "report_top_k": DEFAULT_REPORT_TOP_K,
+        "default_component": default_component,
+        "table_files": table_files,
+        "report_assets": report_assets,
     }
     write_json_atomic(
         export_dir / "visualization_manifest.json",
@@ -3210,7 +4058,9 @@ def _format_metric_diagnostics_text(record: Optional[RunMetricRecord]) -> str:
         f"strategy: {record.strategy}",
         f"family: {record.family or 'n/a'}",
         f"alpha: {'n/a' if record.alpha is None else f'{record.alpha:g}'}",
+        f"preview: {record.preview_path or 'n/a'}",
         f"workspace: {record.workspace_path or 'n/a'}",
+        f"metric_record: {record.metric_record_path or 'n/a'}",
     ]
     if record.metric_means:
         lines.extend(["", "image metrics:"])
@@ -3874,6 +4724,752 @@ class SweepVisualizationApp:
         return exported
 
 
+class SweepVisualizationApp(SweepVisualizationApp):
+    """Enhanced GUI variant installed below via method rebinding."""
+
+    pass
+
+
+def _sweep_visualization_app_init(
+    self: SweepVisualizationApp,
+    root: Any,
+    initial_path: Optional[Path] = None,
+) -> None:
+    import tkinter as tk
+    from tkinter import ttk
+
+    self.root = root
+    self.tk = tk
+    self.ttk = ttk
+    self.filedialog = __import__("tkinter.filedialog", fromlist=["filedialog"])
+    self.messagebox = __import__("tkinter.messagebox", fromlist=["messagebox"])
+    self.FigureCanvasTkAgg = __import__(
+        "matplotlib.backends.backend_tkagg",
+        fromlist=["FigureCanvasTkAgg"],
+    ).FigureCanvasTkAgg
+
+    self.root.title("Sweep Results Visualizer")
+    self.root.geometry("1380x980")
+    self.model = None
+    self._canvases = {}
+    self._preview_image_ref = None
+    self._metric_tab_visible = False
+    self._effect_filter_vars = {}
+    self._effect_filter_combos = {}
+    self._leaderboard_row_lookup: Dict[str, CandidateVisualizationRow] = {}
+    self._leaderboard_sort_column = "rank"
+    self._leaderboard_sort_reverse = False
+
+    self.path_var = tk.StringVar(value=str(initial_path) if initial_path else "")
+    self.status_var = tk.StringVar(value="Idle")
+    self.coverage_stage_var = tk.StringVar(value="")
+    self.coverage_dataset_var = tk.StringVar(value="aggregate")
+    self.coverage_mode_var = tk.StringVar(value="1D Trend")
+    self.coverage_param_var = tk.StringVar(value="")
+    self.coverage_y_param_var = tk.StringVar(value="")
+    self.coverage_value_var = tk.StringVar(value="score")
+    self.coverage_strategy_var = tk.StringVar(value="All")
+    self.coverage_family_var = tk.StringVar(value="All")
+    self.coverage_alpha_var = tk.StringVar(value="All")
+    self.preview_stage_var = tk.StringVar(value="")
+    self.preview_candidate_var = tk.StringVar(value="")
+    self.preview_dataset_var = tk.StringVar(value="")
+    self.leaderboard_stage_var = tk.StringVar(value="")
+    self.leaderboard_dataset_var = tk.StringVar(value="aggregate")
+    self.leaderboard_strategy_var = tk.StringVar(value="All")
+    self.leaderboard_family_var = tk.StringVar(value="All")
+    self.leaderboard_alpha_var = tk.StringVar(value="All")
+    self.comparison_stage_var = tk.StringVar(value="")
+    self.comparison_dataset_var = tk.StringVar(value="")
+    self.comparison_component_var = tk.StringVar(value="gradient")
+    self.diagnostic_stage_var = tk.StringVar(value="")
+    self.diagnostic_candidate_var = tk.StringVar(value="")
+    self.diagnostic_dataset_var = tk.StringVar(value="")
+    self.diagnostic_component_var = tk.StringVar(value="gradient")
+
+    self._build_ui()
+    if initial_path is not None:
+        self.load_from_path(Path(initial_path))
+
+
+def _sweep_visualization_build_ui(self: SweepVisualizationApp) -> None:
+    top = self.ttk.Frame(self.root)
+    top.pack(fill="x", padx=8, pady=6)
+
+    self.ttk.Label(top, text="Sweep folder").pack(side="left")
+    path_entry = self.ttk.Entry(top, textvariable=self.path_var, width=90)
+    path_entry.pack(side="left", padx=6, fill="x", expand=True)
+    self.ttk.Button(top, text="Browse...", command=self._on_browse).pack(side="left", padx=3)
+    self.ttk.Button(top, text="Load", command=self._on_load).pack(side="left", padx=3)
+    self.ttk.Button(top, text="Reload", command=self._on_reload).pack(side="left", padx=3)
+    self.ttk.Button(top, text="Export...", command=self._on_export_dialog).pack(side="left", padx=3)
+    self.ttk.Button(top, text="Open Folder", command=self._on_open_folder).pack(side="left", padx=3)
+    self.ttk.Label(top, textvariable=self.status_var).pack(side="right", padx=8)
+
+    self.notebook = self.ttk.Notebook(self.root)
+    self.notebook.pack(fill="both", expand=True, padx=8, pady=6)
+
+    self.overview_tab = self.ttk.Frame(self.notebook)
+    self.leaderboard_tab = self.ttk.Frame(self.notebook)
+    self.comparison_tab = self.ttk.Frame(self.notebook)
+    self.coverage_tab = self.ttk.Frame(self.notebook)
+    self.progression_tab = self.ttk.Frame(self.notebook)
+    self.significance_tab = self.ttk.Frame(self.notebook)
+    self.metric_tab = self.ttk.Frame(self.notebook)
+    self.diagnostics_tab = self.ttk.Frame(self.notebook)
+
+    self.notebook.add(self.overview_tab, text="Overview")
+    self.notebook.add(self.leaderboard_tab, text="Leaderboard")
+    self.notebook.add(self.comparison_tab, text="Comparison")
+    self.notebook.add(self.coverage_tab, text="Effects")
+    self.notebook.add(self.progression_tab, text="Progression")
+    self.notebook.add(self.significance_tab, text="Significance")
+    self.notebook.add(self.diagnostics_tab, text="Metric Diagnostics")
+
+    self._build_overview_tab()
+    self._build_leaderboard_tab()
+    self._build_comparison_tab()
+    self._build_coverage_tab()
+    self._build_progression_tab()
+    self._build_significance_tab()
+    self._build_metric_tab()
+    self._build_diagnostics_tab()
+
+
+def _sweep_visualization_build_leaderboard_tab(self: SweepVisualizationApp) -> None:
+    controls = self.ttk.Frame(self.leaderboard_tab)
+    controls.pack(fill="x", padx=6, pady=6)
+    for label, variable, width in (
+        ("Stage", self.leaderboard_stage_var, 14),
+        ("Dataset", self.leaderboard_dataset_var, 12),
+        ("Strategy", self.leaderboard_strategy_var, 14),
+        ("Family", self.leaderboard_family_var, 16),
+        ("Alpha", self.leaderboard_alpha_var, 10),
+    ):
+        self.ttk.Label(controls, text=label).pack(side="left", padx=(0 if label == "Stage" else 8, 0))
+        combo = self.ttk.Combobox(
+            controls,
+            textvariable=variable,
+            state="readonly",
+            width=width,
+        )
+        combo.pack(side="left", padx=4)
+        combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_leaderboard())
+        if label == "Stage":
+            self.leaderboard_stage_combo = combo
+        elif label == "Dataset":
+            self.leaderboard_dataset_combo = combo
+        elif label == "Strategy":
+            self.leaderboard_strategy_combo = combo
+        elif label == "Family":
+            self.leaderboard_family_combo = combo
+        else:
+            self.leaderboard_alpha_combo = combo
+
+    tree_frame = self.ttk.Frame(self.leaderboard_tab)
+    tree_frame.pack(fill="both", expand=True, padx=6, pady=4)
+    columns = (
+        "rank",
+        "candidate_id",
+        "strategy",
+        "score",
+        "runtime",
+        "ranking_metric",
+        "family",
+        "alpha",
+        "missing_datasets",
+    )
+    self.leaderboard_tree = self.ttk.Treeview(
+        tree_frame,
+        columns=columns,
+        show="headings",
+        selectmode="extended",
+        height=14,
+    )
+    widths = {
+        "rank": 70,
+        "candidate_id": 190,
+        "strategy": 110,
+        "score": 110,
+        "runtime": 110,
+        "ranking_metric": 150,
+        "family": 130,
+        "alpha": 90,
+        "missing_datasets": 150,
+    }
+    labels = {
+        "rank": "Rank",
+        "candidate_id": "Candidate",
+        "strategy": "Strategy",
+        "score": "Score",
+        "runtime": "Runtime (s)",
+        "ranking_metric": "Ranking Metric",
+        "family": "Family",
+        "alpha": "Alpha",
+        "missing_datasets": "Missing Datasets",
+    }
+    for column in columns:
+        self.leaderboard_tree.heading(
+            column,
+            text=labels[column],
+            command=lambda col=column: self._on_leaderboard_sort(col),
+        )
+        self.leaderboard_tree.column(column, width=widths[column], anchor="w")
+    tree_scroll = self.ttk.Scrollbar(tree_frame, orient="vertical", command=self.leaderboard_tree.yview)
+    self.leaderboard_tree.configure(yscrollcommand=tree_scroll.set)
+    self.leaderboard_tree.pack(side="left", fill="both", expand=True)
+    tree_scroll.pack(side="right", fill="y")
+    self.leaderboard_tree.bind("<<TreeviewSelect>>", lambda _evt: self._on_leaderboard_selection_changed())
+
+    self.leaderboard_detail_text = self.tk.Text(self.leaderboard_tab, height=14, wrap="word")
+    self.leaderboard_detail_text.pack(fill="x", padx=6, pady=6)
+
+
+def _sweep_visualization_build_comparison_tab(self: SweepVisualizationApp) -> None:
+    controls = self.ttk.Frame(self.comparison_tab)
+    controls.pack(fill="x", padx=6, pady=6)
+    self.ttk.Label(controls, text="Stage").pack(side="left")
+    self.comparison_stage_combo = self.ttk.Combobox(
+        controls,
+        textvariable=self.comparison_stage_var,
+        state="readonly",
+        width=14,
+    )
+    self.comparison_stage_combo.pack(side="left", padx=4)
+    self.comparison_stage_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_comparison())
+    self.ttk.Label(controls, text="Dataset").pack(side="left", padx=(8, 0))
+    self.comparison_dataset_combo = self.ttk.Combobox(
+        controls,
+        textvariable=self.comparison_dataset_var,
+        state="readonly",
+        width=14,
+    )
+    self.comparison_dataset_combo.pack(side="left", padx=4)
+    self.comparison_dataset_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_comparison())
+    self.ttk.Label(controls, text="Component").pack(side="left", padx=(8, 0))
+    self.comparison_component_combo = self.ttk.Combobox(
+        controls,
+        textvariable=self.comparison_component_var,
+        state="readonly",
+        width=16,
+    )
+    self.comparison_component_combo.pack(side="left", padx=4)
+    self.comparison_component_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_comparison())
+
+    self.comparison_text = self.tk.Text(self.comparison_tab, height=12, wrap="word")
+    self.comparison_text.pack(fill="x", padx=6, pady=6)
+    self.comparison_plot_frame = self.ttk.Frame(self.comparison_tab)
+    self.comparison_plot_frame.pack(fill="both", expand=True, padx=6, pady=4)
+    self.comparison_robustness_plot_frame = self.ttk.Frame(self.comparison_tab)
+    self.comparison_robustness_plot_frame.pack(fill="both", expand=True, padx=6, pady=4)
+
+
+def _sweep_visualization_build_diagnostics_tab(self: SweepVisualizationApp) -> None:
+    controls = self.ttk.Frame(self.diagnostics_tab)
+    controls.pack(fill="x", padx=6, pady=6)
+    self.ttk.Label(controls, text="Stage").pack(side="left")
+    self.diagnostic_stage_combo = self.ttk.Combobox(
+        controls,
+        textvariable=self.diagnostic_stage_var,
+        state="readonly",
+        width=14,
+    )
+    self.diagnostic_stage_combo.pack(side="left", padx=4)
+    self.diagnostic_stage_combo.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_diagnostic_candidates())
+    self.ttk.Label(controls, text="Candidate").pack(side="left", padx=(8, 0))
+    self.diagnostic_candidate_combo = self.ttk.Combobox(
+        controls,
+        textvariable=self.diagnostic_candidate_var,
+        state="readonly",
+        width=20,
+    )
+    self.diagnostic_candidate_combo.pack(side="left", padx=4)
+    self.diagnostic_candidate_combo.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_diagnostic_datasets())
+    self.ttk.Label(controls, text="Dataset").pack(side="left", padx=(8, 0))
+    self.diagnostic_dataset_combo = self.ttk.Combobox(
+        controls,
+        textvariable=self.diagnostic_dataset_var,
+        state="readonly",
+        width=16,
+    )
+    self.diagnostic_dataset_combo.pack(side="left", padx=4)
+    self.diagnostic_dataset_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_metric_diagnostics())
+    self.ttk.Label(controls, text="Component").pack(side="left", padx=(8, 0))
+    self.diagnostic_component_combo = self.ttk.Combobox(
+        controls,
+        textvariable=self.diagnostic_component_var,
+        state="readonly",
+        width=14,
+    )
+    self.diagnostic_component_combo.pack(side="left", padx=4)
+    self.diagnostic_component_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_metric_diagnostics())
+    self.ttk.Button(controls, text="Open Preview", command=self._open_selected_diagnostic_preview).pack(side="left", padx=(10, 4))
+    self.ttk.Button(controls, text="Open Run Folder", command=self._open_selected_diagnostic_folder).pack(side="left", padx=4)
+    self.ttk.Button(controls, text="Open metric_record", command=self._open_selected_metric_record).pack(side="left", padx=4)
+
+    self.diagnostics_text = self.tk.Text(self.diagnostics_tab, height=12, wrap="word")
+    self.diagnostics_text.pack(fill="x", padx=6, pady=6)
+    self.diagnostics_plot_frame = self.ttk.Frame(self.diagnostics_tab)
+    self.diagnostics_plot_frame.pack(fill="both", expand=True, padx=6, pady=6)
+
+
+def _sweep_visualization_leaderboard_candidate_rows(
+    self: SweepVisualizationApp,
+) -> List[CandidateVisualizationRow]:
+    if self.model is None:
+        return []
+    stage_name = self.leaderboard_stage_var.get() or self.model.primary_stage_name
+    strategy_filter = self.leaderboard_strategy_var.get() or "All"
+    family_filter = self.leaderboard_family_var.get() or "All"
+    alpha_filter = self.leaderboard_alpha_var.get() or "All"
+    rows: List[CandidateVisualizationRow] = []
+    for row in self.model.candidates:
+        if stage_name != "All" and row.stage != stage_name:
+            continue
+        if strategy_filter != "All" and row.strategy != strategy_filter:
+            continue
+        if family_filter != "All" and row.family != family_filter:
+            continue
+        if alpha_filter != "All" and _alpha_filter_value(row.alpha) != alpha_filter:
+            continue
+        rows.append(row)
+    return rows
+
+
+def _sweep_visualization_leaderboard_candidate_label(
+    self: SweepVisualizationApp,
+    row: CandidateVisualizationRow,
+) -> str:
+    stage_name = self.leaderboard_stage_var.get() or (self.model.primary_stage_name if self.model else "")
+    return f"{row.stage}:{row.candidate_id}" if stage_name == "All" else row.candidate_id
+
+
+def _sweep_visualization_sorted_leaderboard_rows(
+    self: SweepVisualizationApp,
+    rows: Sequence[CandidateVisualizationRow],
+) -> List[CandidateVisualizationRow]:
+    if self.model is None:
+        return list(rows)
+    dataset_scope = self.leaderboard_dataset_var.get() or "aggregate"
+    column = self._leaderboard_sort_column
+    if column in {"rank", "score", "runtime", "ranking_metric", "alpha", "missing_datasets"}:
+
+        def numeric_value(row: CandidateVisualizationRow) -> Optional[float]:
+            if column == "rank":
+                return float(row.rank)
+            if column == "score":
+                return _candidate_score_for_dataset(row, dataset_scope, self.model.primary_metric)
+            if column == "runtime":
+                return _candidate_runtime_for_dataset(row, dataset_scope)
+            if column == "ranking_metric":
+                return _candidate_metric_value_for_dataset(
+                    row,
+                    dataset_scope,
+                    self.model.primary_metric,
+                )[1]
+            if column == "alpha":
+                return row.alpha
+            return float(len(row.missing_datasets))
+
+        finite_rows = []
+        missing_rows = []
+        for row in rows:
+            value = numeric_value(row)
+            if value is None or not math.isfinite(value):
+                missing_rows.append(row)
+            else:
+                finite_rows.append((float(value), row))
+        finite_rows.sort(
+            key=lambda item: (item[0], item[1].rank, item[1].candidate_id),
+            reverse=self._leaderboard_sort_reverse,
+        )
+        return [row for _, row in finite_rows] + missing_rows
+
+    return sorted(
+        rows,
+        key=lambda row: (self._leaderboard_candidate_label(row), row.rank),
+        reverse=self._leaderboard_sort_reverse,
+    )
+
+
+def _sweep_visualization_leaderboard_row_values(
+    self: SweepVisualizationApp,
+    row: CandidateVisualizationRow,
+) -> Tuple[str, ...]:
+    assert self.model is not None
+    dataset_scope = self.leaderboard_dataset_var.get() or "aggregate"
+    metric_name, metric_value = _candidate_metric_value_for_dataset(
+        row,
+        dataset_scope,
+        self.model.primary_metric,
+    )
+    return (
+        str(row.rank),
+        self._leaderboard_candidate_label(row),
+        row.strategy,
+        _format_float(_candidate_score_for_dataset(row, dataset_scope, self.model.primary_metric)),
+        _format_float(_candidate_runtime_for_dataset(row, dataset_scope), precision=3),
+        f"{metric_name}: {_format_float(metric_value)}",
+        row.family or "n/a",
+        "n/a" if row.alpha is None else f"{row.alpha:g}",
+        ", ".join(row.missing_datasets) if row.missing_datasets else "none",
+    )
+
+
+def _sweep_visualization_selected_leaderboard_rows(
+    self: SweepVisualizationApp,
+) -> List[CandidateVisualizationRow]:
+    return [
+        self._leaderboard_row_lookup[item_id]
+        for item_id in self.leaderboard_tree.selection()
+        if item_id in self._leaderboard_row_lookup
+    ]
+
+
+def _sweep_visualization_format_leaderboard_detail_text(
+    self: SweepVisualizationApp,
+    rows: Sequence[CandidateVisualizationRow],
+) -> str:
+    if not rows or self.model is None:
+        return "No leaderboard selection."
+    dataset_scope = self.leaderboard_dataset_var.get() or "aggregate"
+    if len(rows) == 1:
+        row = rows[0]
+        metric_name, metric_value = _candidate_metric_value_for_dataset(
+            row,
+            dataset_scope,
+            self.model.primary_metric,
+        )
+        lines = [
+            f"candidate: {row.candidate_id}",
+            f"stage: {row.stage}",
+            f"strategy: {row.strategy}",
+            f"rank: {row.rank}",
+            f"dataset scope: {dataset_scope}",
+            f"score: {_format_float(_candidate_score_for_dataset(row, dataset_scope, self.model.primary_metric))}",
+            f"runtime: {_format_float(_candidate_runtime_for_dataset(row, dataset_scope), precision=3)}s",
+            f"{metric_name}: {_format_float(metric_value)}",
+            f"family: {row.family or 'n/a'}",
+            f"alpha: {'n/a' if row.alpha is None else f'{row.alpha:g}'}",
+            f"missing datasets: {', '.join(row.missing_datasets) if row.missing_datasets else 'none'}",
+            "",
+            "params:",
+            json.dumps(row.params, indent=2, sort_keys=True),
+            "",
+            "config:",
+            json.dumps(row.config, indent=2, sort_keys=True),
+        ]
+        return "\n".join(lines)
+
+    lines = [
+        f"selected candidates: {', '.join(row.candidate_id for row in rows)}",
+        f"dataset scope: {dataset_scope}",
+        "",
+    ]
+    lines.extend(_varying_parameter_lines(rows))
+    lines.append("")
+    for row in rows:
+        lines.append(
+            f"{row.candidate_id}: score={_format_float(_candidate_score_for_dataset(row, dataset_scope, self.model.primary_metric))}, "
+            f"runtime={_format_float(_candidate_runtime_for_dataset(row, dataset_scope), precision=3)}s"
+        )
+    return "\n".join(lines)
+
+
+def _sweep_visualization_on_leaderboard_sort(
+    self: SweepVisualizationApp,
+    column: str,
+) -> None:
+    if self._leaderboard_sort_column == column:
+        self._leaderboard_sort_reverse = not self._leaderboard_sort_reverse
+    else:
+        self._leaderboard_sort_column = column
+        self._leaderboard_sort_reverse = column in {"score", "ranking_metric"}
+    self.refresh_leaderboard()
+
+
+def _sweep_visualization_seed_diagnostics_from_row(
+    self: SweepVisualizationApp,
+    row: CandidateVisualizationRow,
+    *,
+    dataset_hint: Optional[str] = None,
+) -> None:
+    if self.model is None:
+        return
+    candidate_values = _sorted_unique(
+        record.candidate_id for record in self.model.run_metric_records if record.stage == row.stage
+    )
+    dataset_values = _sorted_unique(
+        record.dataset_id
+        for record in self.model.run_metric_records
+        if record.stage == row.stage and record.candidate_id == row.candidate_id
+    )
+    self.diagnostic_stage_combo["values"] = _sorted_unique(record.stage for record in self.model.run_metric_records)
+    self.diagnostic_stage_var.set(row.stage)
+    self.diagnostic_candidate_combo["values"] = candidate_values
+    self.diagnostic_candidate_var.set(
+        row.candidate_id if row.candidate_id in candidate_values else (candidate_values[0] if candidate_values else "")
+    )
+    self.diagnostic_dataset_combo["values"] = dataset_values
+    preferred_dataset = dataset_hint if dataset_hint in dataset_values else None
+    self.diagnostic_dataset_var.set(preferred_dataset or (dataset_values[0] if dataset_values else ""))
+
+
+def _sweep_visualization_on_leaderboard_selection_changed(
+    self: SweepVisualizationApp,
+) -> None:
+    selected_rows = self._selected_leaderboard_rows()
+    self._set_text_widget(
+        self.leaderboard_detail_text,
+        self._format_leaderboard_detail_text(selected_rows),
+    )
+    if selected_rows and self.model is not None:
+        self.comparison_stage_var.set(selected_rows[0].stage)
+        self._seed_diagnostics_from_row(
+            selected_rows[0],
+            dataset_hint=self.comparison_dataset_var.get() or _default_comparison_dataset(self.model),
+        )
+    self.refresh_comparison()
+
+
+def _sweep_visualization_refresh_leaderboard(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        return
+    selected_ids = list(self.leaderboard_tree.selection())
+    rows = self._sorted_leaderboard_rows(self._leaderboard_candidate_rows())
+    self._leaderboard_row_lookup = {row.row_id: row for row in rows}
+    self.leaderboard_tree.delete(*self.leaderboard_tree.get_children())
+    for row in rows:
+        self.leaderboard_tree.insert("", "end", iid=row.row_id, values=self._leaderboard_row_values(row))
+    reselection = [item_id for item_id in selected_ids if item_id in self._leaderboard_row_lookup]
+    if reselection:
+        self.leaderboard_tree.selection_set(reselection)
+    elif rows:
+        self.leaderboard_tree.selection_set(rows[0].row_id)
+    self._on_leaderboard_selection_changed()
+
+
+def _sweep_visualization_comparison_rows(
+    self: SweepVisualizationApp,
+) -> List[CandidateVisualizationRow]:
+    if self.model is None:
+        return []
+    stage_name = self.comparison_stage_var.get() or self.model.primary_stage_name
+    selected = [row for row in self._selected_leaderboard_rows() if row.stage == stage_name]
+    unique_rows: List[CandidateVisualizationRow] = []
+    seen = set()
+    for row in selected:
+        if row.row_id in seen:
+            continue
+        seen.add(row.row_id)
+        unique_rows.append(row)
+    if 2 <= len(unique_rows) <= DEFAULT_REPORT_TOP_K:
+        return unique_rows[:DEFAULT_REPORT_TOP_K]
+    return _top_candidates_for_stage(self.model, stage_name, limit=DEFAULT_REPORT_TOP_K)
+
+
+def _sweep_visualization_refresh_comparison(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        return
+    dataset_id = self.comparison_dataset_var.get() or _default_comparison_dataset(self.model)
+    rows = self._comparison_rows()
+    self._set_text_widget(
+        self.comparison_text,
+        _format_comparison_text(self.model, rows, dataset_id=dataset_id),
+    )
+    self._draw_figure(
+        "comparison_main",
+        self.comparison_plot_frame,
+        create_comparison_figure(
+            self.model,
+            rows,
+            dataset_id=dataset_id,
+            component_name=self.comparison_component_var.get() or _default_component_name(self.model),
+        ),
+    )
+    self._draw_figure(
+        "comparison_robustness",
+        self.comparison_robustness_plot_frame,
+        create_candidate_robustness_figure(self.model, rows),
+    )
+    if rows:
+        self._seed_diagnostics_from_row(rows[0], dataset_hint=dataset_id)
+        self.refresh_metric_diagnostics()
+
+
+def _sweep_visualization_refresh_metric_diagnostics(self: SweepVisualizationApp) -> None:
+    record = self._selected_diagnostic_record()
+    self._set_text_widget(self.diagnostics_text, _format_metric_diagnostics_text(record))
+    self._draw_figure(
+        "diagnostics",
+        self.diagnostics_plot_frame,
+        create_metric_diagnostics_figure(
+            record,
+            component_name=self.diagnostic_component_var.get() or "gradient",
+        ),
+    )
+
+
+def _sweep_visualization_open_selected_diagnostic_preview(self: SweepVisualizationApp) -> None:
+    record = self._selected_diagnostic_record()
+    preview_path = None if record is None else record.preview_path
+    if not preview_path:
+        self.messagebox.showwarning("Preview", "No preview image available for the selected run.")
+        return
+    ok, err = _open_with_system(Path(preview_path))
+    if not ok:
+        self.messagebox.showerror("Preview", err or "Failed to open preview.")
+
+
+def _sweep_visualization_open_selected_diagnostic_folder(self: SweepVisualizationApp) -> None:
+    record = self._selected_diagnostic_record()
+    candidate_path = None
+    if record is not None:
+        for path_text in (record.metric_record_path, record.workspace_path, record.preview_path):
+            if path_text:
+                candidate_path = Path(path_text).parent
+                break
+    if candidate_path is None:
+        self.messagebox.showwarning("Run Folder", "No run folder could be resolved.")
+        return
+    ok, err = _open_with_system(candidate_path)
+    if not ok:
+        self.messagebox.showerror("Run Folder", err or "Failed to open run folder.")
+
+
+def _sweep_visualization_open_selected_metric_record(self: SweepVisualizationApp) -> None:
+    record = self._selected_diagnostic_record()
+    metric_record_path = None if record is None else record.metric_record_path
+    if not metric_record_path:
+        self.messagebox.showwarning("metric_record", "No metric_record.json available for the selected run.")
+        return
+    ok, err = _open_with_system(Path(metric_record_path))
+    if not ok:
+        self.messagebox.showerror("metric_record", err or "Failed to open metric_record.json.")
+
+
+def _sweep_visualization_populate_from_model(
+    self: SweepVisualizationApp,
+    model: SweepVisualizationModel,
+) -> None:
+    self._set_text_widget(self.overview_text, _format_overview_text(model))
+    self._set_text_widget(self.progression_text, "\n".join(_progression_summary_lines(model)))
+    self._set_text_widget(self.significance_text, _format_significance_text(model))
+    self._set_text_widget(self.metric_text, _format_metric_summary_text(model))
+
+    stage_values = ["All", *model.stage_order]
+    self.coverage_stage_combo["values"] = stage_values
+    self.coverage_stage_var.set(model.primary_stage_name)
+    self.coverage_dataset_combo["values"] = ["aggregate", *model.datasets]
+    self.coverage_dataset_var.set("aggregate")
+    preferred_params = _stage_parameter_rankings(model, model.primary_stage_name)
+    parameter_values = preferred_params if preferred_params else model.parameter_names
+    self.coverage_param_combo["values"] = parameter_values
+    self.coverage_y_param_combo["values"] = parameter_values
+    self.coverage_param_var.set(parameter_values[0] if parameter_values else "")
+    self.coverage_y_param_var.set(
+        parameter_values[1] if len(parameter_values) > 1 else (parameter_values[0] if parameter_values else "")
+    )
+    value_options = _value_options(model)
+    self.coverage_value_combo["values"] = value_options
+    self.coverage_value_var.set(
+        "score" if "score" in value_options else (value_options[0] if value_options else "")
+    )
+    self.coverage_strategy_combo["values"] = ["All", *model.strategies]
+    self.coverage_strategy_var.set("All")
+    families = _sorted_unique(
+        [row.family for row in model.candidates if row.family]
+        + [record.family for record in model.run_metric_records if record.family]
+    )
+    alpha_values = _sorted_unique(
+        [_alpha_filter_value(row.alpha) for row in model.candidates if row.alpha is not None]
+        + [
+            _alpha_filter_value(record.alpha)
+            for record in model.run_metric_records
+            if record.alpha is not None
+        ]
+    )
+    self.coverage_family_combo["values"] = ["All", *families]
+    self.coverage_family_var.set("All")
+    self.coverage_alpha_combo["values"] = ["All", *alpha_values]
+    self.coverage_alpha_var.set("All")
+    self.coverage_mode_var.set("1D Trend")
+    self._rebuild_effect_filter_controls(model)
+
+    preview_stage_values = [
+        stage_name
+        for stage_name in model.stage_order
+        if any(row.preview_paths for row in _rows_for_stage(model, stage_name))
+    ]
+    self.preview_stage_combo["values"] = preview_stage_values
+    self.preview_stage_var.set(preview_stage_values[0] if preview_stage_values else "")
+    self._refresh_preview_candidates()
+
+    self.leaderboard_stage_combo["values"] = stage_values
+    self.leaderboard_stage_var.set(model.primary_stage_name)
+    self.leaderboard_dataset_combo["values"] = ["aggregate", *model.datasets]
+    self.leaderboard_dataset_var.set("aggregate")
+    self.leaderboard_strategy_combo["values"] = ["All", *model.strategies]
+    self.leaderboard_strategy_var.set("All")
+    self.leaderboard_family_combo["values"] = ["All", *families]
+    self.leaderboard_family_var.set("All")
+    self.leaderboard_alpha_combo["values"] = ["All", *alpha_values]
+    self.leaderboard_alpha_var.set("All")
+
+    dataset_values = _real_datasets(model)
+    self.comparison_stage_combo["values"] = model.stage_order
+    self.comparison_stage_var.set(model.primary_stage_name)
+    self.comparison_dataset_combo["values"] = dataset_values
+    self.comparison_dataset_var.set(_default_comparison_dataset(model))
+    diagnostic_components = cast(List[str], model.diagnostic_availability.get("components", []))
+    diagnostic_components = diagnostic_components or ["gradient"]
+    self.comparison_component_combo["values"] = diagnostic_components
+    self.comparison_component_var.set(_default_component_name(model))
+
+    diagnostic_stage_values = _sorted_unique(record.stage for record in model.run_metric_records)
+    self.diagnostic_stage_combo["values"] = diagnostic_stage_values
+    self.diagnostic_stage_var.set(
+        model.primary_stage_name if model.primary_stage_name in diagnostic_stage_values else (diagnostic_stage_values[0] if diagnostic_stage_values else "")
+    )
+    self.diagnostic_component_combo["values"] = diagnostic_components
+    self.diagnostic_component_var.set(_default_component_name(model))
+    self._refresh_diagnostic_candidates()
+
+    self._update_metric_tab_visibility(bool(model.alpha_family_summary))
+    self.refresh_effects()
+    self.refresh_leaderboard()
+    self._draw_figure("overview", self.overview_plot_frame, create_overview_figure(model))
+    self._draw_figure("progression", self.progression_plot_frame, create_progression_figure(model))
+    self._draw_figure("significance", self.significance_plot_frame, create_significance_figure(model))
+    self._draw_figure("metric", self.metric_plot_frame, create_metric_formulation_figure(model))
+    self.refresh_comparison()
+    self.refresh_metric_diagnostics()
+
+
+SweepVisualizationApp.__init__ = _sweep_visualization_app_init
+SweepVisualizationApp._build_ui = _sweep_visualization_build_ui
+SweepVisualizationApp._build_leaderboard_tab = _sweep_visualization_build_leaderboard_tab
+SweepVisualizationApp._build_comparison_tab = _sweep_visualization_build_comparison_tab
+SweepVisualizationApp._build_diagnostics_tab = _sweep_visualization_build_diagnostics_tab
+SweepVisualizationApp._leaderboard_candidate_rows = _sweep_visualization_leaderboard_candidate_rows
+SweepVisualizationApp._leaderboard_candidate_label = _sweep_visualization_leaderboard_candidate_label
+SweepVisualizationApp._sorted_leaderboard_rows = _sweep_visualization_sorted_leaderboard_rows
+SweepVisualizationApp._leaderboard_row_values = _sweep_visualization_leaderboard_row_values
+SweepVisualizationApp._selected_leaderboard_rows = _sweep_visualization_selected_leaderboard_rows
+SweepVisualizationApp._format_leaderboard_detail_text = _sweep_visualization_format_leaderboard_detail_text
+SweepVisualizationApp._on_leaderboard_sort = _sweep_visualization_on_leaderboard_sort
+SweepVisualizationApp._seed_diagnostics_from_row = _sweep_visualization_seed_diagnostics_from_row
+SweepVisualizationApp._on_leaderboard_selection_changed = _sweep_visualization_on_leaderboard_selection_changed
+SweepVisualizationApp.refresh_leaderboard = _sweep_visualization_refresh_leaderboard
+SweepVisualizationApp._comparison_rows = _sweep_visualization_comparison_rows
+SweepVisualizationApp.refresh_comparison = _sweep_visualization_refresh_comparison
+SweepVisualizationApp.refresh_metric_diagnostics = _sweep_visualization_refresh_metric_diagnostics
+SweepVisualizationApp._open_selected_diagnostic_preview = _sweep_visualization_open_selected_diagnostic_preview
+SweepVisualizationApp._open_selected_diagnostic_folder = _sweep_visualization_open_selected_diagnostic_folder
+SweepVisualizationApp._open_selected_metric_record = _sweep_visualization_open_selected_metric_record
+SweepVisualizationApp._populate_from_model = _sweep_visualization_populate_from_model
+
+
 def launch_sweep_visualization(initial_path: Optional[Path] = None) -> None:
     import tkinter as tk
 
@@ -3889,11 +5485,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         nargs="?",
         help="Optional sweep output directory to load on startup.",
     )
+    parser.add_argument(
+        "--export-dir",
+        help="Optional output directory for headless export without launching the GUI.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
+    if args.export_dir:
+        if not args.sweep_dir:
+            raise ValueError("--export-dir requires a sweep_dir argument.")
+        model = load_sweep_visualization_model(Path(args.sweep_dir))
+        export_sweep_visualization_bundle(model, Path(args.export_dir))
+        return
     initial_path = Path(args.sweep_dir) if args.sweep_dir else None
     launch_sweep_visualization(initial_path=initial_path)
 

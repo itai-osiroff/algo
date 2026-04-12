@@ -12,9 +12,12 @@ from PIL import Image
 
 from moment_images.sweep_visualization import (
     SweepVisualizationApp,
+    create_candidate_robustness_figure,
+    create_comparison_figure,
     create_effects_figure,
     export_sweep_visualization_bundle,
     load_sweep_visualization_model,
+    main,
 )
 
 
@@ -628,6 +631,15 @@ def test_export_sweep_visualization_bundle_writes_bundle_and_plots(tmp_path):
     assert (export_dir / "progression.png").exists()
     assert (export_dir / "significance.png").exists()
     assert (export_dir / "metric_diagnostics.png").exists()
+    assert (export_dir / "index.html").exists()
+    assert (export_dir / "tables" / "candidate_leaderboard.csv").exists()
+    assert (export_dir / "tables" / "run_metric_records.csv").exists()
+    assert (export_dir / "data" / "report_context.json").exists()
+    assert (export_dir / "assets" / "topk_overview.png").exists()
+    assert (export_dir / "assets" / "preview_d1.png").exists()
+    assert (export_dir / "assets" / "comparison_d1.png").exists()
+    assert (export_dir / "assets" / "diagnostic_d1_gradient.png").exists()
+    assert (export_dir / "assets" / "robustness_heatmap.png").exists()
     with np.load(export_dir / "visualization_bundle.npz", allow_pickle=True) as bundle:
         assert "score_matrix" in bundle.files
         assert "metric_tensor" in bundle.files
@@ -636,6 +648,11 @@ def test_export_sweep_visualization_bundle_writes_bundle_and_plots(tmp_path):
         assert "primary_metric_source" in bundle.files
         assert bundle["score_matrix"].shape[1] == 2
         assert bundle["metric_tensor"].ndim == 3
+    manifest = json.loads((export_dir / "visualization_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["index_html"] == "index.html"
+    assert manifest["report_top_k"] == 6
+    assert "tables/candidate_leaderboard.csv" in manifest["table_files"]
+    assert "assets/topk_overview.png" in manifest["report_assets"]
 
 
 def test_create_effects_figure_supports_aggregate_and_dataset_specific_grouping(tmp_path):
@@ -689,6 +706,65 @@ def test_create_effects_figure_supports_aggregate_and_dataset_specific_grouping(
     assert any(text.get_text() == "2" for text in heatmap.axes[0].texts)
 
 
+def test_create_comparison_and_robustness_figures_render(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_workspace=True,
+    )
+    model = load_sweep_visualization_model(output_dir)
+    rows = [row for row in model.candidates if row.stage == model.primary_stage_name][:2]
+
+    comparison = create_comparison_figure(
+        model,
+        rows,
+        dataset_id="d1",
+        component_name="gradient",
+    )
+    robustness = create_candidate_robustness_figure(model, rows)
+
+    assert len(comparison.axes) >= 5
+    assert "comparison" in comparison._suptitle.get_text().lower()
+    assert robustness.axes[0].get_xlabel() == "dataset"
+    assert robustness.axes[0].get_ylabel() == "candidate"
+
+
+def test_export_bundle_without_workspace_still_writes_report(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_workspace=False,
+    )
+    model = load_sweep_visualization_model(output_dir)
+    export_dir = tmp_path / "no_workspace_export"
+
+    export_sweep_visualization_bundle(model, export_dir)
+
+    assert (export_dir / "index.html").exists()
+    html_text = (export_dir / "index.html").read_text(encoding="utf-8")
+    assert "Sweep Visualization Report" in html_text
+    assert "Dataset: d1" in html_text
+
+
+def test_export_report_handles_partial_and_legacy_models(tmp_path):
+    partial_dir = _create_modern_fixture(tmp_path, include_stage2_summary=False)
+    legacy_dir = _create_legacy_fixture(tmp_path)
+    partial_model = load_sweep_visualization_model(partial_dir)
+    legacy_model = load_sweep_visualization_model(legacy_dir)
+
+    partial_export = tmp_path / "partial_export"
+    legacy_export = tmp_path / "legacy_export"
+    export_sweep_visualization_bundle(partial_model, partial_export)
+    export_sweep_visualization_bundle(legacy_model, legacy_export)
+
+    partial_html = (partial_export / "index.html").read_text(encoding="utf-8")
+    legacy_html = (legacy_export / "index.html").read_text(encoding="utf-8")
+    assert "stage2: planned=4" in partial_html
+    assert "Dataset: aggregate" in legacy_html
+
+
 def _can_create_tk() -> bool:
     try:
         import tkinter as tk
@@ -730,6 +806,8 @@ def test_gui_loads_model_and_toggles_metric_tab(tmp_path):
     app.load_from_path(metric_dir)
     root.update()
     tab_names = [app.notebook.tab(tab_id, "text") for tab_id in app.notebook.tabs()]
+    assert "Leaderboard" in tab_names
+    assert "Comparison" in tab_names
     assert "Effects" in tab_names
     assert "Metric Diagnostics" in tab_names
     assert "Metric Formulations" in tab_names
@@ -738,6 +816,34 @@ def test_gui_loads_model_and_toggles_metric_tab(tmp_path):
     root.update()
     tab_names = [app.notebook.tab(tab_id, "text") for tab_id in app.notebook.tabs()]
     assert "Metric Formulations" not in tab_names
+    root.destroy()
+
+
+def test_gui_leaderboard_selection_drives_comparison_and_diagnostics(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_workspace=True,
+    )
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root, initial_path=output_dir)
+    app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+    root.update()
+
+    children = app.leaderboard_tree.get_children()
+    assert children
+    app.leaderboard_tree.selection_set(children[0])
+    app._on_leaderboard_selection_changed()
+    root.update()
+
+    detail_text = app.leaderboard_detail_text.get("1.0", "end").strip()
+    comparison_text = app.comparison_text.get("1.0", "end").strip()
+    diagnostics_text = app.diagnostics_text.get("1.0", "end").strip()
+
+    assert "candidate:" in detail_text
+    assert "dataset:" in comparison_text
+    assert "run:" in diagnostics_text
     root.destroy()
 
 
@@ -758,3 +864,19 @@ def test_gui_export_writes_bundle(tmp_path):
     assert (export_dir / "visualization_bundle.npz").exists()
     assert (export_dir / "visualization_manifest.json").exists()
     root.destroy()
+
+
+def test_main_supports_headless_export_dir(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_workspace=True,
+    )
+    export_dir = tmp_path / "headless_export"
+
+    main([str(output_dir), "--export-dir", str(export_dir)])
+
+    assert (export_dir / "index.html").exists()
+    assert (export_dir / "visualization_bundle.npz").exists()
+    assert (export_dir / "tables" / "candidate_leaderboard.csv").exists()

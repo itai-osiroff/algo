@@ -346,6 +346,35 @@ Each run creates a folder with:
   - alpha-vs-quality/displacement/consistency aggregates by family
   - warning list for skipped/missing/corrupt artifacts (also saved as `alpha_report_warnings.json`)
 
+### Sweep visualization and report export
+
+Use the interactive visualizer to inspect completed or partial sweep folders:
+
+```bash
+python -m moment_images.sweep_visualization path/to/sweep_output
+```
+
+The GUI now emphasizes two tasks:
+
+- `Leaderboard` for stage/dataset filtered ranking, sorting, and parameter inspection.
+- `Comparison` for candidate-vs-candidate preview and diagnostic map comparison on one dataset.
+
+The existing `Metric Diagnostics` tab remains available for single-run drill-down and direct opening of preview/run artifacts.
+
+To export a self-contained static report without launching Tk:
+
+```bash
+python -m moment_images.sweep_visualization path/to/sweep_output --export-dir path/to/report_folder
+```
+
+The export keeps the existing bundle outputs (`visualization_bundle.npz`, `.mat`, root PNG plots) and additionally writes:
+
+- `index.html` - static overview page with summary figures, top candidates, warnings, and per-dataset sections.
+- `tables/candidate_leaderboard.csv`
+- `tables/run_metric_records.csv`
+- `data/report_context.json`
+- `assets/` - top-K overview, preview sheets, diagnostic comparison sheets, and robustness heatmap.
+
 ---
 
 ## Sweep analysis (`sweep_analysis.py`)
