@@ -278,6 +278,7 @@ def _gaussian_downsample_kernel_1d(downsample_factor: float) -> np.ndarray:
     kernel = np.exp(-(coords * coords) / (2.0 * sigma * sigma))
     kernel_sum = float(np.sum(kernel))
     if not np.isfinite(kernel_sum) or kernel_sum <= 0.0:
+        print("Warning: Non-finite or non-positive kernel sum in Gaussian downsample. Downgrading to box filter.")
         return np.array([1.0 / safe_downsample], dtype=np.float32)
 
     kernel = kernel / kernel_sum
