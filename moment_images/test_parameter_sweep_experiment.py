@@ -704,6 +704,41 @@ def test_spec_from_dict_maps_legacy_metric_formulations_to_experimental_lane():
     assert spec.experimental_metric_sweep.formulations[0].formulation_id == "legacy_grad"
 
 
+def test_spec_from_dict_supports_single_stage_mode_and_defaults_to_two_stage():
+    payload = {
+        "datasets": [{"id": "d1", "views": "x.npy"}],
+        "strategies": ["pixel"],
+        "search_spaces": {
+            "pixel": {
+                "similarity_window_sizes": [1],
+                "max_displacements": [0],
+                "gauss_sigmas": [1.0],
+                "disp_gauss_sigmas": [0.0],
+                "pixel_thresholds": [0.05],
+                "sub_pix_factors": [1],
+                "pixel_sigma_pyramid": [False],
+                "zero_fill_roll": [True],
+            }
+        },
+        "stages": {
+            "mode": "single_stage",
+            "total_budget_per_dataset": 3,
+        },
+    }
+
+    single_stage_spec = SweepExperimentSpec.from_dict(payload)
+    default_stage_spec = SweepExperimentSpec.from_dict(
+        {
+            "datasets": payload["datasets"],
+            "strategies": payload["strategies"],
+            "search_spaces": payload["search_spaces"],
+        }
+    )
+
+    assert single_stage_spec.stages.mode == "single_stage"
+    assert default_stage_spec.stages.mode == "two_stage"
+
+
 def test_experimental_metric_sweep_rejects_global_only_strategies(tmp_path):
     views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
     views_path = tmp_path / "views.npy"
@@ -758,6 +793,107 @@ def test_run_sweep_experiment_writes_run_state_without_root_alpha_report(tmp_pat
     manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
     assert manifest["baseline_displacement_mode"]["family"] == "intensity"
     assert manifest["baseline_displacement_mode"]["alpha"] == 1.0
+
+
+def test_run_sweep_experiment_single_stage_writes_stage1_only_outputs(tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1, 3],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            mode="single_stage",
+            total_budget_per_dataset=2,
+            stage1_fraction=0.5,
+            top_k=1,
+            max_workers=1,
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "single_stage"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    out_dir = run_sweep_experiment(spec)
+
+    assert (out_dir / "stage1_summary.json").exists()
+    assert not (out_dir / "stage2_summary.json").exists()
+    assert (out_dir / "leaderboard.json").exists()
+    assert (out_dir / "best_configs.json").exists()
+    assert not (out_dir / "runs" / "stage2").exists()
+    assert (out_dir / "runs" / "stage1" / "s1c0000" / "d1" / "workspace.npz").exists()
+
+    manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
+    run_state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert manifest["stages"]["mode"] == "single_stage"
+    assert run_state["fingerprint_payload"]["spec"]["stages"]["mode"] == "single_stage"
+    assert "stage2" not in run_state["stages"]
+
+
+def test_run_sweep_experiment_single_stage_still_supports_metric_phase(tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            mode="single_stage",
+            total_budget_per_dataset=1,
+            stage1_fraction=0.5,
+            top_k=1,
+            max_workers=1,
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            shortlist_top_k=1,
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="exp_grad",
+                    family="ncc_gradient",
+                    alphas=[0.25, 0.75],
+                )
+            ],
+        ),
+        output_dir=str(tmp_path / "single_stage_metric_phase"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    out_dir = run_sweep_experiment(spec)
+    metric_dir = out_dir / "metric_experiments"
+
+    assert (out_dir / "stage1_summary.json").exists()
+    assert not (out_dir / "stage2_summary.json").exists()
+    assert (metric_dir / "metric_phase_summary.json").exists()
+    config_paths = sorted(metric_dir.glob("runs/metric_phase/*/*/config.json"))
+    assert config_paths
+    formulation_ids = {
+        json.loads(path.read_text(encoding="utf-8"))["metric_formulation_id"]
+        for path in config_paths
+    }
+    assert formulation_ids == {"exp_grad"}
+    manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
     assert manifest["baseline_displacement_mode"]["metric_formulation_id"] == "intensity_default"
 
     state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))

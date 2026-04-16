@@ -318,6 +318,26 @@ def _resolve_primary_metric(
     return DEFAULT_PRIMARY_METRIC, "default"
 
 
+def _resolve_configured_stage_mode(
+    experiment_manifest: Optional[Dict[str, object]],
+    run_state: Optional[Dict[str, object]],
+) -> str:
+    valid_modes = {"two_stage", "single_stage"}
+    if isinstance(experiment_manifest, dict):
+        manifest_stages = cast(Dict[str, object], experiment_manifest.get("stages", {}))
+        mode = str(manifest_stages.get("mode", "")).strip().lower()
+        if mode in valid_modes:
+            return mode
+    if isinstance(run_state, dict):
+        fingerprint_payload = cast(Dict[str, object], run_state.get("fingerprint_payload", {}))
+        spec_payload = cast(Dict[str, object], fingerprint_payload.get("spec", {}))
+        spec_stages = cast(Dict[str, object], spec_payload.get("stages", {}))
+        mode = str(spec_stages.get("mode", "")).strip().lower()
+        if mode in valid_modes:
+            return mode
+    return "two_stage"
+
+
 def _normalize_alpha_summary_rows(
     payload: object,
     primary_metric: str,
@@ -1193,6 +1213,10 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         cast(Optional[Dict[str, object]], run_state),
         scoring_weights,
     )
+    configured_stage_mode = _resolve_configured_stage_mode(
+        cast(Optional[Dict[str, object]], experiment_manifest),
+        cast(Optional[Dict[str, object]], run_state),
+    )
     stage_summaries: Dict[str, StageVisualizationSummary] = {}
     stage_candidate_ids: Dict[str, List[str]] = {}
     candidate_rows: List[CandidateVisualizationRow] = []
@@ -1381,7 +1405,12 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
             )
 
         stage2_present = bool(summary_payloads.get("stage2"))
-        mode = "metric_phase_dir" if path_scope == "metric_phase_dir" else ("spec_full" if stage2_present else "spec_partial")
+        if path_scope == "metric_phase_dir":
+            mode = "metric_phase_dir"
+        elif configured_stage_mode == "single_stage" and "stage1" in stage_summaries and "stage2" not in stage_summaries:
+            mode = "spec_single_stage"
+        else:
+            mode = "spec_full" if stage2_present else "spec_partial"
     else:
         legacy_records = _load_legacy_records(source_dir, warnings)
         if not legacy_records:
@@ -1613,12 +1642,14 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         "path_scope": path_scope,
         "used_files": sorted(dict.fromkeys(used_files)),
         "mode": mode,
+        "configured_stage_mode": configured_stage_mode,
         "primary_metric_source": primary_metric_source,
         "alpha_summary_source": alpha_summary_source,
     }
     experiment_metadata.update(
         {
             "mode": mode,
+            "configured_stage_mode": configured_stage_mode,
             "dataset_count": len(datasets),
             "candidate_count": len(ordered_candidate_rows),
             "run_record_count": len(run_metric_records),
@@ -2385,8 +2416,14 @@ def create_coverage_figure(
 
 def _progression_summary_lines(model: SweepVisualizationModel) -> List[str]:
     lines: List[str] = []
-    if "stage1" not in model.stages or "stage2" not in model.stages:
+    if "stage1" not in model.stages:
         lines.append("Progression view is only available for staged experiment outputs.")
+        return lines
+    if "stage2" not in model.stages:
+        if model.mode == "spec_single_stage":
+            lines.append("Single-stage baseline run; no stage-2 progression comparison.")
+        else:
+            lines.append("Progression view is only available for staged experiment outputs.")
         return lines
 
     stage1_rows = _rows_for_stage(model, "stage1")
@@ -2450,6 +2487,17 @@ def create_progression_figure(model: SweepVisualizationModel) -> Figure:
 
     if "stage1" not in model.stages and "stage2" not in model.stages:
         top_ax.text(0.5, 0.5, "Legacy sweeps have no staged progression.", ha="center", va="center")
+        top_ax.axis("off")
+        _plot_progress_bars(bottom_ax, model)
+        fig.tight_layout()
+        return fig
+    if "stage2" not in model.stages:
+        message = (
+            "Single-stage baseline run; no stage-2 progression comparison."
+            if model.mode == "spec_single_stage"
+            else "Progression view is only available for staged experiment outputs."
+        )
+        top_ax.text(0.5, 0.5, message, ha="center", va="center")
         top_ax.axis("off")
         _plot_progress_bars(bottom_ax, model)
         fig.tight_layout()

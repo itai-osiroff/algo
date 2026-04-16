@@ -43,10 +43,26 @@ def test_state_to_spec_and_back_roundtrip(tmp_path):
     assert roundtrip.strategy_pixel is True
     assert roundtrip.strategy_combined is True
     assert roundtrip.strategy_global is True
+    assert roundtrip.stage_mode == "two_stage"
     assert roundtrip.pixel_similarity_window_sizes == "11,21"
     assert roundtrip.combined_global_thresholds == "0.1,0.2"
     assert roundtrip.datasets[0].dataset_id == "dataset_a"
     assert roundtrip.metric_experiments_enabled is False
+
+
+def test_state_to_spec_roundtrip_supports_single_stage_mode(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.stage_mode = "single_stage"
+    state.stage1_fraction = "not-a-number"
+
+    issues = validate_state(state)
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    assert not any("Stage1 fraction" in issue for issue in issues)
+    assert payload["stages"]["mode"] == "single_stage"
+    assert payload["stages"]["stage1_fraction"] == 0.6
+    assert roundtrip.stage_mode == "single_stage"
 
 
 def test_state_to_spec_roundtrip_with_metric_experiments(tmp_path):

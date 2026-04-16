@@ -94,6 +94,7 @@
     }
   },
   "stages": {
+    "mode": "two_stage",
     "total_budget_per_dataset": 320,
     "stage1_fraction": 0.6,
     "top_k": 8,

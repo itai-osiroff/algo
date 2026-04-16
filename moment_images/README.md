@@ -238,6 +238,11 @@ Search spaces are strategy-aware:
 - `combined`: global pad/threshold plus pixel refinement controls, including global-average reference toggle.
 - `global`: optional baseline mode using global-only knobs.
 
+Baseline execution mode is configured under `stages.mode`:
+
+- `two_stage` (default): coarse stage-1 ranking followed by stage-2 refinement.
+- `single_stage`: one-pass baseline evaluation over the configured candidate grid.
+
 Baseline stage-1/stage-2 candidates run in **pure intensity mode** by default (`family=intensity`, `alpha=1.0`). Optional metric experiments are configured under `experimental_metric_sweep`. This second phase runs **after** baseline ranking and only expands metric formulations for shortlisted pixel/combined candidates.
 
 Each formulation defines:
@@ -284,7 +289,7 @@ For `composite`:
 Top-level outputs include:
 
 - `stage1_summary.json` - coarse-stage run details, failures, and rankings.
-- `stage2_summary.json` - refinement-stage run details, failures, and rankings.
+- `stage2_summary.json` - refinement-stage run details, failures, and rankings (`two_stage` only).
 - `leaderboard.json` and `leaderboard.csv` - final ranked configurations.
 - `best_configs.json` - overall best and best-per-strategy configurations.
 - `summary.json` - flattened metric records for successful runs.

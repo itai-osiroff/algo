@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from PIL import Image
@@ -256,10 +256,17 @@ class SweepSearchSpace:
 class SweepStageSpec:
     """Controls two-stage coarse/fine search behavior."""
 
+    mode: Literal["two_stage", "single_stage"] = "two_stage"
     total_budget_per_dataset: int = 320
     stage1_fraction: float = 0.6
     top_k: int = 8
     max_workers: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        normalized_mode = str(self.mode).strip().lower()
+        if normalized_mode not in {"two_stage", "single_stage"}:
+            raise ValueError("stages.mode must be either 'two_stage' or 'single_stage'.")
+        self.mode = cast(Literal["two_stage", "single_stage"], normalized_mode)
 
 
 @dataclass
@@ -507,6 +514,10 @@ class SweepExperimentSpec:
 
         stages_raw = cast(Dict[str, object], payload.get("stages", {}))
         stages = SweepStageSpec(
+            mode=cast(
+                Literal["two_stage", "single_stage"],
+                str(stages_raw.get("mode", "two_stage")),
+            ),
             total_budget_per_dataset=int(stages_raw.get("total_budget_per_dataset", 320)),
             stage1_fraction=float(stages_raw.get("stage1_fraction", 0.6)),
             top_k=int(stages_raw.get("top_k", 8)),
@@ -2593,7 +2604,7 @@ def _write_phase_summary_artifacts(
 
 
 def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] = None) -> Path:
-    """Run a full two-stage, multi-dataset sweep experiment."""
+    """Run a staged or single-stage, multi-dataset sweep experiment."""
 
     resolved_output_dir = (
         output_dir
@@ -2618,7 +2629,13 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         fingerprint_payload=fingerprint_payload,
     )
 
+    stage_mode = spec.stages.mode
     stage1_budget, stage2_budget = _stage_budgets(spec.stages)
+    baseline_budget = (
+        stage1_budget
+        if stage_mode == "two_stage"
+        else max(1, int(spec.stages.total_budget_per_dataset))
+    )
 
     coarse_candidates_base: List[SweepCandidate] = []
     for strategy in spec.strategies:
@@ -2626,7 +2643,7 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         coarse_candidates_base.extend(generate_coarse_candidates(search_space, budget=None))
     coarse_candidates = list(coarse_candidates_base)
     coarse_candidates = _dedupe_candidates(coarse_candidates)
-    coarse_candidates = _limit_candidates(coarse_candidates, stage1_budget)
+    coarse_candidates = _limit_candidates(coarse_candidates, baseline_budget)
     coarse_candidates = _assign_candidate_ids(coarse_candidates, "s1c")
     coarse_lookup = {candidate.candidate_id: candidate for candidate in coarse_candidates}
 
@@ -2652,40 +2669,44 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         execution=stage1_eval.execution,
     )
 
-    refined_candidates = generate_refined_candidates(
-        ranked_candidates=stage1_rankings,
-        candidate_lookup=coarse_lookup,
-        search_spaces=spec.search_spaces,
-        top_k=spec.stages.top_k,
-        budget=stage2_budget,
-    )
-    if not refined_candidates and stage1_rankings:
-        # Fallback: keep exploring with the best stage-1 candidate if refinement is empty.
-        best_id = str(stage1_rankings[0]["candidate_id"])
-        refined_candidates = [coarse_lookup[best_id]]
-    refined_candidates = _dedupe_candidates(refined_candidates)
-    refined_candidates = _assign_candidate_ids(refined_candidates, "s2c")
-    refined_lookup = {candidate.candidate_id: candidate for candidate in refined_candidates}
+    refined_lookup: Dict[str, SweepCandidate] = {}
+    stage2_results: List[Dict[str, object]] = []
+    stage2_rankings: List[Dict[str, object]] = []
+    if stage_mode == "two_stage":
+        refined_candidates = generate_refined_candidates(
+            ranked_candidates=stage1_rankings,
+            candidate_lookup=coarse_lookup,
+            search_spaces=spec.search_spaces,
+            top_k=spec.stages.top_k,
+            budget=stage2_budget,
+        )
+        if not refined_candidates and stage1_rankings:
+            # Fallback: keep exploring with the best stage-1 candidate if refinement is empty.
+            best_id = str(stage1_rankings[0]["candidate_id"])
+            refined_candidates = [coarse_lookup[best_id]]
+        refined_candidates = _dedupe_candidates(refined_candidates)
+        refined_candidates = _assign_candidate_ids(refined_candidates, "s2c")
+        refined_lookup = {candidate.candidate_id: candidate for candidate in refined_candidates}
 
-    stage2_eval = _evaluate_stage(
-        stage_name="stage2",
-        candidates=refined_candidates,
-        datasets=prepared_datasets,
-        output_dir=resolved_output_dir,
-        save_figures_flag=spec.save_figures,
-        requested_workers=requested_workers,
-        run_state=run_state,
-        run_state_path=run_state_path,
-    )
-    stage2_results = stage2_eval.stage_results
-    stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
-    _write_stage_outputs(
-        "stage2",
-        stage2_results,
-        stage2_rankings,
-        resolved_output_dir,
-        execution=stage2_eval.execution,
-    )
+        stage2_eval = _evaluate_stage(
+            stage_name="stage2",
+            candidates=refined_candidates,
+            datasets=prepared_datasets,
+            output_dir=resolved_output_dir,
+            save_figures_flag=spec.save_figures,
+            requested_workers=requested_workers,
+            run_state=run_state,
+            run_state_path=run_state_path,
+        )
+        stage2_results = stage2_eval.stage_results
+        stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
+        _write_stage_outputs(
+            "stage2",
+            stage2_results,
+            stage2_rankings,
+            resolved_output_dir,
+            execution=stage2_eval.execution,
+        )
 
     final_rankings = stage2_rankings if stage2_rankings else stage1_rankings
 
@@ -2946,8 +2967,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--spec",
         help=(
-            "Path to a JSON experiment spec for the two-stage multi-dataset sweep "
-            "(recommended path for new workflows)."
+            "Path to a JSON experiment spec for the staged or single-stage "
+            "multi-dataset sweep (recommended path for new workflows)."
         ),
     )
     parser.add_argument(
@@ -3258,6 +3279,7 @@ class SpecGuiState:
     strategy_pixel: bool = True
     strategy_combined: bool = True
     strategy_global: bool = False
+    stage_mode: str = "two_stage"
     total_budget_per_dataset: str = "320"
     stage1_fraction: str = "0.6"
     top_k: str = "8"
@@ -3547,14 +3569,26 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             ),
         }
 
+    stage_mode = state.stage_mode.strip().lower() or "two_stage"
+    if stage_mode not in {"two_stage", "single_stage"}:
+        raise ValueError("Execution mode must be either 'two_stage' or 'single_stage'.")
+    if stage_mode == "two_stage":
+        stage1_fraction_value = float(state.stage1_fraction.strip())
+    else:
+        try:
+            stage1_fraction_value = float(state.stage1_fraction.strip())
+        except Exception:
+            stage1_fraction_value = SweepStageSpec().stage1_fraction
+
     payload: Dict[str, object] = {
         "output_dir": state.output_dir.strip() or None,
         "strategies": strategies,
         "datasets": datasets,
         "search_spaces": search_spaces,
         "stages": {
+            "mode": stage_mode,
             "total_budget_per_dataset": int(state.total_budget_per_dataset.strip()),
-            "stage1_fraction": float(state.stage1_fraction.strip()),
+            "stage1_fraction": stage1_fraction_value,
             "top_k": int(state.top_k.strip()),
             "max_workers": (
                 int(state.max_workers.strip()) if state.max_workers.strip() else None
@@ -3605,6 +3639,7 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
     state.strategy_global = "global" in strategies
 
     stages = cast(Dict[str, object], payload.get("stages", {}))
+    state.stage_mode = str(stages.get("mode", state.stage_mode) or state.stage_mode)
     state.total_budget_per_dataset = str(
         stages.get("total_budget_per_dataset", state.total_budget_per_dataset)
     )
@@ -3801,18 +3836,23 @@ def validate_state(state: SpecGuiState) -> List[str]:
     if not strategies:
         issues.append("Select at least one strategy.")
 
+    stage_mode = state.stage_mode.strip().lower() or "two_stage"
+    if stage_mode not in {"two_stage", "single_stage"}:
+        issues.append("Execution mode must be either 'two_stage' or 'single_stage'.")
+
     try:
         if int(state.total_budget_per_dataset.strip()) < 1:
             issues.append("Total budget per dataset must be >= 1.")
     except Exception:
         issues.append("Total budget per dataset must be an integer.")
 
-    try:
-        fraction = float(state.stage1_fraction.strip())
-        if not (0.0 < fraction < 1.0):
-            issues.append("Stage1 fraction must be between 0 and 1.")
-    except Exception:
-        issues.append("Stage1 fraction must be numeric.")
+    if stage_mode == "two_stage":
+        try:
+            fraction = float(state.stage1_fraction.strip())
+            if not (0.0 < fraction < 1.0):
+                issues.append("Stage1 fraction must be between 0 and 1.")
+        except Exception:
+            issues.append("Stage1 fraction must be numeric.")
 
     try:
         if int(state.top_k.strip()) < 1:
@@ -4081,6 +4121,8 @@ class SpecGuiApp:
                 widget.configure(state=desired)
             except Exception:
                 pass
+        if enabled and hasattr(self, "stage_mode_var"):
+            self._toggle_stage_mode_controls()
         if enabled and hasattr(self, "metric_experiments_enabled_var"):
             self._toggle_metric_experiment_controls()
 
@@ -4185,21 +4227,37 @@ class SpecGuiApp:
 
         stage_frame = self.ttk.Frame(basic_frame)
         stage_frame.grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=2)
-        self.ttk.Label(stage_frame, text="Total budget").grid(row=0, column=0, sticky="w")
+        self.ttk.Label(stage_frame, text="Execution mode").grid(row=0, column=0, sticky="w")
+        self.stage_mode_var = self.tk.StringVar(value="two_stage")
+        self.stage_mode_combo = self.ttk.Combobox(
+            stage_frame,
+            textvariable=self.stage_mode_var,
+            values=["two_stage", "single_stage"],
+            width=14,
+            state="readonly",
+        )
+        self.stage_mode_combo.grid(row=0, column=1, padx=4)
+        self.stage_mode_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt: self._toggle_stage_mode_controls(),
+        )
+        self._register_editable(self.stage_mode_combo)
+        self.ttk.Label(stage_frame, text="Total budget").grid(row=0, column=2, sticky="w")
         self.total_budget_entry = self.ttk.Entry(stage_frame, width=8)
-        self.total_budget_entry.grid(row=0, column=1, padx=4)
+        self.total_budget_entry.grid(row=0, column=3, padx=4)
         self._register_editable(self.total_budget_entry)
-        self.ttk.Label(stage_frame, text="Stage1 fraction").grid(row=0, column=2, sticky="w")
+        self.stage1_fraction_label = self.ttk.Label(stage_frame, text="Stage1 fraction")
+        self.stage1_fraction_label.grid(row=0, column=4, sticky="w")
         self.stage1_fraction_entry = self.ttk.Entry(stage_frame, width=6)
-        self.stage1_fraction_entry.grid(row=0, column=3, padx=4)
+        self.stage1_fraction_entry.grid(row=0, column=5, padx=4)
         self._register_editable(self.stage1_fraction_entry)
-        self.ttk.Label(stage_frame, text="Top-K").grid(row=0, column=4, sticky="w")
+        self.ttk.Label(stage_frame, text="Top-K").grid(row=0, column=6, sticky="w")
         self.top_k_entry = self.ttk.Entry(stage_frame, width=6)
-        self.top_k_entry.grid(row=0, column=5, padx=4)
+        self.top_k_entry.grid(row=0, column=7, padx=4)
         self._register_editable(self.top_k_entry)
-        self.ttk.Label(stage_frame, text="Max workers").grid(row=0, column=6, sticky="w")
+        self.ttk.Label(stage_frame, text="Max workers").grid(row=0, column=8, sticky="w")
         self.max_workers_entry = self.ttk.Entry(stage_frame, width=8)
-        self.max_workers_entry.grid(row=0, column=7, padx=4)
+        self.max_workers_entry.grid(row=0, column=9, padx=4)
         self._register_editable(self.max_workers_entry)
 
         toggles_frame = self.ttk.Frame(basic_frame)
@@ -4353,6 +4411,15 @@ class SpecGuiApp:
             self.metric_experiment_rows_frame.pack_forget()
             self.metric_shortlist_entry.configure(state="disabled")
             self.metric_add_row_btn.configure(state="disabled")
+
+    def _toggle_stage_mode_controls(self) -> None:
+        stage_mode = self.stage_mode_var.get().strip().lower() or "two_stage"
+        if stage_mode == "single_stage":
+            self.stage1_fraction_entry.configure(state="disabled")
+            self.stage1_fraction_label.configure(text="Stage1 fraction (unused)")
+        else:
+            self.stage1_fraction_entry.configure(state="normal")
+            self.stage1_fraction_label.configure(text="Stage1 fraction")
 
     def _clear_dataset_rows(self) -> None:
         for row in self.dataset_rows:
@@ -4573,6 +4640,7 @@ class SpecGuiApp:
             strategy_pixel=bool(self.strategy_pixel_var.get()),
             strategy_combined=bool(self.strategy_combined_var.get()),
             strategy_global=bool(self.strategy_global_var.get()),
+            stage_mode=self.stage_mode_var.get().strip(),
             total_budget_per_dataset=self.total_budget_entry.get().strip(),
             stage1_fraction=self.stage1_fraction_entry.get().strip(),
             top_k=self.top_k_entry.get().strip(),
@@ -4620,6 +4688,7 @@ class SpecGuiApp:
         self.strategy_pixel_var.set(state.strategy_pixel)
         self.strategy_combined_var.set(state.strategy_combined)
         self.strategy_global_var.set(state.strategy_global)
+        self.stage_mode_var.set(state.stage_mode)
         self.total_budget_entry.delete(0, self.tk.END)
         self.total_budget_entry.insert(0, state.total_budget_per_dataset)
         self.stage1_fraction_entry.delete(0, self.tk.END)
@@ -4676,6 +4745,7 @@ class SpecGuiApp:
             self._add_metric_experiment_row(metric_row)
         if not self.metric_experiment_rows:
             self._add_metric_experiment_row()
+        self._toggle_stage_mode_controls()
         self._toggle_metric_experiment_controls()
 
         self.json_text.delete("1.0", self.tk.END)

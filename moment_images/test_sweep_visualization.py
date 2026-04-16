@@ -15,6 +15,7 @@ from moment_images.sweep_visualization import (
     create_candidate_robustness_figure,
     create_comparison_figure,
     create_effects_figure,
+    create_progression_figure,
     export_sweep_visualization_bundle,
     load_sweep_visualization_model,
     main,
@@ -231,6 +232,7 @@ def _run_state_payload(
     *,
     include_stage2_runs: bool = True,
     include_metric_phase: bool = False,
+    stage_mode: str = "two_stage",
 ) -> dict:
     runs = {
         "stage1_s1c0000_d1": {
@@ -241,7 +243,7 @@ def _run_state_payload(
             "status": "ok",
         }
     }
-    if include_stage2_runs:
+    if stage_mode == "two_stage" and include_stage2_runs:
         runs["stage2_s2c0000_d1"] = {
             "run_uid": "stage2_s2c0000_d1",
             "stage": "stage2",
@@ -267,8 +269,9 @@ def _run_state_payload(
 
     stages = {
         "stage1": {"planned_runs": 4, "completed_runs": 4},
-        "stage2": {"planned_runs": 4, "completed_runs": 0},
     }
+    if stage_mode == "two_stage":
+        stages["stage2"] = {"planned_runs": 4, "completed_runs": 0}
     if include_metric_phase:
         stages["metric_phase"] = {"planned_runs": 2, "completed_runs": 2}
 
@@ -281,7 +284,7 @@ def _run_state_payload(
         "fingerprint_payload": {
             "spec": {
                 "strategies": ["combined"],
-                "stages": {"top_k": 1},
+                "stages": {"top_k": 1, "mode": stage_mode},
                 "scoring": {"metric_weights": {"laplacian_variance": 1.0}},
             },
             "datasets": [{"dataset_id": dataset_id} for dataset_id in datasets],
@@ -291,14 +294,14 @@ def _run_state_payload(
     }
 
 
-def _write_manifest(path: Path, datasets: list[str]) -> None:
+def _write_manifest(path: Path, datasets: list[str], *, stage_mode: str = "two_stage") -> None:
     _write_json(
         path,
         {
             "generated_at": "2026-04-01T01:00:00+00:00",
             "strategies": ["combined"],
             "datasets": [{"dataset_id": dataset_id} for dataset_id in datasets],
-            "stages": {"top_k": 1},
+            "stages": {"top_k": 1, "mode": stage_mode},
             "scoring": {"metric_weights": {"laplacian_variance": 1.0}},
             "reporting": {"primary_metric": "laplacian_variance"},
         },
@@ -312,17 +315,19 @@ def _create_modern_fixture(
     include_metric_phase: bool = False,
     include_alpha_report: bool = False,
     include_workspace: bool = False,
+    stage_mode: str = "two_stage",
 ) -> Path:
     output_dir = base_dir / "modern"
     datasets = ["d1", "d2"]
-    _write_manifest(output_dir / "experiment_manifest.json", datasets)
+    _write_manifest(output_dir / "experiment_manifest.json", datasets, stage_mode=stage_mode)
     _write_json(
         output_dir / "run_state.json",
         _run_state_payload(
             output_dir,
             datasets,
-            include_stage2_runs=not include_stage2_summary,
+            include_stage2_runs=(stage_mode == "two_stage" and not include_stage2_summary),
             include_metric_phase=include_metric_phase,
+            stage_mode=stage_mode,
         ),
     )
     stage1_rankings = [
@@ -332,7 +337,7 @@ def _create_modern_fixture(
     _write_json(output_dir / "stage1_summary.json", _stage_summary("stage1", stage1_rankings))
     for dataset_id in datasets:
         _write_preview(output_dir / "runs" / "stage1" / "s1c0000" / dataset_id / "avg_rectified.png")
-    if include_stage2_summary:
+    if stage_mode == "two_stage" and include_stage2_summary:
         stage2_rankings = [
             _ranking("s2c0000", score=0.91, rank=1, datasets=datasets, stage="stage2", params={"max_displacement": 7}),
         ]
@@ -472,6 +477,25 @@ def test_load_sweep_visualization_model_supports_partial_modern_outputs(tmp_path
     assert model.stages["stage2"].num_pending == 1
     assert model.stages["stage2"].num_running == 1
     assert not model.alpha_family_summary
+
+
+def test_load_sweep_visualization_model_supports_single_stage_modern_outputs(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+    progression = create_progression_figure(model)
+    export_dir = tmp_path / "single_stage_export"
+    export_sweep_visualization_bundle(model, export_dir)
+
+    assert model.mode == "spec_single_stage"
+    assert model.stage_order == ["stage1"]
+    assert model.primary_stage_name == "stage1"
+    assert "Single-stage baseline run" in progression.axes[0].texts[0].get_text()
+    assert (export_dir / "progression.png").exists()
 
 
 def test_load_sweep_visualization_model_supports_metric_phase_outputs(tmp_path):
