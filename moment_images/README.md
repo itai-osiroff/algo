@@ -15,7 +15,7 @@ This package focuses on rectifying light-field view grids extracted from graysca
 
 - `im_process.py` - Interactive rectification workflow and reusable rectification helpers.
 - `rectification_strategy.py` - Core algorithms for global translation and pixelwise patch rectification.
-- `parameter_sweep.py` - CLI/GUI runner for two-stage sweeps, alpha-weighted metric formulations, resumable execution, and ranking.
+- `parameter_sweep.py` - CLI/GUI runner for two-stage intensity-first sweeps, optional metric-formulation experiments, resumable execution, and ranking.
 - `sweep_analysis.py` - Metric computation, aggregate analysis, and alpha/family report generation.
 - `unpack_workspace.py` - GUI helper for unpacking `.npz` workspace archives saved by `im_process.py`.
 - `validate_rectification.py` - Tool to validate rectification results against new images from other cameras.
@@ -238,7 +238,7 @@ Search spaces are strategy-aware:
 - `combined`: global pad/threshold plus pixel refinement controls, including global-average reference toggle.
 - `global`: optional baseline mode using global-only knobs.
 
-Optional metric experiments are configured under `experimental_metric_sweep`. This second phase runs **after** baseline ranking and only expands metric formulations for shortlisted pixel/combined candidates.
+Baseline stage-1/stage-2 candidates run in **pure intensity mode** by default (`family=intensity`, `alpha=1.0`). Optional metric experiments are configured under `experimental_metric_sweep`. This second phase runs **after** baseline ranking and only expands metric formulations for shortlisted pixel/combined candidates.
 
 Each formulation defines:
 
@@ -257,7 +257,7 @@ Optional metric-experiment candidate generation is the cross-product of:
 - formulation family/weights
 - alpha values
 
-This keeps the experiment narrative explicit: **global pre-alignment -> pixelwise displacement scoring with alpha-weighted metric terms -> reconstruction -> diagnostics/quality metrics -> side-by-side alpha/family comparison**.
+This keeps the experiment narrative explicit: **global pre-alignment -> intensity-only baseline ranking -> optional metric-formulation experiments on shortlisted candidates -> reconstruction -> diagnostics/quality metrics -> side-by-side alpha/family comparison**.
 
 ### Alpha semantics (pixelwise displacement score)
 
@@ -289,10 +289,8 @@ Top-level outputs include:
 - `best_configs.json` - overall best and best-per-strategy configurations.
 - `summary.json` - flattened metric records for successful runs.
 - `analysis.json` and `analysis.csv` - aggregate metric summaries (when enabled).
-- `alpha_report.json` and `alpha_report.csv` - alpha/family-centric ranking and aggregated comparisons.
-- `alpha_report_warnings.json` - explicit warnings for missing/corrupt/partial artifacts consumed during report generation.
 - `run_state.json` - durable resumable execution state (attempt history, statuses, artifact validation).
-- `experiment_manifest.json` - deterministic manifest of datasets, formulations, scoring, reporting, and run-state location.
+- `experiment_manifest.json` - deterministic manifest of datasets, baseline displacement mode, optional metric experiments, scoring, reporting, and run-state location.
 
 When `experimental_metric_sweep.enabled=true`, additional artifacts are written under `metric_experiments/`:
 
@@ -326,9 +324,12 @@ Each run creates a folder with:
   - `displacement_component_weights`
   - `metric_formulation_id`
 - Stage summaries (`stage1_summary.json`, `stage2_summary.json`):
-  - baseline candidates use fixed metric formulation (`ncc_gradient`, `alpha=0.5`)
+  - baseline candidates use intensity-first displacement mode (`intensity`, `alpha=1.0`)
   - per-run statuses include `pending`, `running`, `ok`, `failed`, `skipped_valid`, `recomputed`
   - artifact-validation details and failure metadata are retained for resume
+- `experiment_manifest.json`:
+  - `baseline_displacement_mode`
+  - `experimental_metric_sweep`
 - Metric experiment summary (`metric_experiments/metric_phase_summary.json`):
   - shortlisted baseline candidates expanded across configured formulation/alpha settings
 - `run_state.json`:

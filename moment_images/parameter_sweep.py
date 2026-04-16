@@ -703,8 +703,8 @@ def _assign_candidate_ids(candidates: Sequence[SweepCandidate], prefix: str) -> 
 def _metric_formulation_from_params(
     params: Dict[str, object],
 ) -> Tuple[str, float, Optional[Dict[str, float]], str]:
-    family = str(params.get("displacement_metric_family", "ncc_gradient")).strip().lower()
-    alpha = float(params.get("displacement_alpha", 0.5))
+    family = str(params.get("displacement_metric_family", "intensity")).strip().lower()
+    alpha = float(params.get("displacement_alpha", 1.0))
     raw_weights_obj = params.get("displacement_component_weights")
     parsed_weights: Optional[Dict[str, float]] = None
     if raw_weights_obj is not None:
@@ -712,9 +712,9 @@ def _metric_formulation_from_params(
             str(key): float(value)
             for key, value in cast(Dict[str, object], raw_weights_obj).items()
         }
-    formulation_id = str(params.get("metric_formulation_id", "default_ncc_gradient_a0p5")).strip()
+    formulation_id = str(params.get("metric_formulation_id", "intensity_default")).strip()
     if not formulation_id:
-        formulation_id = "default_ncc_gradient_a0p5"
+        formulation_id = "intensity_default"
     return family, alpha, parsed_weights, formulation_id
 
 
@@ -750,17 +750,6 @@ def _dedupe_candidates(candidates: Sequence[SweepCandidate]) -> List[SweepCandid
         seen.add(signature)
         deduped.append(candidate)
     return deduped
-
-
-def _baseline_metric_formulations() -> List[MetricFormulationSpec]:
-    return [
-        MetricFormulationSpec(
-            formulation_id="baseline_ncc_gradient_a0p5",
-            family="ncc_gradient",
-            alphas=[0.5],
-            component_weights=None,
-        )
-    ]
 
 
 def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> SweepCandidate:
@@ -2595,7 +2584,7 @@ def _write_phase_summary_artifacts(
     if analyze and all_metric_records:
         analysis = analyze_summary_data(all_metric_records)
         save_analysis(analysis, output_dir / "analysis.json")
-    if reporting.generate_alpha_report:
+    if reporting.generate_alpha_report and stage_name == "metric_phase":
         generate_alpha_report(
             output_dir=output_dir,
             primary_metric=reporting.primary_metric,
@@ -2630,16 +2619,12 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
     )
 
     stage1_budget, stage2_budget = _stage_budgets(spec.stages)
-    baseline_metric_formulations = _baseline_metric_formulations()
 
     coarse_candidates_base: List[SweepCandidate] = []
     for strategy in spec.strategies:
         search_space = spec.search_spaces[strategy]
         coarse_candidates_base.extend(generate_coarse_candidates(search_space, budget=None))
-    coarse_candidates = _expand_candidates_with_metric_formulations(
-        coarse_candidates_base,
-        baseline_metric_formulations,
-    )
+    coarse_candidates = list(coarse_candidates_base)
     coarse_candidates = _dedupe_candidates(coarse_candidates)
     coarse_candidates = _limit_candidates(coarse_candidates, stage1_budget)
     coarse_candidates = _assign_candidate_ids(coarse_candidates, "s1c")
@@ -2736,12 +2721,6 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
     if spec.analyze and all_metric_records:
         analysis = analyze_summary_data(all_metric_records)
         save_analysis(analysis, resolved_output_dir / "analysis.json")
-    if spec.reporting.generate_alpha_report:
-        generate_alpha_report(
-            output_dir=resolved_output_dir,
-            primary_metric=spec.reporting.primary_metric,
-            tolerate_partial_outputs=spec.reporting.tolerate_partial_outputs,
-        )
 
     metric_phase_manifest: Dict[str, object] = {
         "enabled": bool(spec.experimental_metric_sweep and spec.experimental_metric_sweep.enabled),
@@ -2809,9 +2788,11 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
             "generated_at": _utc_now_iso(),
             "output_dir": str(resolved_output_dir.resolve()),
             "strategies": list(spec.strategies),
-            "baseline_metric_formulations": [
-                asdict(item) for item in baseline_metric_formulations
-            ],
+            "baseline_displacement_mode": {
+                "family": RectificationRunConfig().displacement_metric_family,
+                "alpha": float(RectificationRunConfig().displacement_alpha),
+                "metric_formulation_id": RectificationRunConfig().metric_formulation_id,
+            },
             "experimental_metric_sweep": (
                 None
                 if spec.experimental_metric_sweep is None

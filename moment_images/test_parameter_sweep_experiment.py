@@ -583,6 +583,10 @@ def test_run_sweep_experiment_writes_stage_and_leaderboard_outputs(tmp_path):
     assert (stage1_run / "workspace.npz").exists()
     assert (stage1_run / "rectified_views.npy").exists()
     assert (stage1_run / "avg_rectified.png").exists()
+    stage1_config = json.loads((stage1_run / "config.json").read_text(encoding="utf-8"))
+    assert stage1_config["displacement_metric_family"] == "intensity"
+    assert stage1_config["displacement_alpha"] == 1.0
+    assert stage1_config["metric_formulation_id"] == "intensity_default"
 
     leaderboard = json.loads((output_dir / "leaderboard.json").read_text(encoding="utf-8"))
     best = leaderboard[0]
@@ -730,7 +734,7 @@ def test_experimental_metric_sweep_rejects_global_only_strategies(tmp_path):
         )
 
 
-def test_run_sweep_experiment_writes_run_state_and_alpha_report(tmp_path):
+def test_run_sweep_experiment_writes_run_state_without_root_alpha_report(tmp_path):
     views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
     views_path = tmp_path / "views.npy"
     np.save(views_path, views)
@@ -748,9 +752,13 @@ def test_run_sweep_experiment_writes_run_state_and_alpha_report(tmp_path):
 
     out_dir = run_sweep_experiment(spec)
     assert (out_dir / "run_state.json").exists()
-    assert (out_dir / "alpha_report.json").exists()
-    assert (out_dir / "alpha_report.csv").exists()
+    assert not (out_dir / "alpha_report.json").exists()
+    assert not (out_dir / "alpha_report.csv").exists()
     assert (out_dir / "experiment_manifest.json").exists()
+    manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["baseline_displacement_mode"]["family"] == "intensity"
+    assert manifest["baseline_displacement_mode"]["alpha"] == 1.0
+    assert manifest["baseline_displacement_mode"]["metric_formulation_id"] == "intensity_default"
 
     state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
     assert state["schema_version"] == 1
@@ -887,6 +895,7 @@ def test_run_sweep_experiment_with_metric_phase_outputs(tmp_path):
     out_dir = run_sweep_experiment(spec)
     metric_dir = out_dir / "metric_experiments"
     assert metric_dir.exists()
+    assert not (out_dir / "alpha_report.json").exists()
     assert (metric_dir / "metric_phase_summary.json").exists()
     assert (metric_dir / "leaderboard.json").exists()
     assert (metric_dir / "summary.json").exists()

@@ -134,8 +134,8 @@ def _extract_displacement_score_diagnostics(result: RectificationResult) -> Opti
         return None
 
     diagnostics: Dict[str, object] = {
-        "metric_family": str(getattr(similarity, "metric_family", "ncc_gradient")),
-        "alpha": float(getattr(similarity, "alpha", 0.5)),
+        "metric_family": str(getattr(similarity, "metric_family", "intensity")),
+        "alpha": float(getattr(similarity, "alpha", 1.0)),
         "component_weights_raw": getattr(similarity, "component_weights_raw", None),
         "component_weights_normalized": getattr(similarity, "component_weights_normalized", None),
     }
@@ -386,7 +386,8 @@ def _save_alpha_report_plots(
     warnings: List[str],
 ) -> None:
     try:
-        from matplotlib import pyplot as plt
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"Plot generation unavailable: {type(exc).__name__}: {exc}")
         return
@@ -399,7 +400,9 @@ def _save_alpha_report_plots(
         return
 
     metric_key = f"{primary_metric}_mean"
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig = Figure(figsize=(8, 5))
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
     has_lines = False
     for family, rows in sorted(per_family.items(), key=lambda item: item[0]):
         xs = [float(item["alpha"]) for item in rows if item.get(metric_key) is not None]
@@ -416,9 +419,10 @@ def _save_alpha_report_plots(
         ax.legend()
     fig.tight_layout()
     fig.savefig(output_dir / "alpha_report_primary_vs_alpha.png", dpi=180)
-    plt.close(fig)
 
-    fig2, ax2 = plt.subplots(figsize=(8, 5))
+    fig2 = Figure(figsize=(8, 5))
+    FigureCanvasAgg(fig2)
+    ax2 = fig2.add_subplot(111)
     has_lines = False
     for family, rows in sorted(per_family.items(), key=lambda item: item[0]):
         xs = [float(item["alpha"]) for item in rows if item.get("mean_displacement_magnitude_mean") is not None]
@@ -439,7 +443,6 @@ def _save_alpha_report_plots(
         ax2.legend()
     fig2.tight_layout()
     fig2.savefig(output_dir / "alpha_report_displacement_vs_alpha.png", dpi=180)
-    plt.close(fig2)
 
 
 def generate_alpha_report(
@@ -480,17 +483,17 @@ def generate_alpha_report(
         family = str(
             formulation.get("family")
             or config.get("displacement_metric_family")
-            or "ncc_gradient"
+            or "intensity"
         )
         alpha = float(
             formulation.get("alpha")
             if formulation.get("alpha") is not None
-            else config.get("displacement_alpha", 0.5)
+            else config.get("displacement_alpha", 1.0)
         )
         formulation_id = str(
             formulation.get("id")
             or config.get("metric_formulation_id")
-            or "unknown_formulation"
+            or "intensity_default"
         )
         run_rows.append(
             {

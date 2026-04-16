@@ -50,8 +50,10 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
         assert "rectification_strategy" in workspace.files
         assert "run_name" in workspace.files
         assert "config_json" in workspace.files
+        assert "pixel_blended_scores" not in workspace.files
         assert "coordinates" not in workspace.files
         assert "scores" not in workspace.files
+        assert "pixel_component_score_gradient" not in workspace.files
         assert workspace["reference_view_index"].shape == (2,)
         assert workspace["pixel_displacements_x"].ndim == 4
         assert workspace["pixel_displacements_y"].ndim == 4
@@ -62,6 +64,9 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
         )
         parsed_config = json.loads(str(np.asarray(workspace["config_json"]).item()))
         assert parsed_config["strategy"] == "pixel"
+        assert parsed_config["displacement_metric_family"] == "intensity"
+        assert parsed_config["displacement_alpha"] == 1.0
+        assert parsed_config["metric_formulation_id"] == "intensity_default"
 
     direct_config = RectificationRunConfig(
         strategy="pixel",
@@ -81,6 +86,9 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
     np.testing.assert_allclose(sweep_rectified_workspace, direct_result.rectified_views)
     np.testing.assert_allclose(sweep_avg_workspace, direct_result.avg_image)
     np.testing.assert_allclose(sweep_rectified.mean(axis=(0, 1)), direct_result.avg_image)
+    assert direct_result.pixel_similarity is not None
+    assert direct_result.pixel_similarity.blended_score_maps is None
+    assert direct_result.pixel_similarity.component_score_maps is None
     assert (run_dir / "workspace.mat").exists()
     assert not (run_dir / "rectified_views.npz").exists()
 

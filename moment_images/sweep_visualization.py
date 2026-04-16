@@ -1585,7 +1585,13 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
                     primary_metric=primary_metric,
                 )
                 alpha_summary_source = "experiment_root.alpha_report"
-        else:
+        elif isinstance(root_alpha_report_payload, dict):
+            alpha_family_summary, alpha_ranked_runs = _normalize_alpha_summary_rows(
+                root_alpha_report_payload,
+                primary_metric=primary_metric,
+            )
+            alpha_summary_source = "experiment_root.alpha_report"
+        elif mode == "legacy":
             alpha_source_rows = [
                 row for row in ordered_candidate_rows if row.family is not None and row.alpha is not None
             ]

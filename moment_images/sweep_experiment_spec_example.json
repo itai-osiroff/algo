@@ -111,7 +111,7 @@
     "missing_dataset_penalty": 1.0
   },
   "experimental_metric_sweep": {
-    "enabled": true,
+    "enabled": false,
     "shortlist_top_k": 4,
     "formulations": [
       {

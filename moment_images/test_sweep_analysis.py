@@ -1,5 +1,6 @@
 import csv
 import json
+import sys
 
 import numpy as np
 import pytest
@@ -169,3 +170,28 @@ def test_generate_alpha_report_tolerates_corrupt_summary_with_stage_fallback(tmp
 
     assert report["num_runs_considered"] == 1
     assert report["warnings"]
+
+
+def test_generate_alpha_report_is_headless_safe_without_pyplot(tmp_path, monkeypatch):
+    summary = [
+        {
+            "run": "run_a",
+            "config": {
+                "displacement_metric_family": "ncc_gradient",
+                "displacement_alpha": 0.5,
+                "metric_formulation_id": "grad_half",
+            },
+            "metric_formulation": {"id": "grad_half", "family": "ncc_gradient", "alpha": 0.5},
+            "global_and_local_metrics": {"laplacian_variance": 10.0},
+            "displacement_field_metrics": {"mean_magnitude": 1.0},
+            "inter_view_consistency_metrics": {"mean_view_std": 0.2},
+        }
+    ]
+    (tmp_path / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "matplotlib.pyplot", None)
+
+    report = generate_alpha_report(output_dir=tmp_path, primary_metric="laplacian_variance")
+
+    assert report["num_runs_considered"] == 1
+    assert (tmp_path / "alpha_report_primary_vs_alpha.png").exists()
+    assert (tmp_path / "alpha_report_displacement_vs_alpha.png").exists()

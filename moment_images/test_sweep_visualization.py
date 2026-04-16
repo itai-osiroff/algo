@@ -162,18 +162,19 @@ def _ranking(
     rank: int,
     datasets: list[str],
     stage: str,
-    family: str = "ncc_gradient",
-    alpha: float = 0.5,
+    family: str = "intensity",
+    alpha: float = 1.0,
     strategy: str = "combined",
     params: dict | None = None,
 ) -> dict:
+    formulation_id = "intensity_default" if family == "intensity" else f"{family}_{alpha:g}"
     param_payload = {
         "max_displacement": 5 + rank,
         "gauss_sigma": 3.0,
         "pixel_threshold": 0.05,
         "displacement_metric_family": family,
         "displacement_alpha": alpha,
-        "metric_formulation_id": f"{family}_{alpha:g}",
+        "metric_formulation_id": formulation_id,
     }
     if params:
         param_payload.update(params)
@@ -186,7 +187,7 @@ def _ranking(
         "pixel_threshold": param_payload["pixel_threshold"],
         "displacement_metric_family": family,
         "displacement_alpha": alpha,
-        "metric_formulation_id": f"{family}_{alpha:g}",
+        "metric_formulation_id": formulation_id,
     }
     dataset_scores = {dataset_id: score - 0.02 * idx for idx, dataset_id in enumerate(datasets)}
     dataset_metrics = {
@@ -343,12 +344,13 @@ def _create_modern_fixture(
             "run": "stage1_s1c0000_d1",
             "config": {
                 "strategy": "combined",
-                "displacement_metric_family": "ncc_gradient",
-                "displacement_alpha": 0.5,
+                "displacement_metric_family": "intensity",
+                "displacement_alpha": 1.0,
+                "metric_formulation_id": "intensity_default",
                 "max_displacement": 6,
                 "gauss_sigma": 3.0,
             },
-            "metric_formulation": {"family": "ncc_gradient", "alpha": 0.5, "id": "baseline"},
+            "metric_formulation": {"family": "intensity", "alpha": 1.0, "id": "intensity_default"},
             "global_and_local_metrics": _metrics(10.0),
             "displacement_field_metrics": _displacement_metrics(1.0),
             "inter_view_consistency_metrics": _consistency_metrics(0.2),
@@ -456,6 +458,7 @@ def test_load_sweep_visualization_model_supports_full_modern_outputs(tmp_path):
     assert model.stages["stage2"].num_successful == 1
     assert model.score_matrix.shape[1] == 2
     assert model.candidates[0].preview_paths
+    assert not model.alpha_family_summary
 
 
 def test_load_sweep_visualization_model_supports_partial_modern_outputs(tmp_path):
@@ -468,6 +471,7 @@ def test_load_sweep_visualization_model_supports_partial_modern_outputs(tmp_path
     assert model.stages["stage2"].num_runs_planned == 4
     assert model.stages["stage2"].num_pending == 1
     assert model.stages["stage2"].num_running == 1
+    assert not model.alpha_family_summary
 
 
 def test_load_sweep_visualization_model_supports_metric_phase_outputs(tmp_path):

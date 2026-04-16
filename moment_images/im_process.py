@@ -69,10 +69,10 @@ class RectificationRunConfig:
     zero_fill_roll: bool = True
     sub_pix_factor: int = 2
     combined_use_global_avg_reference: bool = True
-    displacement_metric_family: str = "ncc_gradient"
-    displacement_alpha: float = 0.5
+    displacement_metric_family: str = "intensity"
+    displacement_alpha: float = 1.0
     displacement_component_weights: Optional[Dict[str, float]] = None
-    metric_formulation_id: str = "default_ncc_gradient_a0p5"
+    metric_formulation_id: str = "intensity_default"
     hdr_enabled: bool = False
     hdr_exposure_times: Optional[List[float]] = None
     normalize_to_8bit: bool = False
@@ -86,10 +86,10 @@ class RectificationRunConfig:
         self.displacement_alpha = alpha
 
         family = str(self.displacement_metric_family).strip().lower()
-        if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
+        if family not in {"intensity", "ncc_gradient", "ncc_laplacian", "composite"}:
             raise ValueError(
                 "displacement_metric_family must be one of "
-                "'ncc_gradient', 'ncc_laplacian', or 'composite'."
+                "'intensity', 'ncc_gradient', 'ncc_laplacian', or 'composite'."
             )
         self.displacement_metric_family = family
 
@@ -103,6 +103,10 @@ class RectificationRunConfig:
                     raise ValueError("displacement_component_weights values must be non-negative.")
                 normalized_weights[str(key)] = parsed
             self.displacement_component_weights = normalized_weights
+
+        if self.displacement_metric_family == "intensity":
+            self.displacement_alpha = 1.0
+            self.displacement_component_weights = None
 
         formulation_id = str(self.metric_formulation_id).strip()
         if not formulation_id:

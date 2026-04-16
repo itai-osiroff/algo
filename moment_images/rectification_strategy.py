@@ -22,9 +22,10 @@ from scipy.ndimage import gaussian_filter
 
 
 DEFAULT_CORRELATION_PAD_WIDTH = int(125 * 0.45)
-DEFAULT_DISPLACEMENT_METRIC_FAMILY = "ncc_gradient"
-DEFAULT_DISPLACEMENT_ALPHA = 0.5
+DEFAULT_DISPLACEMENT_METRIC_FAMILY = "intensity"
+DEFAULT_DISPLACEMENT_ALPHA = 1.0
 SUPPORTED_DISPLACEMENT_METRIC_FAMILIES = {
+    "intensity",
     "ncc_gradient",
     "ncc_laplacian",
     "composite",
@@ -356,7 +357,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if family not in SUPPORTED_DISPLACEMENT_METRIC_FAMILIES:
             raise ValueError(
                 "metric_family must be one of "
-                "'ncc_gradient', 'ncc_laplacian', or 'composite'."
+                "'intensity', 'ncc_gradient', 'ncc_laplacian', or 'composite'."
             )
         return family
 
@@ -368,6 +369,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
     ) -> Tuple[Dict[str, float], Dict[str, float]]:
         allowed_components = {"gradient", "laplacian"}
 
+        if metric_family == "intensity":
+            return {}, {}
         if metric_family == "ncc_gradient":
             return {"gradient": 1.0}, {"gradient": 1.0}
         if metric_family == "ncc_laplacian":
@@ -418,6 +421,13 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 secondary_blend = secondary_blend + float(component_weight) * component_stacks_norm[component_name]
             blended_stack = blended_stack + (1.0 - float(alpha)) * secondary_blend
         return blended_stack
+
+    @staticmethod
+    def _metric_components_enabled(
+        alpha: float,
+        normalized_component_weights: Dict[str, float],
+    ) -> bool:
+        return float(alpha) < 1.0 and bool(normalized_component_weights)
 
     def compute_similarity_matrices(
         self, views: np.ndarray, ref_view_idx: Tuple[int, int], max_disp: Optional[int] = None,
@@ -568,6 +578,10 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 resolved_metric_family, component_weights, float(alpha)
             )
         )
+        metric_components_enabled = self._metric_components_enabled(
+            alpha=float(alpha),
+            normalized_component_weights=normalized_component_weights,
+        )
 
         if views_arr.ndim != 4:
             raise ValueError("views must have shape (N, N, H, W)")
@@ -633,23 +647,37 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
         coordinates = np.zeros((height, width, grid_rows, grid_cols, 2), dtype=np.float32)
         scores = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
-        blended_score_maps = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
         disps_y = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float32)
         disps_x = np.zeros((height, width, grid_rows, grid_cols), dtype=np.float32)
-        component_keys: List[str] = ["intensity", *list(normalized_component_weights.keys())]
-        component_score_maps = {
-            key: np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
-            for key in component_keys
-        }
-        component_score_maps_raw = {
-            key: np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
-            for key in component_keys
-        }
+        blended_score_maps = (
+            np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
+            if metric_components_enabled
+            else None
+        )
+        component_keys: List[str] = ["intensity"]
+        if metric_components_enabled:
+            component_keys.extend(list(normalized_component_weights.keys()))
+        component_score_maps = (
+            {
+                key: np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
+                for key in component_keys
+            }
+            if metric_components_enabled
+            else None
+        )
+        component_score_maps_raw = (
+            {
+                key: np.zeros((height, width, grid_rows, grid_cols), dtype=np.float64)
+                for key in component_keys
+            }
+            if metric_components_enabled
+            else None
+        )
         base_coords = np.stack(np.meshgrid(np.arange(height), np.arange(width), indexing="ij"), -1)
         ref_grad_y = ref_grad_x = ref_laplacian = None
-        if "gradient" in normalized_component_weights:
+        if metric_components_enabled and "gradient" in normalized_component_weights:
             ref_grad_y, ref_grad_x = np.gradient(ref_view)
-        if "laplacian" in normalized_component_weights:
+        if metric_components_enabled and "laplacian" in normalized_component_weights:
             ref_laplacian = cv.Laplacian(ref_view, cv.CV_32F)
         if normalized_conv:
             ref_view_blurred = gaussian_filter(
@@ -701,7 +729,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         )
                         component_stacks_raw["intensity"][:, :, s_y_ind, s_x_ind] = intensity_corr
 
-                        if "gradient" in normalized_component_weights and ref_grad_x is not None and ref_grad_y is not None:
+                        if metric_components_enabled and "gradient" in normalized_component_weights and ref_grad_x is not None and ref_grad_y is not None:
                             shift_grad_y, shift_grad_x = np.gradient(shifted_view)
                             gradient_corr = gaussian_filter(
                                 ref_grad_x * shift_grad_x + ref_grad_y * shift_grad_y,
@@ -711,7 +739,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                             )
                             component_stacks_raw["gradient"][:, :, s_y_ind, s_x_ind] = gradient_corr
 
-                        if "laplacian" in normalized_component_weights and ref_laplacian is not None:
+                        if metric_components_enabled and "laplacian" in normalized_component_weights and ref_laplacian is not None:
                             shifted_laplacian = cv.Laplacian(shifted_view, cv.CV_32F)
                             laplacian_corr = gaussian_filter(
                                 ref_laplacian * shifted_laplacian,
@@ -746,29 +774,34 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                     key: _normalize_component_stack(stack)
                     for key, stack in component_stacks_raw.items()
                 }
-                blended_stack = self._blend_normalized_components(
-                    component_stacks_norm=component_stacks_norm,
-                    alpha=float(alpha),
-                    normalized_component_weights=normalized_component_weights,
-                )
+                if metric_components_enabled:
+                    blended_stack = self._blend_normalized_components(
+                        component_stacks_norm=component_stacks_norm,
+                        alpha=float(alpha),
+                        normalized_component_weights=normalized_component_weights,
+                    )
+                else:
+                    blended_stack = component_stacks_norm["intensity"]
 
                 max_val = np.max(blended_stack, axis=(2, 3))
                 scores[:, :, i, j] = max_val
-                blended_score_maps[:, :, i, j] = max_val
+                if blended_score_maps is not None:
+                    blended_score_maps[:, :, i, j] = max_val
 
                 flat = blended_stack.reshape((height, width, D * D))
                 argmax_flat = np.argmax(flat, axis=2)
                 idx_y, idx_x = np.unravel_index(argmax_flat, (D, D))
-                gather_index = argmax_flat[:, :, None]
-                for component_name in component_keys:
-                    flat_norm = component_stacks_norm[component_name].reshape((height, width, D * D))
-                    flat_raw = component_stacks_raw[component_name].reshape((height, width, D * D))
-                    component_score_maps[component_name][:, :, i, j] = np.take_along_axis(
-                        flat_norm, gather_index, axis=2
-                    ).squeeze(axis=2)
-                    component_score_maps_raw[component_name][:, :, i, j] = np.take_along_axis(
-                        flat_raw, gather_index, axis=2
-                    ).squeeze(axis=2)
+                if component_score_maps is not None and component_score_maps_raw is not None:
+                    gather_index = argmax_flat[:, :, None]
+                    for component_name in component_keys:
+                        flat_norm = component_stacks_norm[component_name].reshape((height, width, D * D))
+                        flat_raw = component_stacks_raw[component_name].reshape((height, width, D * D))
+                        component_score_maps[component_name][:, :, i, j] = np.take_along_axis(
+                            flat_norm, gather_index, axis=2
+                        ).squeeze(axis=2)
+                        component_score_maps_raw[component_name][:, :, i, j] = np.take_along_axis(
+                            flat_raw, gather_index, axis=2
+                        ).squeeze(axis=2)
 
                 # Preserve the original "no signal => zero displacement" behavior.
                 raw_intensity_max = np.max(np.abs(component_stacks_raw["intensity"]), axis=(2, 3))
@@ -791,17 +824,29 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
         if sub_pix_factor > 1:
             resized_scores = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
-            resized_blended = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
             resized_disps_y = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float32)
             resized_disps_x = np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float32)
-            resized_component_score_maps = {
-                key: np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
-                for key in component_keys
-            }
-            resized_component_score_maps_raw = {
-                key: np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
-                for key in component_keys
-            }
+            resized_blended = (
+                np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
+                if blended_score_maps is not None
+                else None
+            )
+            resized_component_score_maps = (
+                {
+                    key: np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
+                    for key in component_keys
+                }
+                if component_score_maps is not None
+                else None
+            )
+            resized_component_score_maps_raw = (
+                {
+                    key: np.zeros((original_height, original_width, grid_rows, grid_cols), dtype=np.float64)
+                    for key in component_keys
+                }
+                if component_score_maps_raw is not None
+                else None
+            )
             for i in range(grid_rows):
                 for j in range(grid_cols):
                     resized_scores[:, :, i, j] = cv.resize(
@@ -809,11 +854,12 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         (original_width, original_height),
                         interpolation=cv.INTER_LINEAR,
                     )
-                    resized_blended[:, :, i, j] = cv.resize(
-                        blended_score_maps[:, :, i, j],
-                        (original_width, original_height),
-                        interpolation=cv.INTER_LINEAR,
-                    )
+                    if resized_blended is not None and blended_score_maps is not None:
+                        resized_blended[:, :, i, j] = cv.resize(
+                            blended_score_maps[:, :, i, j],
+                            (original_width, original_height),
+                            interpolation=cv.INTER_LINEAR,
+                        )
                     resized_disps_y[:, :, i, j] = cv.resize(
                         disps_y[:, :, i, j],
                         (original_width, original_height),
@@ -824,17 +870,18 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         (original_width, original_height),
                         interpolation=cv.INTER_LINEAR,
                     )
-                    for component_name in component_keys:
-                        resized_component_score_maps[component_name][:, :, i, j] = cv.resize(
-                            component_score_maps[component_name][:, :, i, j],
-                            (original_width, original_height),
-                            interpolation=cv.INTER_LINEAR,
-                        )
-                        resized_component_score_maps_raw[component_name][:, :, i, j] = cv.resize(
-                            component_score_maps_raw[component_name][:, :, i, j],
-                            (original_width, original_height),
-                            interpolation=cv.INTER_LINEAR,
-                        )
+                    if resized_component_score_maps is not None and resized_component_score_maps_raw is not None and component_score_maps is not None and component_score_maps_raw is not None:
+                        for component_name in component_keys:
+                            resized_component_score_maps[component_name][:, :, i, j] = cv.resize(
+                                component_score_maps[component_name][:, :, i, j],
+                                (original_width, original_height),
+                                interpolation=cv.INTER_LINEAR,
+                            )
+                            resized_component_score_maps_raw[component_name][:, :, i, j] = cv.resize(
+                                component_score_maps_raw[component_name][:, :, i, j],
+                                (original_width, original_height),
+                                interpolation=cv.INTER_LINEAR,
+                            )
             scores = resized_scores
             blended_score_maps = resized_blended
             disps_y = resized_disps_y / sub_pix_factor
@@ -849,17 +896,19 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             coordinates[:, :, :, :, 0] = base_coords[:, :, 0][..., None, None] - disps_y
             coordinates[:, :, :, :, 1] = base_coords[:, :, 1][..., None, None] - disps_x
 
-        view_score_summary: Dict[str, Dict[str, Dict[str, float]]] = {}
-        for i in range(grid_rows):
-            for j in range(grid_cols):
-                if not reference_is_external and i == ref_i and j == ref_j:
-                    continue
-                summary_inputs = {
-                    "blended": blended_score_maps[:, :, i, j],
-                }
-                for component_name in component_keys:
-                    summary_inputs[component_name] = component_score_maps[component_name][:, :, i, j]
-                view_score_summary[f"view_{i}_{j}"] = _summarize_view_score_maps(summary_inputs)
+        view_score_summary: Optional[Dict[str, Dict[str, Dict[str, float]]]] = None
+        if blended_score_maps is not None and component_score_maps is not None:
+            view_score_summary = {}
+            for i in range(grid_rows):
+                for j in range(grid_cols):
+                    if not reference_is_external and i == ref_i and j == ref_j:
+                        continue
+                    summary_inputs = {
+                        "blended": blended_score_maps[:, :, i, j],
+                    }
+                    for component_name in component_keys:
+                        summary_inputs[component_name] = component_score_maps[component_name][:, :, i, j]
+                    view_score_summary[f"view_{i}_{j}"] = _summarize_view_score_maps(summary_inputs)
 
         return PixelwiseSimilarityResult(
             coordinates=coordinates,
@@ -874,8 +923,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             view_score_summary=view_score_summary,
             metric_family=resolved_metric_family,
             alpha=float(alpha),
-            component_weights_raw=raw_component_weights,
-            component_weights_normalized=normalized_component_weights,
+            component_weights_raw=raw_component_weights or None,
+            component_weights_normalized=normalized_component_weights or None,
         )
 
     def rectify(
