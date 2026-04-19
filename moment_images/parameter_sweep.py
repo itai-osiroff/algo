@@ -10,7 +10,7 @@ interactive ``main`` workflow.
 from __future__ import annotations
 
 import argparse
-import csv
+import hashlib
 import json
 import math
 import os
@@ -24,10 +24,10 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from PIL import Image
@@ -47,9 +47,19 @@ from moment_images.im_process import (
     extract_views,
     VIEW_DISTANCE_SCALE_FACTOR,
 )
+from moment_images.reliable_io import (
+    FirstValidReadError,
+    read_json_first_valid,
+    read_npy_first_valid,
+    read_npz_first_valid,
+    write_csv_atomic,
+    write_json_atomic,
+    write_npy_atomic,
+)
 from moment_images.sweep_analysis import (
     analyze_summary_data,
     build_metric_record,
+    generate_alpha_report,
     save_analysis,
 )
 
@@ -246,10 +256,17 @@ class SweepSearchSpace:
 class SweepStageSpec:
     """Controls two-stage coarse/fine search behavior."""
 
+    mode: Literal["two_stage", "single_stage"] = "two_stage"
     total_budget_per_dataset: int = 320
     stage1_fraction: float = 0.6
     top_k: int = 8
     max_workers: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        normalized_mode = str(self.mode).strip().lower()
+        if normalized_mode not in {"two_stage", "single_stage"}:
+            raise ValueError("stages.mode must be either 'two_stage' or 'single_stage'.")
+        self.mode = cast(Literal["two_stage", "single_stage"], normalized_mode)
 
 
 @dataclass
@@ -264,6 +281,140 @@ class SweepScoringSpec:
 
 
 @dataclass
+class MetricFormulationSpec:
+    """Displacement metric family definition used as a sweep dimension."""
+
+    formulation_id: str
+    family: str = "ncc_gradient"
+    alphas: List[float] = field(default_factory=lambda: [0.5])
+    component_weights: Optional[Dict[str, float]] = None
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, object], default_idx: int) -> "MetricFormulationSpec":
+        raw_id = str(payload.get("id") or payload.get("formulation_id") or "").strip()
+        formulation_id = raw_id or f"formulation_{default_idx:02d}"
+
+        family = str(payload.get("family", "ncc_gradient")).strip().lower()
+        if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
+            raise ValueError(
+                "metric_formulations[].family must be one of "
+                "'ncc_gradient', 'ncc_laplacian', or 'composite'."
+            )
+
+        alphas_raw = cast(Optional[List[object]], payload.get("alphas"))
+        if alphas_raw is None:
+            alpha_single = payload.get("alpha")
+            if alpha_single is None:
+                alphas = [0.5]
+            else:
+                alphas = [float(alpha_single)]
+        else:
+            if not alphas_raw:
+                raise ValueError("metric_formulations[].alphas cannot be empty.")
+            alphas = [float(item) for item in alphas_raw]
+        for alpha in alphas:
+            if not np.isfinite(alpha) or alpha < 0.0 or alpha > 1.0:
+                raise ValueError("metric_formulations alpha values must be finite and in [0, 1].")
+
+        raw_weights_payload = cast(Optional[Dict[str, object]], payload.get("component_weights"))
+        parsed_weights: Optional[Dict[str, float]] = None
+        if raw_weights_payload is not None:
+            parsed_weights = {}
+            for key, raw_value in raw_weights_payload.items():
+                numeric = float(raw_value)
+                if not np.isfinite(numeric):
+                    raise ValueError("component_weights values must be finite.")
+                if numeric < 0.0:
+                    raise ValueError("component_weights values must be non-negative.")
+                parsed_weights[str(key)] = numeric
+
+        return cls(
+            formulation_id=formulation_id,
+            family=family,
+            alphas=alphas,
+            component_weights=parsed_weights,
+        )
+
+
+@dataclass
+class SweepReportingSpec:
+    """Controls alpha/family report generation after the experiment."""
+
+    primary_metric: str = "laplacian_variance"
+    tolerate_partial_outputs: bool = True
+    generate_alpha_report: bool = True
+
+
+def _clone_metric_formulation(spec: MetricFormulationSpec) -> MetricFormulationSpec:
+    return MetricFormulationSpec(
+        formulation_id=str(spec.formulation_id),
+        family=str(spec.family),
+        alphas=[float(alpha) for alpha in spec.alphas],
+        component_weights=(
+            None if spec.component_weights is None else dict(spec.component_weights)
+        ),
+    )
+
+
+def _parse_metric_formulations_payload(
+    formulations_raw: Optional[List[Dict[str, object]]],
+    *,
+    field_name: str,
+) -> List[MetricFormulationSpec]:
+    if formulations_raw is None:
+        return []
+    if not isinstance(formulations_raw, list):
+        raise ValueError(f"{field_name} must be a list.")
+    for idx, item in enumerate(formulations_raw, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"{field_name}[{idx}] must be an object.")
+    formulations = [
+        MetricFormulationSpec.from_dict(cast(Dict[str, object], item), idx + 1)
+        for idx, item in enumerate(formulations_raw)
+    ]
+    formulation_ids = [item.formulation_id for item in formulations]
+    if len(formulation_ids) != len(set(formulation_ids)):
+        raise ValueError(f"{field_name} IDs must be unique.")
+    return formulations
+
+
+@dataclass
+class ExperimentalMetricSweepSpec:
+    """Optional second-phase sweep over displacement metric formulations."""
+
+    enabled: bool = False
+    shortlist_top_k: int = 8
+    formulations: List[MetricFormulationSpec] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(
+        cls, payload: Dict[str, object], *, default_shortlist_top_k: int
+    ) -> "ExperimentalMetricSweepSpec":
+        enabled = bool(payload.get("enabled", False))
+        shortlist_raw = payload.get("shortlist_top_k")
+        shortlist_top_k = int(
+            default_shortlist_top_k if shortlist_raw is None else shortlist_raw
+        )
+        if shortlist_top_k < 1:
+            raise ValueError(
+                "experimental_metric_sweep.shortlist_top_k must be >= 1."
+            )
+        formulations = _parse_metric_formulations_payload(
+            cast(Optional[List[Dict[str, object]]], payload.get("formulations")),
+            field_name="experimental_metric_sweep.formulations",
+        )
+        if enabled and not formulations:
+            raise ValueError(
+                "experimental_metric_sweep.formulations cannot be empty when enabled."
+            )
+        return cls(
+            enabled=enabled,
+            shortlist_top_k=shortlist_top_k,
+            formulations=formulations,
+        )
+
+
+@dataclass
 class SweepExperimentSpec:
     """Top-level experiment definition loaded from ``--spec`` JSON."""
 
@@ -272,11 +423,71 @@ class SweepExperimentSpec:
     strategies: List[str] = field(default_factory=lambda: ["pixel", "combined"])
     stages: SweepStageSpec = field(default_factory=SweepStageSpec)
     scoring: SweepScoringSpec = field(default_factory=SweepScoringSpec)
+    experimental_metric_sweep: Optional[ExperimentalMetricSweepSpec] = None
+    metric_formulations: Optional[List[MetricFormulationSpec]] = None
+    reporting: SweepReportingSpec = field(default_factory=SweepReportingSpec)
     output_dir: Optional[str] = None
     save_figures: bool = False
     analyze: bool = True
     keep_all_run_artifacts: bool = True
     random_seed: int = 0
+
+    def __post_init__(self) -> None:
+        stage_top_k = max(1, int(self.stages.top_k))
+
+        experimental = self.experimental_metric_sweep
+        if experimental is None:
+            experimental = ExperimentalMetricSweepSpec(
+                enabled=False,
+                shortlist_top_k=stage_top_k,
+                formulations=[],
+            )
+
+        legacy_formulations = (
+            [_clone_metric_formulation(item) for item in self.metric_formulations]
+            if self.metric_formulations is not None
+            else []
+        )
+        if legacy_formulations and not experimental.formulations:
+            experimental = ExperimentalMetricSweepSpec(
+                enabled=True,
+                shortlist_top_k=experimental.shortlist_top_k,
+                formulations=legacy_formulations,
+            )
+
+        if int(experimental.shortlist_top_k) < 1:
+            raise ValueError(
+                "experimental_metric_sweep.shortlist_top_k must be >= 1."
+            )
+        if experimental.enabled and not experimental.formulations:
+            raise ValueError(
+                "experimental_metric_sweep requires at least one formulation when enabled."
+            )
+        if experimental.enabled and not any(
+            strategy in {"pixel", "combined"} for strategy in self.strategies
+        ):
+            raise ValueError(
+                "experimental_metric_sweep requires at least one pixel/combined strategy."
+            )
+
+        cloned_formulations = [
+            _clone_metric_formulation(item) for item in experimental.formulations
+        ]
+        formulation_ids = [item.formulation_id for item in cloned_formulations]
+        if len(formulation_ids) != len(set(formulation_ids)):
+            raise ValueError(
+                "experimental_metric_sweep.formulations IDs must be unique."
+            )
+
+        self.experimental_metric_sweep = ExperimentalMetricSweepSpec(
+            enabled=bool(experimental.enabled),
+            shortlist_top_k=int(experimental.shortlist_top_k),
+            formulations=cloned_formulations,
+        )
+        self.metric_formulations = [
+            _clone_metric_formulation(item)
+            for item in self.experimental_metric_sweep.formulations
+        ]
 
     @classmethod
     def from_dict(cls, payload: Dict[str, object]) -> "SweepExperimentSpec":
@@ -303,6 +514,10 @@ class SweepExperimentSpec:
 
         stages_raw = cast(Dict[str, object], payload.get("stages", {}))
         stages = SweepStageSpec(
+            mode=cast(
+                Literal["two_stage", "single_stage"],
+                str(stages_raw.get("mode", "two_stage")),
+            ),
             total_budget_per_dataset=int(stages_raw.get("total_budget_per_dataset", 320)),
             stage1_fraction=float(stages_raw.get("stage1_fraction", 0.6)),
             top_k=int(stages_raw.get("top_k", 8)),
@@ -319,12 +534,55 @@ class SweepExperimentSpec:
             metric_scope=str(scoring_raw.get("metric_scope", "global_and_local_metrics")),
         )
 
+        has_legacy_formulations = "metric_formulations" in payload
+        legacy_formulations = (
+            _parse_metric_formulations_payload(
+                cast(Optional[List[Dict[str, object]]], payload.get("metric_formulations")),
+                field_name="metric_formulations",
+            )
+            if has_legacy_formulations
+            else None
+        )
+
+        experimental_raw = cast(
+            Optional[Dict[str, object]], payload.get("experimental_metric_sweep")
+        )
+        if experimental_raw is not None:
+            if not isinstance(experimental_raw, dict):
+                raise ValueError("experimental_metric_sweep must be an object.")
+            experimental_metric_sweep = ExperimentalMetricSweepSpec.from_dict(
+                experimental_raw,
+                default_shortlist_top_k=stages.top_k,
+            )
+        elif legacy_formulations is not None:
+            experimental_metric_sweep = ExperimentalMetricSweepSpec(
+                enabled=bool(legacy_formulations),
+                shortlist_top_k=stages.top_k,
+                formulations=legacy_formulations,
+            )
+        else:
+            experimental_metric_sweep = ExperimentalMetricSweepSpec(
+                enabled=False,
+                shortlist_top_k=stages.top_k,
+                formulations=[],
+            )
+
+        reporting_raw = cast(Dict[str, object], payload.get("reporting", {}))
+        reporting = SweepReportingSpec(
+            primary_metric=str(reporting_raw.get("primary_metric", "laplacian_variance")),
+            tolerate_partial_outputs=bool(reporting_raw.get("tolerate_partial_outputs", True)),
+            generate_alpha_report=bool(reporting_raw.get("generate_alpha_report", True)),
+        )
+
         return cls(
             datasets=datasets,
             search_spaces=search_spaces,
             strategies=strategies,
             stages=stages,
             scoring=scoring,
+            experimental_metric_sweep=experimental_metric_sweep,
+            metric_formulations=legacy_formulations,
+            reporting=reporting,
             output_dir=cast(Optional[str], payload.get("output_dir")),
             save_figures=bool(payload.get("save_figures", False)),
             analyze=bool(payload.get("analyze", True)),
@@ -345,6 +603,9 @@ class PreparedDataset:
     views_shape: Tuple[int, ...]
     views_dtype: str
     views_itemsize: int
+    resolved_views_path: Optional[str] = None
+    views_file_size_bytes: Optional[int] = None
+    views_file_mtime_ns: Optional[int] = None
 
 
 @dataclass
@@ -450,8 +711,66 @@ def _assign_candidate_ids(candidates: Sequence[SweepCandidate], prefix: str) -> 
     return assigned
 
 
+def _metric_formulation_from_params(
+    params: Dict[str, object],
+) -> Tuple[str, float, Optional[Dict[str, float]], str]:
+    family = str(params.get("displacement_metric_family", "intensity")).strip().lower()
+    alpha = float(params.get("displacement_alpha", 1.0))
+    raw_weights_obj = params.get("displacement_component_weights")
+    parsed_weights: Optional[Dict[str, float]] = None
+    if raw_weights_obj is not None:
+        parsed_weights = {
+            str(key): float(value)
+            for key, value in cast(Dict[str, object], raw_weights_obj).items()
+        }
+    formulation_id = str(params.get("metric_formulation_id", "intensity_default")).strip()
+    if not formulation_id:
+        formulation_id = "intensity_default"
+    return family, alpha, parsed_weights, formulation_id
+
+
+def _expand_candidates_with_metric_formulations(
+    candidates: Sequence[SweepCandidate],
+    metric_formulations: Sequence[MetricFormulationSpec],
+) -> List[SweepCandidate]:
+    expanded: List[SweepCandidate] = []
+    for candidate in candidates:
+        for formulation in metric_formulations:
+            for alpha in formulation.alphas:
+                params = dict(candidate.params)
+                params["displacement_metric_family"] = formulation.family
+                params["displacement_alpha"] = float(alpha)
+                params["metric_formulation_id"] = formulation.formulation_id
+                params["displacement_component_weights"] = (
+                    None
+                    if formulation.component_weights is None
+                    else dict(formulation.component_weights)
+                )
+                expanded.append(_build_candidate_from_params(candidate.strategy, params))
+    expanded.sort(key=lambda item: json.dumps(item.params, sort_keys=True))
+    return expanded
+
+
+def _dedupe_candidates(candidates: Sequence[SweepCandidate]) -> List[SweepCandidate]:
+    deduped: List[SweepCandidate] = []
+    seen = set()
+    for candidate in candidates:
+        signature = _candidate_signature(candidate)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(candidate)
+    return deduped
+
+
 def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> SweepCandidate:
     defaults = RectificationRunConfig()
+    (
+        displacement_metric_family,
+        displacement_alpha,
+        displacement_component_weights,
+        metric_formulation_id,
+    ) = _metric_formulation_from_params(params)
     if strategy == "pixel":
         window = _normalize_window_size(int(params["similarity_window_size"]))
         gauss_sigma = float(params["gauss_sigma"])
@@ -472,6 +791,10 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             pixel_sigma_pyramid=bool(params["pixel_sigma_pyramid"]),
             zero_fill_roll=bool(params["zero_fill_roll"]),
             sub_pix_factor=int(params["sub_pix_factor"]),
+            displacement_metric_family=displacement_metric_family,
+            displacement_alpha=displacement_alpha,
+            displacement_component_weights=displacement_component_weights,
+            metric_formulation_id=metric_formulation_id,
         )
         normalized_params = dict(params)
         normalized_params["similarity_window_size"] = window
@@ -501,6 +824,10 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             zero_fill_roll=bool(params["zero_fill_roll"]),
             sub_pix_factor=int(params["sub_pix_factor"]),
             combined_use_global_avg_reference=bool(params["combined_use_global_avg_reference"]),
+            displacement_metric_family=displacement_metric_family,
+            displacement_alpha=displacement_alpha,
+            displacement_component_weights=displacement_component_weights,
+            metric_formulation_id=metric_formulation_id,
         )
         normalized_params = dict(params)
         normalized_params["refinement_window_size"] = window
@@ -513,6 +840,10 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             strategy="global",
             correlation_pad_width=int(params["correlation_pad_width"]),
             global_threshold=float(params["global_threshold"]),
+            displacement_metric_family=displacement_metric_family,
+            displacement_alpha=displacement_alpha,
+            displacement_component_weights=displacement_component_weights,
+            metric_formulation_id=metric_formulation_id,
         )
         return SweepCandidate(strategy="global", params=dict(params), config=config)
 
@@ -738,10 +1069,9 @@ def _stage_budgets(stage_spec: SweepStageSpec) -> Tuple[int, int]:
 
 
 def _parse_experiment_spec(path: Path) -> SweepExperimentSpec:
-    if not path.exists():
+    if not path.exists() and not Path(f"{path}.bak").exists():
         raise FileNotFoundError(f"Sweep spec file not found: {path}")
-    with path.open("r", encoding="utf-8") as fp:
-        payload = json.load(fp)
+    payload, _, _ = read_json_first_valid(path, validator=lambda obj: isinstance(obj, dict))
     if not isinstance(payload, dict):
         raise ValueError("Sweep spec must be a JSON object.")
     return SweepExperimentSpec.from_dict(payload)
@@ -751,6 +1081,7 @@ def _save_run_artifacts(
     output_dir: Path,
     run_name: str,
     result: RectificationResult,
+    metric_record: Optional[Dict[str, object]] = None,
 ) -> None:
     config = result.config
     run_dir = output_dir / run_name
@@ -760,13 +1091,25 @@ def _save_run_artifacts(
     avg_preview = np.asarray(min_max_normalize(result.avg_image), dtype=np.uint8)
     Image.fromarray(avg_preview).save(avg_img_path)
 
-    np.save(run_dir / "rectified_views.npy", result.rectified_views)
+    write_npy_atomic(
+        run_dir / "rectified_views.npy",
+        result.rectified_views,
+        allow_pickle=False,
+        create_backup=True,
+    )
 
     pixel_displacements_x = None
     pixel_displacements_y = None
+    pixel_blended_scores = None
+    pixel_component_scores: Dict[str, np.ndarray] = {}
     if result.pixel_similarity is not None:
         pixel_displacements_x = getattr(result.pixel_similarity, "disps_x", None)
         pixel_displacements_y = getattr(result.pixel_similarity, "disps_y", None)
+        pixel_blended_scores = getattr(result.pixel_similarity, "blended_score_maps", None)
+        component_scores = getattr(result.pixel_similarity, "component_score_maps", None)
+        if isinstance(component_scores, dict):
+            for key, value in component_scores.items():
+                pixel_component_scores[str(key)] = np.asarray(value)
 
     config_dict = asdict(config)
     strategy_code = {"global": 1, "pixel": 2, "combined": 3}.get(config.strategy.lower(), 0)
@@ -781,6 +1124,7 @@ def _save_run_artifacts(
         ),
         "pixel_displacements_x": pixel_displacements_x,
         "pixel_displacements_y": pixel_displacements_y,
+        "pixel_blended_scores": pixel_blended_scores,
         "reference_view_index": np.array(result.ref_view_index),
         "rectification_strategy": np.array(strategy_code),
         "hdr_enabled": np.array(config.hdr_enabled),
@@ -792,11 +1136,23 @@ def _save_run_artifacts(
         "normalize_to_8bit": np.array(config.normalize_to_8bit),
         "run_name": np.array(run_name),
         "config_json": np.array(json.dumps(config_dict, sort_keys=True)),
+        "displacement_metric_family": np.array(config.displacement_metric_family),
+        "displacement_alpha": np.array(config.displacement_alpha, dtype=np.float64),
+        "metric_formulation_id": np.array(config.metric_formulation_id),
     }
+    for component_name, component_values in pixel_component_scores.items():
+        workspace_data[f"pixel_component_score_{component_name}"] = component_values
     save_workspace_variables(str(run_dir / "workspace.npz"), workspace_data)
 
-    with (run_dir / "config.json").open("w", encoding="utf-8") as fp:
-        json.dump(config_dict, fp, indent=2)
+    write_json_atomic(run_dir / "config.json", config_dict, indent=2, sort_keys=True, create_backup=True)
+    if metric_record is not None:
+        write_json_atomic(
+            run_dir / "metric_record.json",
+            metric_record,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
+        )
 
 
 def _persist_figures(figures: Dict[str, List[Figure]], base_dir: Path) -> None:
@@ -808,9 +1164,10 @@ def _persist_figures(figures: Dict[str, List[Figure]], base_dir: Path) -> None:
 
 
 def _load_views(path: Path) -> np.ndarray:
-    if not path.exists():
-        raise FileNotFoundError(f"Views file not found: {path}")
-    views = np.load(path)
+    try:
+        views, _, _ = read_npy_first_valid(path, allow_pickle=False)
+    except FirstValidReadError as exc:
+        raise FileNotFoundError(f"Views file not found or unreadable: {path}") from exc
     if views.ndim == 4:
         if views.shape[0] != views.shape[1]:
             raise ValueError("views must have shape (N, N, H, W)")
@@ -850,7 +1207,7 @@ def _generate_views(
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / "generated_views.npy"
-    np.save(cache_path, views)
+    write_npy_atomic(cache_path, views, allow_pickle=False, create_backup=True)
     return views, cache_path
 
 
@@ -897,7 +1254,7 @@ def _generate_exposure_views(
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / "generated_exposure_views.npy"
     exposure_views_arr = np.asarray(exposure_views)
-    np.save(cache_path, exposure_views_arr)
+    write_npy_atomic(cache_path, exposure_views_arr, allow_pickle=False, create_backup=True)
     return exposure_views_arr, cache_path
 
 
@@ -933,6 +1290,7 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             raise ValueError(
                 f"Dataset '{dataset.dataset_id}' exposure time count does not match exposure axis."
             )
+        stat = views_path.stat()
         return PreparedDataset(
             dataset_id=dataset.dataset_id,
             views_path=views_path,
@@ -942,6 +1300,9 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             views_shape=tuple(int(dim) for dim in views_arr.shape),
             views_dtype=str(views_arr.dtype),
             views_itemsize=int(views_arr.dtype.itemsize),
+            resolved_views_path=str(views_path.resolve()),
+            views_file_size_bytes=int(stat.st_size),
+            views_file_mtime_ns=int(stat.st_mtime_ns),
         )
 
     if dataset.source_image is not None:
@@ -972,6 +1333,7 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             raise ValueError(
                 f"Dataset '{dataset.dataset_id}' uses a single source image and cannot enable HDR."
             )
+        stat = views_path.stat()
         return PreparedDataset(
             dataset_id=dataset.dataset_id,
             views_path=views_path,
@@ -981,6 +1343,9 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             views_shape=tuple(int(dim) for dim in views_arr.shape),
             views_dtype=str(views_arr.dtype),
             views_itemsize=int(views_arr.dtype.itemsize),
+            resolved_views_path=str(views_path.resolve()),
+            views_file_size_bytes=int(stat.st_size),
+            views_file_mtime_ns=int(stat.st_mtime_ns),
         )
 
     # source_image_dir branch
@@ -1016,6 +1381,7 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
         raise ValueError(
             f"Dataset '{dataset.dataset_id}' exposure time count does not match exposure stack."
         )
+    stat = views_path.stat()
     return PreparedDataset(
         dataset_id=dataset.dataset_id,
         views_path=views_path,
@@ -1025,6 +1391,9 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
         views_shape=tuple(int(dim) for dim in views_arr.shape),
         views_dtype=str(views_arr.dtype),
         views_itemsize=int(views_arr.dtype.itemsize),
+        resolved_views_path=str(views_path.resolve()),
+        views_file_size_bytes=int(stat.st_size),
+        views_file_mtime_ns=int(stat.st_mtime_ns),
     )
 
 
@@ -1038,6 +1407,177 @@ def _prepare_datasets(spec: SweepExperimentSpec, output_dir: Path) -> List[Prepa
         prepared.append(_prepare_dataset(dataset, output_dir=output_dir))
     prepared.sort(key=lambda item: item.dataset_id)
     return prepared
+
+
+RUN_STATE_FILENAME = "run_state.json"
+RUN_STATE_SCHEMA_VERSION = 1
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _dataset_identity_payload(dataset: PreparedDataset) -> Dict[str, object]:
+    return {
+        "dataset_id": dataset.dataset_id,
+        "resolved_views_path": dataset.resolved_views_path or str(dataset.views_path.resolve()),
+        "views_shape": list(dataset.views_shape),
+        "views_dtype": dataset.views_dtype,
+        "views_itemsize": int(dataset.views_itemsize),
+        "views_file_size_bytes": dataset.views_file_size_bytes,
+        "views_file_mtime_ns": dataset.views_file_mtime_ns,
+    }
+
+
+def _build_experiment_fingerprint_payload(
+    spec: SweepExperimentSpec,
+    prepared_datasets: Sequence[PreparedDataset],
+    output_dir: Path,
+) -> Dict[str, object]:
+    spec_snapshot = asdict(spec)
+    spec_snapshot["output_dir"] = str(output_dir.resolve())
+    datasets_payload = sorted(
+        [_dataset_identity_payload(dataset) for dataset in prepared_datasets],
+        key=lambda item: str(item["dataset_id"]),
+    )
+    return {
+        "schema_version": RUN_STATE_SCHEMA_VERSION,
+        "output_dir": str(output_dir.resolve()),
+        "spec": spec_snapshot,
+        "datasets": datasets_payload,
+    }
+
+
+def _compute_experiment_fingerprint(payload: Dict[str, object]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _persist_run_state(state_path: Path, state: Dict[str, object]) -> None:
+    state["updated_at"] = _utc_now_iso()
+    write_json_atomic(state_path, state, indent=2, sort_keys=False, create_backup=True)
+
+
+def _load_or_initialize_run_state(
+    output_dir: Path,
+    fingerprint_payload: Dict[str, object],
+) -> Tuple[Dict[str, object], Path]:
+    state_path = output_dir / RUN_STATE_FILENAME
+    fingerprint = _compute_experiment_fingerprint(fingerprint_payload)
+    if state_path.exists() or Path(f"{state_path}.bak").exists():
+        loaded, _, _ = read_json_first_valid(
+            state_path,
+            validator=lambda obj: isinstance(obj, dict),
+        )
+        state = cast(Dict[str, object], loaded)
+        existing_fingerprint = str(state.get("experiment_fingerprint", ""))
+        if existing_fingerprint != fingerprint:
+            raise ValueError(
+                "Output directory contains run_state.json with a different experiment "
+                "fingerprint. Refusing to resume with mismatched spec/dataset/path."
+            )
+        existing_output_dir = str(cast(Dict[str, object], state.get("path_compatibility", {})).get("output_dir", ""))
+        current_output_dir = str(output_dir.resolve())
+        if existing_output_dir and existing_output_dir != current_output_dir:
+            raise ValueError(
+                "run_state.json output path mismatch detected. "
+                f"state={existing_output_dir}, current={current_output_dir}"
+            )
+        return state, state_path
+
+    state: Dict[str, object] = {
+        "schema_version": RUN_STATE_SCHEMA_VERSION,
+        "created_at": _utc_now_iso(),
+        "updated_at": _utc_now_iso(),
+        "experiment_fingerprint": fingerprint,
+        "path_compatibility": {
+            "output_dir": str(output_dir.resolve()),
+        },
+        "fingerprint_payload": fingerprint_payload,
+        "stages": {},
+        "runs": {},
+    }
+    _persist_run_state(state_path, state)
+    return state, state_path
+
+
+def _validate_run_artifacts(run_dir: Path) -> Dict[str, object]:
+    diagnostics: Dict[str, object] = {
+        "run_dir": str(run_dir),
+        "valid": False,
+        "missing": [],
+        "corrupt": [],
+    }
+    required_paths = {
+        "config": run_dir / "config.json",
+        "metric_record": run_dir / "metric_record.json",
+        "rectified_views": run_dir / "rectified_views.npy",
+        "workspace": run_dir / "workspace.npz",
+        "avg_rectified": run_dir / "avg_rectified.png",
+    }
+    missing = cast(List[str], diagnostics["missing"])
+    corrupt = cast(List[str], diagnostics["corrupt"])
+    for key, path in required_paths.items():
+        if not path.exists() and not Path(f"{path}.bak").exists():
+            missing.append(f"{key}:{path.name}")
+
+    if missing:
+        diagnostics["valid"] = False
+        return diagnostics
+
+    try:
+        read_json_first_valid(required_paths["config"], validator=lambda obj: isinstance(obj, dict))
+    except Exception as exc:  # noqa: BLE001
+        corrupt.append(f"config:{type(exc).__name__}")
+    try:
+        read_json_first_valid(
+            required_paths["metric_record"],
+            validator=lambda obj: isinstance(obj, dict) and "global_and_local_metrics" in cast(Dict[str, object], obj),
+        )
+    except Exception as exc:  # noqa: BLE001
+        corrupt.append(f"metric_record:{type(exc).__name__}")
+    try:
+        read_npy_first_valid(required_paths["rectified_views"], allow_pickle=False)
+    except Exception as exc:  # noqa: BLE001
+        corrupt.append(f"rectified_views:{type(exc).__name__}")
+    try:
+        read_npz_first_valid(
+            required_paths["workspace"],
+            allow_pickle=True,
+            validator=lambda obj: "rectified_views" in obj and "average_rectified_image" in obj,
+        )
+    except Exception as exc:  # noqa: BLE001
+        corrupt.append(f"workspace:{type(exc).__name__}")
+    if not required_paths["avg_rectified"].exists() and not Path(f"{required_paths['avg_rectified']}.bak").exists():
+        corrupt.append("avg_rectified:missing")
+
+    diagnostics["valid"] = not corrupt and not missing
+    return diagnostics
+
+
+def _load_cached_stage_result(task: Dict[str, object], run_dir: Path) -> Dict[str, object]:
+    config_payload, _, _ = read_json_first_valid(
+        run_dir / "config.json",
+        validator=lambda obj: isinstance(obj, dict),
+    )
+    metric_record, _, _ = read_json_first_valid(
+        run_dir / "metric_record.json",
+        validator=lambda obj: isinstance(obj, dict),
+    )
+    return {
+        "status": "ok",
+        "stage": str(task["stage"]),
+        "candidate_id": str(task["candidate_id"]),
+        "dataset_id": str(task["dataset_id"]),
+        "strategy": str(task["strategy"]),
+        "run_uid": str(task["run_uid"]),
+        "run_dir": str(run_dir),
+        "runtime_seconds": float(0.0),
+        "config": config_payload,
+        "params": task["params"],
+        "metric_record": metric_record,
+        "reused_artifacts": True,
+    }
 
 
 def _set_parallel_thread_limits() -> None:
@@ -1320,11 +1860,13 @@ def _run_task_isolated(task: Dict[str, object]) -> Tuple[Dict[str, object], bool
 def _execute_pool_batch(
     tasks: Sequence[Dict[str, object]],
     workers: int,
+    on_result: Optional[Callable[[Dict[str, object], Dict[str, object]], None]] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Optional[BaseException]]:
     completed_results: List[Dict[str, object]] = []
     completed_indices: set[int] = set()
     pending_tasks = list(tasks)
     executor_exc: Optional[BaseException] = None
+    callback_exc: Optional[BaseException] = None
 
     try:
         with ProcessPoolExecutor(max_workers=workers, initializer=_pool_worker_initializer) as executor:
@@ -1335,12 +1877,18 @@ def _execute_pool_batch(
                 task = future_map[future]
                 try:
                     result = future.result()
-                    result["task_index"] = task["task_index"]
-                    completed_results.append(result)
-                    completed_indices.add(int(task["task_index"]))
                 except Exception as exc:  # noqa: BLE001 - recover by degrading worker count.
                     executor_exc = exc
                     break
+                result["task_index"] = task["task_index"]
+                completed_results.append(result)
+                completed_indices.add(int(task["task_index"]))
+                if on_result is not None:
+                    try:
+                        on_result(task, result)
+                    except Exception as exc:  # noqa: BLE001 - surface callback/persistence failures unchanged.
+                        callback_exc = exc
+                        raise
 
             if executor_exc is None:
                 pending_tasks = []
@@ -1351,6 +1899,8 @@ def _execute_pool_batch(
                     if int(task["task_index"]) not in completed_indices
                 ]
     except Exception as exc:  # noqa: BLE001 - covers pool init/spawn failures.
+        if callback_exc is not None and exc is callback_exc:
+            raise
         executor_exc = exc
         pending_tasks = [
             task
@@ -1374,11 +1924,11 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
         result = rectify_views_from_config(views, config)
         output_dir = Path(cast(str, task["run_parent_dir"]))
         run_name = str(task["run_name"])
-        _save_run_artifacts(output_dir, run_name, result)
+        metric_record = build_metric_record(run_uid, config, result)
+        _save_run_artifacts(output_dir, run_name, result, metric_record=metric_record)
         if bool(task.get("save_figures", False)):
             figures = generate_rectification_figures(result)
             _persist_figures(figures, output_dir / run_name / "figures")
-        metric_record = build_metric_record(run_uid, config, result)
         elapsed = time.perf_counter() - started
         return {
             "status": "ok",
@@ -1417,6 +1967,79 @@ def _default_max_workers(explicit: Optional[int]) -> int:
     return max(1, cpu_count - 1)
 
 
+def _update_stage_progress_state(
+    *,
+    run_state: Optional[Dict[str, object]],
+    stage_name: str,
+    planned_runs: int,
+    completed_runs: int,
+    skipped_valid_count: int,
+    recomputed_count: int,
+    mark_completed: bool = False,
+) -> None:
+    if run_state is None:
+        return
+    stages_state = cast(Dict[str, Dict[str, object]], run_state.setdefault("stages", {}))
+    stage_slot = cast(Dict[str, object], stages_state.setdefault(stage_name, {}))
+    stage_slot["planned_runs"] = int(planned_runs)
+    stage_slot["completed_runs"] = int(completed_runs)
+    stage_slot["skipped_valid_count"] = int(skipped_valid_count)
+    stage_slot["recomputed_count"] = int(recomputed_count)
+    if mark_completed:
+        stage_slot["last_completed_at"] = _utc_now_iso()
+
+
+def _record_stage_task_result(
+    *,
+    task: Dict[str, object],
+    result: Dict[str, object],
+    state_runs: Dict[str, Dict[str, object]],
+    run_state: Optional[Dict[str, object]],
+    run_state_path: Optional[Path],
+    stage_name: str,
+    planned_runs: int,
+    completed_runs: int,
+    skipped_valid_count: int,
+    recomputed_count: int,
+) -> int:
+    if run_state is None:
+        return recomputed_count
+
+    entry = state_runs.get(str(task["run_uid"]))
+    if entry is not None:
+        attempts = cast(List[Dict[str, object]], entry.setdefault("attempts", []))
+        attempts.append(
+            {
+                "timestamp": _utc_now_iso(),
+                "status": result.get("status"),
+                "runtime_seconds": float(result.get("runtime_seconds", 0.0)),
+                "error": result.get("error"),
+            }
+        )
+        if result.get("status") == "ok":
+            if bool(task.get("_recompute_after_invalid", False)):
+                entry["status"] = "recomputed"
+                recomputed_count += 1
+            else:
+                entry["status"] = "ok"
+        else:
+            entry["status"] = "failed"
+        entry["artifact_validation"] = _validate_run_artifacts(Path(cast(str, task["run_dir"])))
+
+    _update_stage_progress_state(
+        run_state=run_state,
+        stage_name=stage_name,
+        planned_runs=planned_runs,
+        completed_runs=completed_runs,
+        skipped_valid_count=skipped_valid_count,
+        recomputed_count=recomputed_count,
+        mark_completed=True,
+    )
+    if run_state_path is not None:
+        _persist_run_state(run_state_path, run_state)
+    return recomputed_count
+
+
 def _evaluate_stage(
     stage_name: str,
     candidates: Sequence[SweepCandidate],
@@ -1424,6 +2047,8 @@ def _evaluate_stage(
     output_dir: Path,
     save_figures_flag: bool,
     requested_workers: int,
+    run_state: Optional[Dict[str, object]] = None,
+    run_state_path: Optional[Path] = None,
 ) -> StageEvaluationResult:
     tasks: List[Dict[str, object]] = []
     for candidate in candidates:
@@ -1454,6 +2079,7 @@ def _evaluate_stage(
     for idx, task in enumerate(tasks):
         task["task_index"] = idx
         task["estimated_peak_bytes"] = int(_estimate_task_peak_bytes(task))
+        task["run_dir"] = str(Path(cast(str, task["run_parent_dir"])) / str(task["run_name"]))
 
     if not tasks:
         return StageEvaluationResult(
@@ -1468,14 +2094,92 @@ def _evaluate_stage(
                 "degrade_events": [],
                 "pool_crash_count": 0,
                 "isolated_crash_count": 0,
+                "skipped_valid_count": 0,
+                "recomputed_count": 0,
             },
         )
 
     stage_results: List[Dict[str, object]] = []
+    tasks_to_execute: List[Dict[str, object]] = []
+    skipped_valid_count = 0
+    recomputed_count = 0
+    state_runs = (
+        cast(Dict[str, Dict[str, object]], run_state.setdefault("runs", {}))
+        if run_state is not None
+        else {}
+    )
+    if run_state is not None:
+        stages_state = cast(Dict[str, Dict[str, object]], run_state.setdefault("stages", {}))
+        stage_slot = cast(Dict[str, object], stages_state.setdefault(stage_name, {}))
+        stage_slot["planned_runs"] = len(tasks)
+        stage_slot["last_started_at"] = _utc_now_iso()
+        if run_state_path is not None:
+            _persist_run_state(run_state_path, run_state)
+
+    for task in tasks:
+        run_uid = str(task["run_uid"])
+        run_dir = Path(cast(str, task["run_dir"]))
+        entry = state_runs.get(run_uid)
+        if entry is None and run_state is not None:
+            entry = {
+                "run_uid": run_uid,
+                "stage": str(task["stage"]),
+                "candidate_id": str(task["candidate_id"]),
+                "dataset_id": str(task["dataset_id"]),
+                "status": "pending",
+                "run_dir": str(run_dir),
+                "attempts": [],
+                "artifact_validation": {},
+            }
+            state_runs[run_uid] = entry
+        previous_status = str(entry.get("status", "pending")) if entry is not None else "pending"
+        if entry is not None and previous_status == "running":
+            entry["status"] = "pending"
+            previous_status = "pending"
+        artifact_validation = _validate_run_artifacts(run_dir)
+        if entry is not None:
+            entry["artifact_validation"] = artifact_validation
+
+        if bool(artifact_validation.get("valid", False)):
+            try:
+                cached_result = _load_cached_stage_result(task, run_dir)
+            except Exception:
+                task["_recompute_after_invalid"] = previous_status in {"ok", "recomputed", "skipped_valid"}
+                tasks_to_execute.append(task)
+                continue
+            cached_result["task_index"] = task["task_index"]
+            stage_results.append(cached_result)
+            skipped_valid_count += 1
+            if entry is not None:
+                attempts = cast(List[Dict[str, object]], entry.setdefault("attempts", []))
+                attempts.append(
+                    {
+                        "timestamp": _utc_now_iso(),
+                        "status": "skipped_valid",
+                        "reason": "artifacts_valid",
+                    }
+                )
+                entry["status"] = "skipped_valid"
+            continue
+
+        task["_recompute_after_invalid"] = previous_status in {"ok", "recomputed", "skipped_valid"}
+        tasks_to_execute.append(task)
+
+    _update_stage_progress_state(
+        run_state=run_state,
+        stage_name=stage_name,
+        planned_runs=len(tasks),
+        completed_runs=len(stage_results),
+        skipped_valid_count=skipped_valid_count,
+        recomputed_count=recomputed_count,
+    )
+    if run_state is not None and run_state_path is not None:
+        _persist_run_state(run_state_path, run_state)
+
     progress_desc = f"Evaluating {stage_name}"
     _set_parallel_thread_limits()
     available_memory_bytes = _get_available_memory_bytes()
-    worker_plan = _select_stage_worker_count(tasks, requested_workers, available_memory_bytes)
+    worker_plan = _select_stage_worker_count(tasks_to_execute, requested_workers, available_memory_bytes)
     selected_workers = int(worker_plan["selected_workers"])
 
     degrade_events: List[Dict[str, object]] = []
@@ -1483,10 +2187,24 @@ def _evaluate_stage(
     isolated_crash_count = 0
     completed_task_indices: set[int] = set()
 
-    remaining_tasks = list(tasks)
+    remaining_tasks = list(tasks_to_execute)
     current_workers = selected_workers
     with tqdm(total=len(tasks), desc=progress_desc, unit="run") as progress_bar:
+        if stage_results:
+            completed_task_indices.update(int(item["task_index"]) for item in stage_results)
+            progress_bar.update(len(stage_results))
         while remaining_tasks:
+            if run_state is not None:
+                for task in remaining_tasks:
+                    run_uid = str(task["run_uid"])
+                    entry = state_runs.get(run_uid)
+                    if entry is None:
+                        continue
+                    entry["status"] = "running"
+                    entry["last_started_at"] = _utc_now_iso()
+                if run_state_path is not None:
+                    _persist_run_state(run_state_path, run_state)
+
             if current_workers <= 1:
                 for task in remaining_tasks:
                     result, crashed = _run_task_isolated(task)
@@ -1495,16 +2213,53 @@ def _evaluate_stage(
                     stage_results.append(result)
                     completed_task_indices.add(int(task["task_index"]))
                     progress_bar.update(1)
+                    recomputed_count = _record_stage_task_result(
+                        task=task,
+                        result=result,
+                        state_runs=state_runs,
+                        run_state=run_state,
+                        run_state_path=run_state_path,
+                        stage_name=stage_name,
+                        planned_runs=len(tasks),
+                        completed_runs=len(stage_results),
+                        skipped_valid_count=skipped_valid_count,
+                        recomputed_count=recomputed_count,
+                    )
                 break
+
+            def _commit_pooled_result(task: Dict[str, object], result: Dict[str, object]) -> None:
+                nonlocal recomputed_count
+                task_index = int(result["task_index"])
+                if task_index in completed_task_indices:
+                    return
+                stage_results.append(result)
+                completed_task_indices.add(task_index)
+                progress_bar.update(1)
+                recomputed_count = _record_stage_task_result(
+                    task=task,
+                    result=result,
+                    state_runs=state_runs,
+                    run_state=run_state,
+                    run_state_path=run_state_path,
+                    stage_name=stage_name,
+                    planned_runs=len(tasks),
+                    completed_runs=len(stage_results),
+                    skipped_valid_count=skipped_valid_count,
+                    recomputed_count=recomputed_count,
+                )
 
             completed_batch, pending_batch, exec_error = _execute_pool_batch(
                 remaining_tasks,
                 workers=current_workers,
+                on_result=_commit_pooled_result,
             )
-            stage_results.extend(completed_batch)
-            completed_task_indices.update(int(item["task_index"]) for item in completed_batch)
             if completed_batch:
-                progress_bar.update(len(completed_batch))
+                by_uid = {str(task["run_uid"]): task for task in remaining_tasks}
+                for result in completed_batch:
+                    task = by_uid.get(str(result["run_uid"]))
+                    if task is None:
+                        continue
+                    _commit_pooled_result(task, result)
 
             if exec_error is None:
                 break
@@ -1531,7 +2286,20 @@ def _evaluate_stage(
     execution["pool_crash_count"] = int(pool_crash_count)
     execution["isolated_crash_count"] = int(isolated_crash_count)
     execution["completed_runs"] = len(stage_results)
+    execution["skipped_valid_count"] = int(skipped_valid_count)
+    execution["recomputed_count"] = int(recomputed_count)
     execution["used_isolated_mode"] = bool(isolated_crash_count > 0 or current_workers == 1)
+    _update_stage_progress_state(
+        run_state=run_state,
+        stage_name=stage_name,
+        planned_runs=len(tasks),
+        completed_runs=len(stage_results),
+        skipped_valid_count=skipped_valid_count,
+        recomputed_count=recomputed_count,
+        mark_completed=True,
+    )
+    if run_state is not None and run_state_path is not None:
+        _persist_run_state(run_state_path, run_state)
     return StageEvaluationResult(stage_results=stage_results, execution=execution)
 
 
@@ -1673,33 +2441,28 @@ def score_and_rank_runs(
 
 
 def _write_leaderboard_csv(rows: Sequence[Dict[str, object]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as fp:
-        writer = csv.DictWriter(
-            fp,
-            fieldnames=[
-                "rank",
-                "candidate_id",
-                "strategy",
-                "score",
-                "mean_dataset_score",
-                "std_dataset_score",
-                "missing_datasets",
-            ],
-        )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {
-                    "rank": row.get("rank"),
-                    "candidate_id": row.get("candidate_id"),
-                    "strategy": row.get("strategy"),
-                    "score": row.get("score"),
-                    "mean_dataset_score": row.get("mean_dataset_score"),
-                    "std_dataset_score": row.get("std_dataset_score"),
-                    "missing_datasets": ",".join(cast(List[str], row.get("missing_datasets", []))),
-                }
-            )
+    fieldnames = [
+        "rank",
+        "candidate_id",
+        "strategy",
+        "score",
+        "mean_dataset_score",
+        "std_dataset_score",
+        "missing_datasets",
+    ]
+    csv_rows = [
+        {
+            "rank": row.get("rank"),
+            "candidate_id": row.get("candidate_id"),
+            "strategy": row.get("strategy"),
+            "score": row.get("score"),
+            "mean_dataset_score": row.get("mean_dataset_score"),
+            "std_dataset_score": row.get("std_dataset_score"),
+            "missing_datasets": ",".join(cast(List[str], row.get("missing_datasets", []))),
+        }
+        for row in rows
+    ]
+    write_csv_atomic(path, fieldnames, csv_rows, create_backup=True)
 
 
 def _write_stage_outputs(
@@ -1722,8 +2485,7 @@ def _write_stage_outputs(
         "execution": dict(execution or {}),
     }
     summary_path = output_dir / f"{stage_name}_summary.json"
-    with summary_path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2)
+    write_json_atomic(summary_path, payload, indent=2, sort_keys=False, create_backup=True)
 
 
 def _best_configs_payload(rankings: Sequence[Dict[str, object]]) -> Dict[str, object]:
@@ -1738,8 +2500,111 @@ def _best_configs_payload(rankings: Sequence[Dict[str, object]]) -> Dict[str, ob
     }
 
 
+def _candidate_without_metric_axes(candidate: SweepCandidate) -> SweepCandidate:
+    metric_keys = {
+        "displacement_metric_family",
+        "displacement_alpha",
+        "metric_formulation_id",
+        "displacement_component_weights",
+    }
+    params = {
+        key: value for key, value in dict(candidate.params).items() if key not in metric_keys
+    }
+    return _build_candidate_from_params(candidate.strategy, params)
+
+
+def _collect_metric_experiment_candidates(
+    final_rankings: Sequence[Dict[str, object]],
+    baseline_candidate_lookup: Dict[str, SweepCandidate],
+    experimental_spec: ExperimentalMetricSweepSpec,
+) -> List[SweepCandidate]:
+    shortlisted_candidates: List[SweepCandidate] = []
+    seen_shortlist = set()
+    for row in final_rankings:
+        candidate_id = str(row.get("candidate_id", ""))
+        if candidate_id in seen_shortlist:
+            continue
+        candidate = baseline_candidate_lookup.get(candidate_id)
+        if candidate is None:
+            continue
+        if candidate.strategy not in {"pixel", "combined"}:
+            continue
+        shortlisted_candidates.append(candidate)
+        seen_shortlist.add(candidate_id)
+        if len(shortlisted_candidates) >= int(experimental_spec.shortlist_top_k):
+            break
+
+    if not shortlisted_candidates:
+        return []
+
+    base_candidates = _dedupe_candidates(
+        [_candidate_without_metric_axes(candidate) for candidate in shortlisted_candidates]
+    )
+    metric_candidates = _expand_candidates_with_metric_formulations(
+        base_candidates,
+        experimental_spec.formulations,
+    )
+    return _dedupe_candidates(metric_candidates)
+
+
+def _write_phase_summary_artifacts(
+    *,
+    output_dir: Path,
+    stage_name: str,
+    stage_results: Sequence[Dict[str, object]],
+    rankings: Sequence[Dict[str, object]],
+    execution: Optional[Dict[str, object]],
+    reporting: SweepReportingSpec,
+    analyze: bool,
+) -> None:
+    _write_stage_outputs(
+        stage_name,
+        stage_results,
+        rankings,
+        output_dir,
+        execution=execution,
+    )
+    write_json_atomic(
+        output_dir / "leaderboard.json",
+        list(rankings),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+    _write_leaderboard_csv(rankings, output_dir / "leaderboard.csv")
+    write_json_atomic(
+        output_dir / "best_configs.json",
+        _best_configs_payload(rankings),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+
+    all_metric_records: List[Dict[str, object]] = []
+    for stage_result in stage_results:
+        if stage_result.get("status") == "ok":
+            all_metric_records.append(cast(Dict[str, object], stage_result["metric_record"]))
+    write_json_atomic(
+        output_dir / "summary.json",
+        all_metric_records,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+
+    if analyze and all_metric_records:
+        analysis = analyze_summary_data(all_metric_records)
+        save_analysis(analysis, output_dir / "analysis.json")
+    if reporting.generate_alpha_report and stage_name == "metric_phase":
+        generate_alpha_report(
+            output_dir=output_dir,
+            primary_metric=reporting.primary_metric,
+            tolerate_partial_outputs=reporting.tolerate_partial_outputs,
+        )
+
+
 def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] = None) -> Path:
-    """Run a full two-stage, multi-dataset sweep experiment."""
+    """Run a staged or single-stage, multi-dataset sweep experiment."""
 
     resolved_output_dir = (
         output_dir
@@ -1754,14 +2619,31 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
 
     prepared_datasets = _prepare_datasets(spec, resolved_output_dir)
     dataset_ids = [dataset.dataset_id for dataset in prepared_datasets]
+    fingerprint_payload = _build_experiment_fingerprint_payload(
+        spec=spec,
+        prepared_datasets=prepared_datasets,
+        output_dir=resolved_output_dir,
+    )
+    run_state, run_state_path = _load_or_initialize_run_state(
+        output_dir=resolved_output_dir,
+        fingerprint_payload=fingerprint_payload,
+    )
 
+    stage_mode = spec.stages.mode
     stage1_budget, stage2_budget = _stage_budgets(spec.stages)
+    baseline_budget = (
+        stage1_budget
+        if stage_mode == "two_stage"
+        else max(1, int(spec.stages.total_budget_per_dataset))
+    )
 
-    coarse_candidates: List[SweepCandidate] = []
+    coarse_candidates_base: List[SweepCandidate] = []
     for strategy in spec.strategies:
         search_space = spec.search_spaces[strategy]
-        coarse_candidates.extend(generate_coarse_candidates(search_space, budget=None))
-    coarse_candidates = _limit_candidates(coarse_candidates, stage1_budget)
+        coarse_candidates_base.extend(generate_coarse_candidates(search_space, budget=None))
+    coarse_candidates = list(coarse_candidates_base)
+    coarse_candidates = _dedupe_candidates(coarse_candidates)
+    coarse_candidates = _limit_candidates(coarse_candidates, baseline_budget)
     coarse_candidates = _assign_candidate_ids(coarse_candidates, "s1c")
     coarse_lookup = {candidate.candidate_id: candidate for candidate in coarse_candidates}
 
@@ -1774,6 +2656,8 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         output_dir=resolved_output_dir,
         save_figures_flag=spec.save_figures,
         requested_workers=requested_workers,
+        run_state=run_state,
+        run_state_path=run_state_path,
     )
     stage1_results = stage1_eval.stage_results
     stage1_rankings = score_and_rank_runs(stage1_results, spec.scoring, dataset_ids=dataset_ids)
@@ -1785,56 +2669,169 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         execution=stage1_eval.execution,
     )
 
-    refined_candidates = generate_refined_candidates(
-        ranked_candidates=stage1_rankings,
-        candidate_lookup=coarse_lookup,
-        search_spaces=spec.search_spaces,
-        top_k=spec.stages.top_k,
-        budget=stage2_budget,
-    )
-    if not refined_candidates and stage1_rankings:
-        # Fallback: keep exploring with the best stage-1 candidate if refinement is empty.
-        best_id = str(stage1_rankings[0]["candidate_id"])
-        refined_candidates = [coarse_lookup[best_id]]
-    refined_candidates = _assign_candidate_ids(refined_candidates, "s2c")
+    refined_lookup: Dict[str, SweepCandidate] = {}
+    stage2_results: List[Dict[str, object]] = []
+    stage2_rankings: List[Dict[str, object]] = []
+    if stage_mode == "two_stage":
+        refined_candidates = generate_refined_candidates(
+            ranked_candidates=stage1_rankings,
+            candidate_lookup=coarse_lookup,
+            search_spaces=spec.search_spaces,
+            top_k=spec.stages.top_k,
+            budget=stage2_budget,
+        )
+        if not refined_candidates and stage1_rankings:
+            # Fallback: keep exploring with the best stage-1 candidate if refinement is empty.
+            best_id = str(stage1_rankings[0]["candidate_id"])
+            refined_candidates = [coarse_lookup[best_id]]
+        refined_candidates = _dedupe_candidates(refined_candidates)
+        refined_candidates = _assign_candidate_ids(refined_candidates, "s2c")
+        refined_lookup = {candidate.candidate_id: candidate for candidate in refined_candidates}
 
-    stage2_eval = _evaluate_stage(
-        stage_name="stage2",
-        candidates=refined_candidates,
-        datasets=prepared_datasets,
-        output_dir=resolved_output_dir,
-        save_figures_flag=spec.save_figures,
-        requested_workers=requested_workers,
-    )
-    stage2_results = stage2_eval.stage_results
-    stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
-    _write_stage_outputs(
-        "stage2",
-        stage2_results,
-        stage2_rankings,
-        resolved_output_dir,
-        execution=stage2_eval.execution,
-    )
+        stage2_eval = _evaluate_stage(
+            stage_name="stage2",
+            candidates=refined_candidates,
+            datasets=prepared_datasets,
+            output_dir=resolved_output_dir,
+            save_figures_flag=spec.save_figures,
+            requested_workers=requested_workers,
+            run_state=run_state,
+            run_state_path=run_state_path,
+        )
+        stage2_results = stage2_eval.stage_results
+        stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
+        _write_stage_outputs(
+            "stage2",
+            stage2_results,
+            stage2_rankings,
+            resolved_output_dir,
+            execution=stage2_eval.execution,
+        )
 
     final_rankings = stage2_rankings if stage2_rankings else stage1_rankings
-    with (resolved_output_dir / "leaderboard.json").open("w", encoding="utf-8") as fp:
-        json.dump(final_rankings, fp, indent=2)
+
+    write_json_atomic(
+        resolved_output_dir / "leaderboard.json",
+        final_rankings,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
     _write_leaderboard_csv(final_rankings, resolved_output_dir / "leaderboard.csv")
 
-    with (resolved_output_dir / "best_configs.json").open("w", encoding="utf-8") as fp:
-        json.dump(_best_configs_payload(final_rankings), fp, indent=2)
+    write_json_atomic(
+        resolved_output_dir / "best_configs.json",
+        _best_configs_payload(final_rankings),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
 
     all_metric_records: List[Dict[str, object]] = []
     for stage_result in (stage1_results + stage2_results):
         if stage_result.get("status") == "ok":
             all_metric_records.append(cast(Dict[str, object], stage_result["metric_record"]))
-    with (resolved_output_dir / "summary.json").open("w", encoding="utf-8") as fp:
-        json.dump(all_metric_records, fp, indent=2)
+    write_json_atomic(
+        resolved_output_dir / "summary.json",
+        all_metric_records,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
 
     if spec.analyze and all_metric_records:
         analysis = analyze_summary_data(all_metric_records)
         save_analysis(analysis, resolved_output_dir / "analysis.json")
 
+    metric_phase_manifest: Dict[str, object] = {
+        "enabled": bool(spec.experimental_metric_sweep and spec.experimental_metric_sweep.enabled),
+        "output_dir": None,
+        "status": "disabled",
+    }
+    experimental_metric_spec = (
+        spec.experimental_metric_sweep
+        if spec.experimental_metric_sweep is not None
+        else ExperimentalMetricSweepSpec(
+            enabled=False,
+            shortlist_top_k=spec.stages.top_k,
+            formulations=[],
+        )
+    )
+    if experimental_metric_spec.enabled:
+        metric_output_dir = resolved_output_dir / "metric_experiments"
+        metric_output_dir.mkdir(parents=True, exist_ok=True)
+        baseline_candidate_lookup = dict(coarse_lookup)
+        baseline_candidate_lookup.update(refined_lookup)
+        metric_candidates = _collect_metric_experiment_candidates(
+            final_rankings=final_rankings,
+            baseline_candidate_lookup=baseline_candidate_lookup,
+            experimental_spec=experimental_metric_spec,
+        )
+        metric_candidates = _assign_candidate_ids(metric_candidates, "m1c")
+
+        metric_eval = _evaluate_stage(
+            stage_name="metric_phase",
+            candidates=metric_candidates,
+            datasets=prepared_datasets,
+            output_dir=metric_output_dir,
+            save_figures_flag=spec.save_figures,
+            requested_workers=requested_workers,
+            run_state=run_state,
+            run_state_path=run_state_path,
+        )
+        metric_results = metric_eval.stage_results
+        metric_rankings = score_and_rank_runs(
+            metric_results, spec.scoring, dataset_ids=dataset_ids
+        )
+        _write_phase_summary_artifacts(
+            output_dir=metric_output_dir,
+            stage_name="metric_phase",
+            stage_results=metric_results,
+            rankings=metric_rankings,
+            execution=metric_eval.execution,
+            reporting=spec.reporting,
+            analyze=spec.analyze,
+        )
+        metric_phase_manifest = {
+            "enabled": True,
+            "output_dir": str(metric_output_dir.resolve()),
+            "status": "completed",
+            "shortlist_top_k": int(experimental_metric_spec.shortlist_top_k),
+            "num_formulations": len(experimental_metric_spec.formulations),
+            "num_candidates": len(metric_candidates),
+            "num_runs": len(metric_results),
+            "num_ranked": len(metric_rankings),
+        }
+
+    write_json_atomic(
+        resolved_output_dir / "experiment_manifest.json",
+        {
+            "generated_at": _utc_now_iso(),
+            "output_dir": str(resolved_output_dir.resolve()),
+            "strategies": list(spec.strategies),
+            "baseline_displacement_mode": {
+                "family": RectificationRunConfig().displacement_metric_family,
+                "alpha": float(RectificationRunConfig().displacement_alpha),
+                "metric_formulation_id": RectificationRunConfig().metric_formulation_id,
+            },
+            "experimental_metric_sweep": (
+                None
+                if spec.experimental_metric_sweep is None
+                else asdict(spec.experimental_metric_sweep)
+            ),
+            "metric_experiments": metric_phase_manifest,
+            "datasets": [_dataset_identity_payload(dataset) for dataset in prepared_datasets],
+            "stages": asdict(spec.stages),
+            "scoring": asdict(spec.scoring),
+            "reporting": asdict(spec.reporting),
+            "run_state_path": str(run_state_path),
+        },
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+
+    _persist_run_state(run_state_path, run_state)
     return resolved_output_dir
 
 
@@ -1935,14 +2932,14 @@ def sweep_parameters(
         if strategy in {"pixel", "combined"}:
             run_name_parts.append(f"pt{pixel_thresh}")
         run_name = "_".join(run_name_parts)
-        _save_run_artifacts(output_dir, run_name, result)
+        record = build_metric_record(run_name, config, result)
+        _save_run_artifacts(output_dir, run_name, result, metric_record=record)
 
         if save_figures_flag:
             figures = generate_rectification_figures(result)  # pass full result so we can save global/pixel maps, originals, overlays, averages
             figures_dir = output_dir / run_name / "figures"
             _persist_figures(figures, figures_dir)
 
-        record = build_metric_record(run_name, config, result)
         summary.append(record)
 
         if live_plot:
@@ -1952,8 +2949,13 @@ def sweep_parameters(
                 plotter = LiveMetricsPlotter(metric_keys)
             plotter.update(run_name, record)
 
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as fp:
-        json.dump(summary, fp, indent=2)
+    write_json_atomic(
+        output_dir / "summary.json",
+        summary,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
 
     if analyze:
         analysis = analyze_summary_data(summary)
@@ -1965,8 +2967,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--spec",
         help=(
-            "Path to a JSON experiment spec for the two-stage multi-dataset sweep "
-            "(recommended path for new workflows)."
+            "Path to a JSON experiment spec for the staged or single-stage "
+            "multi-dataset sweep (recommended path for new workflows)."
         ),
     )
     parser.add_argument(
@@ -2263,11 +3265,21 @@ class SpecGuiDatasetState:
 
 
 @dataclass
+class SpecGuiMetricExperimentRowState:
+    formulation_id: str = "exp_grad_alpha"
+    family: str = "ncc_gradient"
+    alphas: str = "0.0,0.5,1.0"
+    gradient_weight: str = "0.5"
+    laplacian_weight: str = "0.5"
+
+
+@dataclass
 class SpecGuiState:
     output_dir: str = ""
     strategy_pixel: bool = True
     strategy_combined: bool = True
     strategy_global: bool = False
+    stage_mode: str = "two_stage"
     total_budget_per_dataset: str = "320"
     stage1_fraction: str = "0.6"
     top_k: str = "8"
@@ -2302,6 +3314,11 @@ class SpecGuiState:
     runtime_penalty_weight: str = "0.0"
     robustness_lambda: str = "0.5"
     missing_dataset_penalty: str = "1.0"
+    metric_experiments_enabled: bool = False
+    metric_experiments_shortlist_top_k: str = "8"
+    metric_experiment_rows: List[SpecGuiMetricExperimentRowState] = field(
+        default_factory=lambda: [SpecGuiMetricExperimentRowState()]
+    )
     datasets: List[SpecGuiDatasetState] = field(
         default_factory=lambda: [SpecGuiDatasetState(dataset_id="dataset_a")]
     )
@@ -2363,6 +3380,75 @@ def _parse_bool_list_csv(value: str, field_name: str) -> List[bool]:
 
 def _list_to_csv(values: Sequence[object]) -> str:
     return ",".join(str(value) for value in values)
+
+
+def _state_metric_row_to_spec(
+    row: SpecGuiMetricExperimentRowState, row_index: int
+) -> Dict[str, object]:
+    formulation_id = row.formulation_id.strip()
+    if not formulation_id:
+        raise ValueError(
+            f"metric experiment row {row_index} formulation id is required."
+        )
+    family = row.family.strip().lower()
+    if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
+        raise ValueError(
+            f"metric experiment row {row_index} family must be one of "
+            "'ncc_gradient', 'ncc_laplacian', 'composite'."
+        )
+    alphas = _parse_float_list_csv(
+        row.alphas, f"metric experiment row {row_index} alphas"
+    )
+    for alpha in alphas:
+        if alpha < 0.0 or alpha > 1.0 or not np.isfinite(alpha):
+            raise ValueError(
+                f"metric experiment row {row_index} alphas must be finite and within [0, 1]."
+            )
+
+    formulation_payload: Dict[str, object] = {
+        "id": formulation_id,
+        "family": family,
+        "alphas": alphas,
+    }
+    if family == "composite":
+        gradient_weight = float(row.gradient_weight.strip())
+        laplacian_weight = float(row.laplacian_weight.strip())
+        if not np.isfinite(gradient_weight) or not np.isfinite(laplacian_weight):
+            raise ValueError(
+                f"metric experiment row {row_index} composite weights must be finite."
+            )
+        if gradient_weight < 0.0 or laplacian_weight < 0.0:
+            raise ValueError(
+                f"metric experiment row {row_index} composite weights must be non-negative."
+            )
+        if any(float(alpha) < 1.0 for alpha in alphas) and (gradient_weight + laplacian_weight <= 0.0):
+            raise ValueError(
+                f"metric experiment row {row_index} composite weights must sum to a positive value when alpha < 1."
+            )
+        formulation_payload["component_weights"] = {
+            "gradient": gradient_weight,
+            "laplacian": laplacian_weight,
+        }
+    return formulation_payload
+
+
+def _metric_formulation_payload_to_state_row(
+    payload: Dict[str, object], default_idx: int
+) -> SpecGuiMetricExperimentRowState:
+    family = str(payload.get("family", "ncc_gradient")).strip().lower()
+    component_weights = cast(Optional[Dict[str, object]], payload.get("component_weights"))
+    gradient_weight = "0.5"
+    laplacian_weight = "0.5"
+    if component_weights is not None:
+        gradient_weight = str(component_weights.get("gradient", 0.0))
+        laplacian_weight = str(component_weights.get("laplacian", 0.0))
+    return SpecGuiMetricExperimentRowState(
+        formulation_id=str(payload.get("id") or payload.get("formulation_id") or f"formulation_{default_idx:02d}"),
+        family=family,
+        alphas=_list_to_csv(cast(List[object], payload.get("alphas", []))) or "0.5",
+        gradient_weight=gradient_weight,
+        laplacian_weight=laplacian_weight,
+    )
 
 
 def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
@@ -2483,14 +3569,26 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             ),
         }
 
-    return {
+    stage_mode = state.stage_mode.strip().lower() or "two_stage"
+    if stage_mode not in {"two_stage", "single_stage"}:
+        raise ValueError("Execution mode must be either 'two_stage' or 'single_stage'.")
+    if stage_mode == "two_stage":
+        stage1_fraction_value = float(state.stage1_fraction.strip())
+    else:
+        try:
+            stage1_fraction_value = float(state.stage1_fraction.strip())
+        except Exception:
+            stage1_fraction_value = SweepStageSpec().stage1_fraction
+
+    payload: Dict[str, object] = {
         "output_dir": state.output_dir.strip() or None,
         "strategies": strategies,
         "datasets": datasets,
         "search_spaces": search_spaces,
         "stages": {
+            "mode": stage_mode,
             "total_budget_per_dataset": int(state.total_budget_per_dataset.strip()),
-            "stage1_fraction": float(state.stage1_fraction.strip()),
+            "stage1_fraction": stage1_fraction_value,
             "top_k": int(state.top_k.strip()),
             "max_workers": (
                 int(state.max_workers.strip()) if state.max_workers.strip() else None
@@ -2514,6 +3612,20 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
         "save_figures": bool(state.save_figures),
         "analyze": bool(state.analyze),
     }
+    if state.metric_experiments_enabled:
+        if not state.metric_experiment_rows:
+            raise ValueError(
+                "At least one metric experiment formulation row is required when enabled."
+            )
+        payload["experimental_metric_sweep"] = {
+            "enabled": True,
+            "shortlist_top_k": int(state.metric_experiments_shortlist_top_k.strip()),
+            "formulations": [
+                _state_metric_row_to_spec(row, idx + 1)
+                for idx, row in enumerate(state.metric_experiment_rows)
+            ],
+        }
+    return payload
 
 
 def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
@@ -2527,6 +3639,7 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
     state.strategy_global = "global" in strategies
 
     stages = cast(Dict[str, object], payload.get("stages", {}))
+    state.stage_mode = str(stages.get("mode", state.stage_mode) or state.stage_mode)
     state.total_budget_per_dataset = str(
         stages.get("total_budget_per_dataset", state.total_budget_per_dataset)
     )
@@ -2634,6 +3747,41 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         scoring.get("missing_dataset_penalty", state.missing_dataset_penalty)
     )
 
+    experimental_payload = cast(
+        Optional[Dict[str, object]], payload.get("experimental_metric_sweep")
+    )
+    formulations_payload: List[Dict[str, object]] = []
+    if experimental_payload is not None:
+        state.metric_experiments_enabled = bool(experimental_payload.get("enabled", False))
+        shortlist_top_k = experimental_payload.get("shortlist_top_k")
+        if shortlist_top_k is None:
+            shortlist_top_k = stages.get("top_k", state.metric_experiments_shortlist_top_k)
+        state.metric_experiments_shortlist_top_k = str(shortlist_top_k)
+        raw_formulations = cast(
+            List[object], experimental_payload.get("formulations", [])
+        )
+        formulations_payload = [
+            cast(Dict[str, object], item) for item in raw_formulations if isinstance(item, dict)
+        ]
+    elif "metric_formulations" in payload:
+        raw_formulations = cast(List[object], payload.get("metric_formulations", []))
+        formulations_payload = [
+            cast(Dict[str, object], item) for item in raw_formulations if isinstance(item, dict)
+        ]
+        state.metric_experiments_enabled = bool(formulations_payload)
+        state.metric_experiments_shortlist_top_k = str(stages.get("top_k", state.top_k))
+    else:
+        state.metric_experiments_enabled = False
+        state.metric_experiments_shortlist_top_k = str(stages.get("top_k", state.top_k))
+
+    if formulations_payload:
+        state.metric_experiment_rows = [
+            _metric_formulation_payload_to_state_row(item, idx + 1)
+            for idx, item in enumerate(formulations_payload)
+        ]
+    else:
+        state.metric_experiment_rows = [SpecGuiMetricExperimentRowState()]
+
     datasets_payload = cast(List[Dict[str, object]], payload.get("datasets", []))
     datasets: List[SpecGuiDatasetState] = []
     for entry in datasets_payload:
@@ -2688,18 +3836,23 @@ def validate_state(state: SpecGuiState) -> List[str]:
     if not strategies:
         issues.append("Select at least one strategy.")
 
+    stage_mode = state.stage_mode.strip().lower() or "two_stage"
+    if stage_mode not in {"two_stage", "single_stage"}:
+        issues.append("Execution mode must be either 'two_stage' or 'single_stage'.")
+
     try:
         if int(state.total_budget_per_dataset.strip()) < 1:
             issues.append("Total budget per dataset must be >= 1.")
     except Exception:
         issues.append("Total budget per dataset must be an integer.")
 
-    try:
-        fraction = float(state.stage1_fraction.strip())
-        if not (0.0 < fraction < 1.0):
-            issues.append("Stage1 fraction must be between 0 and 1.")
-    except Exception:
-        issues.append("Stage1 fraction must be numeric.")
+    if stage_mode == "two_stage":
+        try:
+            fraction = float(state.stage1_fraction.strip())
+            if not (0.0 < fraction < 1.0):
+                issues.append("Stage1 fraction must be between 0 and 1.")
+        except Exception:
+            issues.append("Stage1 fraction must be numeric.")
 
     try:
         if int(state.top_k.strip()) < 1:
@@ -2832,18 +3985,86 @@ def validate_state(state: SpecGuiState) -> List[str]:
         except Exception:
             issues.append(f"{label} must be numeric.")
 
+    if state.metric_experiments_enabled:
+        if not state.strategy_pixel and not state.strategy_combined:
+            issues.append(
+                "Experimental metrics require at least one pixel/combined strategy."
+            )
+        try:
+            if int(state.metric_experiments_shortlist_top_k.strip()) < 1:
+                issues.append(
+                    "Metric experiment shortlist top-k must be >= 1."
+                )
+        except Exception:
+            issues.append("Metric experiment shortlist top-k must be an integer.")
+
+        if not state.metric_experiment_rows:
+            issues.append(
+                "At least one metric experiment formulation row is required when enabled."
+            )
+        formulation_ids: List[str] = []
+        for idx, row in enumerate(state.metric_experiment_rows, start=1):
+            formulation_id = row.formulation_id.strip()
+            if not formulation_id:
+                issues.append(f"Metric experiment row {idx}: id is required.")
+            else:
+                formulation_ids.append(formulation_id)
+
+            family = row.family.strip().lower()
+            if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
+                issues.append(
+                    f"Metric experiment row {idx}: invalid family '{row.family}'."
+                )
+                continue
+            try:
+                alphas = _parse_float_list_csv(
+                    row.alphas, f"Metric experiment row {idx} alphas"
+                )
+                if any(
+                    (not np.isfinite(alpha)) or alpha < 0.0 or alpha > 1.0
+                    for alpha in alphas
+                ):
+                    issues.append(
+                        f"Metric experiment row {idx}: alphas must be finite and within [0, 1]."
+                    )
+            except ValueError as exc:
+                issues.append(str(exc))
+                continue
+
+            if family == "composite":
+                try:
+                    gradient_weight = float(row.gradient_weight.strip())
+                    laplacian_weight = float(row.laplacian_weight.strip())
+                except Exception:
+                    issues.append(
+                        f"Metric experiment row {idx}: composite weights must be numeric."
+                    )
+                    continue
+                if not np.isfinite(gradient_weight) or not np.isfinite(laplacian_weight):
+                    issues.append(
+                        f"Metric experiment row {idx}: composite weights must be finite."
+                    )
+                if gradient_weight < 0.0 or laplacian_weight < 0.0:
+                    issues.append(
+                        f"Metric experiment row {idx}: composite weights must be non-negative."
+                    )
+                if any(alpha < 1.0 for alpha in alphas) and (gradient_weight + laplacian_weight <= 0.0):
+                    issues.append(
+                        f"Metric experiment row {idx}: composite weights must sum to a positive value when alpha < 1."
+                    )
+
+        if len(formulation_ids) != len(set(formulation_ids)):
+            issues.append("Metric experiment formulation IDs must be unique.")
+
     return issues
 
 
 def _save_spec_payload(path: Path, payload: Dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2)
+    write_json_atomic(path, payload, indent=2, sort_keys=False, create_backup=True)
 
 
 def _load_spec_payload(path: Path) -> Dict[str, object]:
-    with path.open("r", encoding="utf-8") as fp:
-        payload = json.load(fp)
+    payload, _, _ = read_json_first_valid(path, validator=lambda obj: isinstance(obj, dict))
     if not isinstance(payload, dict):
         raise ValueError("Spec file must contain a JSON object.")
     return cast(Dict[str, object], payload)
@@ -2876,6 +4097,7 @@ class SpecGuiApp:
         self.messagebox = __import__("tkinter.messagebox", fromlist=["messagebox"])
         self.state = SpecGuiState()
         self.dataset_rows: List[Dict[str, Any]] = []
+        self.metric_experiment_rows: List[Dict[str, Any]] = []
         self.editable_widgets: List[Any] = []
         self.log_queue: "queue.Queue[Dict[str, object]]" = queue.Queue()
         self.run_thread: Optional[threading.Thread] = None
@@ -2899,6 +4121,10 @@ class SpecGuiApp:
                 widget.configure(state=desired)
             except Exception:
                 pass
+        if enabled and hasattr(self, "stage_mode_var"):
+            self._toggle_stage_mode_controls()
+        if enabled and hasattr(self, "metric_experiments_enabled_var"):
+            self._toggle_metric_experiment_controls()
 
     def _append_log(self, message: str) -> None:
         self.log_text.configure(state="normal")
@@ -3001,21 +4227,37 @@ class SpecGuiApp:
 
         stage_frame = self.ttk.Frame(basic_frame)
         stage_frame.grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=2)
-        self.ttk.Label(stage_frame, text="Total budget").grid(row=0, column=0, sticky="w")
+        self.ttk.Label(stage_frame, text="Execution mode").grid(row=0, column=0, sticky="w")
+        self.stage_mode_var = self.tk.StringVar(value="two_stage")
+        self.stage_mode_combo = self.ttk.Combobox(
+            stage_frame,
+            textvariable=self.stage_mode_var,
+            values=["two_stage", "single_stage"],
+            width=14,
+            state="readonly",
+        )
+        self.stage_mode_combo.grid(row=0, column=1, padx=4)
+        self.stage_mode_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt: self._toggle_stage_mode_controls(),
+        )
+        self._register_editable(self.stage_mode_combo)
+        self.ttk.Label(stage_frame, text="Total budget").grid(row=0, column=2, sticky="w")
         self.total_budget_entry = self.ttk.Entry(stage_frame, width=8)
-        self.total_budget_entry.grid(row=0, column=1, padx=4)
+        self.total_budget_entry.grid(row=0, column=3, padx=4)
         self._register_editable(self.total_budget_entry)
-        self.ttk.Label(stage_frame, text="Stage1 fraction").grid(row=0, column=2, sticky="w")
+        self.stage1_fraction_label = self.ttk.Label(stage_frame, text="Stage1 fraction")
+        self.stage1_fraction_label.grid(row=0, column=4, sticky="w")
         self.stage1_fraction_entry = self.ttk.Entry(stage_frame, width=6)
-        self.stage1_fraction_entry.grid(row=0, column=3, padx=4)
+        self.stage1_fraction_entry.grid(row=0, column=5, padx=4)
         self._register_editable(self.stage1_fraction_entry)
-        self.ttk.Label(stage_frame, text="Top-K").grid(row=0, column=4, sticky="w")
+        self.ttk.Label(stage_frame, text="Top-K").grid(row=0, column=6, sticky="w")
         self.top_k_entry = self.ttk.Entry(stage_frame, width=6)
-        self.top_k_entry.grid(row=0, column=5, padx=4)
+        self.top_k_entry.grid(row=0, column=7, padx=4)
         self._register_editable(self.top_k_entry)
-        self.ttk.Label(stage_frame, text="Max workers").grid(row=0, column=6, sticky="w")
+        self.ttk.Label(stage_frame, text="Max workers").grid(row=0, column=8, sticky="w")
         self.max_workers_entry = self.ttk.Entry(stage_frame, width=8)
-        self.max_workers_entry.grid(row=0, column=7, padx=4)
+        self.max_workers_entry.grid(row=0, column=9, padx=4)
         self._register_editable(self.max_workers_entry)
 
         toggles_frame = self.ttk.Frame(basic_frame)
@@ -3098,6 +4340,48 @@ class SpecGuiApp:
         self.robustness_entry = self._build_labeled_entry(adv_right, 5, "Robustness lambda", "0.5")
         self.missing_penalty_entry = self._build_labeled_entry(adv_right, 6, "Missing dataset penalty", "1.0")
 
+        metric_exp_container = self.ttk.LabelFrame(
+            self.advanced_frame, text="Experimental Metrics (Optional)"
+        )
+        metric_exp_container.pack(fill="x", padx=4, pady=6)
+        metric_exp_controls = self.ttk.Frame(metric_exp_container)
+        metric_exp_controls.pack(fill="x", padx=4, pady=2)
+        self.metric_experiments_enabled_var = self.tk.BooleanVar(value=False)
+        metric_enabled_chk = self.ttk.Checkbutton(
+            metric_exp_controls,
+            text="Enable experimental metric sweep",
+            variable=self.metric_experiments_enabled_var,
+            command=self._toggle_metric_experiment_controls,
+        )
+        metric_enabled_chk.pack(side="left", padx=4)
+        self._register_editable(metric_enabled_chk)
+        self.ttk.Label(metric_exp_controls, text="Shortlist top-k").pack(
+            side="left", padx=(12, 2)
+        )
+        self.metric_shortlist_entry = self.ttk.Entry(metric_exp_controls, width=8)
+        self.metric_shortlist_entry.insert(0, "8")
+        self.metric_shortlist_entry.pack(side="left", padx=2)
+        self._register_editable(self.metric_shortlist_entry)
+        self.metric_add_row_btn = self.ttk.Button(
+            metric_exp_controls,
+            text="Add Formulation",
+            command=self._add_metric_experiment_row,
+        )
+        self.metric_add_row_btn.pack(side="left", padx=8)
+        self._register_editable(self.metric_add_row_btn)
+
+        self.metric_exp_headers = self.ttk.Frame(metric_exp_container)
+        self.metric_exp_headers.pack(fill="x", padx=4, pady=(2, 0))
+        self.ttk.Label(self.metric_exp_headers, text="id", width=18).pack(side="left")
+        self.ttk.Label(self.metric_exp_headers, text="family", width=14).pack(side="left")
+        self.ttk.Label(self.metric_exp_headers, text="alphas", width=20).pack(side="left")
+        self.ttk.Label(self.metric_exp_headers, text="grad w", width=10).pack(side="left")
+        self.ttk.Label(self.metric_exp_headers, text="lap w", width=10).pack(side="left")
+
+        self.metric_experiment_rows_frame = self.ttk.Frame(metric_exp_container)
+        self.metric_experiment_rows_frame.pack(fill="x", padx=4, pady=2)
+        self._toggle_metric_experiment_controls()
+
         json_frame = self.ttk.LabelFrame(self.content_frame, text="JSON Preview / Editor (Optional)")
         json_frame.pack(fill="both", expand=True, pady=6)
         self.json_text = self.tk.Text(json_frame, height=12, wrap="none")
@@ -3114,6 +4398,28 @@ class SpecGuiApp:
             self.advanced_frame.pack(fill="x", padx=4, pady=4)
         else:
             self.advanced_frame.pack_forget()
+
+    def _toggle_metric_experiment_controls(self) -> None:
+        enabled = bool(self.metric_experiments_enabled_var.get())
+        if enabled:
+            self.metric_exp_headers.pack(fill="x", padx=4, pady=(2, 0))
+            self.metric_experiment_rows_frame.pack(fill="x", padx=4, pady=2)
+            self.metric_shortlist_entry.configure(state="normal")
+            self.metric_add_row_btn.configure(state="normal")
+        else:
+            self.metric_exp_headers.pack_forget()
+            self.metric_experiment_rows_frame.pack_forget()
+            self.metric_shortlist_entry.configure(state="disabled")
+            self.metric_add_row_btn.configure(state="disabled")
+
+    def _toggle_stage_mode_controls(self) -> None:
+        stage_mode = self.stage_mode_var.get().strip().lower() or "two_stage"
+        if stage_mode == "single_stage":
+            self.stage1_fraction_entry.configure(state="disabled")
+            self.stage1_fraction_label.configure(text="Stage1 fraction (unused)")
+        else:
+            self.stage1_fraction_entry.configure(state="normal")
+            self.stage1_fraction_label.configure(text="Stage1 fraction")
 
     def _clear_dataset_rows(self) -> None:
         for row in self.dataset_rows:
@@ -3206,6 +4512,79 @@ class SpecGuiApp:
                 del self.dataset_rows[idx]
                 break
 
+    def _clear_metric_experiment_rows(self) -> None:
+        for row in self.metric_experiment_rows:
+            row["frame"].destroy()
+        self.metric_experiment_rows = []
+
+    def _add_metric_experiment_row(
+        self, initial: Optional[SpecGuiMetricExperimentRowState] = None
+    ) -> None:
+        initial_state = initial or SpecGuiMetricExperimentRowState(
+            formulation_id=f"exp_formulation_{len(self.metric_experiment_rows) + 1}"
+        )
+        row_frame = self.ttk.Frame(self.metric_experiment_rows_frame)
+        row_frame.pack(fill="x", pady=1)
+
+        id_var = self.tk.StringVar(value=initial_state.formulation_id)
+        family_var = self.tk.StringVar(value=initial_state.family)
+        alphas_var = self.tk.StringVar(value=initial_state.alphas)
+        gradient_weight_var = self.tk.StringVar(value=initial_state.gradient_weight)
+        laplacian_weight_var = self.tk.StringVar(value=initial_state.laplacian_weight)
+
+        id_entry = self.ttk.Entry(row_frame, textvariable=id_var, width=22)
+        id_entry.pack(side="left", padx=2)
+        self._register_editable(id_entry)
+        family_menu = self.ttk.OptionMenu(
+            row_frame,
+            family_var,
+            family_var.get(),
+            "ncc_gradient",
+            "ncc_laplacian",
+            "composite",
+        )
+        family_menu.pack(side="left", padx=2)
+        self._register_editable(family_menu)
+        alphas_entry = self.ttk.Entry(row_frame, textvariable=alphas_var, width=24)
+        alphas_entry.pack(side="left", padx=2)
+        self._register_editable(alphas_entry)
+        gradient_entry = self.ttk.Entry(row_frame, textvariable=gradient_weight_var, width=10)
+        gradient_entry.pack(side="left", padx=2)
+        self._register_editable(gradient_entry)
+        laplacian_entry = self.ttk.Entry(row_frame, textvariable=laplacian_weight_var, width=10)
+        laplacian_entry.pack(side="left", padx=2)
+        self._register_editable(laplacian_entry)
+        remove_btn = self.ttk.Button(
+            row_frame,
+            text="Remove",
+            command=lambda frame=row_frame: self._remove_metric_experiment_row(frame),
+        )
+        remove_btn.pack(side="left", padx=4)
+        self._register_editable(remove_btn)
+
+        self.metric_experiment_rows.append(
+            {
+                "frame": row_frame,
+                "id_var": id_var,
+                "family_var": family_var,
+                "alphas_var": alphas_var,
+                "gradient_weight_var": gradient_weight_var,
+                "laplacian_weight_var": laplacian_weight_var,
+            }
+        )
+
+    def _remove_metric_experiment_row(self, frame: Any) -> None:
+        if len(self.metric_experiment_rows) <= 1:
+            self.messagebox.showwarning(
+                "Metric Experiments", "At least one formulation row is required."
+            )
+            return
+        for idx, row in enumerate(self.metric_experiment_rows):
+            if row["frame"] == frame:
+                row["frame"].destroy()
+                del self.metric_experiment_rows[idx]
+                break
+
     def _browse_dataset_path(self, source_type_var: Any, path_var: Any) -> None:
         source_type = source_type_var.get()
         if source_type == "views":
@@ -3244,11 +4623,24 @@ class SpecGuiApp:
                 )
             )
 
+        metric_rows: List[SpecGuiMetricExperimentRowState] = []
+        for row in self.metric_experiment_rows:
+            metric_rows.append(
+                SpecGuiMetricExperimentRowState(
+                    formulation_id=row["id_var"].get().strip(),
+                    family=row["family_var"].get().strip(),
+                    alphas=row["alphas_var"].get().strip(),
+                    gradient_weight=row["gradient_weight_var"].get().strip(),
+                    laplacian_weight=row["laplacian_weight_var"].get().strip(),
+                )
+            )
+
         return SpecGuiState(
             output_dir=self.output_dir_entry.get().strip(),
             strategy_pixel=bool(self.strategy_pixel_var.get()),
             strategy_combined=bool(self.strategy_combined_var.get()),
             strategy_global=bool(self.strategy_global_var.get()),
+            stage_mode=self.stage_mode_var.get().strip(),
             total_budget_per_dataset=self.total_budget_entry.get().strip(),
             stage1_fraction=self.stage1_fraction_entry.get().strip(),
             top_k=self.top_k_entry.get().strip(),
@@ -3283,6 +4675,9 @@ class SpecGuiApp:
             runtime_penalty_weight=self.runtime_penalty_entry.get().strip(),
             robustness_lambda=self.robustness_entry.get().strip(),
             missing_dataset_penalty=self.missing_penalty_entry.get().strip(),
+            metric_experiments_enabled=bool(self.metric_experiments_enabled_var.get()),
+            metric_experiments_shortlist_top_k=self.metric_shortlist_entry.get().strip(),
+            metric_experiment_rows=metric_rows,
             datasets=datasets,
             json_preview=self.json_text.get("1.0", self.tk.END).strip(),
         )
@@ -3293,6 +4688,7 @@ class SpecGuiApp:
         self.strategy_pixel_var.set(state.strategy_pixel)
         self.strategy_combined_var.set(state.strategy_combined)
         self.strategy_global_var.set(state.strategy_global)
+        self.stage_mode_var.set(state.stage_mode)
         self.total_budget_entry.delete(0, self.tk.END)
         self.total_budget_entry.insert(0, state.total_budget_per_dataset)
         self.stage1_fraction_entry.delete(0, self.tk.END)
@@ -3303,6 +4699,9 @@ class SpecGuiApp:
         self.max_workers_entry.insert(0, state.max_workers)
         self.analyze_var.set(state.analyze)
         self.save_figures_var.set(state.save_figures)
+        self.metric_experiments_enabled_var.set(state.metric_experiments_enabled)
+        self.metric_shortlist_entry.delete(0, self.tk.END)
+        self.metric_shortlist_entry.insert(0, state.metric_experiments_shortlist_top_k)
 
         field_mapping = [
             (self.pixel_window_entry, state.pixel_similarity_window_sizes),
@@ -3341,6 +4740,13 @@ class SpecGuiApp:
         self._clear_dataset_rows()
         for dataset in state.datasets:
             self._add_dataset_row(dataset)
+        self._clear_metric_experiment_rows()
+        for metric_row in state.metric_experiment_rows:
+            self._add_metric_experiment_row(metric_row)
+        if not self.metric_experiment_rows:
+            self._add_metric_experiment_row()
+        self._toggle_stage_mode_controls()
+        self._toggle_metric_experiment_controls()
 
         self.json_text.delete("1.0", self.tk.END)
         if state.json_preview:

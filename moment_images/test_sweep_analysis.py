@@ -1,4 +1,6 @@
 import csv
+import json
+import sys
 
 import numpy as np
 import pytest
@@ -8,6 +10,7 @@ from moment_images.sweep_analysis import (
     analyze_summary_data,
     build_metric_record,
     compute_image_metrics,
+    generate_alpha_report,
     save_analysis,
 )
 
@@ -42,6 +45,9 @@ def test_build_metric_record_handles_global_and_local_metrics():
 
     assert pytest.approx(record["global_only_metrics"]["average_intensity"]) == 2.0
     assert pytest.approx(record["global_and_local_metrics"]["average_intensity"]) == 1.0
+    assert record["metric_formulation"]["family"] == config.displacement_metric_family
+    assert "displacement_field_metrics" in record
+    assert "inter_view_consistency_metrics" in record
 
 
 def test_analyze_summary_data_reports_extrema_and_means():
@@ -102,3 +108,90 @@ def test_compute_image_metrics_reports_level2_dwt_metric():
 
     assert "dwt_level2_hv_energy" in metrics
     assert metrics["dwt_level2_hv_energy"] > 0.0
+
+
+def test_generate_alpha_report_uses_fallback_metric_when_primary_missing(tmp_path):
+    summary = [
+        {
+            "run": "run_a",
+            "config": {},
+            "metric_formulation": {"id": "f1", "family": "ncc_gradient", "alpha": 0.1},
+            "global_and_local_metrics": {
+                "sum_squared_gradient": 10.0,
+            },
+            "displacement_field_metrics": {"mean_magnitude": 1.0},
+            "inter_view_consistency_metrics": {"mean_view_std": 0.2},
+        },
+        {
+            "run": "run_b",
+            "config": {},
+            "metric_formulation": {"id": "f1", "family": "ncc_gradient", "alpha": 0.9},
+            "global_and_local_metrics": {
+                "sum_squared_gradient": 20.0,
+            },
+            "displacement_field_metrics": {"mean_magnitude": 1.2},
+            "inter_view_consistency_metrics": {"mean_view_std": 0.1},
+        },
+    ]
+    (tmp_path / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    report = generate_alpha_report(
+        output_dir=tmp_path,
+        primary_metric="laplacian_variance",
+        tolerate_partial_outputs=True,
+    )
+
+    assert report["ranked_runs"][0]["run"] == "run_b"
+    assert report["ranked_runs"][0]["ranking_metric_name"] == "sum_squared_gradient"
+    assert (tmp_path / "alpha_report.json").exists()
+    assert (tmp_path / "alpha_report.csv").exists()
+
+
+def test_generate_alpha_report_tolerates_corrupt_summary_with_stage_fallback(tmp_path):
+    (tmp_path / "summary.json").write_text("{corrupt", encoding="utf-8")
+    stage_payload = {
+        "runs": [
+            {
+                "status": "ok",
+                "metric_record": {
+                    "run": "stage_run",
+                    "config": {"displacement_metric_family": "ncc_gradient", "displacement_alpha": 0.5},
+                    "global_and_local_metrics": {"laplacian_variance": 3.0},
+                    "metric_formulation": {"id": "f1", "family": "ncc_gradient", "alpha": 0.5},
+                    "displacement_field_metrics": {"mean_magnitude": 0.7},
+                    "inter_view_consistency_metrics": {"mean_view_std": 0.3},
+                },
+            }
+        ]
+    }
+    (tmp_path / "stage1_summary.json").write_text(json.dumps(stage_payload, indent=2), encoding="utf-8")
+
+    report = generate_alpha_report(output_dir=tmp_path, tolerate_partial_outputs=True)
+
+    assert report["num_runs_considered"] == 1
+    assert report["warnings"]
+
+
+def test_generate_alpha_report_is_headless_safe_without_pyplot(tmp_path, monkeypatch):
+    summary = [
+        {
+            "run": "run_a",
+            "config": {
+                "displacement_metric_family": "ncc_gradient",
+                "displacement_alpha": 0.5,
+                "metric_formulation_id": "grad_half",
+            },
+            "metric_formulation": {"id": "grad_half", "family": "ncc_gradient", "alpha": 0.5},
+            "global_and_local_metrics": {"laplacian_variance": 10.0},
+            "displacement_field_metrics": {"mean_magnitude": 1.0},
+            "inter_view_consistency_metrics": {"mean_view_std": 0.2},
+        }
+    ]
+    (tmp_path / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "matplotlib.pyplot", None)
+
+    report = generate_alpha_report(output_dir=tmp_path, primary_metric="laplacian_variance")
+
+    assert report["num_runs_considered"] == 1
+    assert (tmp_path / "alpha_report_primary_vs_alpha.png").exists()
+    assert (tmp_path / "alpha_report_displacement_vs_alpha.png").exists()

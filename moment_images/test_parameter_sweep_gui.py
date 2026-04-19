@@ -6,6 +6,7 @@ import pytest
 
 from moment_images.parameter_sweep import (
     SpecGuiDatasetState,
+    SpecGuiMetricExperimentRowState,
     SpecGuiState,
     _load_spec_payload,
     _save_spec_payload,
@@ -42,9 +43,58 @@ def test_state_to_spec_and_back_roundtrip(tmp_path):
     assert roundtrip.strategy_pixel is True
     assert roundtrip.strategy_combined is True
     assert roundtrip.strategy_global is True
+    assert roundtrip.stage_mode == "two_stage"
     assert roundtrip.pixel_similarity_window_sizes == "11,21"
     assert roundtrip.combined_global_thresholds == "0.1,0.2"
     assert roundtrip.datasets[0].dataset_id == "dataset_a"
+    assert roundtrip.metric_experiments_enabled is False
+
+
+def test_state_to_spec_roundtrip_supports_single_stage_mode(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.stage_mode = "single_stage"
+    state.stage1_fraction = "not-a-number"
+
+    issues = validate_state(state)
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    assert not any("Stage1 fraction" in issue for issue in issues)
+    assert payload["stages"]["mode"] == "single_stage"
+    assert payload["stages"]["stage1_fraction"] == 0.6
+    assert roundtrip.stage_mode == "single_stage"
+
+
+def test_state_to_spec_roundtrip_with_metric_experiments(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.metric_experiments_enabled = True
+    state.metric_experiments_shortlist_top_k = "3"
+    state.metric_experiment_rows = [
+        SpecGuiMetricExperimentRowState(
+            formulation_id="grad_alpha",
+            family="ncc_gradient",
+            alphas="0.0,0.5,1.0",
+        ),
+        SpecGuiMetricExperimentRowState(
+            formulation_id="comp_alpha",
+            family="composite",
+            alphas="0.25,0.75",
+            gradient_weight="0.7",
+            laplacian_weight="0.3",
+        ),
+    ]
+
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    experimental = payload["experimental_metric_sweep"]
+    assert experimental["enabled"] is True
+    assert experimental["shortlist_top_k"] == 3
+    assert len(experimental["formulations"]) == 2
+    assert roundtrip.metric_experiments_enabled is True
+    assert roundtrip.metric_experiments_shortlist_top_k == "3"
+    assert len(roundtrip.metric_experiment_rows) == 2
+    assert roundtrip.metric_experiment_rows[1].family == "composite"
 
 
 def test_validate_state_reports_duplicate_and_missing_fields(tmp_path):
@@ -71,6 +121,32 @@ def test_validate_state_reports_duplicate_and_missing_fields(tmp_path):
     assert any("source path is required" in issue for issue in issues)
     assert any("center_x is required" in issue for issue in issues)
     assert any("view_radius is required" in issue for issue in issues)
+
+
+def test_validate_state_experimental_metrics_rules(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.strategy_pixel = False
+    state.strategy_combined = False
+    state.strategy_global = True
+    state.metric_experiments_enabled = True
+    state.metric_experiments_shortlist_top_k = "0"
+    state.metric_experiment_rows = [
+        SpecGuiMetricExperimentRowState(
+            formulation_id="",
+            family="composite",
+            alphas="1.2",
+            gradient_weight="-1",
+            laplacian_weight="0",
+        )
+    ]
+
+    issues = validate_state(state)
+
+    assert any("pixel/combined strategy" in issue for issue in issues)
+    assert any("shortlist top-k" in issue for issue in issues)
+    assert any("id is required" in issue for issue in issues)
+    assert any("alphas" in issue and "[0, 1]" in issue for issue in issues)
+    assert any("non-negative" in issue for issue in issues)
 
 
 def test_state_to_spec_maps_advanced_search_controls(tmp_path):
@@ -107,6 +183,35 @@ def test_save_and_load_spec_payload(tmp_path):
     _save_spec_payload(path, payload)
     loaded = _load_spec_payload(path)
     assert loaded == payload
+
+
+def test_spec_dict_to_state_supports_legacy_metric_formulations(tmp_path):
+    payload = {
+        "output_dir": str(tmp_path / "out"),
+        "strategies": ["pixel"],
+        "datasets": [{"id": "dataset_a", "views": "x.npy"}],
+        "search_spaces": {
+            "pixel": {
+                "similarity_window_sizes": [15],
+                "max_displacements": [5],
+                "gauss_sigmas": [3.0],
+                "disp_gauss_sigmas": [0.0],
+                "pixel_thresholds": [0.05],
+                "sub_pix_factors": [1],
+                "pixel_sigma_pyramid": [False],
+                "zero_fill_roll": [True],
+            }
+        },
+        "metric_formulations": [
+            {"id": "legacy_grad", "family": "ncc_gradient", "alphas": [0.5]}
+        ],
+    }
+
+    state = spec_dict_to_state(payload)
+
+    assert state.metric_experiments_enabled is True
+    assert len(state.metric_experiment_rows) == 1
+    assert state.metric_experiment_rows[0].formulation_id == "legacy_grad"
 
 
 def _can_create_tk():

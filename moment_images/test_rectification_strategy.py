@@ -89,6 +89,12 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
         self.assertIsInstance(result, PixelwiseSimilarityResult)
         self.assertEqual(result.coordinates.shape, (2, 2, 1, 1, 2))
         self.assertEqual(result.scores.shape, (2, 2, 1, 1))
+        self.assertEqual(result.metric_family, "intensity")
+        self.assertEqual(result.alpha, 1.0)
+        self.assertIsNone(result.blended_score_maps)
+        self.assertIsNone(result.component_score_maps)
+        self.assertIsNone(result.component_score_maps_raw)
+        self.assertIsNone(result.view_score_summary)
 
     def test_rectify_uses_backward_mapping(self) -> None:
         views = np.zeros((2, 2, 3, 3), dtype=np.float32)
@@ -163,6 +169,116 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
             )
             # 4 -> 2 -> 1
             self.assertEqual(mock_compute.call_count, 3)
+
+    def test_blend_normalized_components_respects_alpha_semantics(self) -> None:
+        intensity = np.array([[[[0.9, 0.1]]]], dtype=np.float32)
+        gradient = np.array([[[[0.2, 0.8]]]], dtype=np.float32)
+        stacks = {"intensity": intensity, "gradient": gradient}
+
+        blended_intensity_only = self.strategy._blend_normalized_components(
+            component_stacks_norm=stacks,
+            alpha=1.0,
+            normalized_component_weights={"gradient": 1.0},
+        )
+        blended_secondary_only = self.strategy._blend_normalized_components(
+            component_stacks_norm=stacks,
+            alpha=0.0,
+            normalized_component_weights={"gradient": 1.0},
+        )
+
+        np.testing.assert_allclose(blended_intensity_only, intensity)
+        np.testing.assert_allclose(blended_secondary_only, gradient)
+
+    def test_composite_requires_non_intensity_mass_when_alpha_below_one(self) -> None:
+        with self.assertRaises(ValueError):
+            self.strategy._resolve_non_intensity_component_weights(
+                metric_family="composite",
+                component_weights=None,
+                alpha=0.5,
+            )
+
+    def test_composite_weights_are_normalized(self) -> None:
+        raw, normalized = self.strategy._resolve_non_intensity_component_weights(
+            metric_family="composite",
+            component_weights={"gradient": 2.0, "laplacian": 6.0},
+            alpha=0.2,
+        )
+        self.assertEqual(raw["gradient"], 2.0)
+        self.assertEqual(raw["laplacian"], 6.0)
+        self.assertAlmostEqual(sum(normalized.values()), 1.0)
+        self.assertAlmostEqual(normalized["gradient"], 0.25)
+        self.assertAlmostEqual(normalized["laplacian"], 0.75)
+
+    def test_intensity_family_has_no_non_intensity_weights(self) -> None:
+        raw, normalized = self.strategy._resolve_non_intensity_component_weights(
+            metric_family="intensity",
+            component_weights={"gradient": 2.0},
+            alpha=1.0,
+        )
+
+        self.assertEqual(raw, {})
+        self.assertEqual(normalized, {})
+
+    def test_metric_mode_populates_component_diagnostics_when_requested(self) -> None:
+        views = np.array(
+            [
+                [
+                    [[0.0, 1.0], [2.0, 3.0]],
+                    [[1.0, 2.0], [3.0, 4.0]],
+                ],
+                [
+                    [[2.0, 3.0], [4.0, 5.0]],
+                    [[3.0, 4.0], [5.0, 6.0]],
+                ],
+            ],
+            dtype=np.float32,
+        )
+
+        result = self.strategy.compute_similarity_matrices(
+            views,
+            (0, 0),
+            max_disp=0,
+            sub_pix_factor=1,
+            metric_family="ncc_gradient",
+            alpha=0.5,
+        )
+
+        self.assertEqual(result.metric_family, "ncc_gradient")
+        self.assertEqual(result.alpha, 0.5)
+        self.assertIsNotNone(result.blended_score_maps)
+        self.assertIsNotNone(result.component_score_maps)
+        self.assertIn("gradient", result.component_score_maps or {})
+        self.assertIsNotNone(result.view_score_summary)
+
+    def test_alpha_one_metric_family_skips_metric_diagnostics(self) -> None:
+        views = np.array(
+            [
+                [
+                    [[0.0, 1.0], [2.0, 3.0]],
+                    [[1.0, 2.0], [3.0, 4.0]],
+                ],
+                [
+                    [[2.0, 3.0], [4.0, 5.0]],
+                    [[3.0, 4.0], [5.0, 6.0]],
+                ],
+            ],
+            dtype=np.float32,
+        )
+
+        result = self.strategy.compute_similarity_matrices(
+            views,
+            (0, 0),
+            max_disp=0,
+            sub_pix_factor=1,
+            metric_family="ncc_gradient",
+            alpha=1.0,
+        )
+
+        self.assertEqual(result.metric_family, "ncc_gradient")
+        self.assertEqual(result.alpha, 1.0)
+        self.assertIsNone(result.blended_score_maps)
+        self.assertIsNone(result.component_score_maps)
+        self.assertIsNone(result.view_score_summary)
 
 
 if __name__ == "__main__":

@@ -94,6 +94,7 @@
     }
   },
   "stages": {
+    "mode": "two_stage",
     "total_budget_per_dataset": 320,
     "stage1_fraction": 0.6,
     "top_k": 8,
@@ -109,6 +110,36 @@
     "runtime_penalty_weight": 0.0,
     "robustness_lambda": 0.5,
     "missing_dataset_penalty": 1.0
+  },
+  "experimental_metric_sweep": {
+    "enabled": false,
+    "shortlist_top_k": 4,
+    "formulations": [
+      {
+        "id": "ncc_grad_alpha_sweep",
+        "family": "ncc_gradient",
+        "alphas": [0.0, 0.25, 0.5, 0.75, 1.0]
+      },
+      {
+        "id": "ncc_lap_alpha_sweep",
+        "family": "ncc_laplacian",
+        "alphas": [0.25, 0.5, 0.75]
+      },
+      {
+        "id": "composite_grad_lap",
+        "family": "composite",
+        "alphas": [0.3, 0.7],
+        "component_weights": {
+          "gradient": 0.7,
+          "laplacian": 0.3
+        }
+      }
+    ]
+  },
+  "reporting": {
+    "primary_metric": "laplacian_variance",
+    "tolerate_partial_outputs": true,
+    "generate_alpha_report": true
   },
   "save_figures": false,
   "analyze": true
