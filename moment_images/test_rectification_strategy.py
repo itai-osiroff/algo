@@ -4,6 +4,8 @@ from unittest import mock
 import numpy as np
 
 from moment_images.rectification_strategy import (
+    BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
+    BLURRED_GRADIENT_CORR_METRIC_FAMILY,
     GlobalTranslationRectificationStrategy,
     PixelwisePatchRectificationStrategy,
     PixelwiseSimilarityResult,
@@ -192,14 +194,14 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
     def test_composite_requires_non_intensity_mass_when_alpha_below_one(self) -> None:
         with self.assertRaises(ValueError):
             self.strategy._resolve_non_intensity_component_weights(
-                metric_family="composite",
+                metric_family=BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
                 component_weights=None,
                 alpha=0.5,
             )
 
     def test_composite_weights_are_normalized(self) -> None:
         raw, normalized = self.strategy._resolve_non_intensity_component_weights(
-            metric_family="composite",
+            metric_family=BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
             component_weights={"gradient": 2.0, "laplacian": 6.0},
             alpha=0.2,
         )
@@ -243,7 +245,7 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
             alpha=0.5,
         )
 
-        self.assertEqual(result.metric_family, "ncc_gradient")
+        self.assertEqual(result.metric_family, BLURRED_GRADIENT_CORR_METRIC_FAMILY)
         self.assertEqual(result.alpha, 0.5)
         self.assertIsNotNone(result.blended_score_maps)
         self.assertIsNotNone(result.component_score_maps)
@@ -274,7 +276,7 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
             alpha=1.0,
         )
 
-        self.assertEqual(result.metric_family, "ncc_gradient")
+        self.assertEqual(result.metric_family, BLURRED_GRADIENT_CORR_METRIC_FAMILY)
         self.assertEqual(result.alpha, 1.0)
         self.assertIsNone(result.blended_score_maps)
         self.assertIsNone(result.component_score_maps)

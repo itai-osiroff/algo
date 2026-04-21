@@ -18,6 +18,7 @@ if __package__ is None or __package__ == "":
     from rectification_strategy import (
         GlobalTranslationRectificationStrategy,
         PixelwisePatchRectificationStrategy,
+        normalize_displacement_metric_family,
         resolve_reference_view,
     )
     from reliable_io import write_npz_atomic
@@ -26,6 +27,7 @@ else:
     from .rectification_strategy import (
         GlobalTranslationRectificationStrategy,
         PixelwisePatchRectificationStrategy,
+        normalize_displacement_metric_family,
         resolve_reference_view,
     )
     from .reliable_io import write_npz_atomic
@@ -52,6 +54,10 @@ class RectificationRunConfig:
     that external scripts can inject deterministic values when sweeping
     parameters. Set ``hdr_enabled`` to ``True`` and provide a stack of exposures
     shaped ``(E, N, N, H, W)`` to assemble HDR output after rectification.
+    ``displacement_metric_family`` and ``displacement_alpha`` control how local
+    pixelwise displacement candidates are ranked; ``alpha`` is the local
+    displacement score blend weight between the intensity term and any selected
+    auxiliary blurred-correlation components.
     """
 
     strategy: str = "pixel"
@@ -85,13 +91,9 @@ class RectificationRunConfig:
             raise ValueError("displacement_alpha must be between 0 and 1.")
         self.displacement_alpha = alpha
 
-        family = str(self.displacement_metric_family).strip().lower()
-        if family not in {"intensity", "ncc_gradient", "ncc_laplacian", "composite"}:
-            raise ValueError(
-                "displacement_metric_family must be one of "
-                "'intensity', 'ncc_gradient', 'ncc_laplacian', or 'composite'."
-            )
-        self.displacement_metric_family = family
+        self.displacement_metric_family = normalize_displacement_metric_family(
+            self.displacement_metric_family
+        )
 
         if self.displacement_component_weights is not None:
             normalized_weights: Dict[str, float] = {}

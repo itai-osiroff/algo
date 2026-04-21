@@ -10,6 +10,10 @@ import cv2 as cv
 import numpy as np
 
 from moment_images.im_process import RectificationRunConfig, RectificationResult
+from moment_images.rectification_strategy import (
+    DEFAULT_DISPLACEMENT_METRIC_FAMILY,
+    normalize_optional_displacement_metric_family,
+)
 from moment_images.reliable_io import (
     read_json_first_valid,
     write_csv_atomic,
@@ -134,7 +138,13 @@ def _extract_displacement_score_diagnostics(result: RectificationResult) -> Opti
         return None
 
     diagnostics: Dict[str, object] = {
-        "metric_family": str(getattr(similarity, "metric_family", "intensity")),
+        "metric_family": (
+            normalize_optional_displacement_metric_family(
+                getattr(similarity, "metric_family", DEFAULT_DISPLACEMENT_METRIC_FAMILY),
+                allow_unknown=True,
+            )
+            or DEFAULT_DISPLACEMENT_METRIC_FAMILY
+        ),
         "alpha": float(getattr(similarity, "alpha", 1.0)),
         "component_weights_raw": getattr(similarity, "component_weights_raw", None),
         "component_weights_normalized": getattr(similarity, "component_weights_normalized", None),
@@ -411,7 +421,7 @@ def _save_alpha_report_plots(
             continue
         ax.plot(xs, ys, marker="o", label=family)
         has_lines = True
-    ax.set_xlabel("alpha (intensity weight)")
+    ax.set_xlabel("alpha (local displacement score blend weight)")
     ax.set_ylabel(metric_key)
     ax.set_title("Primary Metric vs Alpha by Metric Family")
     ax.grid(True, linestyle=":", alpha=0.5)
@@ -435,7 +445,7 @@ def _save_alpha_report_plots(
             continue
         ax2.plot(xs, ys, marker="o", label=family)
         has_lines = True
-    ax2.set_xlabel("alpha (intensity weight)")
+    ax2.set_xlabel("alpha (local displacement score blend weight)")
     ax2.set_ylabel("mean displacement magnitude")
     ax2.set_title("Displacement Magnitude vs Alpha by Metric Family")
     ax2.grid(True, linestyle=":", alpha=0.5)
@@ -480,10 +490,16 @@ def generate_alpha_report(
 
         formulation = cast(Dict[str, object], record.get("metric_formulation", {}))
         config = cast(Dict[str, object], record.get("config", {}))
-        family = str(
-            formulation.get("family")
-            or config.get("displacement_metric_family")
-            or "intensity"
+        family = (
+            normalize_optional_displacement_metric_family(
+                formulation.get("family"),
+                allow_unknown=True,
+            )
+            or normalize_optional_displacement_metric_family(
+                config.get("displacement_metric_family"),
+                allow_unknown=True,
+            )
+            or DEFAULT_DISPLACEMENT_METRIC_FAMILY
         )
         alpha = float(
             formulation.get("alpha")

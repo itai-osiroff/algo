@@ -24,12 +24,60 @@ from scipy.ndimage import gaussian_filter
 DEFAULT_CORRELATION_PAD_WIDTH = int(125 * 0.45)
 DEFAULT_DISPLACEMENT_METRIC_FAMILY = "intensity"
 DEFAULT_DISPLACEMENT_ALPHA = 1.0
+BLURRED_GRADIENT_CORR_METRIC_FAMILY = "blurred_gradient_corr"
+BLURRED_LAPLACIAN_CORR_METRIC_FAMILY = "blurred_laplacian_corr"
+BLURRED_COMPOSITE_CORR_METRIC_FAMILY = "blurred_composite_corr"
+LEGACY_DISPLACEMENT_METRIC_FAMILY_ALIASES = {
+    "ncc_gradient": BLURRED_GRADIENT_CORR_METRIC_FAMILY,
+    "ncc_laplacian": BLURRED_LAPLACIAN_CORR_METRIC_FAMILY,
+    "composite": BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
+}
 SUPPORTED_DISPLACEMENT_METRIC_FAMILIES = {
     "intensity",
-    "ncc_gradient",
-    "ncc_laplacian",
-    "composite",
+    BLURRED_GRADIENT_CORR_METRIC_FAMILY,
+    BLURRED_LAPLACIAN_CORR_METRIC_FAMILY,
+    BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
 }
+
+
+def normalize_displacement_metric_family(
+    metric_family: object | None,
+    *,
+    default: str = DEFAULT_DISPLACEMENT_METRIC_FAMILY,
+    allow_unknown: bool = False,
+) -> str:
+    """Return the canonical family name for local displacement score blending."""
+
+    family = default if metric_family is None else str(metric_family).strip().lower()
+    canonical_family = LEGACY_DISPLACEMENT_METRIC_FAMILY_ALIASES.get(family, family)
+    if canonical_family not in SUPPORTED_DISPLACEMENT_METRIC_FAMILIES:
+        if allow_unknown:
+            return canonical_family
+        raise ValueError(
+            "metric family must be one of "
+            "'intensity', 'blurred_gradient_corr', 'blurred_laplacian_corr', "
+            "or 'blurred_composite_corr'. Legacy aliases "
+            "'ncc_gradient', 'ncc_laplacian', and 'composite' are also accepted."
+        )
+    return canonical_family
+
+
+def normalize_optional_displacement_metric_family(
+    metric_family: object | None,
+    *,
+    allow_unknown: bool = False,
+) -> Optional[str]:
+    """Normalize a possibly-missing family value for artifact loading paths."""
+
+    if metric_family is None:
+        return None
+    family = str(metric_family).strip()
+    if not family:
+        return None
+    return normalize_displacement_metric_family(
+        family,
+        allow_unknown=allow_unknown,
+    )
 
 
 def _normalize_component_stack(component_stack: np.ndarray) -> np.ndarray:
@@ -349,17 +397,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
     @staticmethod
     def _resolve_metric_family(metric_family: Optional[str]) -> str:
-        family = (
-            DEFAULT_DISPLACEMENT_METRIC_FAMILY
-            if metric_family is None
-            else str(metric_family).strip().lower()
-        )
-        if family not in SUPPORTED_DISPLACEMENT_METRIC_FAMILIES:
-            raise ValueError(
-                "metric_family must be one of "
-                "'intensity', 'ncc_gradient', 'ncc_laplacian', or 'composite'."
-            )
-        return family
+        return normalize_displacement_metric_family(metric_family)
 
     @staticmethod
     def _resolve_non_intensity_component_weights(
@@ -371,9 +409,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
 
         if metric_family == "intensity":
             return {}, {}
-        if metric_family == "ncc_gradient":
+        if metric_family == BLURRED_GRADIENT_CORR_METRIC_FAMILY:
             return {"gradient": 1.0}, {"gradient": 1.0}
-        if metric_family == "ncc_laplacian":
+        if metric_family == BLURRED_LAPLACIAN_CORR_METRIC_FAMILY:
             return {"laplacian": 1.0}, {"laplacian": 1.0}
 
         parsed: Dict[str, float] = {}
@@ -395,7 +433,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         weight_mass = float(sum(parsed.values()))
         if alpha < 1.0 and weight_mass <= 0.0:
             raise ValueError(
-                "Composite metric requires positive non-intensity component "
+                "Blurred composite correlation metric requires positive non-intensity component "
                 "weights when displacement_alpha < 1."
             )
         if weight_mass <= 0.0:
@@ -442,12 +480,14 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         component_weights: Optional[Dict[str, float]] = None,
     ) -> PixelwiseSimilarityResult:
         """
-        Perform per-pixel patch correlation between each view and the reference.
+        Perform per-pixel patch matching between each view and the reference.
 
         For every non-reference view, the function rolls the image across a
-        displacement grid and computes Gaussian-filtered correlation scores
-        against the (optionally thresholded) reference. The best displacement
-        per pixel is recorded along with raw scores and derived flow fields.
+        displacement grid and computes Gaussian-smoothed product scores against
+        the (optionally thresholded) reference. The best displacement per pixel
+        is recorded along with raw score maps and derived flow fields. These
+        families are blurred correlation-like ranking metrics; they do not
+        implement true local NCC/ZNCC normalization.
 
         Args:
             views: Square grid of grayscale patches with shape ``(N, N, H, W)``.
@@ -466,9 +506,12 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             sub_pix_factor: Upsampling factor for sub-pixel displacement
                 searches. ``1`` keeps full-pixel shifts, ``2`` enables half-pixel
                 shifts, and so on.
+            alpha: Blend weight for local displacement-score ranking. ``alpha``
+                controls the relative importance of the intensity score versus
+                the selected auxiliary blurred-correlation component(s).
 
         Returns:
-            ``PixelwiseSimilarityResult`` containing correlation scores,
+            ``PixelwiseSimilarityResult`` containing local displacement scores,
             displacement maps, and target coordinates for each view.
         """
         if not use_sigma_pyramid:

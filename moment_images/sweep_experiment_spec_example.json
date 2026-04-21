@@ -116,18 +116,18 @@
     "shortlist_top_k": 4,
     "formulations": [
       {
-        "id": "ncc_grad_alpha_sweep",
-        "family": "ncc_gradient",
+        "id": "blurred_grad_corr_alpha_sweep",
+        "family": "blurred_gradient_corr",
         "alphas": [0.0, 0.25, 0.5, 0.75, 1.0]
       },
       {
-        "id": "ncc_lap_alpha_sweep",
-        "family": "ncc_laplacian",
+        "id": "blurred_lap_corr_alpha_sweep",
+        "family": "blurred_laplacian_corr",
         "alphas": [0.25, 0.5, 0.75]
       },
       {
-        "id": "composite_grad_lap",
-        "family": "composite",
+        "id": "blurred_composite_grad_lap",
+        "family": "blurred_composite_corr",
         "alphas": [0.3, 0.7],
         "component_weights": {
           "gradient": 0.7,

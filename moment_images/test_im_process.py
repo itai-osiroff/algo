@@ -41,3 +41,13 @@ def test_rectification_run_config_normalizes_intensity_mode_overrides():
     assert config.displacement_metric_family == "intensity"
     assert config.displacement_alpha == 1.0
     assert config.displacement_component_weights is None
+
+
+def test_rectification_run_config_canonicalizes_legacy_metric_family_alias():
+    config = RectificationRunConfig(
+        displacement_metric_family="ncc_gradient",
+        displacement_alpha=0.25,
+    )
+
+    assert config.displacement_metric_family == "blurred_gradient_corr"
+    assert config.displacement_alpha == 0.25

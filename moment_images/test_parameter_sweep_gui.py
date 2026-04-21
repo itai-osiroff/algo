@@ -91,10 +91,13 @@ def test_state_to_spec_roundtrip_with_metric_experiments(tmp_path):
     assert experimental["enabled"] is True
     assert experimental["shortlist_top_k"] == 3
     assert len(experimental["formulations"]) == 2
+    assert experimental["formulations"][0]["family"] == "blurred_gradient_corr"
+    assert experimental["formulations"][1]["family"] == "blurred_composite_corr"
     assert roundtrip.metric_experiments_enabled is True
     assert roundtrip.metric_experiments_shortlist_top_k == "3"
     assert len(roundtrip.metric_experiment_rows) == 2
-    assert roundtrip.metric_experiment_rows[1].family == "composite"
+    assert roundtrip.metric_experiment_rows[0].family == "blurred_gradient_corr"
+    assert roundtrip.metric_experiment_rows[1].family == "blurred_composite_corr"
 
 
 def test_validate_state_reports_duplicate_and_missing_fields(tmp_path):
@@ -212,6 +215,7 @@ def test_spec_dict_to_state_supports_legacy_metric_formulations(tmp_path):
     assert state.metric_experiments_enabled is True
     assert len(state.metric_experiment_rows) == 1
     assert state.metric_experiment_rows[0].formulation_id == "legacy_grad"
+    assert state.metric_experiment_rows[0].family == "blurred_gradient_corr"
 
 
 def _can_create_tk():

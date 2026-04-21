@@ -671,7 +671,7 @@ def test_metric_formulations_expand_candidates_with_alpha_dimension():
     assert len(expanded) == 4
     families = {candidate.config.displacement_metric_family for candidate in expanded}
     alphas = {candidate.config.displacement_alpha for candidate in expanded}
-    assert families == {"ncc_gradient", "ncc_laplacian"}
+    assert families == {"blurred_gradient_corr", "blurred_laplacian_corr"}
     assert alphas == {0.0, 0.5, 1.0}
 
 
@@ -702,6 +702,7 @@ def test_spec_from_dict_maps_legacy_metric_formulations_to_experimental_lane():
     assert spec.experimental_metric_sweep.enabled is True
     assert len(spec.experimental_metric_sweep.formulations) == 1
     assert spec.experimental_metric_sweep.formulations[0].formulation_id == "legacy_grad"
+    assert spec.experimental_metric_sweep.formulations[0].family == "blurred_gradient_corr"
 
 
 def test_spec_from_dict_supports_single_stage_mode_and_defaults_to_two_stage():
@@ -1044,6 +1045,9 @@ def test_run_sweep_experiment_with_metric_phase_outputs(tmp_path):
     ]
     formulation_ids = {payload["metric_formulation_id"] for payload in config_payloads}
     assert {"exp_grad", "exp_lap"}.issubset(formulation_ids)
+    assert {
+        payload["displacement_metric_family"] for payload in config_payloads
+    } == {"blurred_gradient_corr", "blurred_laplacian_corr"}
 
 
 def test_run_sweep_resume_recomputes_corrupt_metric_phase_artifact(tmp_path):

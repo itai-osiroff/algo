@@ -248,9 +248,9 @@ Baseline stage-1/stage-2 candidates run in **pure intensity mode** by default (`
 Each formulation defines:
 
 - `id`: stable formulation identifier for reporting and traceability.
-- `family`: `ncc_gradient`, `ncc_laplacian`, or `composite`.
+- `family`: `blurred_gradient_corr`, `blurred_laplacian_corr`, or `blurred_composite_corr`.
 - `alphas`: one or more alpha values to evaluate.
-- `component_weights` (composite only): non-intensity component weights (validated and normalized internally).
+- `component_weights` (`blurred_composite_corr` only): non-intensity component weights (validated and normalized internally).
 
 Baseline candidate generation is the cross-product of:
 
@@ -264,20 +264,22 @@ Optional metric-experiment candidate generation is the cross-product of:
 
 This keeps the experiment narrative explicit: **global pre-alignment -> intensity-only baseline ranking -> optional metric-formulation experiments on shortlisted candidates -> reconstruction -> diagnostics/quality metrics -> side-by-side alpha/family comparison**.
 
-### Alpha semantics (pixelwise displacement score)
+### Alpha semantics (local displacement score blending)
 
-For pair families (`ncc_gradient`, `ncc_laplacian`):
+The non-intensity displacement families are **blurred-correlation** score formulations. They use Gaussian-smoothed product scores and do **not** implement true local NCC/ZNCC normalization. Legacy aliases `ncc_gradient`, `ncc_laplacian`, and `composite` are still accepted on input, but new configs and outputs use the canonical names below.
 
-- `alpha` directly weights the intensity agreement term:
+For pair families (`blurred_gradient_corr`, `blurred_laplacian_corr`):
+
+- `alpha` is the local displacement score blend weight:
   `score = alpha * I + (1 - alpha) * S`
 
-For `composite`:
+For `blurred_composite_corr`:
 
 - `W_intensity = alpha`
 - non-intensity terms are normalized to sum to 1
 - each non-intensity term gets `W_k = (1 - alpha) * normalized_k`
 
-`alpha=1` is intensity-only scoring. `alpha=0` is non-intensity-only scoring.
+`alpha=1` is intensity-only local displacement ranking. `alpha=0` is non-intensity-only local displacement ranking.
 
 ### Live plotting and figures
 
