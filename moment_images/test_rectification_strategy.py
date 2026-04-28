@@ -1,11 +1,13 @@
 import unittest
 from unittest import mock
+from typing import Tuple
 
 import numpy as np
 
 from moment_images.rectification_strategy import (
     BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
     BLURRED_GRADIENT_CORR_METRIC_FAMILY,
+    BLURRED_LAPLACIAN_CORR_METRIC_FAMILY,
     GlobalTranslationRectificationStrategy,
     PixelwisePatchRectificationStrategy,
     PixelwiseSimilarityResult,
@@ -82,6 +84,23 @@ class GlobalTranslationRectificationStrategyTests(unittest.TestCase):
 class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.strategy = PixelwisePatchRectificationStrategy(window_size=1)
+        self.metric_strategy = PixelwisePatchRectificationStrategy(window_size=5, step_size=1)
+
+    @staticmethod
+    def _make_shifted_blob_case(
+        shift_x: int = 3,
+    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], int]:
+        height = width = 21
+        yy, xx = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+        center_y = center_x = 10
+        sigma = 1.2
+        reference_view = np.exp(
+            -(((yy - center_y) ** 2) + ((xx - center_x) ** 2)) / (2 * sigma**2)
+        ).astype(np.float32)
+        shifted_view = np.exp(
+            -(((yy - center_y) ** 2) + ((xx - (center_x - shift_x)) ** 2)) / (2 * sigma**2)
+        ).astype(np.float32)
+        return shifted_view[None, None, :, :], reference_view, (center_y, center_x), shift_x
 
     def test_compute_similarity_matrix_produces_expected_shapes(self) -> None:
         views = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
@@ -192,34 +211,47 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
         np.testing.assert_allclose(blended_secondary_only, gradient)
 
     def test_composite_requires_non_intensity_mass_when_alpha_below_one(self) -> None:
+        views = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+
         with self.assertRaises(ValueError):
-            self.strategy._resolve_non_intensity_component_weights(
+            self.strategy.compute_similarity_matrices(
+                views,
+                (0, 0),
                 metric_family=BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
-                component_weights=None,
                 alpha=0.5,
             )
 
-    def test_composite_weights_are_normalized(self) -> None:
-        raw, normalized = self.strategy._resolve_non_intensity_component_weights(
-            metric_family=BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
-            component_weights={"gradient": 2.0, "laplacian": 6.0},
-            alpha=0.2,
-        )
-        self.assertEqual(raw["gradient"], 2.0)
-        self.assertEqual(raw["laplacian"], 6.0)
-        self.assertAlmostEqual(sum(normalized.values()), 1.0)
-        self.assertAlmostEqual(normalized["gradient"], 0.25)
-        self.assertAlmostEqual(normalized["laplacian"], 0.75)
+    def test_intensity_family_requires_alpha_one(self) -> None:
+        views = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
 
-    def test_intensity_family_has_no_non_intensity_weights(self) -> None:
-        raw, normalized = self.strategy._resolve_non_intensity_component_weights(
-            metric_family="intensity",
-            component_weights={"gradient": 2.0},
-            alpha=1.0,
-        )
+        with self.assertRaises(ValueError):
+            self.strategy.compute_similarity_matrices(
+                views,
+                (0, 0),
+                metric_family="intensity",
+                alpha=0.5,
+            )
 
-        self.assertEqual(raw, {})
-        self.assertEqual(normalized, {})
+    def test_pair_families_reject_component_weights(self) -> None:
+        views = np.arange(4, dtype=np.float32).reshape(1, 1, 2, 2)
+
+        with self.assertRaises(ValueError):
+            self.strategy.compute_similarity_matrices(
+                views,
+                (0, 0),
+                metric_family=BLURRED_GRADIENT_CORR_METRIC_FAMILY,
+                alpha=0.5,
+                component_weights={"gradient": 1.0},
+            )
+
+        with self.assertRaises(ValueError):
+            self.strategy.compute_similarity_matrices(
+                views,
+                (0, 0),
+                metric_family=BLURRED_LAPLACIAN_CORR_METRIC_FAMILY,
+                alpha=0.5,
+                component_weights={"laplacian": 1.0},
+            )
 
     def test_metric_mode_populates_component_diagnostics_when_requested(self) -> None:
         views = np.array(
@@ -252,6 +284,70 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
         self.assertIn("gradient", result.component_score_maps or {})
         self.assertIsNotNone(result.view_score_summary)
 
+    def test_gradient_metric_rectifies_shift_with_gradient_diagnostics(self) -> None:
+        views, reference_view, center, expected_shift_x = self._make_shifted_blob_case()
+
+        result = self.metric_strategy.compute_similarity_matrices(
+            views,
+            (0, 0),
+            max_disp=4,
+            gauss_sigma=1.0,
+            gauss_size=5,
+            normalized_conv=False,
+            sub_pix_factor=1,
+            reference_view=reference_view,
+            metric_family=BLURRED_GRADIENT_CORR_METRIC_FAMILY,
+            alpha=0.0,
+        )
+        avg_image, rectified_views = self.metric_strategy.rectify(views, result, (0, 0))
+
+        self.assertTrue(result.reference_is_external)
+        self.assertEqual(result.metric_family, BLURRED_GRADIENT_CORR_METRIC_FAMILY)
+        self.assertEqual(result.alpha, 0.0)
+        self.assertIsNotNone(result.blended_score_maps)
+        self.assertIsNotNone(result.component_score_maps)
+        self.assertIsNotNone(result.component_score_maps_raw)
+        self.assertIn("gradient", result.component_score_maps or {})
+        self.assertNotIn("laplacian", result.component_score_maps or {})
+        self.assertIn("view_0_0", result.view_score_summary or {})
+        self.assertAlmostEqual(result.disps_x[center[0], center[1], 0, 0], expected_shift_x)
+        self.assertAlmostEqual(result.disps_y[center[0], center[1], 0, 0], 0.0)
+        self.assertEqual(np.unravel_index(np.argmax(rectified_views[0, 0]), rectified_views[0, 0].shape), center)
+        self.assertAlmostEqual(rectified_views[0, 0, center[0], center[1]], 1.0, places=5)
+        self.assertAlmostEqual(avg_image[center[0], center[1]], 1.0, places=5)
+
+    def test_laplacian_metric_rectifies_shift_with_laplacian_diagnostics(self) -> None:
+        views, reference_view, center, expected_shift_x = self._make_shifted_blob_case()
+
+        result = self.metric_strategy.compute_similarity_matrices(
+            views,
+            (0, 0),
+            max_disp=4,
+            gauss_sigma=1.0,
+            gauss_size=5,
+            normalized_conv=False,
+            sub_pix_factor=1,
+            reference_view=reference_view,
+            metric_family=BLURRED_LAPLACIAN_CORR_METRIC_FAMILY,
+            alpha=0.0,
+        )
+        avg_image, rectified_views = self.metric_strategy.rectify(views, result, (0, 0))
+
+        self.assertTrue(result.reference_is_external)
+        self.assertEqual(result.metric_family, BLURRED_LAPLACIAN_CORR_METRIC_FAMILY)
+        self.assertEqual(result.alpha, 0.0)
+        self.assertIsNotNone(result.blended_score_maps)
+        self.assertIsNotNone(result.component_score_maps)
+        self.assertIsNotNone(result.component_score_maps_raw)
+        self.assertIn("laplacian", result.component_score_maps or {})
+        self.assertNotIn("gradient", result.component_score_maps or {})
+        self.assertIn("view_0_0", result.view_score_summary or {})
+        self.assertAlmostEqual(result.disps_x[center[0], center[1], 0, 0], expected_shift_x)
+        self.assertAlmostEqual(result.disps_y[center[0], center[1], 0, 0], 0.0)
+        self.assertEqual(np.unravel_index(np.argmax(rectified_views[0, 0]), rectified_views[0, 0].shape), center)
+        self.assertAlmostEqual(rectified_views[0, 0, center[0], center[1]], 1.0, places=5)
+        self.assertAlmostEqual(avg_image[center[0], center[1]], 1.0, places=5)
+
     def test_alpha_one_metric_family_skips_metric_diagnostics(self) -> None:
         views = np.array(
             [
@@ -281,6 +377,53 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
         self.assertIsNone(result.blended_score_maps)
         self.assertIsNone(result.component_score_maps)
         self.assertIsNone(result.view_score_summary)
+
+    def test_alpha_one_gradient_and_laplacian_families_match_intensity_outputs(self) -> None:
+        views, reference_view, _, _ = self._make_shifted_blob_case()
+
+        intensity_result = self.metric_strategy.compute_similarity_matrices(
+            views,
+            (0, 0),
+            max_disp=4,
+            gauss_sigma=1.0,
+            gauss_size=5,
+            normalized_conv=False,
+            sub_pix_factor=1,
+            reference_view=reference_view,
+            metric_family="intensity",
+            alpha=1.0,
+        )
+        intensity_avg, intensity_rectified = self.metric_strategy.rectify(views, intensity_result, (0, 0))
+
+        for family in (
+            BLURRED_GRADIENT_CORR_METRIC_FAMILY,
+            BLURRED_LAPLACIAN_CORR_METRIC_FAMILY,
+        ):
+            result = self.metric_strategy.compute_similarity_matrices(
+                views,
+                (0, 0),
+                max_disp=4,
+                gauss_sigma=1.0,
+                gauss_size=5,
+                normalized_conv=False,
+                sub_pix_factor=1,
+                reference_view=reference_view,
+                metric_family=family,
+                alpha=1.0,
+            )
+            avg_image, rectified_views = self.metric_strategy.rectify(views, result, (0, 0))
+
+            self.assertEqual(result.metric_family, family)
+            self.assertEqual(result.alpha, 1.0)
+            self.assertIsNone(result.blended_score_maps)
+            self.assertIsNone(result.component_score_maps)
+            self.assertIsNone(result.component_score_maps_raw)
+            self.assertIsNone(result.view_score_summary)
+            np.testing.assert_allclose(result.disps_x, intensity_result.disps_x)
+            np.testing.assert_allclose(result.disps_y, intensity_result.disps_y)
+            np.testing.assert_allclose(result.scores, intensity_result.scores)
+            np.testing.assert_allclose(avg_image, intensity_avg)
+            np.testing.assert_allclose(rectified_views, intensity_rectified)
 
 
 if __name__ == "__main__":

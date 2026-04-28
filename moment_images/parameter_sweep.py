@@ -1496,6 +1496,70 @@ def _compute_experiment_fingerprint(payload: Dict[str, object]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _normalize_fingerprint_payload_for_resume_compat(
+    payload: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    Remove machine-specific path details and volatile cache mtimes.
+
+    This keeps the strict fingerprint for normal operation, while allowing a
+    copied run directory to be adopted on another machine if the semantic spec
+    and prepared dataset identities are otherwise unchanged.
+    """
+
+    normalized = dict(payload)
+    if normalized.get("output_dir") is not None:
+        normalized["output_dir"] = "<output_dir>"
+
+    spec_payload = normalized.get("spec")
+    if isinstance(spec_payload, dict):
+        spec_snapshot = dict(spec_payload)
+        if spec_snapshot.get("output_dir") is not None:
+            spec_snapshot["output_dir"] = "<output_dir>"
+        datasets_snapshot = spec_snapshot.get("datasets")
+        if isinstance(datasets_snapshot, list):
+            normalized_datasets: List[object] = []
+            for entry in datasets_snapshot:
+                if not isinstance(entry, dict):
+                    normalized_datasets.append(entry)
+                    continue
+                dataset_entry = dict(entry)
+                for key in ("views_path", "source_image", "source_image_dir"):
+                    if dataset_entry.get(key) is not None:
+                        dataset_entry[key] = f"<{key}>"
+                normalized_datasets.append(dataset_entry)
+            spec_snapshot["datasets"] = normalized_datasets
+        normalized["spec"] = spec_snapshot
+
+    datasets_payload = normalized.get("datasets")
+    if isinstance(datasets_payload, list):
+        normalized_dataset_payload: List[object] = []
+        for entry in datasets_payload:
+            if not isinstance(entry, dict):
+                normalized_dataset_payload.append(entry)
+                continue
+            dataset_entry = dict(entry)
+            if dataset_entry.get("resolved_views_path") is not None:
+                dataset_entry["resolved_views_path"] = "<resolved_views_path>"
+            dataset_entry.pop("views_file_mtime_ns", None)
+            normalized_dataset_payload.append(dataset_entry)
+        normalized["datasets"] = normalized_dataset_payload
+
+    return normalized
+
+
+def _fingerprint_payloads_resume_compatible(
+    existing_payload_raw: object,
+    current_payload: Dict[str, object],
+) -> bool:
+    if not isinstance(existing_payload_raw, dict):
+        return False
+    existing_payload = cast(Dict[str, object], existing_payload_raw)
+    return _normalize_fingerprint_payload_for_resume_compat(
+        existing_payload
+    ) == _normalize_fingerprint_payload_for_resume_compat(current_payload)
+
+
 def _persist_run_state(state_path: Path, state: Dict[str, object]) -> None:
     state["updated_at"] = _utc_now_iso()
     write_json_atomic(state_path, state, indent=2, sort_keys=False, create_backup=True)
@@ -1515,10 +1579,23 @@ def _load_or_initialize_run_state(
         state = cast(Dict[str, object], loaded)
         existing_fingerprint = str(state.get("experiment_fingerprint", ""))
         if existing_fingerprint != fingerprint:
-            raise ValueError(
-                "Output directory contains run_state.json with a different experiment "
-                "fingerprint. Refusing to resume with mismatched spec/dataset/path."
-            )
+            if _fingerprint_payloads_resume_compatible(
+                state.get("fingerprint_payload"),
+                fingerprint_payload,
+            ):
+                state["experiment_fingerprint"] = fingerprint
+                state["fingerprint_payload"] = fingerprint_payload
+                path_compatibility = cast(
+                    Dict[str, object],
+                    state.setdefault("path_compatibility", {}),
+                )
+                path_compatibility["output_dir"] = str(output_dir.resolve())
+                _persist_run_state(state_path, state)
+            else:
+                raise ValueError(
+                    "Output directory contains run_state.json with a different experiment "
+                    "fingerprint. Refusing to resume with mismatched spec/dataset/path."
+                )
         existing_output_dir = str(cast(Dict[str, object], state.get("path_compatibility", {})).get("output_dir", ""))
         current_output_dir = str(output_dir.resolve())
         if existing_output_dir and existing_output_dir != current_output_dir:

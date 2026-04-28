@@ -16,18 +16,20 @@ if __package__ is None or __package__ == "":
     # Running as a script: make local package modules importable
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
     from rectification_strategy import (
+        BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         GlobalTranslationRectificationStrategy,
         PixelwisePatchRectificationStrategy,
-        normalize_displacement_metric_family,
+        resolve_displacement_metric_spec,
         resolve_reference_view,
     )
     from reliable_io import write_npz_atomic
 else:
     # Imported as a module within the package
     from .rectification_strategy import (
+        BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         GlobalTranslationRectificationStrategy,
         PixelwisePatchRectificationStrategy,
-        normalize_displacement_metric_family,
+        resolve_displacement_metric_spec,
         resolve_reference_view,
     )
     from .reliable_io import write_npz_atomic
@@ -84,30 +86,20 @@ class RectificationRunConfig:
     normalize_to_8bit: bool = False
 
     def __post_init__(self) -> None:
-        alpha = float(self.displacement_alpha)
-        if not np.isfinite(alpha):
-            raise ValueError("displacement_alpha must be finite.")
-        if alpha < 0.0 or alpha > 1.0:
-            raise ValueError("displacement_alpha must be between 0 and 1.")
-        self.displacement_alpha = alpha
-
-        self.displacement_metric_family = normalize_displacement_metric_family(
-            self.displacement_metric_family
+        metric_spec = resolve_displacement_metric_spec(
+            self.displacement_metric_family,
+            alpha=self.displacement_alpha,
+            component_weights=self.displacement_component_weights,
         )
-
-        if self.displacement_component_weights is not None:
-            normalized_weights: Dict[str, float] = {}
-            for key, raw_value in self.displacement_component_weights.items():
-                parsed = float(raw_value)
-                if not np.isfinite(parsed):
-                    raise ValueError("displacement_component_weights values must be finite.")
-                if parsed < 0.0:
-                    raise ValueError("displacement_component_weights values must be non-negative.")
-                normalized_weights[str(key)] = parsed
-            self.displacement_component_weights = normalized_weights
-
-        if self.displacement_metric_family == "intensity":
-            self.displacement_alpha = 1.0
+        self.displacement_metric_family = metric_spec.family
+        self.displacement_alpha = metric_spec.alpha
+        if metric_spec.family == BLURRED_COMPOSITE_CORR_METRIC_FAMILY:
+            self.displacement_component_weights = (
+                dict(metric_spec.raw_component_weights)
+                if metric_spec.raw_component_weights
+                else None
+            )
+        else:
             self.displacement_component_weights = None
 
         formulation_id = str(self.metric_formulation_id).strip()

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from moment_images.im_process import RectificationRunConfig, save_workspace_variables
 
@@ -31,23 +32,65 @@ def test_rectification_run_config_defaults_to_intensity_mode():
     assert config.metric_formulation_id == "intensity_default"
 
 
-def test_rectification_run_config_normalizes_intensity_mode_overrides():
-    config = RectificationRunConfig(
-        displacement_metric_family="intensity",
-        displacement_alpha=0.25,
-        displacement_component_weights={"gradient": 1.0},
-    )
+def test_rectification_run_config_rejects_non_default_intensity_settings():
+    with pytest.raises(ValueError, match="requires alpha=1.0"):
+        RectificationRunConfig(
+            displacement_metric_family="intensity",
+            displacement_alpha=0.25,
+        )
 
-    assert config.displacement_metric_family == "intensity"
-    assert config.displacement_alpha == 1.0
-    assert config.displacement_component_weights is None
+    with pytest.raises(ValueError, match="does not accept component_weights"):
+        RectificationRunConfig(
+            displacement_metric_family="intensity",
+            displacement_component_weights={"gradient": 1.0},
+        )
 
 
-def test_rectification_run_config_canonicalizes_legacy_metric_family_alias():
-    config = RectificationRunConfig(
+def test_rectification_run_config_canonicalizes_legacy_metric_family_aliases():
+    gradient_config = RectificationRunConfig(
         displacement_metric_family="ncc_gradient",
         displacement_alpha=0.25,
     )
+    laplacian_config = RectificationRunConfig(
+        displacement_metric_family="ncc_laplacian",
+        displacement_alpha=0.25,
+    )
 
-    assert config.displacement_metric_family == "blurred_gradient_corr"
-    assert config.displacement_alpha == 0.25
+    assert gradient_config.displacement_metric_family == "blurred_gradient_corr"
+    assert gradient_config.displacement_alpha == 0.25
+    assert gradient_config.displacement_component_weights is None
+    assert laplacian_config.displacement_metric_family == "blurred_laplacian_corr"
+    assert laplacian_config.displacement_alpha == 0.25
+    assert laplacian_config.displacement_component_weights is None
+
+
+def test_rectification_run_config_rejects_pair_family_component_weights():
+    with pytest.raises(ValueError, match="does not accept component_weights"):
+        RectificationRunConfig(
+            displacement_metric_family="ncc_gradient",
+            displacement_alpha=0.5,
+            displacement_component_weights={"gradient": 1.0},
+        )
+
+    with pytest.raises(ValueError, match="does not accept component_weights"):
+        RectificationRunConfig(
+            displacement_metric_family="ncc_laplacian",
+            displacement_alpha=0.5,
+            displacement_component_weights={"laplacian": 1.0},
+        )
+
+
+def test_rectification_run_config_rejects_invalid_composite_weights():
+    with pytest.raises(ValueError, match="only support"):
+        RectificationRunConfig(
+            displacement_metric_family="composite",
+            displacement_alpha=0.5,
+            displacement_component_weights={"gradnt": 1.0},
+        )
+
+    with pytest.raises(ValueError, match="requires positive non-intensity component weights"):
+        RectificationRunConfig(
+            displacement_metric_family="composite",
+            displacement_alpha=0.5,
+            displacement_component_weights={"gradient": 0.0, "laplacian": 0.0},
+        )
