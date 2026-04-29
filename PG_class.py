@@ -29,8 +29,7 @@ class PG_controller:
         self.start()
         self.stop()
         self.set_rois()
-        self.cam.AdcBitDepth = 'Bit12'
-        self.cam.PixelFormat = 'Mono8'
+        self._apply_raw_output_config()
 
         self.num_mean = settings.get("PG_num_mean", 1)
         self.PG_exp_FLR = settings.get("PG_exp_FLR")
@@ -46,6 +45,36 @@ class PG_controller:
         # self.cam.GevSCPD = 1000                # inter-packet delay; increase if packets drop
 
         self.start()
+
+    def _apply_raw_output_config(self):
+        requested_adc = str(self.settings.get("PG_adc_bit_depth", "Bit12"))
+        requested_pixel = str(self.settings.get("PG_pixel_format", "Mono8"))
+
+        try:
+            self.cam.AdcBitDepth = requested_adc
+        except Exception as exc:
+            raise ValueError(
+                f"Unsupported PG_adc_bit_depth='{requested_adc}'."
+            ) from exc
+
+        actual_adc = str(self.cam.AdcBitDepth)
+        if actual_adc.lower() != requested_adc.lower():
+            raise ValueError(
+                f"Failed to apply PG_adc_bit_depth='{requested_adc}'. Camera reports '{actual_adc}'."
+            )
+
+        try:
+            self.cam.PixelFormat = requested_pixel
+        except Exception as exc:
+            raise ValueError(
+                f"Unsupported PG_pixel_format='{requested_pixel}'."
+            ) from exc
+
+        actual_pixel = str(self.cam.PixelFormat)
+        if actual_pixel.lower() != requested_pixel.lower():
+            raise ValueError(
+                f"Failed to apply PG_pixel_format='{requested_pixel}'. Camera reports '{actual_pixel}'."
+            )
 
     def __del__(self):
         if self.cam is None:
