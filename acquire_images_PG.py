@@ -13,6 +13,17 @@ SAVE_FORMAT_CYCLE = ("tiff", "npy", "png")
 KEY_QUIT = ord("q")
 KEY_SAVE = ord("s")
 KEY_FORMAT = ord("f")
+DEFAULT_MAX_WINDOW_WIDTH = 1600
+DEFAULT_MAX_WINDOW_HEIGHT = 900
+WINDOW_FRAME_MARGIN_WIDTH = 80
+WINDOW_FRAME_MARGIN_HEIGHT = 140
+PREVIEW_LINE_HEIGHT = 24
+PREVIEW_HEADER_PADDING = 8
+PREVIEW_TEXT_ORIGIN_X = 10
+PREVIEW_TEXT_LINE1_Y = 22
+PREVIEW_TEXT_LINE2_Y = 46
+PREVIEW_TEXT_FONT_SCALE = 0.55
+PREVIEW_TEXT_THICKNESS = 1
 
 
 @dataclass
@@ -21,6 +32,12 @@ class PreviewState:
     mouse_y: int = 0
     mouse_valid: bool = False
     format_index: int = 0
+    frame_width: int = 0
+    frame_height: int = 0
+    display_scale: float = 1.0
+    display_header_height: int = 0
+    display_frame_width: int = 0
+    display_frame_height: int = 0
 
 
 def centered_roi(sensor_height, sensor_width, crop_height, crop_width, row_offset=0, col_offset=0):
@@ -116,10 +133,28 @@ def resolve_output_dir(cli_output_dir):
 
 
 def _on_mouse(event, x, y, _flags, state):
-    if event >= 0:
-        state.mouse_x = int(x)
-        state.mouse_y = int(y)
-        state.mouse_valid = True
+    if event < 0:
+        return
+
+    if state.display_scale <= 0 or state.frame_width <= 0 or state.frame_height <= 0:
+        state.mouse_valid = False
+        return
+
+    local_y = int(y) - state.display_header_height
+    local_x = int(x)
+
+    if (
+        local_x < 0
+        or local_y < 0
+        or local_x >= state.display_frame_width
+        or local_y >= state.display_frame_height
+    ):
+        state.mouse_valid = False
+        return
+
+    state.mouse_x = min(int(local_x / state.display_scale), state.frame_width - 1)
+    state.mouse_y = min(int(local_y / state.display_scale), state.frame_height - 1)
+    state.mouse_valid = True
 
 
 def _snapshot_format(state):
@@ -141,22 +176,14 @@ def _ensure_single_image(frame):
     return frame
 
 
-def _text_color_for_frame(frame):
-    if np.issubdtype(frame.dtype, np.integer):
-        return int(np.iinfo(frame.dtype).max)
-    return 255
-
-
 def _format_pixel_value(value):
     if isinstance(value, np.generic):
         value = value.item()
     return str(value)
 
 
-def annotate_preview_frame(raw_frame, state, global_row0, global_col0, mode_label):
-    annotated = raw_frame.copy()
-    h, w = annotated.shape[:2]
-
+def _preview_info_lines(raw_frame, state, global_row0, global_col0, mode_label):
+    h, w = raw_frame.shape[:2]
     info_line1 = (
         f"mode={mode_label} save={_snapshot_format(state)} "
         f"keys: q=quit s=snap f=format"
@@ -175,32 +202,144 @@ def annotate_preview_frame(raw_frame, state, global_row0, global_col0, mode_labe
             f"value={_format_pixel_value(value)}"
         )
 
-    line_height = 24
-    overlay_height = line_height * 2 + 8
-    cv2.rectangle(annotated, (0, 0), (w - 1, overlay_height), 0, thickness=-1)
+    return info_line1, info_line2
 
-    color = _text_color_for_frame(annotated)
+
+def _frame_to_display_u8(raw_frame):
+    if raw_frame.dtype == np.uint8:
+        return raw_frame
+
+    if raw_frame.dtype == np.bool_:
+        return raw_frame.astype(np.uint8) * 255
+
+    if np.issubdtype(raw_frame.dtype, np.unsignedinteger):
+        shift = max(raw_frame.dtype.itemsize * 8 - 8, 0)
+        if shift:
+            return np.right_shift(raw_frame, shift).astype(np.uint8)
+        return raw_frame.astype(np.uint8)
+
+    if np.issubdtype(raw_frame.dtype, np.integer):
+        clipped = np.clip(raw_frame, 0, None).astype(np.float32)
+    else:
+        clipped = np.nan_to_num(
+            raw_frame.astype(np.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        clipped = np.clip(clipped, 0.0, None)
+
+    max_value = float(np.max(clipped)) if clipped.size else 0.0
+    if max_value <= 0:
+        return np.zeros(raw_frame.shape, dtype=np.uint8)
+
+    scale = 255.0 if max_value <= 1.0 else 255.0 / max_value
+    return cv2.convertScaleAbs(clipped, alpha=scale)
+
+
+def _preview_window_limits():
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        screen_width = int(user32.GetSystemMetrics(0))
+        screen_height = int(user32.GetSystemMetrics(1))
+        if screen_width > 0 and screen_height > 0:
+            return (
+                max(320, screen_width - WINDOW_FRAME_MARGIN_WIDTH),
+                max(240, screen_height - WINDOW_FRAME_MARGIN_HEIGHT),
+            )
+    except Exception:
+        pass
+
+    return DEFAULT_MAX_WINDOW_WIDTH, DEFAULT_MAX_WINDOW_HEIGHT
+
+
+def _scaled_frame_shape(frame_width, frame_height, max_width, max_height):
+    max_width = max(1, int(max_width))
+    max_height = max(1, int(max_height))
+    scale = min(1.0, max_width / frame_width, max_height / frame_height)
+    display_width = max(1, int(round(frame_width * scale)))
+    display_height = max(1, int(round(frame_height * scale)))
+    return scale, display_width, display_height
+
+
+def build_preview_display(raw_frame, state, global_row0, global_col0, mode_label, max_window_width, max_window_height):
+    raw_h, raw_w = raw_frame.shape[:2]
+    info_line1, info_line2 = _preview_info_lines(
+        raw_frame=raw_frame,
+        state=state,
+        global_row0=global_row0,
+        global_col0=global_col0,
+        mode_label=mode_label,
+    )
+
+    header_height = PREVIEW_LINE_HEIGHT * 2 + PREVIEW_HEADER_PADDING
+    available_height = max(1, max_window_height - header_height)
+    scale, display_w, display_h = _scaled_frame_shape(
+        frame_width=raw_w,
+        frame_height=raw_h,
+        max_width=max_window_width,
+        max_height=available_height,
+    )
+
+    frame_display = _frame_to_display_u8(raw_frame)
+    if (display_w, display_h) != (raw_w, raw_h):
+        frame_display = cv2.resize(
+            frame_display,
+            (display_w, display_h),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    display = np.zeros((header_height + display_h, display_w), dtype=np.uint8)
+    display[header_height:, :] = frame_display
+
+    state.frame_width = raw_w
+    state.frame_height = raw_h
+    state.display_scale = scale
+    state.display_header_height = header_height
+    state.display_frame_width = display_w
+    state.display_frame_height = display_h
+
     cv2.putText(
-        annotated,
+        display,
         info_line1,
-        (10, 22),
+        (PREVIEW_TEXT_ORIGIN_X, PREVIEW_TEXT_LINE1_Y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        color,
-        1,
+        PREVIEW_TEXT_FONT_SCALE,
+        255,
+        PREVIEW_TEXT_THICKNESS,
         cv2.LINE_AA,
     )
     cv2.putText(
-        annotated,
+        display,
         info_line2,
-        (10, 46),
+        (PREVIEW_TEXT_ORIGIN_X, PREVIEW_TEXT_LINE2_Y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        color,
-        1,
+        PREVIEW_TEXT_FONT_SCALE,
+        255,
+        PREVIEW_TEXT_THICKNESS,
         cv2.LINE_AA,
     )
-    return annotated
+    return display
+
+
+def _create_preview_window(window_name, state, display_shape):
+    flags = cv2.WINDOW_NORMAL
+    if hasattr(cv2, "WINDOW_KEEPRATIO"):
+        flags |= cv2.WINDOW_KEEPRATIO
+
+    display_h, display_w = display_shape[:2]
+    cv2.namedWindow(window_name, flags)
+    cv2.resizeWindow(window_name, int(display_w), int(display_h))
+    cv2.setMouseCallback(window_name, _on_mouse, state)
+
+
+def _window_is_closed(window_name):
+    try:
+        return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return True
 
 
 def save_raw_snapshot(raw_frame, output_dir, mode_label, file_format):
@@ -224,9 +363,8 @@ def run_preview(pg, mode, output_dir, window_name="PG Preview"):
     roi = [int(v) for v in np.asarray(pg.big_roi, dtype=int).tolist()]
     global_row0 = roi[0]
     global_col0 = roi[2]
-
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(window_name, _on_mouse, state)
+    max_window_width, max_window_height = _preview_window_limits()
+    current_window_shape = None
 
     static_frame = None
     if mode == "single":
@@ -239,16 +377,26 @@ def run_preview(pg, mode, output_dir, window_name="PG Preview"):
             else:
                 raw_frame = static_frame
 
-            preview = annotate_preview_frame(
+            preview = build_preview_display(
                 raw_frame=raw_frame,
                 state=state,
                 global_row0=global_row0,
                 global_col0=global_col0,
                 mode_label=mode,
+                max_window_width=max_window_width,
+                max_window_height=max_window_height,
             )
+
+            preview_shape = preview.shape[:2]
+            if preview_shape != current_window_shape:
+                _create_preview_window(window_name, state, preview.shape)
+                current_window_shape = preview_shape
+
             cv2.imshow(window_name, preview)
 
             key = cv2.waitKey(1 if mode == "stream" else 30) & 0xFF
+            if _window_is_closed(window_name):
+                break
             if key == KEY_QUIT:
                 break
             if key == KEY_FORMAT:
@@ -277,10 +425,12 @@ def run_preview(pg, mode, output_dir, window_name="PG Preview"):
 def main():
     args = parse_args()
 
-    crop_height = 3104
-    crop_width = 3252
-    row_offset = -150
-    col_offset = 50
+    # crop_height = 3104
+    # crop_width = 3252
+    crop_height = 500
+    crop_width = 700
+    row_offset = -100
+    col_offset = 0
     sensor_width = 5320
     sensor_height = 4600
     roi = centered_roi(
@@ -295,8 +445,8 @@ def main():
     output_dir = resolve_output_dir(args.output_dir)
     pg = PG_controller({
         "PG_num_mean": 1,
-        "PG_exp": 10e3,
-        "PG_gain": 20,
+        "PG_exp": 3e3,
+        "PG_gain": 0,
         "PG_sensor_width": sensor_width,
         "PG_sensor_height": sensor_height,
         "PG_single_roi": True,
