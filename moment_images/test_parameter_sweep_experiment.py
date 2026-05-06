@@ -671,7 +671,7 @@ def test_metric_formulations_expand_candidates_with_alpha_dimension():
     assert len(expanded) == 4
     families = {candidate.config.displacement_metric_family for candidate in expanded}
     alphas = {candidate.config.displacement_alpha for candidate in expanded}
-    assert families == {"ncc_gradient", "ncc_laplacian"}
+    assert families == {"blurred_gradient_corr", "blurred_laplacian_corr"}
     assert alphas == {0.0, 0.5, 1.0}
 
 
@@ -702,6 +702,7 @@ def test_spec_from_dict_maps_legacy_metric_formulations_to_experimental_lane():
     assert spec.experimental_metric_sweep.enabled is True
     assert len(spec.experimental_metric_sweep.formulations) == 1
     assert spec.experimental_metric_sweep.formulations[0].formulation_id == "legacy_grad"
+    assert spec.experimental_metric_sweep.formulations[0].family == "blurred_gradient_corr"
 
 
 def test_spec_from_dict_supports_single_stage_mode_and_defaults_to_two_stage():
@@ -989,6 +990,56 @@ def test_run_sweep_blocks_mismatched_fingerprint(tmp_path):
         run_sweep_experiment(changed_spec, output_dir=out_dir)
 
 
+def test_run_sweep_resume_adopts_relocated_run_state(tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    old_views_dir = tmp_path / "old_input"
+    old_views_dir.mkdir()
+    old_views_path = old_views_dir / "views.npy"
+    np.save(old_views_path, views)
+
+    base_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(old_views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "original_run"),
+        save_figures=False,
+        analyze=False,
+    )
+    original_out_dir = run_sweep_experiment(base_spec)
+
+    relocated_output_dir = tmp_path / "relocated_run"
+    shutil.copytree(original_out_dir, relocated_output_dir)
+
+    new_views_dir = tmp_path / "new_input"
+    new_views_dir.mkdir()
+    new_views_path = new_views_dir / "views.npy"
+    np.save(new_views_path, views)
+
+    relocated_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(new_views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(relocated_output_dir),
+        save_figures=False,
+        analyze=False,
+    )
+
+    out_dir = run_sweep_experiment(relocated_spec, output_dir=relocated_output_dir)
+
+    state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert state["path_compatibility"]["output_dir"] == str(relocated_output_dir.resolve())
+    assert (
+        state["experiment_fingerprint"]
+        == parameter_sweep._compute_experiment_fingerprint(state["fingerprint_payload"])
+    )
+    statuses = {entry["status"] for entry in state["runs"].values()}
+    assert "skipped_valid" in statuses
+
+
 def test_run_sweep_experiment_with_metric_phase_outputs(tmp_path):
     views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
     views_path = tmp_path / "views.npy"
@@ -1044,6 +1095,9 @@ def test_run_sweep_experiment_with_metric_phase_outputs(tmp_path):
     ]
     formulation_ids = {payload["metric_formulation_id"] for payload in config_payloads}
     assert {"exp_grad", "exp_lap"}.issubset(formulation_ids)
+    assert {
+        payload["displacement_metric_family"] for payload in config_payloads
+    } == {"blurred_gradient_corr", "blurred_laplacian_corr"}
 
 
 def test_run_sweep_resume_recomputes_corrupt_metric_phase_artifact(tmp_path):

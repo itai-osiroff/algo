@@ -142,7 +142,9 @@ def test_generate_alpha_report_uses_fallback_metric_when_primary_missing(tmp_pat
     )
 
     assert report["ranked_runs"][0]["run"] == "run_b"
+    assert report["ranked_runs"][0]["family"] == "blurred_gradient_corr"
     assert report["ranked_runs"][0]["ranking_metric_name"] == "sum_squared_gradient"
+    assert report["alpha_family_summary"][0]["family"] == "blurred_gradient_corr"
     assert (tmp_path / "alpha_report.json").exists()
     assert (tmp_path / "alpha_report.csv").exists()
 
@@ -169,6 +171,7 @@ def test_generate_alpha_report_tolerates_corrupt_summary_with_stage_fallback(tmp
     report = generate_alpha_report(output_dir=tmp_path, tolerate_partial_outputs=True)
 
     assert report["num_runs_considered"] == 1
+    assert report["ranked_runs"][0]["family"] == "blurred_gradient_corr"
     assert report["warnings"]
 
 
@@ -193,5 +196,6 @@ def test_generate_alpha_report_is_headless_safe_without_pyplot(tmp_path, monkeyp
     report = generate_alpha_report(output_dir=tmp_path, primary_metric="laplacian_variance")
 
     assert report["num_runs_considered"] == 1
+    assert report["ranked_runs"][0]["family"] == "blurred_gradient_corr"
     assert (tmp_path / "alpha_report_primary_vs_alpha.png").exists()
     assert (tmp_path / "alpha_report_displacement_vs_alpha.png").exists()

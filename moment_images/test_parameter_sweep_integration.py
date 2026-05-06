@@ -13,7 +13,12 @@ from moment_images.im_process import (
     min_max_normalize,
     rectify_views_from_config,
 )
-from moment_images.parameter_sweep import LiveMetricsPlotter, _generate_views, sweep_parameters
+from moment_images.parameter_sweep import (
+    LiveMetricsPlotter,
+    _generate_views,
+    _save_run_artifacts,
+    sweep_parameters,
+)
 
 
 def test_parameter_sweep_matches_direct_rectification(tmp_path):
@@ -91,6 +96,48 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
     assert direct_result.pixel_similarity.component_score_maps is None
     assert (run_dir / "workspace.mat").exists()
     assert not (run_dir / "rectified_views.npz").exists()
+
+
+def test_non_intensity_pixel_run_saves_metric_workspace_artifacts(tmp_path):
+    views = np.array(
+        [
+            [
+                [[0.0, 1.0], [2.0, 3.0]],
+                [[1.0, 2.0], [3.0, 4.0]],
+            ],
+            [
+                [[2.0, 3.0], [4.0, 5.0]],
+                [[3.0, 4.0], [5.0, 6.0]],
+            ],
+        ],
+        dtype=np.float32,
+    )
+    config = RectificationRunConfig(
+        strategy="pixel",
+        similarity_window_size=1,
+        refinement_window_size=1,
+        max_displacement=0,
+        gauss_sigma=1.0,
+        gauss_size=5,
+        disp_gauss_sigma=0.0,
+        disp_gauss_size=1,
+        pixel_threshold=0.05,
+        sub_pix_factor=1,
+        displacement_metric_family="ncc_gradient",
+        displacement_alpha=0.5,
+    )
+
+    result = rectify_views_from_config(views, config)
+    _save_run_artifacts(tmp_path, "gradient_metric_run", result)
+
+    run_dir = tmp_path / "gradient_metric_run"
+    with np.load(run_dir / "workspace.npz") as workspace:
+        assert "pixel_blended_scores" in workspace.files
+        assert "pixel_component_score_gradient" in workspace.files
+        assert "pixel_component_score_laplacian" not in workspace.files
+        parsed_config = json.loads(str(np.asarray(workspace["config_json"]).item()))
+        assert parsed_config["displacement_metric_family"] == "blurred_gradient_corr"
+        assert parsed_config["displacement_alpha"] == 0.5
 
 
 def test_live_metrics_plotter_tracks_metrics():

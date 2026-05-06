@@ -7,3 +7,5 @@ opencv-python
 Pillow
 scipy
 tqdm
+pyspin
+simple_pyspin

@@ -514,7 +514,7 @@ def test_load_sweep_visualization_model_supports_metric_phase_outputs(tmp_path):
     assert model.alpha_family_summary
     assert model.alpha_ranked_runs
     families = {row["family"] for row in model.alpha_family_summary}
-    assert {"ncc_gradient", "ncc_laplacian"}.issubset(families)
+    assert {"blurred_gradient_corr", "blurred_laplacian_corr"}.issubset(families)
     assert model.diagnostic_availability["score_maps"] is True
     assert "gradient" in model.diagnostic_availability["components"]
 

@@ -47,6 +47,12 @@ from moment_images.im_process import (
     extract_views,
     VIEW_DISTANCE_SCALE_FACTOR,
 )
+from moment_images.rectification_strategy import (
+    BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
+    BLURRED_GRADIENT_CORR_METRIC_FAMILY,
+    BLURRED_LAPLACIAN_CORR_METRIC_FAMILY,
+    normalize_displacement_metric_family,
+)
 from moment_images.reliable_io import (
     FirstValidReadError,
     read_json_first_valid,
@@ -282,24 +288,59 @@ class SweepScoringSpec:
 
 @dataclass
 class MetricFormulationSpec:
-    """Displacement metric family definition used as a sweep dimension."""
+    """Local displacement-score family definition used as a sweep dimension."""
 
     formulation_id: str
-    family: str = "ncc_gradient"
+    family: str = BLURRED_GRADIENT_CORR_METRIC_FAMILY
     alphas: List[float] = field(default_factory=lambda: [0.5])
     component_weights: Optional[Dict[str, float]] = None
+
+    def __post_init__(self) -> None:
+        formulation_id = str(self.formulation_id).strip()
+        if not formulation_id:
+            raise ValueError("metric_formulations[].id must be non-empty.")
+        self.formulation_id = formulation_id
+
+        self.family = normalize_displacement_metric_family(self.family)
+
+        if not self.alphas:
+            raise ValueError("metric_formulations[].alphas cannot be empty.")
+        normalized_alphas = [float(item) for item in self.alphas]
+        for alpha in normalized_alphas:
+            if not np.isfinite(alpha) or alpha < 0.0 or alpha > 1.0:
+                raise ValueError("metric_formulations alpha values must be finite and in [0, 1].")
+        self.alphas = normalized_alphas
+
+        if self.component_weights is None:
+            return
+
+        normalized_weights: Dict[str, float] = {}
+        for key, raw_value in self.component_weights.items():
+            numeric = float(raw_value)
+            if not np.isfinite(numeric):
+                raise ValueError("component_weights values must be finite.")
+            if numeric < 0.0:
+                raise ValueError("component_weights values must be non-negative.")
+            normalized_weights[str(key)] = numeric
+        if (
+            self.family == BLURRED_COMPOSITE_CORR_METRIC_FAMILY
+            and any(alpha < 1.0 for alpha in self.alphas)
+            and sum(normalized_weights.values()) <= 0.0
+        ):
+            raise ValueError(
+                "component_weights must sum to a positive value when "
+                "blurred_composite_corr alpha < 1."
+            )
+        self.component_weights = normalized_weights
 
     @classmethod
     def from_dict(cls, payload: Dict[str, object], default_idx: int) -> "MetricFormulationSpec":
         raw_id = str(payload.get("id") or payload.get("formulation_id") or "").strip()
         formulation_id = raw_id or f"formulation_{default_idx:02d}"
 
-        family = str(payload.get("family", "ncc_gradient")).strip().lower()
-        if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
-            raise ValueError(
-                "metric_formulations[].family must be one of "
-                "'ncc_gradient', 'ncc_laplacian', or 'composite'."
-            )
+        family = normalize_displacement_metric_family(
+            payload.get("family", BLURRED_GRADIENT_CORR_METRIC_FAMILY)
+        )
 
         alphas_raw = cast(Optional[List[object]], payload.get("alphas"))
         if alphas_raw is None:
@@ -714,7 +755,9 @@ def _assign_candidate_ids(candidates: Sequence[SweepCandidate], prefix: str) -> 
 def _metric_formulation_from_params(
     params: Dict[str, object],
 ) -> Tuple[str, float, Optional[Dict[str, float]], str]:
-    family = str(params.get("displacement_metric_family", "intensity")).strip().lower()
+    family = normalize_displacement_metric_family(
+        params.get("displacement_metric_family", "intensity")
+    )
     alpha = float(params.get("displacement_alpha", 1.0))
     raw_weights_obj = params.get("displacement_component_weights")
     parsed_weights: Optional[Dict[str, float]] = None
@@ -1453,6 +1496,70 @@ def _compute_experiment_fingerprint(payload: Dict[str, object]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _normalize_fingerprint_payload_for_resume_compat(
+    payload: Dict[str, object],
+) -> Dict[str, object]:
+    """
+    Remove machine-specific path details and volatile cache mtimes.
+
+    This keeps the strict fingerprint for normal operation, while allowing a
+    copied run directory to be adopted on another machine if the semantic spec
+    and prepared dataset identities are otherwise unchanged.
+    """
+
+    normalized = dict(payload)
+    if normalized.get("output_dir") is not None:
+        normalized["output_dir"] = "<output_dir>"
+
+    spec_payload = normalized.get("spec")
+    if isinstance(spec_payload, dict):
+        spec_snapshot = dict(spec_payload)
+        if spec_snapshot.get("output_dir") is not None:
+            spec_snapshot["output_dir"] = "<output_dir>"
+        datasets_snapshot = spec_snapshot.get("datasets")
+        if isinstance(datasets_snapshot, list):
+            normalized_datasets: List[object] = []
+            for entry in datasets_snapshot:
+                if not isinstance(entry, dict):
+                    normalized_datasets.append(entry)
+                    continue
+                dataset_entry = dict(entry)
+                for key in ("views_path", "source_image", "source_image_dir"):
+                    if dataset_entry.get(key) is not None:
+                        dataset_entry[key] = f"<{key}>"
+                normalized_datasets.append(dataset_entry)
+            spec_snapshot["datasets"] = normalized_datasets
+        normalized["spec"] = spec_snapshot
+
+    datasets_payload = normalized.get("datasets")
+    if isinstance(datasets_payload, list):
+        normalized_dataset_payload: List[object] = []
+        for entry in datasets_payload:
+            if not isinstance(entry, dict):
+                normalized_dataset_payload.append(entry)
+                continue
+            dataset_entry = dict(entry)
+            if dataset_entry.get("resolved_views_path") is not None:
+                dataset_entry["resolved_views_path"] = "<resolved_views_path>"
+            dataset_entry.pop("views_file_mtime_ns", None)
+            normalized_dataset_payload.append(dataset_entry)
+        normalized["datasets"] = normalized_dataset_payload
+
+    return normalized
+
+
+def _fingerprint_payloads_resume_compatible(
+    existing_payload_raw: object,
+    current_payload: Dict[str, object],
+) -> bool:
+    if not isinstance(existing_payload_raw, dict):
+        return False
+    existing_payload = cast(Dict[str, object], existing_payload_raw)
+    return _normalize_fingerprint_payload_for_resume_compat(
+        existing_payload
+    ) == _normalize_fingerprint_payload_for_resume_compat(current_payload)
+
+
 def _persist_run_state(state_path: Path, state: Dict[str, object]) -> None:
     state["updated_at"] = _utc_now_iso()
     write_json_atomic(state_path, state, indent=2, sort_keys=False, create_backup=True)
@@ -1472,10 +1579,23 @@ def _load_or_initialize_run_state(
         state = cast(Dict[str, object], loaded)
         existing_fingerprint = str(state.get("experiment_fingerprint", ""))
         if existing_fingerprint != fingerprint:
-            raise ValueError(
-                "Output directory contains run_state.json with a different experiment "
-                "fingerprint. Refusing to resume with mismatched spec/dataset/path."
-            )
+            if _fingerprint_payloads_resume_compatible(
+                state.get("fingerprint_payload"),
+                fingerprint_payload,
+            ):
+                state["experiment_fingerprint"] = fingerprint
+                state["fingerprint_payload"] = fingerprint_payload
+                path_compatibility = cast(
+                    Dict[str, object],
+                    state.setdefault("path_compatibility", {}),
+                )
+                path_compatibility["output_dir"] = str(output_dir.resolve())
+                _persist_run_state(state_path, state)
+            else:
+                raise ValueError(
+                    "Output directory contains run_state.json with a different experiment "
+                    "fingerprint. Refusing to resume with mismatched spec/dataset/path."
+                )
         existing_output_dir = str(cast(Dict[str, object], state.get("path_compatibility", {})).get("output_dir", ""))
         current_output_dir = str(output_dir.resolve())
         if existing_output_dir and existing_output_dir != current_output_dir:
@@ -3267,7 +3387,7 @@ class SpecGuiDatasetState:
 @dataclass
 class SpecGuiMetricExperimentRowState:
     formulation_id: str = "exp_grad_alpha"
-    family: str = "ncc_gradient"
+    family: str = BLURRED_GRADIENT_CORR_METRIC_FAMILY
     alphas: str = "0.0,0.5,1.0"
     gradient_weight: str = "0.5"
     laplacian_weight: str = "0.5"
@@ -3390,12 +3510,7 @@ def _state_metric_row_to_spec(
         raise ValueError(
             f"metric experiment row {row_index} formulation id is required."
         )
-    family = row.family.strip().lower()
-    if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
-        raise ValueError(
-            f"metric experiment row {row_index} family must be one of "
-            "'ncc_gradient', 'ncc_laplacian', 'composite'."
-        )
+    family = normalize_displacement_metric_family(row.family)
     alphas = _parse_float_list_csv(
         row.alphas, f"metric experiment row {row_index} alphas"
     )
@@ -3410,7 +3525,7 @@ def _state_metric_row_to_spec(
         "family": family,
         "alphas": alphas,
     }
-    if family == "composite":
+    if family == BLURRED_COMPOSITE_CORR_METRIC_FAMILY:
         gradient_weight = float(row.gradient_weight.strip())
         laplacian_weight = float(row.laplacian_weight.strip())
         if not np.isfinite(gradient_weight) or not np.isfinite(laplacian_weight):
@@ -3435,7 +3550,10 @@ def _state_metric_row_to_spec(
 def _metric_formulation_payload_to_state_row(
     payload: Dict[str, object], default_idx: int
 ) -> SpecGuiMetricExperimentRowState:
-    family = str(payload.get("family", "ncc_gradient")).strip().lower()
+    family = normalize_displacement_metric_family(
+        payload.get("family", BLURRED_GRADIENT_CORR_METRIC_FAMILY),
+        allow_unknown=True,
+    )
     component_weights = cast(Optional[Dict[str, object]], payload.get("component_weights"))
     gradient_weight = "0.5"
     laplacian_weight = "0.5"
@@ -4010,8 +4128,9 @@ def validate_state(state: SpecGuiState) -> List[str]:
             else:
                 formulation_ids.append(formulation_id)
 
-            family = row.family.strip().lower()
-            if family not in {"ncc_gradient", "ncc_laplacian", "composite"}:
+            try:
+                family = normalize_displacement_metric_family(row.family)
+            except ValueError:
                 issues.append(
                     f"Metric experiment row {idx}: invalid family '{row.family}'."
                 )
@@ -4031,7 +4150,7 @@ def validate_state(state: SpecGuiState) -> List[str]:
                 issues.append(str(exc))
                 continue
 
-            if family == "composite":
+            if family == BLURRED_COMPOSITE_CORR_METRIC_FAMILY:
                 try:
                     gradient_weight = float(row.gradient_weight.strip())
                     laplacian_weight = float(row.laplacian_weight.strip())
@@ -4539,9 +4658,9 @@ class SpecGuiApp:
             row_frame,
             family_var,
             family_var.get(),
-            "ncc_gradient",
-            "ncc_laplacian",
-            "composite",
+            BLURRED_GRADIENT_CORR_METRIC_FAMILY,
+            BLURRED_LAPLACIAN_CORR_METRIC_FAMILY,
+            BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         )
         family_menu.pack(side="left", padx=2)
         self._register_editable(family_menu)

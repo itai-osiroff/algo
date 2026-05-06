@@ -8,6 +8,8 @@ This package focuses on rectifying light-field view grids extracted from graysca
 - **Sweep analysis/reporting** utilities in `sweep_analysis.py` for metric summaries and alpha-centric comparison reports across many runs.
 
 > All file paths and commands in this README are relative to the `moment_images/` package directory.
+>
+> For the separate Point Grey acquisition workflow at the repository root, see `../POINT_GREY_ACQUISITION_GUIDE.md`.
 
 ---
 
@@ -205,6 +207,17 @@ For scripted or swept runs, `rectify_views_from_config()` provides a single entr
 5. **Return object**
    - The result is a `RectificationResult` containing the averaged image, rectified view stack, similarity data, and optional global/pixelwise diagnostics for downstream visualization.
 
+### Automation entrypoints
+
+`RectificationRunConfig` is the public configuration surface for scripted runs and sweep-generated `config.json` files. The local displacement-score fields most likely to matter when automating runs are:
+
+- `displacement_metric_family`
+- `displacement_alpha`
+- `displacement_component_weights`
+- `metric_formulation_id`
+
+Saved configs use canonical metric family names such as `blurred_gradient_corr`, `blurred_laplacian_corr`, and `blurred_composite_corr` even when a legacy alias was accepted on input.
+
 ---
 
 ## Parameter sweeping (`parameter_sweep.py`)
@@ -248,9 +261,11 @@ Baseline stage-1/stage-2 candidates run in **pure intensity mode** by default (`
 Each formulation defines:
 
 - `id`: stable formulation identifier for reporting and traceability.
-- `family`: `ncc_gradient`, `ncc_laplacian`, or `composite`.
+- `family`: `blurred_gradient_corr`, `blurred_laplacian_corr`, or `blurred_composite_corr`.
 - `alphas`: one or more alpha values to evaluate.
-- `component_weights` (composite only): non-intensity component weights (validated and normalized internally).
+- `component_weights` (`blurred_composite_corr` only): non-intensity component weights (validated and normalized internally).
+
+Legacy aliases `ncc_gradient`, `ncc_laplacian`, and `composite` are still accepted on input, but saved configs and downstream reports use the canonical names above.
 
 Baseline candidate generation is the cross-product of:
 
@@ -264,20 +279,22 @@ Optional metric-experiment candidate generation is the cross-product of:
 
 This keeps the experiment narrative explicit: **global pre-alignment -> intensity-only baseline ranking -> optional metric-formulation experiments on shortlisted candidates -> reconstruction -> diagnostics/quality metrics -> side-by-side alpha/family comparison**.
 
-### Alpha semantics (pixelwise displacement score)
+### Alpha semantics (local displacement score blending)
 
-For pair families (`ncc_gradient`, `ncc_laplacian`):
+The non-intensity displacement families are **blurred-correlation** score formulations. They use Gaussian-smoothed product scores and do **not** implement true local NCC/ZNCC normalization. Legacy aliases `ncc_gradient`, `ncc_laplacian`, and `composite` are still accepted on input, but new configs and outputs use the canonical names below.
 
-- `alpha` directly weights the intensity agreement term:
+For pair families (`blurred_gradient_corr`, `blurred_laplacian_corr`):
+
+- `alpha` is the local displacement score blend weight:
   `score = alpha * I + (1 - alpha) * S`
 
-For `composite`:
+For `blurred_composite_corr`:
 
 - `W_intensity = alpha`
 - non-intensity terms are normalized to sum to 1
 - each non-intensity term gets `W_k = (1 - alpha) * normalized_k`
 
-`alpha=1` is intensity-only scoring. `alpha=0` is non-intensity-only scoring.
+`alpha=1` is intensity-only local displacement ranking. `alpha=0` is non-intensity-only local displacement ranking.
 
 ### Live plotting and figures
 
@@ -304,6 +321,8 @@ When `experimental_metric_sweep.enabled=true`, additional artifacts are written 
 - `summary.json`
 - `alpha_report.json`, `alpha_report.csv`, and `alpha_report_warnings.json`
 
+This optional metric phase can run after either baseline mode: the default `two_stage` flow or `single_stage`.
+
 Each run creates a folder with:
 
 - `avg_rectified.png` - averaged rectified output.
@@ -316,8 +335,9 @@ Each run creates a folder with:
 ### Resume and compatibility checks
 
 - Every spec run writes `run_state.json` atomically.
-- Restarting in the same output directory resumes only when the stored fingerprint and path-compatibility keys match the current experiment.
-- A mismatch is a hard failure (no partial overwrite of incompatible results).
+- Restarting in the same output directory resumes when the stored experiment fingerprint matches the current experiment.
+- If a run directory was copied or relocated, resume can adopt it when the semantic fingerprint payload is still compatible after normalizing machine-specific paths and volatile cache metadata.
+- True spec or dataset mismatches are still hard failures (no partial overwrite of incompatible results).
 - Completed runs are skipped only when required artifacts still validate; missing/corrupt artifacts trigger recompute for that run only.
 - Failure history is append-only: retries add attempts without deleting prior error records.
 
@@ -328,6 +348,7 @@ Each run creates a folder with:
   - `displacement_alpha`
   - `displacement_component_weights`
   - `metric_formulation_id`
+  - saved `config.json` files use canonical metric family names even when the input spec used a legacy alias
 - Stage summaries (`stage1_summary.json`, `stage2_summary.json`):
   - baseline candidates use intensity-first displacement mode (`intensity`, `alpha=1.0`)
   - per-run statuses include `pending`, `running`, `ok`, `failed`, `skipped_valid`, `recomputed`
@@ -335,6 +356,7 @@ Each run creates a folder with:
 - `experiment_manifest.json`:
   - `baseline_displacement_mode`
   - `experimental_metric_sweep`
+  - `single_stage` baseline runs can still feed the optional `metric_experiments/` phase
 - Metric experiment summary (`metric_experiments/metric_phase_summary.json`):
   - shortlisted baseline candidates expanded across configured formulation/alpha settings
 - `run_state.json`:
@@ -344,10 +366,12 @@ Each run creates a folder with:
   - per-run status, attempts, error history, and artifact validation state
 - `metric_record.json` / `summary.json` rows:
   - `metric_formulation` metadata
+  - canonicalized metric family names in config/formulation metadata
   - displacement-field metrics
   - inter-view consistency metrics
   - displacement score diagnostics (blended and component-level)
 - `alpha_report.json`:
+  - saved under `metric_experiments/alpha_report.*` when the optional metric phase is enabled
   - ranking by configured primary metric with fallback chain
   - alpha-vs-quality/displacement/consistency aggregates by family
   - warning list for skipped/missing/corrupt artifacts (also saved as `alpha_report_warnings.json`)

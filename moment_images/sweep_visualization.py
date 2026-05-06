@@ -20,6 +20,9 @@ from matplotlib.figure import Figure
 from PIL import Image
 
 from moment_images.im_process import save_workspace_variables
+from moment_images.rectification_strategy import (
+    normalize_optional_displacement_metric_family,
+)
 from moment_images.reliable_io import (
     read_json_first_valid,
     read_npz_first_valid,
@@ -354,7 +357,10 @@ def _normalize_alpha_summary_rows(
                 continue
             summary_rows.append(
                 {
-                    "family": item.get("family"),
+                    "family": normalize_optional_displacement_metric_family(
+                        item.get("family"),
+                        allow_unknown=True,
+                    ),
                     "alpha": _coerce_float(item.get("alpha")),
                     "count": int(item.get("count", 0) or 0),
                     "mean_score": _coerce_float(item.get("mean_score")),
@@ -384,7 +390,18 @@ def _normalize_alpha_summary_rows(
     ranked_runs: List[Dict[str, object]] = []
     raw_ranked = payload.get("ranked_runs")
     if isinstance(raw_ranked, list):
-        ranked_runs = [dict(item) for item in raw_ranked if isinstance(item, dict)]
+        ranked_runs = []
+        for item in raw_ranked:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            family = normalize_optional_displacement_metric_family(
+                row.get("family"),
+                allow_unknown=True,
+            )
+            if family is not None:
+                row["family"] = family
+            ranked_runs.append(row)
 
     return summary_rows, ranked_runs
 
@@ -446,11 +463,29 @@ def _numeric_param(value: object) -> float:
 
 
 def _params_from_config(config: Dict[str, object]) -> Dict[str, object]:
-    return {
+    params = {
         str(key): value
         for key, value in config.items()
         if key != "hdr_exposure_times" and value is not None
     }
+    family = normalize_optional_displacement_metric_family(
+        params.get("displacement_metric_family"),
+        allow_unknown=True,
+    )
+    if family is not None:
+        params["displacement_metric_family"] = family
+    return params
+
+
+def _canonicalize_metric_family_fields(mapping: Dict[str, object]) -> Dict[str, object]:
+    normalized = {str(key): value for key, value in mapping.items()}
+    family = normalize_optional_displacement_metric_family(
+        normalized.get("displacement_metric_family"),
+        allow_unknown=True,
+    )
+    if family is not None:
+        normalized["displacement_metric_family"] = family
+    return normalized
 
 
 def _resolve_ranking_metric(
@@ -483,7 +518,10 @@ def _extract_metric_axes(
     if formulation_id is None:
         formulation_id = config.get("metric_formulation_id", params.get("metric_formulation_id"))
 
-    family_text = str(family).strip() if family is not None and str(family).strip() else None
+    family_text = normalize_optional_displacement_metric_family(
+        family,
+        allow_unknown=True,
+    )
     alpha_value = _coerce_float(alpha)
     formulation_text = (
         str(formulation_id).strip()
@@ -712,8 +750,12 @@ def _candidate_row_from_ranking(
     primary_metric: str,
 ) -> CandidateVisualizationRow:
     candidate_id = str(ranking.get("candidate_id", f"{stage_name}_{rank_fallback:04d}"))
-    config = cast(Dict[str, object], ranking.get("config", {}))
-    params = cast(Dict[str, object], ranking.get("params", {}))
+    config = _canonicalize_metric_family_fields(
+        cast(Dict[str, object], ranking.get("config", {}))
+    )
+    params = _canonicalize_metric_family_fields(
+        cast(Dict[str, object], ranking.get("params", {}))
+    )
     dataset_scores = _mapping_to_float_dict(ranking.get("dataset_scores", {}))
     dataset_runtimes = _mapping_to_float_dict(ranking.get("runtime_seconds", {}))
     dataset_metrics = _nested_metrics_to_float_dict(ranking.get("dataset_metrics", {}))
@@ -744,8 +786,8 @@ def _candidate_row_from_ranking(
         metric_means=metric_means,
         mean_runtime_seconds=_mean_value(dataset_runtimes),
         missing_datasets=[str(item) for item in cast(List[object], ranking.get("missing_datasets", []))],
-        params={str(key): value for key, value in params.items()},
-        config={str(key): value for key, value in config.items()},
+        params=dict(params),
+        config=dict(config),
         family=family,
         alpha=alpha,
         formulation_id=formulation_id,
@@ -761,7 +803,9 @@ def _candidate_row_from_legacy_record(
     primary_metric: str,
 ) -> CandidateVisualizationRow:
     run_name = str(record.get("run", f"legacy_{rank:04d}"))
-    config = cast(Dict[str, object], record.get("config", {}))
+    config = _canonicalize_metric_family_fields(
+        cast(Dict[str, object], record.get("config", {}))
+    )
     params = _params_from_config(config)
     metrics = _mapping_to_float_dict(record.get("global_and_local_metrics", {}))
     ranking_metric_name, ranking_metric_value = _resolve_ranking_metric(metrics, primary_metric)
@@ -792,7 +836,7 @@ def _candidate_row_from_legacy_record(
         mean_runtime_seconds=None,
         missing_datasets=[],
         params=params,
-        config={str(key): value for key, value in config.items()},
+        config=dict(config),
         family=family,
         alpha=alpha,
         formulation_id=formulation_id,
@@ -998,7 +1042,9 @@ def _build_run_metric_record(
         run_lookup=run_lookup,
         path_hint=path_hint,
     )
-    config = cast(Dict[str, object], metric_record.get("config", {}))
+    config = _canonicalize_metric_family_fields(
+        cast(Dict[str, object], metric_record.get("config", {}))
+    )
     params = _params_from_config(config)
     image_metrics = _mapping_to_float_dict(metric_record.get("global_and_local_metrics", {}))
     global_only_metrics = _mapping_to_float_dict(metric_record.get("global_only_metrics", {}))
@@ -1037,7 +1083,7 @@ def _build_run_metric_record(
         alpha=alpha,
         formulation_id=formulation_id,
         params=params,
-        config={str(key): value for key, value in config.items()},
+        config=dict(config),
         score=score,
         mean_dataset_score=mean_dataset_score,
         mean_runtime_seconds=mean_runtime_seconds,
@@ -2724,28 +2770,28 @@ def create_metric_formulation_figure(model: SweepVisualizationModel) -> Optional
         if xs_consistency:
             consistency_ax.plot(xs_consistency, ys_consistency, marker="o", label=family)
 
-    quality_ax.set_xlabel("alpha")
+    quality_ax.set_xlabel("alpha (local displacement score blend weight)")
     quality_ax.set_ylabel("mean score / primary metric")
     quality_ax.set_title("Quality vs metric formulation alpha")
     quality_ax.grid(True, linestyle=":", alpha=0.4)
     if quality_ax.lines:
         quality_ax.legend()
 
-    runtime_ax.set_xlabel("alpha")
+    runtime_ax.set_xlabel("alpha (local displacement score blend weight)")
     runtime_ax.set_ylabel("mean runtime (s)")
     runtime_ax.set_title("Runtime vs metric formulation alpha")
     runtime_ax.grid(True, linestyle=":", alpha=0.4)
     if runtime_ax.lines:
         runtime_ax.legend()
 
-    displacement_ax.set_xlabel("alpha")
+    displacement_ax.set_xlabel("alpha (local displacement score blend weight)")
     displacement_ax.set_ylabel("mean displacement magnitude")
     displacement_ax.set_title("Displacement vs metric formulation alpha")
     displacement_ax.grid(True, linestyle=":", alpha=0.4)
     if displacement_ax.lines:
         displacement_ax.legend()
 
-    consistency_ax.set_xlabel("alpha")
+    consistency_ax.set_xlabel("alpha (local displacement score blend weight)")
     consistency_ax.set_ylabel("mean view std")
     consistency_ax.set_title("Consistency vs metric formulation alpha")
     consistency_ax.grid(True, linestyle=":", alpha=0.4)
