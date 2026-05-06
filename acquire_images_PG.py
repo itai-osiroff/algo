@@ -2,6 +2,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -13,6 +14,13 @@ SAVE_FORMAT_CYCLE = ("tiff", "npy", "png")
 KEY_QUIT = ord("q")
 KEY_SAVE = ord("s")
 KEY_FORMAT = ord("f")
+KEY_ZOOM_IN = ord("i")
+KEY_ZOOM_OUT = ord("o")
+KEY_ZOOM_RESET = ord("0")
+KEY_EXPOSURE_DOWN = ord("[")
+KEY_EXPOSURE_UP = ord("]")
+KEY_GAIN_DOWN = ord(",")
+KEY_GAIN_UP = ord(".")
 DEFAULT_MAX_WINDOW_WIDTH = 1600
 DEFAULT_MAX_WINDOW_HEIGHT = 900
 WINDOW_FRAME_MARGIN_WIDTH = 80
@@ -22,8 +30,17 @@ PREVIEW_HEADER_PADDING = 8
 PREVIEW_TEXT_ORIGIN_X = 10
 PREVIEW_TEXT_LINE1_Y = 22
 PREVIEW_TEXT_LINE2_Y = 46
+PREVIEW_TEXT_LINE3_Y = 70
 PREVIEW_TEXT_FONT_SCALE = 0.55
 PREVIEW_TEXT_THICKNESS = 1
+MIN_PREVIEW_ZOOM = 1.0
+MAX_PREVIEW_ZOOM = 8.0
+ZOOM_STEP_IN = 1.25
+ZOOM_STEP_OUT = 0.8
+EXPOSURE_STEP_UP = 1.25
+EXPOSURE_STEP_DOWN = 0.8
+GAIN_STEP = 1.0
+STATUS_TTL_FRAMES = 90
 
 
 @dataclass
@@ -38,6 +55,17 @@ class PreviewState:
     display_header_height: int = 0
     display_frame_width: int = 0
     display_frame_height: int = 0
+    view_row0: int = 0
+    view_col0: int = 0
+    view_width: int = 0
+    view_height: int = 0
+    zoom_factor: float = 1.0
+    zoom_center_x: Optional[int] = None
+    zoom_center_y: Optional[int] = None
+    current_exposure: Optional[float] = None
+    current_gain: Optional[float] = None
+    status_text: str = ""
+    status_frames_remaining: int = 0
 
 
 def centered_roi(sensor_height, sensor_width, crop_height, crop_width, row_offset=0, col_offset=0):
@@ -136,7 +164,13 @@ def _on_mouse(event, x, y, _flags, state):
     if event < 0:
         return
 
-    if state.display_scale <= 0 or state.frame_width <= 0 or state.frame_height <= 0:
+    if (
+        state.display_scale <= 0
+        or state.frame_width <= 0
+        or state.frame_height <= 0
+        or state.view_width <= 0
+        or state.view_height <= 0
+    ):
         state.mouse_valid = False
         return
 
@@ -152,9 +186,19 @@ def _on_mouse(event, x, y, _flags, state):
         state.mouse_valid = False
         return
 
-    state.mouse_x = min(int(local_x / state.display_scale), state.frame_width - 1)
-    state.mouse_y = min(int(local_y / state.display_scale), state.frame_height - 1)
+    raw_x = state.view_col0 + min(int(local_x / state.display_scale), state.view_width - 1)
+    raw_y = state.view_row0 + min(int(local_y / state.display_scale), state.view_height - 1)
+    state.mouse_x = min(raw_x, state.frame_width - 1)
+    state.mouse_y = min(raw_y, state.frame_height - 1)
     state.mouse_valid = True
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        state.zoom_center_x = state.mouse_x
+        state.zoom_center_y = state.mouse_y
+        _set_status(
+            state,
+            f"Zoom center locked at ({state.mouse_x},{state.mouse_y})",
+        )
 
 
 def _snapshot_format(state):
@@ -164,6 +208,62 @@ def _snapshot_format(state):
 def _cycle_snapshot_format(state):
     state.format_index = (state.format_index + 1) % len(SAVE_FORMAT_CYCLE)
     return _snapshot_format(state)
+
+
+def _set_status(state, message, ttl=STATUS_TTL_FRAMES):
+    state.status_text = str(message)
+    state.status_frames_remaining = max(0, int(ttl))
+
+
+def _tick_status(state):
+    if state.status_frames_remaining <= 0:
+        state.status_text = ""
+        return
+
+    state.status_frames_remaining -= 1
+    if state.status_frames_remaining <= 0:
+        state.status_text = ""
+
+
+def _clamp_zoom_factor(zoom_factor):
+    return float(np.clip(float(zoom_factor), MIN_PREVIEW_ZOOM, MAX_PREVIEW_ZOOM))
+
+
+def _apply_zoom_step(state, multiplier):
+    state.zoom_factor = _clamp_zoom_factor(state.zoom_factor * float(multiplier))
+    return state.zoom_factor
+
+
+def _reset_zoom(state):
+    state.zoom_factor = MIN_PREVIEW_ZOOM
+    state.zoom_center_x = None
+    state.zoom_center_y = None
+
+
+def compute_zoom_crop(frame_shape, zoom_factor, center_x=None, center_y=None):
+    frame_h = int(frame_shape[0])
+    frame_w = int(frame_shape[1])
+    if frame_h <= 0 or frame_w <= 0:
+        raise ValueError("frame_shape must describe a non-empty image.")
+
+    zoom_factor = _clamp_zoom_factor(zoom_factor)
+    view_h = min(frame_h, max(1, int(round(frame_h / zoom_factor))))
+    view_w = min(frame_w, max(1, int(round(frame_w / zoom_factor))))
+
+    if center_x is None:
+        center_x = frame_w // 2
+    if center_y is None:
+        center_y = frame_h // 2
+
+    center_x = int(np.clip(int(center_x), 0, frame_w - 1))
+    center_y = int(np.clip(int(center_y), 0, frame_h - 1))
+
+    col0 = center_x - view_w // 2
+    row0 = center_y - view_h // 2
+    col0 = int(np.clip(col0, 0, frame_w - view_w))
+    row0 = int(np.clip(row0, 0, frame_h - view_h))
+
+    return row0, row0 + view_h, col0, col0 + view_w
 
 
 def _ensure_single_image(frame):
@@ -182,11 +282,21 @@ def _format_pixel_value(value):
     return str(value)
 
 
+def _format_status_value(value, precision=1):
+    if value is None:
+        return "-"
+
+    value = float(value)
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.{precision}f}"
+
+
 def _preview_info_lines(raw_frame, state, global_row0, global_col0, mode_label):
     h, w = raw_frame.shape[:2]
     info_line1 = (
         f"mode={mode_label} save={_snapshot_format(state)} "
-        f"keys: q=quit s=snap f=format"
+        "keys:q s f click i/o 0 [/] ,/."
     )
     info_line2 = "local(x,y)=(-,-) global(x,y)=(-,-) value=-"
 
@@ -202,7 +312,15 @@ def _preview_info_lines(raw_frame, state, global_row0, global_col0, mode_label):
             f"value={_format_pixel_value(value)}"
         )
 
-    return info_line1, info_line2
+    status_text = state.status_text if state.status_text else "-"
+    info_line3 = (
+        f"zoom={state.zoom_factor:.2f}x "
+        f"exp={_format_status_value(state.current_exposure, precision=0)}us "
+        f"gain={_format_status_value(state.current_gain, precision=1)}dB "
+        f"status={status_text}"
+    )
+
+    return info_line1, info_line2, info_line3
 
 
 def _frame_to_display_u8(raw_frame):
@@ -255,10 +373,12 @@ def _preview_window_limits():
     return DEFAULT_MAX_WINDOW_WIDTH, DEFAULT_MAX_WINDOW_HEIGHT
 
 
-def _scaled_frame_shape(frame_width, frame_height, max_width, max_height):
+def _scaled_frame_shape(frame_width, frame_height, max_width, max_height, allow_upscale=False):
     max_width = max(1, int(max_width))
     max_height = max(1, int(max_height))
-    scale = min(1.0, max_width / frame_width, max_height / frame_height)
+    scale = min(max_width / frame_width, max_height / frame_height)
+    if not allow_upscale:
+        scale = min(1.0, scale)
     display_width = max(1, int(round(frame_width * scale)))
     display_height = max(1, int(round(frame_height * scale)))
     return scale, display_width, display_height
@@ -266,7 +386,15 @@ def _scaled_frame_shape(frame_width, frame_height, max_width, max_height):
 
 def build_preview_display(raw_frame, state, global_row0, global_col0, mode_label, max_window_width, max_window_height):
     raw_h, raw_w = raw_frame.shape[:2]
-    info_line1, info_line2 = _preview_info_lines(
+    row0, row1, col0, col1 = compute_zoom_crop(
+        frame_shape=raw_frame.shape[:2],
+        zoom_factor=state.zoom_factor,
+        center_x=state.zoom_center_x,
+        center_y=state.zoom_center_y,
+    )
+    view_frame = raw_frame[row0:row1, col0:col1]
+
+    info_line1, info_line2, info_line3 = _preview_info_lines(
         raw_frame=raw_frame,
         state=state,
         global_row0=global_row0,
@@ -274,21 +402,23 @@ def build_preview_display(raw_frame, state, global_row0, global_col0, mode_label
         mode_label=mode_label,
     )
 
-    header_height = PREVIEW_LINE_HEIGHT * 2 + PREVIEW_HEADER_PADDING
+    header_height = PREVIEW_LINE_HEIGHT * 3 + PREVIEW_HEADER_PADDING
     available_height = max(1, max_window_height - header_height)
     scale, display_w, display_h = _scaled_frame_shape(
-        frame_width=raw_w,
-        frame_height=raw_h,
+        frame_width=view_frame.shape[1],
+        frame_height=view_frame.shape[0],
         max_width=max_window_width,
         max_height=available_height,
+        allow_upscale=state.zoom_factor > MIN_PREVIEW_ZOOM,
     )
 
-    frame_display = _frame_to_display_u8(raw_frame)
-    if (display_w, display_h) != (raw_w, raw_h):
+    frame_display = _frame_to_display_u8(view_frame)
+    if (display_w, display_h) != view_frame.shape[1::-1]:
+        interpolation = cv2.INTER_NEAREST if scale > 1.0 else cv2.INTER_AREA
         frame_display = cv2.resize(
             frame_display,
             (display_w, display_h),
-            interpolation=cv2.INTER_AREA,
+            interpolation=interpolation,
         )
 
     display = np.zeros((header_height + display_h, display_w), dtype=np.uint8)
@@ -300,6 +430,10 @@ def build_preview_display(raw_frame, state, global_row0, global_col0, mode_label
     state.display_header_height = header_height
     state.display_frame_width = display_w
     state.display_frame_height = display_h
+    state.view_row0 = row0
+    state.view_col0 = col0
+    state.view_width = view_frame.shape[1]
+    state.view_height = view_frame.shape[0]
 
     cv2.putText(
         display,
@@ -315,6 +449,16 @@ def build_preview_display(raw_frame, state, global_row0, global_col0, mode_label
         display,
         info_line2,
         (PREVIEW_TEXT_ORIGIN_X, PREVIEW_TEXT_LINE2_Y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        PREVIEW_TEXT_FONT_SCALE,
+        255,
+        PREVIEW_TEXT_THICKNESS,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        display,
+        info_line3,
+        (PREVIEW_TEXT_ORIGIN_X, PREVIEW_TEXT_LINE3_Y),
         cv2.FONT_HERSHEY_SIMPLEX,
         PREVIEW_TEXT_FONT_SCALE,
         255,
@@ -358,6 +502,104 @@ def save_raw_snapshot(raw_frame, output_dir, mode_label, file_format):
     return out_path
 
 
+def capture_snapshot(raw_frame, state, output_dir, mode_label):
+    return save_raw_snapshot(
+        raw_frame=raw_frame,
+        output_dir=output_dir,
+        mode_label=mode_label,
+        file_format=_snapshot_format(state),
+    )
+
+
+def adjust_exposure(pg, state, increase):
+    if state.current_exposure is None:
+        state.current_exposure = float(pg.get_exp())
+
+    multiplier = EXPOSURE_STEP_UP if increase else EXPOSURE_STEP_DOWN
+    target_exposure = float(state.current_exposure) * multiplier
+    applied_exposure = float(pg.set_exposure(target_exposure))
+    state.current_exposure = applied_exposure
+    return applied_exposure
+
+
+def adjust_gain(pg, state, increase):
+    if state.current_gain is None:
+        state.current_gain = float(pg.get_gain())
+
+    gain_step = GAIN_STEP if increase else -GAIN_STEP
+    target_gain = float(state.current_gain) + gain_step
+    applied_gain = float(pg.set_gain(target_gain))
+    state.current_gain = applied_gain
+    return applied_gain
+
+
+def handle_preview_key(key, state, pg, mode, raw_frame, output_dir):
+    if key == KEY_QUIT:
+        return False
+
+    if key == KEY_FORMAT:
+        new_format = _cycle_snapshot_format(state)
+        print(f"Snapshot format set to: {new_format}")
+        _set_status(state, f"Snapshot format set to {new_format}")
+        return True
+
+    if key == KEY_SAVE:
+        try:
+            saved_path = capture_snapshot(
+                raw_frame=raw_frame,
+                state=state,
+                output_dir=output_dir,
+                mode_label=mode,
+            )
+            print(f"Saved snapshot: {saved_path}")
+            _set_status(state, f"Saved snapshot: {saved_path.name}")
+        except Exception as exc:
+            print(f"Snapshot save failed: {exc}")
+            _set_status(state, f"Snapshot save failed: {exc}")
+        return True
+
+    if key == KEY_ZOOM_IN:
+        zoom_factor = _apply_zoom_step(state, ZOOM_STEP_IN)
+        _set_status(state, f"Zoom set to {zoom_factor:.2f}x")
+        return True
+
+    if key == KEY_ZOOM_OUT:
+        zoom_factor = _apply_zoom_step(state, ZOOM_STEP_OUT)
+        _set_status(state, f"Zoom set to {zoom_factor:.2f}x")
+        return True
+
+    if key == KEY_ZOOM_RESET:
+        _reset_zoom(state)
+        _set_status(state, "Zoom reset")
+        return True
+
+    if key in (KEY_EXPOSURE_DOWN, KEY_EXPOSURE_UP):
+        if mode != "stream":
+            _set_status(state, "Exposure control is only available in stream mode")
+            return True
+
+        try:
+            exposure = adjust_exposure(pg=pg, state=state, increase=(key == KEY_EXPOSURE_UP))
+            _set_status(state, f"Exposure set to {_format_status_value(exposure, precision=0)}us")
+        except Exception as exc:
+            _set_status(state, f"Exposure update failed: {exc}")
+        return True
+
+    if key in (KEY_GAIN_DOWN, KEY_GAIN_UP):
+        if mode != "stream":
+            _set_status(state, "Gain control is only available in stream mode")
+            return True
+
+        try:
+            gain = adjust_gain(pg=pg, state=state, increase=(key == KEY_GAIN_UP))
+            _set_status(state, f"Gain set to {_format_status_value(gain, precision=1)}dB")
+        except Exception as exc:
+            _set_status(state, f"Gain update failed: {exc}")
+        return True
+
+    return True
+
+
 def run_preview(pg, mode, output_dir, window_name="PG Preview"):
     state = PreviewState()
     roi = [int(v) for v in np.asarray(pg.big_roi, dtype=int).tolist()]
@@ -365,6 +607,14 @@ def run_preview(pg, mode, output_dir, window_name="PG Preview"):
     global_col0 = roi[2]
     max_window_width, max_window_height = _preview_window_limits()
     current_window_shape = None
+    try:
+        state.current_exposure = float(pg.get_exp())
+    except Exception:
+        state.current_exposure = None
+    try:
+        state.current_gain = float(pg.get_gain())
+    except Exception:
+        state.current_gain = None
 
     static_frame = None
     if mode == "single":
@@ -393,28 +643,22 @@ def run_preview(pg, mode, output_dir, window_name="PG Preview"):
                 current_window_shape = preview_shape
 
             cv2.imshow(window_name, preview)
+            _tick_status(state)
 
             key = cv2.waitKey(1 if mode == "stream" else 30) & 0xFF
             if _window_is_closed(window_name):
                 break
-            if key == KEY_QUIT:
-                break
-            if key == KEY_FORMAT:
-                new_format = _cycle_snapshot_format(state)
-                print(f"Snapshot format set to: {new_format}")
-                continue
-            if key == KEY_SAVE:
-                save_format = _snapshot_format(state)
-                try:
-                    saved_path = save_raw_snapshot(
-                        raw_frame=raw_frame,
-                        output_dir=output_dir,
-                        mode_label=mode,
-                        file_format=save_format,
-                    )
-                    print(f"Saved snapshot: {saved_path}")
-                except Exception as exc:
-                    print(f"Snapshot save failed: {exc}")
+            if key != 0xFF:
+                should_continue = handle_preview_key(
+                    key=key,
+                    state=state,
+                    pg=pg,
+                    mode=mode,
+                    raw_frame=raw_frame,
+                    output_dir=output_dir,
+                )
+                if not should_continue:
+                    break
     finally:
         try:
             pg.stop()
@@ -427,9 +671,9 @@ def main():
 
     # crop_height = 3104
     # crop_width = 3252
-    crop_height = 500
-    crop_width = 700
-    row_offset = -100
+    crop_height = 2000
+    crop_width = 2000
+    row_offset = 250
     col_offset = 0
     sensor_width = 5320
     sensor_height = 4600
@@ -445,8 +689,8 @@ def main():
     output_dir = resolve_output_dir(args.output_dir)
     pg = PG_controller({
         "PG_num_mean": 1,
-        "PG_exp": 3e3,
-        "PG_gain": 0,
+        "PG_exp": 10e3,
+        "PG_gain": 15,
         "PG_sensor_width": sensor_width,
         "PG_sensor_height": sensor_height,
         "PG_single_roi": True,

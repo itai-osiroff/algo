@@ -20,6 +20,7 @@ class PG_controller:
         self.N_window = None
         self.Nr_big = None
         self.Nc_big = None
+        self._node_info_cache = {}
         self.single_roi_mode = False
         self.single_roi_request = settings.get("PG_single_roi")
         self.user_single_roi = settings.get("PG_roi")
@@ -106,17 +107,92 @@ class PG_controller:
         self.cam.TriggerMode = 'On'
         self.cam.TriggerSource = 'Software'
 
+    def get_node_info(self, name, use_cache=True):
+        if use_cache and name in self._node_info_cache:
+            return dict(self._node_info_cache[name])
+
+        try:
+            info = dict(self.cam.get_info(name))
+        except Exception as exc:
+            raise ValueError(f"Camera node '{name}' is unavailable: {exc}") from exc
+
+        if use_cache:
+            self._node_info_cache[name] = dict(info)
+        return info
+
+    @staticmethod
+    def _validate_numeric_node_access(name, info):
+        access = info.get("access")
+        if isinstance(access, str) and "write" not in access.lower():
+            raise ValueError(
+                f"Camera node '{name}' is not writable right now (access={access})."
+            )
+        if access == 0:
+            raise ValueError(f"Camera node '{name}' is not accessible right now.")
+
+    def _get_numeric_node_limits(self, name):
+        info = self.get_node_info(name)
+        self._validate_numeric_node_access(name, info)
+
+        missing = [key for key in ("min", "max") if key not in info]
+        if missing:
+            missing_text = ", ".join(missing)
+            raise ValueError(
+                f"Camera node '{name}' is missing numeric limit metadata: {missing_text}."
+            )
+
+        try:
+            return float(info["min"]), float(info["max"])
+        except Exception as exc:
+            raise ValueError(
+                f"Camera node '{name}' returned invalid numeric limits."
+            ) from exc
+
+    def get_exposure_limits(self):
+        return self._get_numeric_node_limits("ExposureTime")
+
+    def get_gain_limits(self):
+        return self._get_numeric_node_limits("Gain")
+
     def set_exposure(self, new_exp):
-        self.cam.ExposureAuto = 'Off'
-        self.cam.ExposureTime = new_exp
-        # Validate exposure change
-        cam_exp = self.cam.ExposureTime
-        if cam_exp / new_exp > 1.5 or cam_exp / new_exp < (2 / 3):
-            print('Supposed to be ' + str(new_exp) + ', but the exposure is ' + str(cam_exp))
+        min_exp, max_exp = self.get_exposure_limits()
+        requested_exp = float(new_exp)
+        clamped_exp = float(np.clip(requested_exp, min_exp, max_exp))
+
+        try:
+            self.cam.ExposureAuto = 'Off'
+            self.cam.ExposureTime = clamped_exp
+            applied_exp = float(self.cam.ExposureTime)
+        except Exception as exc:
+            raise ValueError(f"Failed to set camera exposure: {exc}") from exc
+
+        if requested_exp != clamped_exp:
+            print(
+                f"Requested exposure {requested_exp} clamped to supported range "
+                f"[{min_exp}, {max_exp}] -> {clamped_exp}."
+            )
+
+        return applied_exp
 
     def set_gain(self, new_gain):
-        self.cam.GainAuto = 'Off'
-        self.cam.Gain = new_gain
+        min_gain, max_gain = self.get_gain_limits()
+        requested_gain = float(new_gain)
+        clamped_gain = float(np.clip(requested_gain, min_gain, max_gain))
+
+        try:
+            self.cam.GainAuto = 'Off'
+            self.cam.Gain = clamped_gain
+            applied_gain = float(self.cam.Gain)
+        except Exception as exc:
+            raise ValueError(f"Failed to set camera gain: {exc}") from exc
+
+        if requested_gain != clamped_gain:
+            print(
+                f"Requested gain {requested_gain} clamped to supported range "
+                f"[{min_gain}, {max_gain}] -> {clamped_gain}."
+            )
+
+        return applied_gain
 
     def set_gamma(self, new_gamma):
         self.cam.GammaEnable = True
