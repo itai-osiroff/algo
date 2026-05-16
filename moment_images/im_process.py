@@ -15,6 +15,7 @@ from django.utils.text import slugify
 if __package__ is None or __package__ == "":
     # Running as a script: make local package modules importable
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from iterative_subtractive_max_rebuild import iterative_subtractive_max_rebuild
     from rectification_strategy import (
         BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         GlobalTranslationRectificationStrategy,
@@ -25,6 +26,7 @@ if __package__ is None or __package__ == "":
     from reliable_io import write_npz_atomic
 else:
     # Imported as a module within the package
+    from .iterative_subtractive_max_rebuild import iterative_subtractive_max_rebuild
     from .rectification_strategy import (
         BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         GlobalTranslationRectificationStrategy,
@@ -46,6 +48,50 @@ VIEW_DISTANCE_SCALE_FACTOR = 1
 CORRELATION_PAD_WIDTH = int(120*0.45) # 45% of expected viewpoint size (120 pixels)
 DEFAULT_SEARCH_RADIUS_MIN = 100
 DEFAULT_SEARCH_RADIUS_MAX = 130
+COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE = "global_average"
+COMBINED_REFERENCE_MODE_CENTER_VIEW = "center_view"
+COMBINED_REFERENCE_MODE_ITERATIVE_SUBTRACTIVE_MAX_REBUILD = (
+    "iterative_subtractive_max_rebuild"
+)
+_COMBINED_REFERENCE_MODE_ALIASES = {
+    "avg": COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE,
+    "global_avg": COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE,
+    "global_average": COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE,
+    "center": COMBINED_REFERENCE_MODE_CENTER_VIEW,
+    "center_view": COMBINED_REFERENCE_MODE_CENTER_VIEW,
+    "view": COMBINED_REFERENCE_MODE_CENTER_VIEW,
+    "iterative_subtractive_max_rebuild": (
+        COMBINED_REFERENCE_MODE_ITERATIVE_SUBTRACTIVE_MAX_REBUILD
+    ),
+    "iterative_rebuild": COMBINED_REFERENCE_MODE_ITERATIVE_SUBTRACTIVE_MAX_REBUILD,
+    "rebuild": COMBINED_REFERENCE_MODE_ITERATIVE_SUBTRACTIVE_MAX_REBUILD,
+}
+
+
+def normalize_combined_reference_mode(
+    mode: Optional[object],
+    *,
+    use_global_avg_reference: bool,
+) -> str:
+    """Resolve the combined-stage reference selection mode."""
+
+    if mode is None:
+        return (
+            COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE
+            if use_global_avg_reference
+            else COMBINED_REFERENCE_MODE_CENTER_VIEW
+        )
+
+    normalized = str(mode).strip().lower()
+    if not normalized:
+        raise ValueError("combined_reference_mode must be non-empty when provided.")
+    canonical = _COMBINED_REFERENCE_MODE_ALIASES.get(normalized)
+    if canonical is None:
+        raise ValueError(
+            "combined_reference_mode must be one of 'global_average', "
+            "'center_view', or 'iterative_subtractive_max_rebuild'."
+        )
+    return canonical
 
 
 @dataclass
@@ -77,6 +123,7 @@ class RectificationRunConfig:
     zero_fill_roll: bool = True
     sub_pix_factor: int = 2
     combined_use_global_avg_reference: bool = True
+    combined_reference_mode: Optional[str] = None
     displacement_metric_family: str = "intensity"
     displacement_alpha: float = 1.0
     displacement_component_weights: Optional[Dict[str, float]] = None
@@ -86,6 +133,14 @@ class RectificationRunConfig:
     normalize_to_8bit: bool = False
 
     def __post_init__(self) -> None:
+        self.combined_reference_mode = normalize_combined_reference_mode(
+            self.combined_reference_mode,
+            use_global_avg_reference=bool(self.combined_use_global_avg_reference),
+        )
+        self.combined_use_global_avg_reference = (
+            self.combined_reference_mode == COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE
+        )
+
         metric_spec = resolve_displacement_metric_spec(
             self.displacement_metric_family,
             alpha=self.displacement_alpha,
@@ -353,7 +408,21 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         rectification_strategy_pixel = PixelwisePatchRectificationStrategy(
             config.refinement_window_size, zero_fill_roll=config.zero_fill_roll
         )
-        reference_view = global_avg_image if config.combined_use_global_avg_reference else None
+        if config.combined_reference_mode == COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE:
+            reference_view = global_avg_image
+        elif (
+            config.combined_reference_mode
+            == COMBINED_REFERENCE_MODE_ITERATIVE_SUBTRACTIVE_MAX_REBUILD
+        ):
+            reference_view = iterative_subtractive_max_rebuild(
+                global_rectified_views,
+                global_average=global_avg_image,
+                metric_family=config.displacement_metric_family,
+                alpha=config.displacement_alpha,
+                component_weights=config.displacement_component_weights,
+            ).reference_image
+        else:
+            reference_view = None
         pixel_similarity = rectification_strategy_pixel.compute_similarity_matrices(
             global_rectified_views,
             ref_view_idx,

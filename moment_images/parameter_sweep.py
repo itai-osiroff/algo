@@ -37,6 +37,7 @@ from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 
 from moment_images.im_process import (
+    COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE,
     RectificationRunConfig,
     RectificationResult,
     generate_rectification_figures,
@@ -229,6 +230,7 @@ class SweepSearchSpace:
     zero_fill_roll: List[bool] = field(default_factory=lambda: [True])
     correlation_pad_widths: List[int] = field(default_factory=lambda: [RectificationRunConfig().correlation_pad_width])
     combined_use_global_avg_reference: List[bool] = field(default_factory=lambda: [True])
+    combined_reference_mode: Optional[str] = None
     gauss_sizes: Optional[List[int]] = None
     disp_gauss_sizes: Optional[List[int]] = None
 
@@ -249,6 +251,10 @@ class SweepSearchSpace:
             zero_fill_roll=[bool(v) for v in raw.get("zero_fill_roll", [True])],  # type: ignore[arg-type]
             correlation_pad_widths=[int(v) for v in raw.get("correlation_pad_widths", [RectificationRunConfig().correlation_pad_width])],  # type: ignore[arg-type]
             combined_use_global_avg_reference=[bool(v) for v in raw.get("combined_use_global_avg_reference", [True])],  # type: ignore[arg-type]
+            combined_reference_mode=cast(
+                Optional[str],
+                raw.get("combined_reference_mode"),
+            ),
             gauss_sizes=None
             if raw.get("gauss_sizes") is None
             else [int(v) for v in raw.get("gauss_sizes", [])],  # type: ignore[arg-type]
@@ -867,6 +873,7 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             zero_fill_roll=bool(params["zero_fill_roll"]),
             sub_pix_factor=int(params["sub_pix_factor"]),
             combined_use_global_avg_reference=bool(params["combined_use_global_avg_reference"]),
+            combined_reference_mode=cast(Optional[str], params.get("combined_reference_mode")),
             displacement_metric_family=displacement_metric_family,
             displacement_alpha=displacement_alpha,
             displacement_component_weights=displacement_component_weights,
@@ -955,6 +962,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
                 "sub_pix_factor": int(sub_pix_factor),
                 "pixel_sigma_pyramid": bool(pixel_sigma_pyramid),
                 "combined_use_global_avg_reference": bool(combined_use_global_avg_reference),
+                "combined_reference_mode": search_space.combined_reference_mode,
                 "zero_fill_roll": bool(zero_fill_roll),
             }
             for (
@@ -2972,6 +2980,7 @@ def sweep_parameters(
     hdr_enabled: bool = False,
     hdr_exposure_times: Sequence[float] | None = None,
     combined_use_global_avg_reference: bool = True,
+    combined_reference_mode: str | None = None,
     normalize_to_8bit: bool = False,
 ) -> None:
     default_config = RectificationRunConfig()
@@ -3037,6 +3046,7 @@ def sweep_parameters(
             hdr_enabled=hdr_enabled,
             hdr_exposure_times=list(hdr_exposure_times) if hdr_exposure_times is not None else None,
             combined_use_global_avg_reference=combined_use_global_avg_reference,
+            combined_reference_mode=combined_reference_mode,
             normalize_to_8bit=normalize_to_8bit,
         )
 
@@ -3047,6 +3057,11 @@ def sweep_parameters(
             f"g{gauss}",
             f"dg{disp_gauss}",
         ]
+        if (
+            strategy == "combined"
+            and config.combined_reference_mode != COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE
+        ):
+            run_name_parts.append(f"ref_{config.combined_reference_mode}")
         if strategy in {"global", "combined"}:
             run_name_parts.append(f"gt{global_thresh}")
         if strategy in {"pixel", "combined"}:
@@ -3204,6 +3219,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--combined-reference-mode",
+        choices=[
+            "global_average",
+            "center_view",
+            "iterative_subtractive_max_rebuild",
+        ],
+        default=None,
+        help=(
+            "Override the combined-stage pixel reference source. When omitted, "
+            "--use-global-avg-reference preserves the legacy global-average vs "
+            "center-view behavior."
+        ),
+    )
+    parser.add_argument(
         "--normalize-to-8bit",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -3348,6 +3377,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         hdr_enabled=args.hdr_assemble,
         hdr_exposure_times=exposure_times,
         combined_use_global_avg_reference=args.use_global_avg_reference,
+        combined_reference_mode=args.combined_reference_mode,
         normalize_to_8bit=args.normalize_to_8bit,
     )
     return output_dir

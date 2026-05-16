@@ -675,6 +675,31 @@ def test_metric_formulations_expand_candidates_with_alpha_dimension():
     assert alphas == {0.0, 0.5, 1.0}
 
 
+def test_combined_search_space_propagates_reference_mode_into_candidates():
+    candidates = generate_coarse_candidates(
+        SweepSearchSpace(
+            strategy="combined",
+            refinement_window_sizes=[1],
+            max_displacements=[0],
+            gauss_sigmas=[1.0],
+            disp_gauss_sigmas=[0.0],
+            global_thresholds=[0.1],
+            pixel_thresholds=[0.05],
+            correlation_pad_widths=[3],
+            sub_pix_factors=[1],
+            pixel_sigma_pyramid=[False],
+            zero_fill_roll=[True],
+            combined_reference_mode="iterative_subtractive_max_rebuild",
+        )
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.config.combined_reference_mode == "iterative_subtractive_max_rebuild"
+    assert candidate.config.combined_use_global_avg_reference is False
+    assert candidate.params["combined_reference_mode"] == "iterative_subtractive_max_rebuild"
+
+
 def test_spec_from_dict_maps_legacy_metric_formulations_to_experimental_lane():
     payload = {
         "datasets": [{"id": "d1", "views": "x.npy"}],

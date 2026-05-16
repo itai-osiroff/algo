@@ -671,9 +671,9 @@ def main():
 
     # crop_height = 3104
     # crop_width = 3252
-    crop_height = 2000
-    crop_width = 2000
-    row_offset = 250
+    crop_height = 4600
+    crop_width = 5320
+    row_offset = 0
     col_offset = 0
     sensor_width = 5320
     sensor_height = 4600
