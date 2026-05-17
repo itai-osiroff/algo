@@ -34,7 +34,7 @@ PREVIEW_TEXT_LINE3_Y = 70
 PREVIEW_TEXT_FONT_SCALE = 0.55
 PREVIEW_TEXT_THICKNESS = 1
 MIN_PREVIEW_ZOOM = 1.0
-MAX_PREVIEW_ZOOM = 8.0
+MAX_PREVIEW_ZOOM = 20.0
 ZOOM_STEP_IN = 1.25
 ZOOM_STEP_OUT = 0.8
 EXPOSURE_STEP_UP = 1.25
@@ -690,7 +690,7 @@ def main():
     pg = PG_controller({
         "PG_num_mean": 1,
         "PG_exp": 10e3,
-        "PG_gain": 15,
+        "PG_gain": 0,
         "PG_sensor_width": sensor_width,
         "PG_sensor_height": sensor_height,
         "PG_single_roi": True,
