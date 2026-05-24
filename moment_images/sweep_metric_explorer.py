@@ -184,6 +184,42 @@ class SearchResult:
     spearman_correlation: Optional[float]
 
 
+ComparisonRecordKey = Tuple[str, str, str]
+
+
+@dataclass
+class ComparisonMetricRow:
+    """One metric row shown in the A/B comparison table."""
+
+    metric_name: str
+    metric_label: str
+    category: str
+    direction: str
+    value_a: float
+    value_b: float
+    delta: float
+    winner: str
+
+
+@dataclass
+class ComparisonDisplayBundle:
+    """Display-ready image channels for one raw record."""
+
+    preview: Optional[np.ndarray]
+    avg_image: Optional[np.ndarray]
+    guide_log: Optional[np.ndarray]
+    warnings: List[str] = field(default_factory=list)
+
+    def get(self, view_name: str) -> Optional[np.ndarray]:
+        if view_name == "preview":
+            return self.preview
+        if view_name == "avg_image":
+            return self.avg_image
+        if view_name == "guide_log":
+            return self.guide_log
+        return None
+
+
 @dataclass
 class SweepMetricExplorerModel:
     """Canonical model used by the raw metric explorer."""
@@ -250,12 +286,31 @@ def _metric_row_key(record: RawMetricRecord) -> Tuple[str, str, str]:
     return record.stage, record.candidate_id, record.dataset_id
 
 
+def _stable_unique_strings(values: Iterable[str]) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for value in values:
+        cleaned = str(value).strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        ordered.append(cleaned)
+    return ordered
+
+
 def _candidate_lookup(rows: Sequence[CandidateVisualizationRow]) -> Dict[Tuple[str, str], CandidateVisualizationRow]:
     return {(row.stage, row.candidate_id): row for row in rows}
 
 
 def _record_lookup(records: Sequence[RawMetricRecord]) -> Dict[Tuple[str, str, str], RawMetricRecord]:
     return {_metric_row_key(record): record for record in records}
+
+
+def _record_key_to_text(key: Optional[ComparisonRecordKey]) -> str:
+    if key is None:
+        return "not set"
+    stage_name, candidate_id, dataset_id = key
+    return f"{candidate_id} / {dataset_id} / {stage_name}"
 
 
 def _stringify_param(value: object) -> str:
@@ -913,6 +968,34 @@ def compute_image_channels(
     avg_image = _prepare_avg_image_channel(avg_image_raw)
     guide_log = _prepare_guide_log_channel(avg_image_raw)
     return avg_image, guide_log, warnings
+
+
+def load_comparison_display_bundle(record: RawMetricRecord) -> ComparisonDisplayBundle:
+    """Load preview and raw-derived display channels for one comparison record."""
+
+    preview: Optional[np.ndarray] = None
+    warnings = list(record.warnings)
+    if record.preview_path:
+        preview_path = Path(record.preview_path)
+        if preview_path.exists():
+            try:
+                preview = np.asarray(Image.open(preview_path).convert("L"), dtype=np.float64)
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(
+                    f"Failed to load preview {preview_path.name}: {type(exc).__name__}: {exc}"
+                )
+    avg_image = guide_log = None
+    if record.workspace_path:
+        avg_image, guide_log, channel_warnings = compute_image_channels(Path(record.workspace_path))
+        warnings.extend(channel_warnings)
+    if preview is None:
+        preview = avg_image
+    return ComparisonDisplayBundle(
+        preview=preview,
+        avg_image=avg_image,
+        guide_log=guide_log,
+        warnings=_stable_unique_strings(warnings),
+    )
 
 
 def _scan_raw_records(
@@ -1741,12 +1824,21 @@ def create_channel_comparison_figure(
     records: Sequence[RawMetricRecord],
     *,
     channel_name: str,
+    figure_scale: float = 1.0,
 ) -> Figure:
     """Render preview + selected channel for one or more records."""
 
     if not records:
         return _figure_message("No selected records.")
-    fig = Figure(figsize=(max(10, 4 * len(records)), 8))
+    safe_scale = max(0.75, float(figure_scale))
+    per_column_width = 5.8 * safe_scale
+    per_row_height = 4.2 * safe_scale
+    fig = Figure(
+        figsize=(
+            max(9.5, per_column_width * max(1, len(records))),
+            max(7.0, per_row_height * 2.0),
+        )
+    )
     axes = fig.subplots(2, len(records), squeeze=False)
     for col_idx, record in enumerate(records):
         preview_ax = axes[0, col_idx]
@@ -1809,6 +1901,88 @@ def _format_record_metric_lines(model: SweepMetricExplorerModel, record: RawMetr
     return "\n".join(lines)
 
 
+def _format_pairwise_metric_delta_lines(
+    model: SweepMetricExplorerModel,
+    record_a: RawMetricRecord,
+    record_b: RawMetricRecord,
+) -> List[str]:
+    lines = [
+        "pairwise metric deltas (A - B):",
+        f"A: {_record_key_to_text((record_a.stage, record_a.candidate_id, record_a.dataset_id))}",
+        f"B: {_record_key_to_text((record_b.stage, record_b.candidate_id, record_b.dataset_id))}",
+        "",
+    ]
+    for row in build_comparison_metric_rows(model, record_a, record_b):
+        lines.append(
+            f"{row.metric_label}: "
+            f"A={row.value_a:.6f} | B={row.value_b:.6f} | delta={row.delta:+.6f} | winner={row.winner}"
+        )
+    return lines
+
+
+def build_comparison_metric_rows(
+    model: SweepMetricExplorerModel,
+    record_a: RawMetricRecord,
+    record_b: RawMetricRecord,
+) -> List[ComparisonMetricRow]:
+    """Build structured A/B metric rows for the comparison table."""
+
+    rows: List[ComparisonMetricRow] = []
+    for metric_name, descriptor in model.metric_registry.items():
+        value_a = record_a.metrics.get(metric_name)
+        value_b = record_b.metrics.get(metric_name)
+        if value_a is None or value_b is None:
+            continue
+        delta = float(value_a) - float(value_b)
+        if abs(delta) <= 1e-12:
+            winner = "="
+        elif descriptor.direction == "min":
+            winner = "A" if delta < 0 else "B"
+        else:
+            winner = "A" if delta > 0 else "B"
+        rows.append(
+            ComparisonMetricRow(
+                metric_name=metric_name,
+                metric_label=descriptor.label,
+                category=descriptor.category,
+                direction=descriptor.direction,
+                value_a=float(value_a),
+                value_b=float(value_b),
+                delta=delta,
+                winner=winner,
+            )
+        )
+    return rows
+
+
+def _resolve_comparison_records(
+    record_lookup: Mapping[ComparisonRecordKey, RawMetricRecord],
+    selected_rows: Sequence[ProfileCandidateScore],
+    *,
+    dataset_id: str,
+    comparison_mode: str,
+    slot_a: Optional[ComparisonRecordKey],
+    slot_b: Optional[ComparisonRecordKey],
+) -> List[RawMetricRecord]:
+    if comparison_mode == "A vs B":
+        ordered_keys = [slot_a, slot_b]
+        seen: set[ComparisonRecordKey] = set()
+        records: List[RawMetricRecord] = []
+        for key in ordered_keys:
+            if key is None or key in seen or key not in record_lookup:
+                continue
+            seen.add(key)
+            records.append(record_lookup[key])
+        return records
+
+    records = [
+        record_lookup[(row.stage, row.candidate_id, dataset_id)]
+        for row in selected_rows
+        if (row.stage, row.candidate_id, dataset_id) in record_lookup
+    ]
+    return records
+
+
 def _format_evaluation_text(model: SweepMetricExplorerModel, stage_name: str) -> str:
     rows = [row for row in model.evaluations if row.stage == stage_name]
     if not rows:
@@ -1844,6 +2018,349 @@ def _format_search_results_text(results: Sequence[SearchResult]) -> str:
     return "\n".join(lines)
 
 
+class _ComparisonImageInspector:
+    """Interactive single-run image inspector used inside the comparison workspace."""
+
+    VIEW_OPTIONS = ("preview", "avg_image", "guide_log")
+    VIEW_LABELS = {
+        "preview": "Preview",
+        "avg_image": "Avg Image",
+        "guide_log": "Guide LoG",
+    }
+    CONTRAST_OPTIONS = ("auto", "p2-p98", "p5-p95")
+    CONTRAST_LABELS = {
+        "auto": "Auto",
+        "p2-p98": "P2-P98",
+        "p5-p95": "P5-P95",
+    }
+
+    def __init__(
+        self,
+        app: "SweepMetricExplorerApp",
+        parent: Any,
+        *,
+        slot_name: str,
+        on_view_changed: Optional[Any] = None,
+        on_limits_changed: Optional[Any] = None,
+        on_open_large: Optional[Any] = None,
+        allow_open_large: bool = True,
+    ):
+        self.app = app
+        self.tk = app.tk
+        self.ttk = app.ttk
+        self.slot_name = slot_name
+        self.on_view_changed = on_view_changed
+        self.on_limits_changed = on_limits_changed
+        self.on_open_large = on_open_large
+        self.allow_open_large = allow_open_large
+
+        self.frame = self.ttk.Frame(parent)
+        self.title_var = self.tk.StringVar(value=f"Run {slot_name}")
+        self.meta_var = self.tk.StringVar(value=f"Set slot {slot_name} from the leaderboard.")
+        self.warning_var = self.tk.StringVar(value="")
+        self.view_var = self.tk.StringVar(value="preview")
+        self.contrast_var = self.tk.StringVar(value="auto")
+
+        self._record: Optional[RawMetricRecord] = None
+        self._bundle: Optional[ComparisonDisplayBundle] = None
+        self._record_key: Optional[ComparisonRecordKey] = None
+        self._suspend_limit_events = False
+        self._last_rendered_shape: Optional[Tuple[int, int]] = None
+
+        header = self.ttk.Frame(self.frame)
+        header.pack(fill="x", padx=6, pady=(6, 0))
+        self.ttk.Label(header, textvariable=self.title_var).pack(anchor="w")
+        self.ttk.Label(header, textvariable=self.meta_var, justify="left", wraplength=700).pack(
+            anchor="w", pady=(2, 0)
+        )
+        self.ttk.Label(header, textvariable=self.warning_var, justify="left", wraplength=700).pack(
+            anchor="w", pady=(2, 0)
+        )
+
+        controls = self.ttk.Frame(self.frame)
+        controls.pack(fill="x", padx=6, pady=6)
+        self.ttk.Label(controls, text="View").pack(side="left")
+        view_combo = self.ttk.Combobox(
+            controls,
+            textvariable=self.view_var,
+            state="readonly",
+            width=12,
+            values=list(self.VIEW_OPTIONS),
+        )
+        view_combo.pack(side="left", padx=4)
+        view_combo.bind("<<ComboboxSelected>>", self._handle_view_change)
+
+        self.ttk.Label(controls, text="Contrast").pack(side="left", padx=(8, 0))
+        contrast_combo = self.ttk.Combobox(
+            controls,
+            textvariable=self.contrast_var,
+            state="readonly",
+            width=10,
+            values=list(self.CONTRAST_OPTIONS),
+        )
+        contrast_combo.pack(side="left", padx=4)
+        contrast_combo.bind("<<ComboboxSelected>>", lambda _evt: self.render(reset_view=False))
+
+        self.ttk.Button(controls, text="Fit", command=self.fit_view).pack(side="left", padx=(10, 3))
+        self.ttk.Button(controls, text="1:1", command=self.pixel_view).pack(side="left", padx=3)
+        self.ttk.Button(controls, text="Reset", command=self.reset_view_state).pack(side="left", padx=3)
+        if self.allow_open_large and self.on_open_large is not None:
+            self.ttk.Button(controls, text="Open Large", command=self._open_large).pack(side="left", padx=3)
+
+        self.toolbar_frame = self.ttk.Frame(self.frame)
+        self.toolbar_frame.pack(fill="x", padx=6, pady=(0, 2))
+        self.canvas_frame = self.ttk.Frame(self.frame)
+        self.canvas_frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        self.figure = Figure(figsize=(6.4, 6.2))
+        self.axis = self.figure.add_subplot(111)
+        self.canvas = self.app.FigureCanvasTkAgg(self.figure, master=self.canvas_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        try:
+            self.toolbar = self.app.NavigationToolbar2Tk(
+                self.canvas,
+                self.toolbar_frame,
+                pack_toolbar=False,
+            )
+        except TypeError:
+            self.toolbar = self.app.NavigationToolbar2Tk(self.canvas, self.toolbar_frame)
+        self.toolbar.update()
+        if hasattr(self.toolbar, "pack"):
+            self.toolbar.pack(fill="x")
+        self.axis.callbacks.connect("xlim_changed", lambda _axes: self._notify_limits_changed())
+        self.axis.callbacks.connect("ylim_changed", lambda _axes: self._notify_limits_changed())
+        self._render_placeholder(f"Run {slot_name} is not set.")
+
+    @property
+    def record(self) -> Optional[RawMetricRecord]:
+        return self._record
+
+    @property
+    def record_key(self) -> Optional[ComparisonRecordKey]:
+        return self._record_key
+
+    def current_view(self) -> str:
+        return self.view_var.get()
+
+    def current_contrast(self) -> str:
+        return self.contrast_var.get()
+
+    def current_image_shape(self) -> Optional[Tuple[int, int]]:
+        image = self.current_image()
+        if not isinstance(image, np.ndarray) or image.ndim != 2:
+            return None
+        return int(image.shape[0]), int(image.shape[1])
+
+    def current_image(self) -> Optional[np.ndarray]:
+        if self._bundle is None:
+            return None
+        image = self._bundle.get(self.view_var.get())
+        if isinstance(image, np.ndarray) and image.ndim == 2 and image.size:
+            return np.asarray(image, dtype=np.float64)
+        return None
+
+    def has_image(self) -> bool:
+        return self.current_image() is not None
+
+    def set_view(self, view_name: str, *, emit_event: bool = False, reset_view: bool = False) -> None:
+        if view_name not in self.VIEW_OPTIONS:
+            return
+        changed = self.view_var.get() != view_name
+        self.view_var.set(view_name)
+        self.render(reset_view=reset_view or changed)
+        if emit_event and changed and self.on_view_changed is not None:
+            self.on_view_changed(self, view_name)
+
+    def set_contrast(self, contrast_mode: str, *, redraw: bool = True) -> None:
+        if contrast_mode not in self.CONTRAST_OPTIONS:
+            return
+        self.contrast_var.set(contrast_mode)
+        if redraw:
+            self.render(reset_view=False)
+
+    def set_record(
+        self,
+        record: Optional[RawMetricRecord],
+        bundle: Optional[ComparisonDisplayBundle],
+        *,
+        annotation_label: str = "",
+    ) -> None:
+        previous_key = self._record_key
+        self._record = record
+        self._bundle = bundle
+        self._record_key = _metric_row_key(record) if record is not None else None
+        if record is None:
+            self.title_var.set(f"Run {self.slot_name}")
+            self.meta_var.set(f"Set slot {self.slot_name} from the leaderboard.")
+            self.warning_var.set("")
+            self._render_placeholder(f"Run {self.slot_name} is not set.")
+            return
+
+        self.title_var.set(
+            f"Run {self.slot_name}: {record.candidate_id} | {record.dataset_id}"
+        )
+        meta_parts = [
+            f"stage={record.stage}",
+            f"strategy={record.strategy}",
+        ]
+        if record.family:
+            meta_parts.append(f"family={record.family}")
+        if record.alpha is not None:
+            meta_parts.append(f"alpha={record.alpha:g}")
+        meta_parts.append(f"label={annotation_label or 'unlabeled'}")
+        self.meta_var.set(" | ".join(meta_parts))
+        warning_text = ""
+        if bundle is not None and bundle.warnings:
+            warning_text = f"Warnings: {' | '.join(bundle.warnings[:3])}"
+        self.warning_var.set(warning_text)
+        self.render(reset_view=previous_key != self._record_key)
+
+    def fit_view(self) -> None:
+        shape = self.current_image_shape()
+        if shape is None:
+            return
+        height, width = shape
+        self.apply_axes_limits((-0.5, width - 0.5), (height - 0.5, -0.5))
+
+    def pixel_view(self) -> None:
+        shape = self.current_image_shape()
+        if shape is None:
+            return
+        self.canvas.draw()
+        bbox = self.axis.get_window_extent()
+        visible_width = max(1.0, min(float(shape[1]), float(bbox.width)))
+        visible_height = max(1.0, min(float(shape[0]), float(bbox.height)))
+        xlim, ylim = self.get_axes_limits()
+        if xlim is None or ylim is None:
+            self.fit_view()
+            xlim, ylim = self.get_axes_limits()
+            if xlim is None or ylim is None:
+                return
+        center_x = 0.5 * (xlim[0] + xlim[1])
+        center_y = 0.5 * (ylim[0] + ylim[1])
+        full_x = self._bounded_limits(center_x, visible_width, -0.5, shape[1] - 0.5)
+        full_y = self._bounded_limits(center_y, visible_height, -0.5, shape[0] - 0.5)
+        if ylim[1] < ylim[0]:
+            full_y = (full_y[1], full_y[0])
+        self.apply_axes_limits(full_x, full_y)
+
+    def reset_view_state(self) -> None:
+        self.contrast_var.set("auto")
+        self.fit_view()
+        self.render(reset_view=False)
+
+    def get_axes_limits(self) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
+        if not self.axis.images:
+            return None, None
+        xlim = cast(Tuple[float, float], tuple(float(value) for value in self.axis.get_xlim()))
+        ylim = cast(Tuple[float, float], tuple(float(value) for value in self.axis.get_ylim()))
+        return xlim, ylim
+
+    def apply_axes_limits(
+        self,
+        x_limits: Tuple[float, float],
+        y_limits: Tuple[float, float],
+    ) -> None:
+        self._suspend_limit_events = True
+        try:
+            self.axis.set_xlim(*x_limits)
+            self.axis.set_ylim(*y_limits)
+        finally:
+            self._suspend_limit_events = False
+        self.canvas.draw_idle()
+
+    def clone_view_state_from(self, other: "_ComparisonImageInspector") -> None:
+        self.set_view(other.current_view(), emit_event=False, reset_view=True)
+        self.set_contrast(other.current_contrast(), redraw=True)
+        xlim, ylim = other.get_axes_limits()
+        if xlim is not None and ylim is not None and self.has_image():
+            self.apply_axes_limits(xlim, ylim)
+
+    def render(self, *, reset_view: bool) -> None:
+        image = self.current_image()
+        previous_shape = self._last_rendered_shape
+        previous_limits = self.get_axes_limits()
+        if image is None:
+            placeholder = self.VIEW_LABELS.get(self.view_var.get(), self.view_var.get())
+            self._render_placeholder(f"{placeholder} unavailable.")
+            return
+
+        self.axis.clear()
+        vmin, vmax = self._contrast_limits(image)
+        cmap = "viridis" if self.view_var.get() == "guide_log" else "gray"
+        self.axis.imshow(
+            image,
+            cmap=cmap,
+            aspect="equal",
+            interpolation="nearest",
+            vmin=vmin,
+            vmax=vmax,
+        )
+        self.axis.set_xticks([])
+        self.axis.set_yticks([])
+        self.axis.set_title(self.VIEW_LABELS.get(self.view_var.get(), self.view_var.get()))
+        if reset_view or previous_limits[0] is None or previous_shape != image.shape:
+            self.fit_view()
+        else:
+            self.apply_axes_limits(cast(Tuple[float, float], previous_limits[0]), cast(Tuple[float, float], previous_limits[1]))
+        self._last_rendered_shape = (int(image.shape[0]), int(image.shape[1]))
+        self.canvas.draw_idle()
+
+    def _render_placeholder(self, text: str) -> None:
+        self.axis.clear()
+        self.axis.text(0.5, 0.5, text, ha="center", va="center")
+        self.axis.set_xticks([])
+        self.axis.set_yticks([])
+        self.axis.set_title(self.VIEW_LABELS.get(self.view_var.get(), self.view_var.get()))
+        self._last_rendered_shape = None
+        self.canvas.draw_idle()
+
+    def _handle_view_change(self, _event: Optional[object] = None) -> None:
+        self.render(reset_view=False)
+        if self.on_view_changed is not None:
+            self.on_view_changed(self, self.view_var.get())
+
+    def _open_large(self) -> None:
+        if self.on_open_large is not None:
+            self.on_open_large(self.slot_name)
+
+    def _notify_limits_changed(self) -> None:
+        if self._suspend_limit_events or self.on_limits_changed is None or not self.axis.images:
+            return
+        self.on_limits_changed(self)
+
+    def _contrast_limits(self, image: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
+        mode = self.contrast_var.get()
+        if mode == "p2-p98":
+            low, high = np.percentile(image, [2.0, 98.0])
+        elif mode == "p5-p95":
+            low, high = np.percentile(image, [5.0, 95.0])
+        else:
+            return None, None
+        low_value = float(low)
+        high_value = float(high)
+        if not math.isfinite(low_value) or not math.isfinite(high_value) or high_value <= low_value:
+            return None, None
+        return low_value, high_value
+
+    @staticmethod
+    def _bounded_limits(center: float, span: float, lower: float, upper: float) -> Tuple[float, float]:
+        total_width = upper - lower
+        if span >= total_width:
+            return lower, upper
+        half = span / 2.0
+        start = center - half
+        end = center + half
+        if start < lower:
+            end += lower - start
+            start = lower
+        if end > upper:
+            start -= end - upper
+            end = upper
+        return start, end
+
+
 class SweepMetricExplorerApp:
     """Tkinter GUI for loading, re-scoring, annotating, and exporting raw metrics."""
 
@@ -1856,28 +2373,40 @@ class SweepMetricExplorerApp:
         self.ttk = ttk
         self.filedialog = __import__("tkinter.filedialog", fromlist=["filedialog"])
         self.messagebox = __import__("tkinter.messagebox", fromlist=["messagebox"])
-        self.FigureCanvasTkAgg = __import__(
+        backend_tkagg = __import__(
             "matplotlib.backends.backend_tkagg",
-            fromlist=["FigureCanvasTkAgg"],
-        ).FigureCanvasTkAgg
+            fromlist=["FigureCanvasTkAgg", "NavigationToolbar2Tk"],
+        )
+        self.FigureCanvasTkAgg = backend_tkagg.FigureCanvasTkAgg
+        self.NavigationToolbar2Tk = backend_tkagg.NavigationToolbar2Tk
 
         self.root.title("Sweep Raw Metric Explorer")
         self.root.geometry("1440x980")
         self.model: Optional[SweepMetricExplorerModel] = None
         self.metrics_config_path = metrics_config_path
-        self._canvases: Dict[str, Any] = {}
+        self._comparison_image_cache: Dict[ComparisonRecordKey, ComparisonDisplayBundle] = {}
+        self._comparison_popouts: Dict[str, Dict[str, Any]] = {}
+        self._comparison_sync_in_progress = False
+        self._comparison_view_sync_in_progress = False
 
         self.path_var = tk.StringVar(value=str(initial_path) if initial_path else "")
         self.status_var = tk.StringVar(value="Idle")
         self.stage_var = tk.StringVar(value="")
         self.profile_var = tk.StringVar(value="")
         self.dataset_var = tk.StringVar(value="")
-        self.channel_var = tk.StringVar(value="avg_image")
+        self.comparison_sync_var = tk.BooleanVar(value=True)
+        self.comparison_lock_views_var = tk.BooleanVar(value=True)
+        self.comparison_layout_var = tk.StringVar(value="Horizontal")
+        self.comparison_summary_var = tk.StringVar(value="Set A and B from the leaderboard to begin.")
+        self.comparison_slot_a_var = tk.StringVar(value="A: not set")
+        self.comparison_slot_b_var = tk.StringVar(value="B: not set")
         self.search_stage_var = tk.StringVar(value="")
         self.search_profile_name_var = tk.StringVar(value="custom_profile")
         self.search_step_var = tk.StringVar(value=f"{DEFAULT_SEARCH_WEIGHT_STEP:g}")
         self.search_max_metrics_var = tk.StringVar(value="6")
         self.weight_json_var = tk.StringVar(value="{}")
+        self._comparison_slot_a_key: Optional[ComparisonRecordKey] = None
+        self._comparison_slot_b_key: Optional[ComparisonRecordKey] = None
 
         self._leaderboard_rows: List[ProfileCandidateScore] = []
         self._leaderboard_row_lookup: Dict[str, ProfileCandidateScore] = {}
@@ -1938,6 +2467,9 @@ class SweepMetricExplorerApp:
         self.ttk.Button(controls, text="Label Good", command=lambda: self._set_labels_for_selection("good")).pack(side="left", padx=3)
         self.ttk.Button(controls, text="Label Bad", command=lambda: self._set_labels_for_selection("bad")).pack(side="left", padx=3)
         self.ttk.Button(controls, text="Clear Label", command=self._clear_labels_for_selection).pack(side="left", padx=3)
+        self.ttk.Button(controls, text="Compare A", command=lambda: self._set_comparison_slot("A")).pack(side="left", padx=(12, 3))
+        self.ttk.Button(controls, text="Compare B", command=lambda: self._set_comparison_slot("B")).pack(side="left", padx=3)
+        self.ttk.Button(controls, text="Compare 2", command=self._assign_comparison_slots_from_selection).pack(side="left", padx=3)
 
         split = self.ttk.Panedwindow(self.leaderboard_tab, orient="horizontal")
         split.pack(fill="both", expand=True, padx=6, pady=6)
@@ -1973,20 +2505,101 @@ class SweepMetricExplorerApp:
     def _build_comparison_tab(self) -> None:
         controls = self.ttk.Frame(self.comparison_tab)
         controls.pack(fill="x", padx=6, pady=6)
-        self.ttk.Label(controls, text="Channel").pack(side="left")
-        self.channel_combo = self.ttk.Combobox(
-            controls,
-            textvariable=self.channel_var,
-            state="readonly",
-            width=16,
-            values=["avg_image", "guide_log"],
+        self.ttk.Button(controls, text="Set A", command=lambda: self._set_comparison_slot("A")).pack(
+            side="left", padx=(0, 3)
         )
-        self.channel_combo.pack(side="left", padx=4)
-        self.channel_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_comparison())
-        self.comparison_text = self.tk.Text(self.comparison_tab, height=14, wrap="word")
-        self.comparison_text.pack(fill="x", padx=6, pady=6)
-        self.comparison_plot_frame = self.ttk.Frame(self.comparison_tab)
-        self.comparison_plot_frame.pack(fill="both", expand=True, padx=6, pady=6)
+        self.ttk.Button(controls, text="Set B", command=lambda: self._set_comparison_slot("B")).pack(side="left", padx=3)
+        self.ttk.Button(controls, text="Use 2 Selected", command=self._assign_comparison_slots_from_selection).pack(
+            side="left", padx=3
+        )
+        self.ttk.Button(controls, text="Swap", command=self._swap_comparison_slots).pack(side="left", padx=3)
+        self.ttk.Button(controls, text="Clear Slots", command=self._clear_comparison_slots).pack(side="left", padx=3)
+        self.ttk.Label(controls, text="Layout").pack(side="left", padx=(12, 0))
+        self.comparison_layout_combo = self.ttk.Combobox(
+            controls,
+            textvariable=self.comparison_layout_var,
+            state="readonly",
+            width=12,
+            values=["Horizontal", "Vertical"],
+        )
+        self.comparison_layout_combo.pack(side="left", padx=4)
+        self.comparison_layout_combo.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_comparison_layout())
+        self.ttk.Checkbutton(
+            controls,
+            text="Sync Zoom/Pan",
+            variable=self.comparison_sync_var,
+        ).pack(side="left", padx=(12, 4))
+        self.ttk.Checkbutton(
+            controls,
+            text="Lock Views",
+            variable=self.comparison_lock_views_var,
+        ).pack(side="left", padx=4)
+
+        slot_frame = self.ttk.Frame(self.comparison_tab)
+        slot_frame.pack(fill="x", padx=6, pady=(0, 4))
+        self.ttk.Label(slot_frame, textvariable=self.comparison_slot_a_var).pack(side="left", padx=(0, 16))
+        self.ttk.Label(slot_frame, textvariable=self.comparison_slot_b_var).pack(side="left")
+        self.ttk.Label(
+            slot_frame,
+            text="Use the Matplotlib toolbars under each image for zoom, pan, back, and home.",
+        ).pack(side="right")
+
+        comparison_split = self.ttk.Panedwindow(self.comparison_tab, orient="vertical")
+        comparison_split.pack(fill="both", expand=True, padx=6, pady=6)
+        inspectors_frame = self.ttk.Frame(comparison_split)
+        details_frame = self.ttk.Frame(comparison_split)
+        comparison_split.add(inspectors_frame, weight=5)
+        comparison_split.add(details_frame, weight=2)
+
+        self.comparison_inspector_grid = self.ttk.Frame(inspectors_frame)
+        self.comparison_inspector_grid.pack(fill="both", expand=True)
+        self.comparison_inspector_a = _ComparisonImageInspector(
+            self,
+            self.comparison_inspector_grid,
+            slot_name="A",
+            on_view_changed=self._on_inspector_view_changed,
+            on_limits_changed=self._on_inspector_limits_changed,
+            on_open_large=self._open_single_inspector_window,
+        )
+        self.comparison_inspector_b = _ComparisonImageInspector(
+            self,
+            self.comparison_inspector_grid,
+            slot_name="B",
+            on_view_changed=self._on_inspector_view_changed,
+            on_limits_changed=self._on_inspector_limits_changed,
+            on_open_large=self._open_single_inspector_window,
+        )
+        self._refresh_comparison_layout()
+
+        self.ttk.Label(details_frame, textvariable=self.comparison_summary_var, justify="left").pack(
+            anchor="w", padx=4, pady=(4, 6)
+        )
+        metric_columns = ("metric", "a_value", "b_value", "delta", "winner", "category")
+        self.comparison_metric_tree = self.ttk.Treeview(
+            details_frame,
+            columns=metric_columns,
+            show="headings",
+            height=12,
+        )
+        for column, label, width in (
+            ("metric", "Metric", 240),
+            ("a_value", "A", 110),
+            ("b_value", "B", 110),
+            ("delta", "A-B", 110),
+            ("winner", "Preferred", 90),
+            ("category", "Group", 90),
+        ):
+            self.comparison_metric_tree.heading(column, text=label)
+            anchor = "w" if column == "metric" else "center"
+            self.comparison_metric_tree.column(column, width=width, anchor=anchor)
+        metric_scroll = self.ttk.Scrollbar(
+            details_frame,
+            orient="vertical",
+            command=self.comparison_metric_tree.yview,
+        )
+        self.comparison_metric_tree.configure(yscrollcommand=metric_scroll.set)
+        self.comparison_metric_tree.pack(side="left", fill="both", expand=True, padx=(4, 0), pady=(0, 4))
+        metric_scroll.pack(side="right", fill="y", padx=(0, 4), pady=(0, 4))
 
     def _build_evaluation_tab(self) -> None:
         controls = self.ttk.Frame(self.evaluation_tab)
@@ -2061,17 +2674,6 @@ class SweepMetricExplorerApp:
         widget.delete("1.0", self.tk.END)
         widget.insert(self.tk.END, text)
 
-    def _draw_figure(self, key: str, parent: Any, figure: Optional[Figure]) -> None:
-        existing = self._canvases.pop(key, None)
-        if existing is not None:
-            existing.get_tk_widget().destroy()
-        if figure is None:
-            return
-        canvas = self.FigureCanvasTkAgg(figure, master=parent)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-        self._canvases[key] = canvas
-
     def _on_browse(self) -> None:
         selection = self.filedialog.askdirectory()
         if selection:
@@ -2119,6 +2721,11 @@ class SweepMetricExplorerApp:
         self._populate_from_model(model)
 
     def _populate_from_model(self, model: SweepMetricExplorerModel) -> None:
+        self._comparison_image_cache.clear()
+        self._comparison_slot_a_key = None
+        self._comparison_slot_b_key = None
+        self._close_comparison_popouts()
+        self._update_comparison_slot_labels()
         stage_values = list(model.base_model.stage_order)
         self.stage_combo["values"] = stage_values
         self.evaluation_stage_combo["values"] = stage_values
@@ -2154,6 +2761,100 @@ class SweepMetricExplorerApp:
         self.refresh_comparison()
         self.refresh_evaluation()
         self._set_text(self.search_results_text, _format_search_results_text(model.search_results))
+
+    def _update_comparison_slot_labels(self) -> None:
+        self.comparison_slot_a_var.set(f"A: {_record_key_to_text(self._comparison_slot_a_key)}")
+        self.comparison_slot_b_var.set(f"B: {_record_key_to_text(self._comparison_slot_b_key)}")
+
+    def _comparison_slot_key_ref(self, slot_name: str) -> Optional[ComparisonRecordKey]:
+        return self._comparison_slot_a_key if slot_name == "A" else self._comparison_slot_b_key
+
+    def _set_comparison_slot_key(self, slot_name: str, key: Optional[ComparisonRecordKey]) -> None:
+        if slot_name == "A":
+            self._comparison_slot_a_key = key
+        else:
+            self._comparison_slot_b_key = key
+
+    def _set_comparison_slot(self, slot_name: str) -> None:
+        if self.model is None:
+            return
+        selected = self._selected_leaderboard_rows()
+        if not selected:
+            self.messagebox.showwarning("Comparison", "Select a run in the leaderboard first.")
+            return
+        dataset_id = self.dataset_var.get() or (_real_datasets(self.model.base_model)[0])
+        row = selected[0]
+        key = (row.stage, row.candidate_id, dataset_id)
+        self._set_comparison_slot_key(slot_name, key)
+        self._update_comparison_slot_labels()
+        self.refresh_comparison()
+
+    def _assign_comparison_slots_from_selection(self) -> None:
+        if self.model is None:
+            return
+        selected = self._selected_leaderboard_rows()
+        if not selected:
+            self.messagebox.showwarning("Comparison", "Select one or two runs in the leaderboard first.")
+            return
+        dataset_id = self.dataset_var.get() or (_real_datasets(self.model.base_model)[0])
+        ordered = selected[:2]
+        if ordered:
+            self._comparison_slot_a_key = (ordered[0].stage, ordered[0].candidate_id, dataset_id)
+        if len(ordered) > 1:
+            self._comparison_slot_b_key = (ordered[1].stage, ordered[1].candidate_id, dataset_id)
+        self._update_comparison_slot_labels()
+        self.refresh_comparison()
+
+    def _swap_comparison_slots(self) -> None:
+        self._comparison_slot_a_key, self._comparison_slot_b_key = (
+            self._comparison_slot_b_key,
+            self._comparison_slot_a_key,
+        )
+        self._update_comparison_slot_labels()
+        self.refresh_comparison()
+
+    def _clear_comparison_slots(self) -> None:
+        self._comparison_slot_a_key = None
+        self._comparison_slot_b_key = None
+        self._update_comparison_slot_labels()
+        self.refresh_comparison()
+
+    def _refresh_comparison_layout(self) -> None:
+        if not hasattr(self, "comparison_inspector_a"):
+            return
+        for child in self.comparison_inspector_grid.winfo_children():
+            child.grid_forget()
+        orientation = self.comparison_layout_var.get()
+        if orientation == "Vertical":
+            self.comparison_inspector_grid.rowconfigure(0, weight=1)
+            self.comparison_inspector_grid.rowconfigure(1, weight=1)
+            self.comparison_inspector_grid.columnconfigure(0, weight=1)
+            self.comparison_inspector_grid.columnconfigure(1, weight=0)
+            self.comparison_inspector_a.frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+            self.comparison_inspector_b.frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        else:
+            self.comparison_inspector_grid.rowconfigure(0, weight=1)
+            self.comparison_inspector_grid.rowconfigure(1, weight=0)
+            self.comparison_inspector_grid.columnconfigure(0, weight=1)
+            self.comparison_inspector_grid.columnconfigure(1, weight=1)
+            self.comparison_inspector_a.frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+            self.comparison_inspector_b.frame.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
+
+    def _record_for_key(self, key: Optional[ComparisonRecordKey]) -> Optional[RawMetricRecord]:
+        if self.model is None or key is None:
+            return None
+        return _record_lookup(self.model.raw_records).get(key)
+
+    def _display_bundle_for_record(self, record: Optional[RawMetricRecord]) -> Optional[ComparisonDisplayBundle]:
+        if record is None:
+            return None
+        key = _metric_row_key(record)
+        cached = self._comparison_image_cache.get(key)
+        if cached is not None:
+            return cached
+        bundle = load_comparison_display_bundle(record)
+        self._comparison_image_cache[key] = bundle
+        return bundle
 
     def _current_profile_results(self) -> List[ProfileCandidateScore]:
         if self.model is None:
@@ -2234,23 +2935,180 @@ class SweepMetricExplorerApp:
         self._set_text(self.leaderboard_detail, "\n".join(lines).strip())
         self.refresh_comparison()
 
+    def _comparison_annotation_label(self, record: Optional[RawMetricRecord]) -> str:
+        if self.model is None or record is None:
+            return ""
+        annotation = self.model.annotations.get(
+            _annotation_key(record.stage, record.candidate_id, record.dataset_id)
+        )
+        return annotation.label if annotation is not None else ""
+
+    def _current_comparison_records(self) -> List[RawMetricRecord]:
+        records = [
+            self._record_for_key(self._comparison_slot_a_key),
+            self._record_for_key(self._comparison_slot_b_key),
+        ]
+        return [record for record in records if record is not None]
+
+    def _refresh_comparison_metric_table(
+        self,
+        record_a: Optional[RawMetricRecord],
+        record_b: Optional[RawMetricRecord],
+    ) -> None:
+        self.comparison_metric_tree.delete(*self.comparison_metric_tree.get_children())
+        if self.model is None or record_a is None or record_b is None:
+            return
+        for row in build_comparison_metric_rows(self.model, record_a, record_b):
+            self.comparison_metric_tree.insert(
+                "",
+                "end",
+                values=(
+                    row.metric_label,
+                    f"{row.value_a:.6f}",
+                    f"{row.value_b:.6f}",
+                    f"{row.delta:+.6f}",
+                    row.winner,
+                    row.category,
+                ),
+            )
+
+    def _comparison_summary_text(
+        self,
+        record_a: Optional[RawMetricRecord],
+        record_b: Optional[RawMetricRecord],
+    ) -> str:
+        if record_a is None and record_b is None:
+            return "Set A and B from the leaderboard to begin."
+        if record_a is None or record_b is None:
+            missing = "A" if record_a is None else "B"
+            ready = "B" if record_a is None else "A"
+            ready_record = record_b if record_a is None else record_a
+            assert ready_record is not None
+            return (
+                f"Run {ready} is ready ({ready_record.candidate_id} / {ready_record.dataset_id}). "
+                f"Set slot {missing} to start direct A/B comparison."
+            )
+        dataset_status = (
+            "same dataset"
+            if record_a.dataset_id == record_b.dataset_id
+            else f"different datasets ({record_a.dataset_id} vs {record_b.dataset_id})"
+        )
+        return (
+            f"Comparing {record_a.candidate_id} against {record_b.candidate_id} "
+            f"with {dataset_status}. Use each toolbar for local inspection; "
+            f"{'zoom/pan is synced' if self.comparison_sync_var.get() else 'zoom/pan is independent'}."
+        )
+
     def refresh_comparison(self) -> None:
         if self.model is None:
             return
-        dataset_id = self.dataset_var.get() or (_real_datasets(self.model.base_model)[0])
-        record_lookup = _record_lookup(self.model.raw_records)
-        records = [
-            record_lookup[(row.stage, row.candidate_id, dataset_id)]
-            for row in self._selected_leaderboard_rows()
-            if (row.stage, row.candidate_id, dataset_id) in record_lookup
-        ]
-        text = "\n\n".join(_format_record_metric_lines(self.model, record) for record in records) or "No comparison selection."
-        self._set_text(self.comparison_text, text)
-        self._draw_figure(
-            "comparison",
-            self.comparison_plot_frame,
-            create_channel_comparison_figure(self.model, records, channel_name=self.channel_var.get()),
+        record_a = self._record_for_key(self._comparison_slot_a_key)
+        record_b = self._record_for_key(self._comparison_slot_b_key)
+        self.comparison_inspector_a.set_record(
+            record_a,
+            self._display_bundle_for_record(record_a),
+            annotation_label=self._comparison_annotation_label(record_a),
         )
+        self.comparison_inspector_b.set_record(
+            record_b,
+            self._display_bundle_for_record(record_b),
+            annotation_label=self._comparison_annotation_label(record_b),
+        )
+        self.comparison_summary_var.set(self._comparison_summary_text(record_a, record_b))
+        self._refresh_comparison_metric_table(record_a, record_b)
+        self._refresh_open_comparison_popouts()
+
+    def _on_inspector_view_changed(self, source: _ComparisonImageInspector, view_name: str) -> None:
+        if not self.comparison_lock_views_var.get() or self._comparison_view_sync_in_progress:
+            return
+        other = self.comparison_inspector_b if source is self.comparison_inspector_a else self.comparison_inspector_a
+        self._comparison_view_sync_in_progress = True
+        try:
+            other.set_view(view_name, emit_event=False, reset_view=False)
+        finally:
+            self._comparison_view_sync_in_progress = False
+        self._refresh_open_comparison_popouts()
+
+    def _on_inspector_limits_changed(self, source: _ComparisonImageInspector) -> None:
+        if not self.comparison_sync_var.get() or self._comparison_sync_in_progress:
+            return
+        other = self.comparison_inspector_b if source is self.comparison_inspector_a else self.comparison_inspector_a
+        if not source.has_image() or not other.has_image():
+            return
+        xlim, ylim = source.get_axes_limits()
+        if xlim is None or ylim is None:
+            return
+        self._comparison_sync_in_progress = True
+        try:
+            other.apply_axes_limits(xlim, ylim)
+        finally:
+            self._comparison_sync_in_progress = False
+        self._refresh_open_comparison_popouts()
+
+    def _open_single_inspector_window(self, slot_name: str) -> None:
+        source = self.comparison_inspector_a if slot_name == "A" else self.comparison_inspector_b
+        if source.record is None:
+            self.messagebox.showwarning("Comparison Viewer", f"Set slot {slot_name} first.")
+            return
+        existing = self._comparison_popouts.get(slot_name)
+        if existing is not None:
+            window = existing["window"]
+            if window.winfo_exists():
+                self._sync_popout_from_main(slot_name)
+                window.deiconify()
+                window.lift()
+                window.focus_force()
+                return
+        viewer = self.tk.Toplevel(self.root)
+        viewer.title(f"Run {slot_name} Viewer")
+        viewer.geometry("1200x980")
+        inspector = _ComparisonImageInspector(
+            self,
+            viewer,
+            slot_name=slot_name,
+            on_view_changed=None,
+            on_limits_changed=None,
+            on_open_large=None,
+            allow_open_large=False,
+        )
+        inspector.frame.pack(fill="both", expand=True)
+        self._comparison_popouts[slot_name] = {"window": viewer, "inspector": inspector}
+
+        def _close_popout() -> None:
+            self._comparison_popouts.pop(slot_name, None)
+            viewer.destroy()
+
+        viewer.protocol("WM_DELETE_WINDOW", _close_popout)
+        self._sync_popout_from_main(slot_name)
+
+    def _sync_popout_from_main(self, slot_name: str) -> None:
+        popout = self._comparison_popouts.get(slot_name)
+        if popout is None:
+            return
+        target = cast(_ComparisonImageInspector, popout["inspector"])
+        source = self.comparison_inspector_a if slot_name == "A" else self.comparison_inspector_b
+        target.set_record(
+            source.record,
+            self._display_bundle_for_record(source.record),
+            annotation_label=self._comparison_annotation_label(source.record),
+        )
+        if source.record is not None:
+            target.clone_view_state_from(source)
+
+    def _refresh_open_comparison_popouts(self) -> None:
+        for slot_name, payload in list(self._comparison_popouts.items()):
+            window = payload.get("window")
+            if window is None or not window.winfo_exists():
+                self._comparison_popouts.pop(slot_name, None)
+                continue
+            self._sync_popout_from_main(slot_name)
+
+    def _close_comparison_popouts(self) -> None:
+        for slot_name, payload in list(self._comparison_popouts.items()):
+            window = payload.get("window")
+            if window is not None and window.winfo_exists():
+                window.destroy()
+            self._comparison_popouts.pop(slot_name, None)
 
     def refresh_evaluation(self) -> None:
         if self.model is None:

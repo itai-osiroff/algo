@@ -426,6 +426,7 @@ This helper:
 - keeps the existing saved metrics and scores available as comparison baselines
 - supports manual `top` / `good` / `bad` annotations stored under `metric_review/annotations.json`
 - compares built-in and custom ranking profiles, including mixed old+new metric combinations
+- provides a persistent A/B comparison workspace with per-image Matplotlib toolbars, syncable zoom/pan, fit/1:1 controls, and pop-out viewers
 
 Built-in new metrics include:
 

@@ -15,9 +15,12 @@ from moment_images.sweep_metric_explorer import (
     _normalized_dct_channel,
     _normalized_shannon_entropy,
     _prepare_guide_log_channel,
+    _resolve_comparison_records,
     _vollath_f4,
+    build_comparison_metric_rows,
     create_channel_comparison_figure,
     export_metric_report,
+    load_comparison_display_bundle,
     load_sweep_metric_explorer_model,
     main,
     search_profile_combinations,
@@ -328,3 +331,87 @@ def test_channel_comparison_figure_preserves_image_aspect_ratio(tmp_path):
     image_axes = [ax for ax in figure.axes if ax.images]
     assert image_axes
     assert all(ax.get_aspect() == 1.0 for ax in image_axes)
+
+
+def test_channel_comparison_figure_grows_with_scale(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    model = load_sweep_metric_explorer_model(output_dir)
+    records = [
+        record
+        for record in model.raw_records
+        if record.stage == "stage1" and record.dataset_id == "d1"
+    ][:2]
+
+    small = create_channel_comparison_figure(model, records, channel_name="avg_image", figure_scale=1.0)
+    large = create_channel_comparison_figure(model, records, channel_name="avg_image", figure_scale=2.0)
+
+    assert large.get_figwidth() > small.get_figwidth()
+    assert large.get_figheight() > small.get_figheight()
+
+
+def test_resolve_comparison_records_supports_selected_and_slot_modes(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    model = load_sweep_metric_explorer_model(output_dir)
+    record_lookup = {
+        (record.stage, record.candidate_id, record.dataset_id): record
+        for record in model.raw_records
+    }
+    selected_rows = model.profile_results[("stage1", "new_dct_sparse")]
+
+    selected_mode = _resolve_comparison_records(
+        record_lookup,
+        selected_rows,
+        dataset_id="d1",
+        comparison_mode="Selected",
+        slot_a=None,
+        slot_b=None,
+    )
+    slot_mode = _resolve_comparison_records(
+        record_lookup,
+        selected_rows,
+        dataset_id="d1",
+        comparison_mode="A vs B",
+        slot_a=("stage1", "c_good", "d1"),
+        slot_b=("stage1", "c_bad", "d2"),
+    )
+
+    assert [record.candidate_id for record in selected_mode] == ["c_good", "c_bad"]
+    assert [(record.candidate_id, record.dataset_id) for record in slot_mode] == [
+        ("c_good", "d1"),
+        ("c_bad", "d2"),
+    ]
+
+
+def test_load_comparison_display_bundle_returns_preview_avg_and_guide(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    model = load_sweep_metric_explorer_model(output_dir)
+    record = next(
+        item for item in model.raw_records if item.stage == "stage1" and item.candidate_id == "c_good" and item.dataset_id == "d1"
+    )
+
+    bundle = load_comparison_display_bundle(record)
+
+    assert bundle.preview is not None
+    assert bundle.avg_image is not None
+    assert bundle.guide_log is not None
+    assert bundle.get("preview").shape == bundle.get("avg_image").shape
+    assert bundle.get("guide_log").shape == bundle.get("avg_image").shape
+
+
+def test_build_comparison_metric_rows_identifies_preferred_side(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    model = load_sweep_metric_explorer_model(output_dir)
+    good = next(
+        item for item in model.raw_records if item.stage == "stage1" and item.candidate_id == "c_good" and item.dataset_id == "d1"
+    )
+    bad = next(
+        item for item in model.raw_records if item.stage == "stage1" and item.candidate_id == "c_bad" and item.dataset_id == "d1"
+    )
+
+    rows = build_comparison_metric_rows(model, good, bad)
+
+    vollath = next(row for row in rows if row.metric_name == "vollath_f4_avg")
+    shannon = next(row for row in rows if row.metric_name == "ndct_shannon_avg")
+    assert vollath.winner == "A"
+    assert vollath.delta > 0
+    assert shannon.winner == "A"

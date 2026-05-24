@@ -173,19 +173,78 @@ Useful interpretation:
 
 ### 4. Compare actual images
 
-Select one or more rows in the `Leaderboard` tab.
+The `Comparison` tab is now a persistent `A / B` workspace rather than a single static preview figure.
 
-Then switch to `Comparison`.
+The smoothest flow is:
 
-The comparison view shows:
+1. Select one run in `Leaderboard` and click `Compare A`
+2. Select a second run and click `Compare B`
+3. Or select two rows and click `Compare 2`
+4. Switch to `Comparison`
 
-- preview image from `avg_rectified.png`
-- selected raw channel:
+The comparison view shows two independent inspector panels:
+
+- `Run A`
+- `Run B`
+
+Each panel has:
+
+- a dedicated Matplotlib toolbar
+- a `View` selector:
+  - `preview`
   - `avg_image`
   - `guide_log`
-- per-record metric readout in the text area
+- a `Contrast` selector:
+  - `auto`
+  - `p2-p98`
+  - `p5-p95`
+- `Fit`
+- `1:1`
+- `Reset`
+- `Open Large`
 
-Use this tab to sanity-check whether the metric is rewarding something meaningful or just noise / contrast artifacts.
+This is the intended inspection workflow:
+
+- use the Matplotlib toolbar for real zoom / pan / home / back behavior
+- use `Fit` to jump back to the full image
+- use `1:1` when you want a truer pixel-scale view of a region
+- use `Open Large` to pop one side into a dedicated full-size viewer
+- use `Contrast` when focus differences are subtle
+
+The comparison-level controls are:
+
+- `Set A`
+- `Set B`
+- `Use 2 Selected`
+- `Swap`
+- `Clear Slots`
+- `Layout`
+  - `Horizontal`
+  - `Vertical`
+- `Sync Zoom/Pan`
+- `Lock Views`
+
+Use `Sync Zoom/Pan` when you want the same region to stay aligned between both runs.
+
+Use `Lock Views` when switching one panel from `preview` to `avg_image` or `guide_log` should automatically switch the other panel too.
+
+The lower comparison table now shows metric-by-metric A/B deltas and which side each metric prefers.
+
+Use this tab to sanity-check whether a metric is rewarding genuinely sharper images or just boosting contrast/noise artifacts.
+
+### Comparing two runs directly
+
+If you want a stable side-by-side comparison between two runs:
+
+1. Select the first run in `Leaderboard`
+2. Click `Compare A` or `Set A`
+3. Select the second run
+4. Click `Compare B` or `Set B`
+5. Open `Comparison`
+
+Now the comparison tab shows exactly those two runs together, even if the current leaderboard selection changes later.
+
+When both runs are set, the metric table also includes deltas in `A - B` form plus a `Preferred` column, so you can quickly see which run each metric favors.
 
 ### 5. Add manual labels
 
