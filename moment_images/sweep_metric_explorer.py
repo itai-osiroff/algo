@@ -8,10 +8,11 @@ import json
 import math
 import platform
 import subprocess
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, cast
 
 import cv2 as cv
 import numpy as np
@@ -38,6 +39,8 @@ DEFAULT_GUIDE_SIGMA = 1.0
 DEFAULT_SEARCH_WEIGHT_STEP = 0.1
 DEFAULT_TOP_K = 5
 ANNOTATION_LABEL_SCORES = {"bad": 0.0, "good": 1.0, "top": 2.0}
+HYDRATE_MODE_EAGER = "eager"
+HYDRATE_MODE_LAZY = "lazy"
 
 
 @dataclass(frozen=True)
@@ -227,6 +230,7 @@ class SweepMetricExplorerModel:
     base_model: SweepVisualizationModel
     review_dir: Path
     cache_path: Path
+    metric_cache_entries: Dict[str, Dict[str, object]]
     annotations_path: Path
     config: MetricExplorerConfig
     metric_registry: Dict[str, MetricDescriptor]
@@ -238,6 +242,7 @@ class SweepMetricExplorerModel:
     search_results: List[SearchResult]
     warnings: List[str]
     scoring_config: Dict[str, float]
+    hydrate_mode: str = HYDRATE_MODE_EAGER
 
 
 def _utc_now_iso() -> str:
@@ -590,6 +595,37 @@ def build_metric_registry() -> Dict[str, MetricDescriptor]:
             description="Raw focus metric recomputed from the workspace artifact.",
         )
     return registry
+
+
+def _metric_names_by_categories(
+    metric_registry: Mapping[str, MetricDescriptor],
+    categories: Iterable[str],
+) -> List[str]:
+    category_set = {str(category) for category in categories}
+    return [
+        name
+        for name, descriptor in metric_registry.items()
+        if descriptor.category in category_set
+    ]
+
+
+def _workspace_metric_names(metric_registry: Mapping[str, MetricDescriptor]) -> List[str]:
+    return _metric_names_by_categories(metric_registry, ("old", "new"))
+
+
+def _new_metric_names(metric_registry: Mapping[str, MetricDescriptor]) -> List[str]:
+    return _metric_names_by_categories(metric_registry, ("new",))
+
+
+def _profile_metric_names(
+    profile: RankingProfileSpec,
+    metric_registry: Mapping[str, MetricDescriptor],
+) -> List[str]:
+    return [
+        name
+        for name, weight in profile.metric_weights.items()
+        if name in metric_registry and float(weight) > 0.0
+    ]
 
 
 def _default_old_metric_weights(metric_registry: Mapping[str, MetricDescriptor]) -> Dict[str, float]:
@@ -998,61 +1034,150 @@ def load_comparison_display_bundle(record: RawMetricRecord) -> ComparisonDisplay
     )
 
 
-def _scan_raw_records(
+def _run_metric_record_lookup(
+    model: SweepVisualizationModel,
+) -> Dict[Tuple[str, str, str], Any]:
+    return {
+        (record.stage, record.candidate_id, record.dataset_id): record
+        for record in model.run_metric_records
+    }
+
+
+def _workspace_path_for_row(
+    model: SweepVisualizationModel,
+    row: CandidateVisualizationRow,
+    dataset_id: str,
+) -> Path:
+    base_dir = (
+        model.metric_phase_dir
+        if row.stage == "metric_phase" and model.metric_phase_dir is not None
+        else model.experiment_root
+    )
+    return base_dir / "runs" / row.stage / row.candidate_id / dataset_id / "workspace.npz"
+
+
+def _preview_path_for_row(
+    model: SweepVisualizationModel,
+    row: CandidateVisualizationRow,
+    dataset_id: str,
+) -> Optional[str]:
+    preview_path = row.preview_paths.get(dataset_id) or row.preview_paths.get("aggregate")
+    if preview_path is not None:
+        return preview_path
+    preview_candidate = (
+        _workspace_path_for_row(model, row, dataset_id).parent / "avg_rectified.png"
+    )
+    return str(preview_candidate) if preview_candidate.exists() else None
+
+
+def _summary_metric_values(
+    row: CandidateVisualizationRow,
+    dataset_id: str,
+    run_record: Optional[Any],
+    metric_registry: Mapping[str, MetricDescriptor],
+) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    old_metric_names = _metric_names_by_categories(metric_registry, ("old",))
+    summary_metrics = dict(row.dataset_metrics.get(dataset_id, {}))
+    if run_record is not None:
+        metric_means = getattr(run_record, "metric_means", {})
+        if isinstance(metric_means, dict):
+            summary_metrics.update(metric_means)
+    for metric_name in old_metric_names:
+        value = _coerce_float(summary_metrics.get(metric_name))
+        if value is not None:
+            metrics[metric_name] = float(value)
+    return metrics
+
+
+def _cache_entry_payload(
+    entry: Mapping[str, object],
+    metric_registry: Mapping[str, MetricDescriptor],
+) -> Tuple[Dict[str, float], List[str]]:
+    cached_metrics = entry.get("metrics", {})
+    metrics: Dict[str, float] = {}
+    if isinstance(cached_metrics, dict):
+        metrics = {
+            str(name): float(value)
+            for name, value in cached_metrics.items()
+            if str(name) in metric_registry and _coerce_float(value) is not None
+        }
+    warnings = [str(item) for item in cast(List[object], entry.get("warnings", []))]
+    return metrics, warnings
+
+
+def _valid_cache_entry_for_record(
+    record: RawMetricRecord,
+    cache_entries: Mapping[str, Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    workspace_path = None if record.workspace_path is None else Path(record.workspace_path)
+    cache_key = _cache_key_for_workspace(workspace_path)
+    entry = cache_entries.get(record.row_id)
+    if not isinstance(entry, dict):
+        return None
+    entry_key = str(entry.get("cache_key", ""))
+    return dict(entry) if entry_key == cache_key else None
+
+
+def _seed_cached_metrics(
+    summary_metrics: Mapping[str, float],
+    cached_metrics: Mapping[str, float],
+    metric_registry: Mapping[str, MetricDescriptor],
+) -> Dict[str, float]:
+    metrics = dict(summary_metrics)
+    for metric_name, value in cached_metrics.items():
+        descriptor = metric_registry.get(metric_name)
+        if descriptor is None:
+            continue
+        if descriptor.category == "new" or metric_name not in metrics:
+            metrics[metric_name] = float(value)
+    return metrics
+
+
+def _build_raw_records(
     model: SweepVisualizationModel,
     review_dir: Path,
     metric_registry: Mapping[str, MetricDescriptor],
-) -> Tuple[List[RawMetricRecord], List[str], Path]:
+) -> Tuple[List[RawMetricRecord], List[str], Path, Dict[str, Dict[str, object]]]:
     cache_path = review_dir / "cache" / "metric_cache.json"
     cache_entries = _load_metric_cache(cache_path)
     warnings: List[str] = []
     raw_records: List[RawMetricRecord] = []
-    candidate_lookup = _candidate_lookup(model.candidates)
+    run_record_lookup = _run_metric_record_lookup(model)
 
     for row in model.candidates:
         dataset_ids = _candidate_dataset_ids(row, model)
         for dataset_id in dataset_ids:
-            base_dir = (
-                model.metric_phase_dir
-                if row.stage == "metric_phase" and model.metric_phase_dir is not None
-                else model.experiment_root
+            row_id = _annotation_key(row.stage, row.candidate_id, dataset_id)
+            workspace_path = _workspace_path_for_row(model, row, dataset_id)
+            preview_path = _preview_path_for_row(model, row, dataset_id)
+            run_record = run_record_lookup.get((row.stage, row.candidate_id, dataset_id))
+            summary_metrics = _summary_metric_values(row, dataset_id, run_record, metric_registry)
+            summary_metrics["saved_score"] = _candidate_score_for_dataset(row, dataset_id) or float("nan")
+            summary_metrics["saved_mean_dataset_score"] = row.mean_dataset_score or float("nan")
+            valid_entry = _valid_cache_entry_for_record(
+                RawMetricRecord(
+                    row_id=row_id,
+                    stage=row.stage,
+                    candidate_id=row.candidate_id,
+                    dataset_id=dataset_id,
+                    strategy=row.strategy,
+                    family=row.family,
+                    alpha=row.alpha,
+                    formulation_id=row.formulation_id,
+                    preview_path=preview_path,
+                    workspace_path=str(workspace_path) if workspace_path.exists() else None,
+                    saved_score=_candidate_score_for_dataset(row, dataset_id),
+                    saved_mean_dataset_score=row.mean_dataset_score,
+                    metrics={},
+                ),
+                cache_entries,
             )
-            workspace_path = base_dir / "runs" / row.stage / row.candidate_id / dataset_id / "workspace.npz"
-            preview_path = row.preview_paths.get(dataset_id) or row.preview_paths.get("aggregate")
-            if preview_path is None:
-                preview_candidate = base_dir / "runs" / row.stage / row.candidate_id / dataset_id / "avg_rectified.png"
-                preview_path = str(preview_candidate) if preview_candidate.exists() else None
-            cache_key = _cache_key_for_workspace(workspace_path if workspace_path.exists() else None)
-            entry = cache_entries.get(_annotation_key(row.stage, row.candidate_id, dataset_id), {})
-            entry_key = str(entry.get("cache_key", ""))
-            metrics: Dict[str, float] = {}
+            cached_metrics: Dict[str, float] = {}
             metric_warnings: List[str] = []
-            if entry_key == cache_key:
-                cached_metrics = entry.get("metrics", {})
-                if isinstance(cached_metrics, dict):
-                    metrics = {
-                        str(name): float(value)
-                        for name, value in cached_metrics.items()
-                        if str(name) in metric_registry and _coerce_float(value) is not None
-                    }
-                    metric_warnings = [str(item) for item in cast(List[object], entry.get("warnings", []))]
-            elif workspace_path.exists():
-                metrics, metric_warnings = compute_metrics_from_workspace(workspace_path)
-                cache_entries[_annotation_key(row.stage, row.candidate_id, dataset_id)] = {
-                    "cache_key": cache_key,
-                    "metrics": metrics,
-                    "warnings": metric_warnings,
-                }
-            else:
-                metric_warnings = [f"Workspace not found for {row.stage}/{row.candidate_id}/{dataset_id}."]
-                cache_entries[_annotation_key(row.stage, row.candidate_id, dataset_id)] = {
-                    "cache_key": cache_key,
-                    "metrics": {},
-                    "warnings": metric_warnings,
-                }
-
-            metrics["saved_score"] = _candidate_score_for_dataset(row, dataset_id) or float("nan")
-            metrics["saved_mean_dataset_score"] = row.mean_dataset_score or float("nan")
+            if valid_entry is not None:
+                cached_metrics, metric_warnings = _cache_entry_payload(valid_entry, metric_registry)
+            metrics = _seed_cached_metrics(summary_metrics, cached_metrics, metric_registry)
             parsed_config = dict(row.config)
             strategy = str(parsed_config.get("strategy", row.strategy))
             family = row.family
@@ -1077,12 +1202,188 @@ def _scan_raw_records(
                         for name, value in metrics.items()
                         if name in metric_registry and math.isfinite(float(value))
                     },
-                    warnings=metric_warnings,
+                    warnings=_stable_unique_strings(metric_warnings),
                 )
             )
             warnings.extend(metric_warnings)
-    _save_metric_cache(cache_path, cache_entries)
-    return raw_records, warnings, cache_path
+    return raw_records, _stable_unique_strings(warnings), cache_path, cache_entries
+
+
+def _merge_model_warnings(model: SweepMetricExplorerModel, items: Iterable[str]) -> None:
+    model.warnings = _stable_unique_strings([*model.warnings, *list(items)])
+
+
+def _replace_evaluation_summary(
+    model: SweepMetricExplorerModel,
+    summary: ProfileEvaluationSummary,
+) -> None:
+    model.evaluations = [
+        item
+        for item in model.evaluations
+        if not (item.stage == summary.stage and item.profile_name == summary.profile_name)
+    ]
+    model.evaluations.append(summary)
+    model.evaluations.sort(key=lambda item: (item.stage, item.profile_name))
+
+
+def _replace_disagreements(
+    model: SweepMetricExplorerModel,
+    stage_name: str,
+    profile_name: str,
+    disagreements: Sequence[DisagreementRecord],
+) -> None:
+    model.disagreements = [
+        item
+        for item in model.disagreements
+        if not (item.stage == stage_name and item.profile_name == profile_name)
+    ]
+    model.disagreements.extend(disagreements)
+    model.disagreements.sort(
+        key=lambda item: (item.stage, item.profile_name, -item.label_gap, -item.rank_gap)
+    )
+
+
+def _replace_search_results_for_stage(
+    model: SweepMetricExplorerModel,
+    stage_name: str,
+    results: Sequence[SearchResult],
+) -> None:
+    model.search_results = [item for item in model.search_results if item.stage != stage_name]
+    model.search_results.extend(results)
+    model.search_results.sort(key=lambda item: (item.stage, item.profile_name))
+
+
+def _metrics_ready_for_stage(
+    raw_records: Sequence[RawMetricRecord],
+    *,
+    stage_name: str,
+    metric_names: Sequence[str],
+) -> bool:
+    required = [name for name in metric_names if name not in {"saved_score", "saved_mean_dataset_score"}]
+    if not required:
+        return True
+    stage_records = [record for record in raw_records if record.stage == stage_name]
+    if not stage_records:
+        return False
+    for record in stage_records:
+        for metric_name in required:
+            value = record.metrics.get(metric_name)
+            if value is None or not math.isfinite(float(value)):
+                return False
+    return True
+
+
+def _profile_by_name(
+    model: SweepMetricExplorerModel,
+    profile_name: str,
+) -> RankingProfileSpec:
+    for profile in model.config.profiles:
+        if profile.name == profile_name:
+            return profile
+    raise KeyError(f"Unknown profile: {profile_name}")
+
+
+def _ensure_record_hydrated(
+    model: SweepMetricExplorerModel,
+    record: RawMetricRecord,
+) -> Tuple[bool, bool, List[str]]:
+    valid_entry = _valid_cache_entry_for_record(record, model.metric_cache_entries)
+    metric_warnings: List[str] = []
+    hydrated_metrics: Dict[str, float] = {}
+    cache_dirty = False
+    if valid_entry is not None:
+        hydrated_metrics, metric_warnings = _cache_entry_payload(valid_entry, model.metric_registry)
+    elif record.workspace_path is not None:
+        workspace_path = Path(record.workspace_path)
+        hydrated_metrics, metric_warnings = compute_metrics_from_workspace(workspace_path)
+        model.metric_cache_entries[record.row_id] = {
+            "cache_key": _cache_key_for_workspace(workspace_path),
+            "metrics": hydrated_metrics,
+            "warnings": metric_warnings,
+        }
+        cache_dirty = True
+    else:
+        metric_warnings = [f"Workspace not found for {record.stage}/{record.candidate_id}/{record.dataset_id}."]
+        model.metric_cache_entries[record.row_id] = {
+            "cache_key": "missing",
+            "metrics": {},
+            "warnings": metric_warnings,
+        }
+        cache_dirty = True
+
+    changed = False
+    for metric_name, value in hydrated_metrics.items():
+        descriptor = model.metric_registry.get(metric_name)
+        if descriptor is None or not math.isfinite(float(value)):
+            continue
+        if descriptor.category == "new" or metric_name not in record.metrics:
+            prior = record.metrics.get(metric_name)
+            numeric = float(value)
+            if prior is None or not math.isfinite(float(prior)) or abs(float(prior) - numeric) > 1e-12:
+                changed = True
+            record.metrics[metric_name] = numeric
+    merged_warnings = _stable_unique_strings([*record.warnings, *metric_warnings])
+    if merged_warnings != record.warnings:
+        changed = True
+        record.warnings = merged_warnings
+    return changed, cache_dirty, metric_warnings
+
+
+def _records_needing_metrics(
+    model: SweepMetricExplorerModel,
+    *,
+    stage_name: Optional[str],
+    metric_names: Sequence[str],
+) -> List[RawMetricRecord]:
+    required = [
+        name
+        for name in metric_names
+        if name in model.metric_registry and model.metric_registry[name].category != "saved"
+    ]
+    if not required:
+        return []
+    records: List[RawMetricRecord] = []
+    for record in model.raw_records:
+        if stage_name is not None and record.stage != stage_name:
+            continue
+        missing = [
+            metric_name
+            for metric_name in required
+            if metric_name not in record.metrics or not math.isfinite(float(record.metrics[metric_name]))
+        ]
+        if not missing:
+            continue
+        if record.workspace_path is None:
+            continue
+        valid_entry = _valid_cache_entry_for_record(record, model.metric_cache_entries)
+        if valid_entry is not None:
+            continue
+        records.append(record)
+    return records
+
+
+def _ensure_metrics_available(
+    model: SweepMetricExplorerModel,
+    *,
+    stage_name: Optional[str],
+    metric_names: Sequence[str],
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> int:
+    targets = _records_needing_metrics(model, stage_name=stage_name, metric_names=metric_names)
+    total = len(targets)
+    cache_dirty = False
+    collected_warnings: List[str] = []
+    for index, record in enumerate(targets, start=1):
+        _, dirty, metric_warnings = _ensure_record_hydrated(model, record)
+        cache_dirty = cache_dirty or dirty
+        collected_warnings.extend(metric_warnings)
+        if progress_callback is not None:
+            progress_callback(index, total)
+    if cache_dirty:
+        _save_metric_cache(model.cache_path, model.metric_cache_entries)
+    if collected_warnings:
+        _merge_model_warnings(model, collected_warnings)
+    return total
 
 
 def _saved_original_profile_result(
@@ -1371,6 +1672,132 @@ def _generate_weight_combinations(num_metrics: int, step: float) -> Iterable[Tup
         yield tuple(count * step for count in counts)
 
 
+def _ensure_profile_results(
+    model: SweepMetricExplorerModel,
+    *,
+    stage_name: str,
+    profile_name: str,
+    include_analysis: bool = True,
+) -> List[ProfileCandidateScore]:
+    profile = _profile_by_name(model, profile_name)
+    metric_names = _profile_metric_names(profile, model.metric_registry)
+    _ensure_metrics_available(model, stage_name=stage_name, metric_names=metric_names)
+    scored = _score_profile_for_stage(
+        stage_name,
+        profile,
+        model.base_model,
+        model.raw_records,
+        model.metric_registry,
+        model.scoring_config,
+    )
+    model.profile_results[(stage_name, profile.name)] = scored
+    if include_analysis:
+        summary = _evaluate_profile_for_stage(
+            stage_name,
+            profile.name,
+            scored,
+            model.annotations,
+        )
+        _replace_evaluation_summary(model, summary)
+        _replace_disagreements(
+            model,
+            stage_name,
+            profile.name,
+            _build_disagreements(stage_name, profile.name, scored, model.annotations),
+        )
+    return scored
+
+
+def _ensure_default_search_results_for_stage(
+    model: SweepMetricExplorerModel,
+    *,
+    stage_name: str,
+) -> List[SearchResult]:
+    subset = list(model.config.search_defaults.metric_subset)
+    if (
+        not subset
+        or len(subset) > model.config.search_defaults.max_metrics
+        or not model.annotations
+    ):
+        _replace_search_results_for_stage(model, stage_name, [])
+        return []
+    _ensure_metrics_available(model, stage_name=stage_name, metric_names=subset)
+    results = search_profile_combinations(
+        model,
+        stage_name=stage_name,
+        metric_names=subset,
+        weight_step=model.config.search_defaults.weight_step,
+    )
+    _replace_search_results_for_stage(model, stage_name, results)
+    return results
+
+
+def _prime_summary_backed_profiles(model: SweepMetricExplorerModel) -> None:
+    for stage_name in model.base_model.stage_order:
+        for profile in model.config.profiles:
+            metric_names = _profile_metric_names(profile, model.metric_registry)
+            if not _metrics_ready_for_stage(
+                model.raw_records,
+                stage_name=stage_name,
+                metric_names=metric_names,
+            ):
+                continue
+            model.profile_results[(stage_name, profile.name)] = _score_profile_for_stage(
+                stage_name,
+                profile,
+                model.base_model,
+                model.raw_records,
+                model.metric_registry,
+                model.scoring_config,
+            )
+
+
+def _hydrate_model_for_export(model: SweepMetricExplorerModel) -> None:
+    _ensure_metrics_available(
+        model,
+        stage_name=None,
+        metric_names=_workspace_metric_names(model.metric_registry),
+    )
+    for stage_name in model.base_model.stage_order:
+        for profile in model.config.profiles:
+            _ensure_profile_results(
+                model,
+                stage_name=stage_name,
+                profile_name=profile.name,
+                include_analysis=True,
+            )
+        _ensure_default_search_results_for_stage(model, stage_name=stage_name)
+
+
+def _deferred_record_count(model: SweepMetricExplorerModel) -> int:
+    return len(
+        _records_needing_metrics(
+            model,
+            stage_name=None,
+            metric_names=_workspace_metric_names(model.metric_registry),
+        )
+    )
+
+
+def _loaded_status_text(model: SweepMetricExplorerModel) -> str:
+    deferred = _deferred_record_count(model)
+    if model.hydrate_mode == HYDRATE_MODE_LAZY:
+        if deferred > 0:
+            return f"Loaded summaries for {len(model.raw_records)} rows; {deferred} deferred"
+        return f"Loaded summaries for {len(model.raw_records)} rows"
+    return f"Loaded {len(model.raw_records)} raw metric rows"
+
+
+def _initial_profile_name(model: SweepMetricExplorerModel) -> str:
+    primary_stage = model.base_model.primary_stage_name
+    if (primary_stage, model.config.default_profile) in model.profile_results:
+        return model.config.default_profile
+    for profile in model.config.profiles:
+        if (primary_stage, profile.name) in model.profile_results:
+            return profile.name
+    return model.config.profiles[0].name if model.config.profiles else ""
+
+
 def search_profile_combinations(
     explorer_model: SweepMetricExplorerModel,
     *,
@@ -1383,6 +1810,11 @@ def search_profile_combinations(
     candidate_metrics = [name for name in metric_names if name in explorer_model.metric_registry]
     if not candidate_metrics or len(candidate_metrics) > 6:
         return []
+    _ensure_metrics_available(
+        explorer_model,
+        stage_name=stage_name,
+        metric_names=candidate_metrics,
+    )
     results: List[SearchResult] = []
     for weights in _generate_weight_combinations(len(candidate_metrics), weight_step):
         metric_weights = {
@@ -1435,6 +1867,7 @@ def load_sweep_metric_explorer_model(
     path: Path,
     *,
     metrics_config_path: Optional[Path] = None,
+    hydrate_mode: str = HYDRATE_MODE_EAGER,
 ) -> SweepMetricExplorerModel:
     """Load sweep artifacts and recompute focus metrics from raw workspace bundles."""
 
@@ -1455,87 +1888,35 @@ def load_sweep_metric_explorer_model(
         for name in config.enabled_metrics
         if name in metric_registry
     }
-    raw_records, record_warnings, cache_path = _scan_raw_records(
+    raw_records, record_warnings, cache_path, cache_entries = _build_raw_records(
         base_model,
         review_dir,
         enabled_registry,
     )
     scoring_config = _scoring_config(base_model)
 
-    profile_results: Dict[Tuple[str, str], List[ProfileCandidateScore]] = {}
-    evaluations: List[ProfileEvaluationSummary] = []
-    disagreements: List[DisagreementRecord] = []
-    for stage_name in base_model.stage_order:
-        for profile in config.profiles:
-            scored = _score_profile_for_stage(
-                stage_name,
-                profile,
-                base_model,
-                raw_records,
-                enabled_registry,
-                scoring_config,
-            )
-            if not scored:
-                continue
-            profile_results[(stage_name, profile.name)] = scored
-            summary = _evaluate_profile_for_stage(
-                stage_name,
-                profile.name,
-                scored,
-                annotations,
-            )
-            evaluations.append(summary)
-            disagreements.extend(
-                _build_disagreements(stage_name, profile.name, scored, annotations)
-            )
-
-    search_results: List[SearchResult] = []
-    if (
-        config.search_defaults.metric_subset
-        and len(config.search_defaults.metric_subset) <= config.search_defaults.max_metrics
-        and annotations
-    ):
-        for stage_name in base_model.stage_order:
-            search_results.extend(
-                search_profile_combinations(
-                    SweepMetricExplorerModel(
-                        base_model=base_model,
-                        review_dir=review_dir,
-                        cache_path=cache_path,
-                        annotations_path=annotations_path,
-                        config=config,
-                        metric_registry=enabled_registry,
-                        raw_records=raw_records,
-                        profile_results=profile_results,
-                        evaluations=evaluations,
-                        disagreements=disagreements,
-                        annotations=annotations,
-                        search_results=[],
-                        warnings=[],
-                        scoring_config=scoring_config,
-                    ),
-                    stage_name=stage_name,
-                    metric_names=config.search_defaults.metric_subset,
-                    weight_step=config.search_defaults.weight_step,
-                )
-            )
-
-    return SweepMetricExplorerModel(
+    explorer_model = SweepMetricExplorerModel(
         base_model=base_model,
         review_dir=review_dir,
         cache_path=cache_path,
+        metric_cache_entries=cache_entries,
         annotations_path=annotations_path,
         config=config,
         metric_registry=enabled_registry,
         raw_records=raw_records,
-        profile_results=profile_results,
-        evaluations=evaluations,
-        disagreements=disagreements,
+        profile_results={},
+        evaluations=[],
+        disagreements=[],
         annotations=annotations,
-        search_results=search_results,
+        search_results=[],
         warnings=config_warnings + record_warnings,
         scoring_config=scoring_config,
+        hydrate_mode=hydrate_mode,
     )
+    _prime_summary_backed_profiles(explorer_model)
+    if hydrate_mode == HYDRATE_MODE_EAGER:
+        _hydrate_model_for_export(explorer_model)
+    return explorer_model
 
 
 def _raw_metric_fieldnames(model: SweepMetricExplorerModel) -> List[str]:
@@ -1635,6 +2016,7 @@ def _search_rows(model: SweepMetricExplorerModel) -> List[Dict[str, object]]:
 def export_metric_report(model: SweepMetricExplorerModel, output_dir: Path) -> Path:
     """Export the current model to CSV/JSON/HTML report artifacts."""
 
+    _hydrate_model_for_export(model)
     export_dir = Path(output_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
     candidate_metrics_path = export_dir / "candidate_metrics.csv"
@@ -2411,6 +2793,13 @@ class SweepMetricExplorerApp:
         self._leaderboard_rows: List[ProfileCandidateScore] = []
         self._leaderboard_row_lookup: Dict[str, ProfileCandidateScore] = {}
         self._search_results: List[SearchResult] = []
+        self._hydration_queue: Deque[RawMetricRecord] = deque()
+        self._hydration_total = 0
+        self._hydration_processed = 0
+        self._hydration_cache_dirty = False
+        self._hydration_warnings: List[str] = []
+        self._hydration_completion: Optional[Callable[[], None]] = None
+        self._hydration_label = ""
 
         self._build_ui()
         if initial_path is not None:
@@ -2674,6 +3063,126 @@ class SweepMetricExplorerApp:
         widget.delete("1.0", self.tk.END)
         widget.insert(self.tk.END, text)
 
+    def _hydration_active(self) -> bool:
+        return bool(self._hydration_queue) or self._hydration_completion is not None
+
+    def _finish_hydration(self) -> None:
+        if self.model is None:
+            self._hydration_completion = None
+            self._hydration_queue.clear()
+            return
+        if self._hydration_cache_dirty:
+            _save_metric_cache(self.model.cache_path, self.model.metric_cache_entries)
+        if self._hydration_warnings:
+            _merge_model_warnings(self.model, self._hydration_warnings)
+        completion = self._hydration_completion
+        self._hydration_queue.clear()
+        self._hydration_total = 0
+        self._hydration_processed = 0
+        self._hydration_cache_dirty = False
+        self._hydration_warnings = []
+        self._hydration_completion = None
+        self._hydration_label = ""
+        if completion is not None:
+            completion()
+        if self.model is not None:
+            self.status_var.set(_loaded_status_text(self.model))
+
+    def _pump_hydration_queue(self) -> None:
+        if self.model is None:
+            self._finish_hydration()
+            return
+        batch_size = 4
+        for _ in range(batch_size):
+            if not self._hydration_queue:
+                break
+            record = self._hydration_queue.popleft()
+            _, dirty, warnings = _ensure_record_hydrated(self.model, record)
+            self._hydration_cache_dirty = self._hydration_cache_dirty or dirty
+            self._hydration_warnings.extend(warnings)
+            self._hydration_processed += 1
+        if self._hydration_total > 0:
+            self.status_var.set(
+                f"{self._hydration_label}: {self._hydration_processed}/{self._hydration_total}"
+            )
+        if self._hydration_queue:
+            self.root.after(1, self._pump_hydration_queue)
+            return
+        self._finish_hydration()
+
+    def _start_hydration(
+        self,
+        records: Sequence[RawMetricRecord],
+        *,
+        label: str,
+        on_complete: Callable[[], None],
+    ) -> None:
+        if self._hydration_active():
+            self.status_var.set("Hydration already in progress")
+            return
+        ordered_records: List[RawMetricRecord] = []
+        seen = set()
+        for record in records:
+            if record.row_id in seen:
+                continue
+            seen.add(record.row_id)
+            ordered_records.append(record)
+        if not ordered_records:
+            on_complete()
+            if self.model is not None:
+                self.status_var.set(_loaded_status_text(self.model))
+            return
+        self._hydration_queue = deque(ordered_records)
+        self._hydration_total = len(ordered_records)
+        self._hydration_processed = 0
+        self._hydration_cache_dirty = False
+        self._hydration_warnings = []
+        self._hydration_completion = on_complete
+        self._hydration_label = label
+        self.status_var.set(f"{label}: 0/{self._hydration_total}")
+        self.root.after(1, self._pump_hydration_queue)
+
+    def _ensure_profile_ready(
+        self,
+        *,
+        stage_name: str,
+        profile_name: str,
+        include_analysis: bool = True,
+        on_ready: Optional[Callable[[], None]] = None,
+        notify_ready: bool = False,
+    ) -> bool:
+        if self.model is None:
+            return False
+        profile = _profile_by_name(self.model, profile_name)
+        metric_names = _profile_metric_names(profile, self.model.metric_registry)
+        targets = _records_needing_metrics(
+            self.model,
+            stage_name=stage_name,
+            metric_names=metric_names,
+        )
+        if targets:
+            self._start_hydration(
+                targets,
+                label=f"Hydrating {profile_name}",
+                on_complete=lambda: self._ensure_profile_ready(
+                    stage_name=stage_name,
+                    profile_name=profile_name,
+                    include_analysis=include_analysis,
+                    on_ready=on_ready,
+                    notify_ready=True,
+                ),
+            )
+            return False
+        _ensure_profile_results(
+            self.model,
+            stage_name=stage_name,
+            profile_name=profile_name,
+            include_analysis=include_analysis,
+        )
+        if notify_ready and on_ready is not None:
+            on_ready()
+        return True
+
     def _on_browse(self) -> None:
         selection = self.filedialog.askdirectory()
         if selection:
@@ -2710,14 +3219,18 @@ class SweepMetricExplorerApp:
 
     def load_from_path(self, path: Path) -> None:
         try:
-            model = load_sweep_metric_explorer_model(path, metrics_config_path=self.metrics_config_path)
+            model = load_sweep_metric_explorer_model(
+                path,
+                metrics_config_path=self.metrics_config_path,
+                hydrate_mode=HYDRATE_MODE_LAZY,
+            )
         except Exception as exc:  # noqa: BLE001
             self.status_var.set("Load failed")
             self.messagebox.showerror("Metric Explorer", str(exc))
             return
         self.model = model
         self.path_var.set(str(path))
-        self.status_var.set(f"Loaded {len(model.raw_records)} raw metric rows")
+        self.status_var.set(_loaded_status_text(model))
         self._populate_from_model(model)
 
     def _populate_from_model(self, model: SweepMetricExplorerModel) -> None:
@@ -2737,7 +3250,7 @@ class SweepMetricExplorerApp:
         profile_values = [profile.name for profile in model.config.profiles]
         self.profile_combo["values"] = profile_values
         if profile_values:
-            self.profile_var.set(model.config.default_profile)
+            self.profile_var.set(_initial_profile_name(model))
         self.dataset_combo["values"] = _real_datasets(model.base_model)
         self.dataset_var.set((_real_datasets(model.base_model) or ["aggregate"])[0])
         self.metric_listbox.delete(0, self.tk.END)
@@ -2868,6 +3381,19 @@ class SweepMetricExplorerApp:
 
     def refresh_leaderboard(self) -> None:
         if self.model is None:
+            return
+        stage_name = self.stage_var.get()
+        profile_name = self.profile_var.get()
+        if not stage_name or not profile_name:
+            return
+        if not self._ensure_profile_ready(
+            stage_name=stage_name,
+            profile_name=profile_name,
+            include_analysis=True,
+            on_ready=self.refresh_leaderboard,
+        ):
+            self.leaderboard_tree.delete(*self.leaderboard_tree.get_children())
+            self._set_text(self.leaderboard_detail, f"Hydrating {profile_name} metrics...")
             return
         self._leaderboard_rows = self._current_profile_results()
         candidate_rows = {
@@ -3114,6 +3640,17 @@ class SweepMetricExplorerApp:
         if self.model is None:
             return
         stage_name = self.search_stage_var.get() or self.stage_var.get()
+        profile_name = self.profile_var.get()
+        if stage_name and profile_name:
+            if not self._ensure_profile_ready(
+                stage_name=stage_name,
+                profile_name=profile_name,
+                include_analysis=True,
+                on_ready=self.refresh_evaluation,
+            ):
+                self._set_text(self.evaluation_text, f"Hydrating {profile_name} metrics...")
+                self.disagreement_tree.delete(*self.disagreement_tree.get_children())
+                return
         self._set_text(self.evaluation_text, _format_evaluation_text(self.model, stage_name))
         self.disagreement_tree.delete(*self.disagreement_tree.get_children())
         for idx, row in enumerate(
@@ -3149,6 +3686,7 @@ class SweepMetricExplorerApp:
         self.model = load_sweep_metric_explorer_model(
             Path(self.path_var.get().strip()),
             metrics_config_path=self.metrics_config_path,
+            hydrate_mode=HYDRATE_MODE_LAZY,
         )
         self._populate_from_model(self.model)
 
@@ -3162,6 +3700,7 @@ class SweepMetricExplorerApp:
         self.model = load_sweep_metric_explorer_model(
             Path(self.path_var.get().strip()),
             metrics_config_path=self.metrics_config_path,
+            hydrate_mode=HYDRATE_MODE_LAZY,
         )
         self._populate_from_model(self.model)
 
@@ -3215,28 +3754,11 @@ class SweepMetricExplorerApp:
         self.profile_combo["values"] = profile_values
         self.profile_var.set(profile_name)
         for stage_name in self.model.base_model.stage_order:
-            self.model.profile_results[(stage_name, profile.name)] = _score_profile_for_stage(
-                stage_name,
-                profile,
-                self.model.base_model,
-                self.model.raw_records,
-                self.model.metric_registry,
-                self.model.scoring_config,
-            )
-            summary = _evaluate_profile_for_stage(
-                stage_name,
-                profile.name,
-                self.model.profile_results[(stage_name, profile.name)],
-                self.model.annotations,
-            )
-            self.model.evaluations.append(summary)
-            self.model.disagreements.extend(
-                _build_disagreements(
-                    stage_name,
-                    profile.name,
-                    self.model.profile_results[(stage_name, profile.name)],
-                    self.model.annotations,
-                )
+            _ensure_profile_results(
+                self.model,
+                stage_name=stage_name,
+                profile_name=profile.name,
+                include_analysis=True,
             )
         self.refresh_leaderboard()
         self.refresh_evaluation()
@@ -3255,6 +3777,20 @@ class SweepMetricExplorerApp:
             step = float(self.search_step_var.get().strip())
         except ValueError:
             self.messagebox.showerror("Search", "Weight step must be numeric.")
+            return
+        targets = _records_needing_metrics(
+            self.model,
+            stage_name=self.search_stage_var.get() or self.stage_var.get(),
+            metric_names=selected,
+        )
+        if targets:
+            stage_name = self.search_stage_var.get() or self.stage_var.get()
+            self._start_hydration(
+                targets,
+                label="Hydrating search metrics",
+                on_complete=lambda: self._run_search(),
+            )
+            self._set_text(self.search_results_text, f"Hydrating metrics for search on {stage_name}...")
             return
         results = search_profile_combinations(
             self.model,

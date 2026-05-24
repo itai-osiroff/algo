@@ -8,7 +8,10 @@ from PIL import Image
 
 matplotlib.use("Agg")
 
+from moment_images import sweep_metric_explorer as explorer
 from moment_images.sweep_metric_explorer import (
+    HYDRATE_MODE_LAZY,
+    _ensure_profile_results,
     _bayes_dct_entropy,
     _gini_index,
     _hoyer_index,
@@ -269,6 +272,49 @@ def test_load_sweep_metric_explorer_model_recomputes_metrics_and_profiles(tmp_pa
     assert good_d1.metrics["hoyer_avg"] > bad_d2.metrics["hoyer_avg"]
 
 
+def test_lazy_load_defers_workspace_metrics_until_profile_is_requested(tmp_path, monkeypatch):
+    output_dir = _make_modern_fixture(tmp_path)
+    calls: list[Path] = []
+    original = explorer.compute_metrics_from_workspace
+
+    def _counting_loader(workspace_path: Path):
+        calls.append(Path(workspace_path))
+        return original(workspace_path)
+
+    monkeypatch.setattr(explorer, "compute_metrics_from_workspace", _counting_loader)
+
+    model = load_sweep_metric_explorer_model(output_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+
+    assert calls == []
+    assert ("stage1", "saved_original") in model.profile_results
+    assert ("stage1", "old_recomputed") in model.profile_results
+    assert ("stage1", "new_dct_sparse") not in model.profile_results
+
+    _ensure_profile_results(model, stage_name="stage1", profile_name="new_dct_sparse", include_analysis=True)
+
+    assert len(calls) == 4
+    assert ("stage1", "new_dct_sparse") in model.profile_results
+
+
+def test_lazy_reload_reuses_metric_cache_without_reopening_workspaces(tmp_path, monkeypatch):
+    output_dir = _make_modern_fixture(tmp_path)
+    model = load_sweep_metric_explorer_model(output_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+    _ensure_profile_results(model, stage_name="stage1", profile_name="new_dct_sparse", include_analysis=True)
+
+    calls: list[Path] = []
+    original = explorer.compute_metrics_from_workspace
+
+    def _counting_loader(workspace_path: Path):
+        calls.append(Path(workspace_path))
+        return original(workspace_path)
+
+    monkeypatch.setattr(explorer, "compute_metrics_from_workspace", _counting_loader)
+    reloaded = load_sweep_metric_explorer_model(output_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+
+    assert calls == []
+    assert ("stage1", "new_dct_sparse") in reloaded.profile_results
+
+
 def test_annotations_enable_evaluation_and_search(tmp_path):
     output_dir = _make_modern_fixture(tmp_path)
     _write_annotations(output_dir)
@@ -294,6 +340,28 @@ def test_annotations_enable_evaluation_and_search(tmp_path):
     )
     assert search_results
     assert search_results[0].pairwise_agreement is not None
+
+
+def test_export_metric_report_hydrates_lazy_model(tmp_path, monkeypatch):
+    output_dir = _make_modern_fixture(tmp_path)
+    _write_annotations(output_dir)
+    model = load_sweep_metric_explorer_model(output_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+    calls: list[Path] = []
+    original = explorer.compute_metrics_from_workspace
+
+    def _counting_loader(workspace_path: Path):
+        calls.append(Path(workspace_path))
+        return original(workspace_path)
+
+    monkeypatch.setattr(explorer, "compute_metrics_from_workspace", _counting_loader)
+
+    export_dir = tmp_path / "lazy_export"
+    export_metric_report(model, export_dir)
+
+    assert calls
+    assert ("stage1", "new_dct_sparse") in model.profile_results
+    assert (export_dir / "candidate_metrics.csv").exists()
+    assert (export_dir / "profile_results.csv").exists()
 
 
 def test_export_metric_report_and_main(tmp_path):
