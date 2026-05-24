@@ -405,6 +405,45 @@ The export keeps the existing bundle outputs (`visualization_bundle.npz`, `.mat`
 - `data/report_context.json`
 - `assets/` - top-K overview, preview sheets, diagnostic comparison sheets, and robustness heatmap.
 
+### Raw metric explorer
+
+Use the raw metric explorer when you want to re-rank existing sweep runs from `workspace.npz` rather than the originally saved sweep metrics:
+
+```bash
+python -m moment_images.sweep_metric_explorer path/to/sweep_output
+```
+
+For headless export:
+
+```bash
+python -m moment_images.sweep_metric_explorer path/to/sweep_output --export-dir path/to/report_folder
+```
+
+This helper:
+
+- reuses the sweep folder/stage/candidate layout from `sweep_visualization.py`
+- recomputes metrics from `average_rectified_image` in each `workspace.npz`
+- keeps the existing saved metrics and scores available as comparison baselines
+- supports manual `top` / `good` / `bad` annotations stored under `metric_review/annotations.json`
+- compares built-in and custom ranking profiles, including mixed old+new metric combinations
+
+Built-in new metrics include:
+
+- normalized-DCT Shannon entropy on the rectified average and on an LoG guide map
+- Bayes/DCTS-style block-DCT entropy on the rectified average and on an LoG guide map
+- Gini index on the rectified average and on an LoG guide map
+- Hoyer sparsity index on the rectified average and on an LoG guide map
+- Vollath F4 on the rectified average and on an LoG guide map
+
+Explorer-owned outputs are written under `metric_review/` and include:
+
+- `candidate_metrics.csv`
+- `profile_results.csv`
+- `search_results.csv`
+- `disagreements.csv`
+- `report.json`
+- optional `index.html` export summaries
+
 ---
 
 ## Sweep analysis (`sweep_analysis.py`)
