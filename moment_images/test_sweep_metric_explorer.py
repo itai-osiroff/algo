@@ -4,6 +4,7 @@ from pathlib import Path
 import cv2 as cv
 import matplotlib
 import numpy as np
+import pytest
 from PIL import Image
 
 matplotlib.use("Agg")
@@ -221,6 +222,31 @@ def _write_annotations(output_dir: Path) -> None:
             ],
         },
     )
+
+
+def _can_create_tk() -> bool:
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        root.destroy()
+        return True
+    except Exception:
+        return False
+
+
+def _make_root_or_skip():
+    if not _can_create_tk():
+        pytest.skip("Tkinter UI unavailable in this environment")
+    import tkinter as tk
+
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        return root
+    except Exception:
+        pytest.skip("Tkinter root unavailable in this environment")
 
 
 def test_new_metric_primitives_behave_as_expected():
@@ -483,3 +509,100 @@ def test_build_comparison_metric_rows_identifies_preferred_side(tmp_path):
     assert vollath.winner == "A"
     assert vollath.delta > 0
     assert shannon.winner == "A"
+
+
+def test_gui_labeling_preserves_filters_and_selection(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+        app.load_from_path(output_dir)
+        root.update()
+
+        app.profile_var.set("old_recomputed")
+        app.dataset_var.set("d2")
+        app.refresh_leaderboard()
+        root.update()
+
+        app.leaderboard_tree.selection_set("c_good")
+        app._on_leaderboard_selection_changed()
+        root.update()
+
+        app._set_labels_for_selection("top")
+        root.update()
+
+        assert app.stage_var.get() == "stage1"
+        assert app.profile_var.get() == "old_recomputed"
+        assert app.dataset_var.get() == "d2"
+        assert app.leaderboard_tree.selection() == ("c_good",)
+        assert app.model is not None
+        assert app.model.annotations[explorer._annotation_key("stage1", "c_good", "d2")].label == "top"
+    finally:
+        root.destroy()
+
+
+def test_gui_custom_profile_persists_to_next_load(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    config_path = output_dir / "metric_review" / "metrics_config.json"
+    weights = {"average_intensity": 0.25, "laplacian_variance": 0.75}
+
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+        app.load_from_path(output_dir)
+        app.search_profile_name_var.set("saved_custom")
+        app._set_text(app.weight_json_text, json.dumps(weights, indent=2, sort_keys=True))
+        app._build_json_profile()
+        root.update()
+    finally:
+        root.destroy()
+
+    assert config_path.exists()
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    saved_rows = [row for row in payload["profiles"] if row["name"] == "saved_custom"]
+    assert len(saved_rows) == 1
+    assert saved_rows[0]["metric_weights"] == weights
+
+    reloaded = load_sweep_metric_explorer_model(output_dir)
+    matches = [profile for profile in reloaded.config.profiles if profile.name == "saved_custom"]
+    assert len(matches) == 1
+    assert matches[0].metric_weights == weights
+
+
+def test_gui_custom_profile_overwrites_same_name(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    config_path = output_dir / "metric_review" / "metrics_config.json"
+    first_weights = {"laplacian_variance": 1.0}
+    second_weights = {"average_intensity": 1.0}
+
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+        app.load_from_path(output_dir)
+        app.search_profile_name_var.set("saved_custom")
+        app._set_text(app.weight_json_text, json.dumps(first_weights, indent=2, sort_keys=True))
+        app._build_json_profile()
+        app._set_text(app.weight_json_text, json.dumps(second_weights, indent=2, sort_keys=True))
+        app._build_json_profile()
+        root.update()
+    finally:
+        root.destroy()
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    saved_rows = [row for row in payload["profiles"] if row["name"] == "saved_custom"]
+    assert len(saved_rows) == 1
+    assert saved_rows[0]["metric_weights"] == second_weights
+
+    reloaded = load_sweep_metric_explorer_model(output_dir)
+    matches = [profile for profile in reloaded.config.profiles if profile.name == "saved_custom"]
+    assert len(matches) == 1
+    assert matches[0].metric_weights == second_weights

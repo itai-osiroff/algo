@@ -897,6 +897,40 @@ def save_annotations(model: SweepMetricExplorerModel) -> None:
     write_json_atomic(model.annotations_path, payload, indent=2, sort_keys=False, create_backup=True)
 
 
+def _metrics_config_write_path(review_dir: Path, config_path: Optional[Path]) -> Path:
+    return config_path if config_path is not None else review_dir / "metrics_config.json"
+
+
+def _profile_to_config_payload(profile: RankingProfileSpec) -> Dict[str, object]:
+    return {
+        "name": profile.name,
+        "label": profile.label,
+        "metric_weights": dict(profile.metric_weights),
+        "description": profile.description,
+    }
+
+
+def save_metric_explorer_config(
+    model: SweepMetricExplorerModel,
+    *,
+    config_path: Optional[Path] = None,
+) -> Path:
+    path = _metrics_config_write_path(model.review_dir, config_path)
+    payload, _, _ = _load_config_payload(path)
+    merged_payload = dict(payload) if isinstance(payload, dict) else {}
+    merged_payload["enabled_metrics"] = list(model.config.enabled_metrics)
+    merged_payload["profiles"] = [
+        _profile_to_config_payload(profile)
+        for profile in model.config.profiles
+        if not profile.built_in
+    ]
+    merged_payload["default_profile"] = model.config.default_profile
+    merged_payload["search_defaults"] = asdict(model.config.search_defaults)
+    write_json_atomic(path, merged_payload, indent=2, sort_keys=False, create_backup=True)
+    model.config.source_path = str(path)
+    return path
+
+
 def _load_metric_cache(path: Path) -> Dict[str, Dict[str, object]]:
     if not path.exists():
         return {}
@@ -1251,6 +1285,16 @@ def _replace_search_results_for_stage(
     model.search_results = [item for item in model.search_results if item.stage != stage_name]
     model.search_results.extend(results)
     model.search_results.sort(key=lambda item: (item.stage, item.profile_name))
+
+
+def _invalidate_annotation_dependent_stage(
+    model: SweepMetricExplorerModel,
+    *,
+    stage_name: str,
+) -> None:
+    model.evaluations = [item for item in model.evaluations if item.stage != stage_name]
+    model.disagreements = [item for item in model.disagreements if item.stage != stage_name]
+    _replace_search_results_for_stage(model, stage_name, [])
 
 
 def _metrics_ready_for_stage(
@@ -3001,7 +3045,7 @@ class SweepMetricExplorerApp:
             width=16,
         )
         self.evaluation_stage_combo.pack(side="left", padx=4)
-        self.evaluation_stage_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_evaluation())
+        self.evaluation_stage_combo.bind("<<ComboboxSelected>>", lambda _evt: self._on_search_stage_changed())
 
         self.evaluation_text = self.tk.Text(self.evaluation_tab, height=12, wrap="word")
         self.evaluation_text.pack(fill="x", padx=6, pady=6)
@@ -3032,6 +3076,7 @@ class SweepMetricExplorerApp:
             width=16,
         )
         self.search_stage_combo.pack(side="left", padx=4)
+        self.search_stage_combo.bind("<<ComboboxSelected>>", lambda _evt: self._on_search_stage_changed())
         self.ttk.Label(controls, text="Weight Step").pack(side="left", padx=(8, 0))
         self.ttk.Entry(controls, textvariable=self.search_step_var, width=6).pack(side="left", padx=4)
         self.ttk.Label(controls, text="Max Metrics").pack(side="left", padx=(8, 0))
@@ -3273,7 +3318,7 @@ class SweepMetricExplorerApp:
         self.refresh_leaderboard()
         self.refresh_comparison()
         self.refresh_evaluation()
-        self._set_text(self.search_results_text, _format_search_results_text(model.search_results))
+        self._refresh_search_results_text()
 
     def _update_comparison_slot_labels(self) -> None:
         self.comparison_slot_a_var.set(f"A: {_record_key_to_text(self._comparison_slot_a_key)}")
@@ -3379,18 +3424,36 @@ class SweepMetricExplorerApp:
             )
         )
 
-    def refresh_leaderboard(self) -> None:
+    def _current_search_stage(self) -> str:
+        return self.search_stage_var.get() or self.stage_var.get()
+
+    def _search_results_for_stage(self, stage_name: str) -> List[SearchResult]:
+        if self.model is None:
+            return []
+        return [item for item in self.model.search_results if item.stage == stage_name]
+
+    def _refresh_search_results_text(self) -> None:
+        stage_name = self._current_search_stage()
+        self._search_results = self._search_results_for_stage(stage_name)
+        self._set_text(self.search_results_text, _format_search_results_text(self._search_results))
+
+    def _on_search_stage_changed(self) -> None:
+        self.refresh_evaluation()
+        self._refresh_search_results_text()
+
+    def refresh_leaderboard(self, preserve_selection: Optional[Sequence[str]] = None) -> None:
         if self.model is None:
             return
         stage_name = self.stage_var.get()
         profile_name = self.profile_var.get()
         if not stage_name or not profile_name:
             return
+        selected_ids = list(preserve_selection) if preserve_selection is not None else list(self.leaderboard_tree.selection())
         if not self._ensure_profile_ready(
             stage_name=stage_name,
             profile_name=profile_name,
             include_analysis=True,
-            on_ready=self.refresh_leaderboard,
+            on_ready=lambda: self.refresh_leaderboard(preserve_selection=selected_ids),
         ):
             self.leaderboard_tree.delete(*self.leaderboard_tree.get_children())
             self._set_text(self.leaderboard_detail, f"Hydrating {profile_name} metrics...")
@@ -3430,7 +3493,10 @@ class SweepMetricExplorerApp:
                     label.label if label is not None else "",
                 ),
             )
-        if self._leaderboard_rows:
+        restorable = [candidate_id for candidate_id in selected_ids if candidate_id in self._leaderboard_row_lookup]
+        if restorable:
+            self.leaderboard_tree.selection_set(restorable)
+        elif self._leaderboard_rows:
             self.leaderboard_tree.selection_set(self._leaderboard_rows[0].candidate_id)
         self._on_leaderboard_selection_changed()
 
@@ -3639,7 +3705,7 @@ class SweepMetricExplorerApp:
     def refresh_evaluation(self) -> None:
         if self.model is None:
             return
-        stage_name = self.search_stage_var.get() or self.stage_var.get()
+        stage_name = self._current_search_stage()
         profile_name = self.profile_var.get()
         if stage_name and profile_name:
             if not self._ensure_profile_ready(
@@ -3670,11 +3736,30 @@ class SweepMetricExplorerApp:
                 ),
             )
 
+    def _refresh_after_annotation_change(
+        self,
+        *,
+        stage_name: str,
+        selected_candidate_ids: Sequence[str],
+    ) -> None:
+        if self.model is None:
+            return
+        _invalidate_annotation_dependent_stage(self.model, stage_name=stage_name)
+        self.refresh_leaderboard(preserve_selection=selected_candidate_ids)
+        self.refresh_comparison()
+        self.refresh_evaluation()
+        self._refresh_search_results_text()
+
     def _set_labels_for_selection(self, label: str) -> None:
         if self.model is None:
             return
+        selected_rows = self._selected_leaderboard_rows()
+        if not selected_rows:
+            return
         dataset_id = self.dataset_var.get() or (_real_datasets(self.model.base_model)[0])
-        for row in self._selected_leaderboard_rows():
+        selected_candidate_ids = [row.candidate_id for row in selected_rows]
+        stage_name = selected_rows[0].stage
+        for row in selected_rows:
             key = _annotation_key(row.stage, row.candidate_id, dataset_id)
             self.model.annotations[key] = QualityAnnotation(
                 stage=row.stage,
@@ -3683,26 +3768,27 @@ class SweepMetricExplorerApp:
                 label=label,
             )
         save_annotations(self.model)
-        self.model = load_sweep_metric_explorer_model(
-            Path(self.path_var.get().strip()),
-            metrics_config_path=self.metrics_config_path,
-            hydrate_mode=HYDRATE_MODE_LAZY,
+        self._refresh_after_annotation_change(
+            stage_name=stage_name,
+            selected_candidate_ids=selected_candidate_ids,
         )
-        self._populate_from_model(self.model)
 
     def _clear_labels_for_selection(self) -> None:
         if self.model is None:
             return
+        selected_rows = self._selected_leaderboard_rows()
+        if not selected_rows:
+            return
         dataset_id = self.dataset_var.get() or (_real_datasets(self.model.base_model)[0])
-        for row in self._selected_leaderboard_rows():
+        selected_candidate_ids = [row.candidate_id for row in selected_rows]
+        stage_name = selected_rows[0].stage
+        for row in selected_rows:
             self.model.annotations.pop(_annotation_key(row.stage, row.candidate_id, dataset_id), None)
         save_annotations(self.model)
-        self.model = load_sweep_metric_explorer_model(
-            Path(self.path_var.get().strip()),
-            metrics_config_path=self.metrics_config_path,
-            hydrate_mode=HYDRATE_MODE_LAZY,
+        self._refresh_after_annotation_change(
+            stage_name=stage_name,
+            selected_candidate_ids=selected_candidate_ids,
         )
-        self._populate_from_model(self.model)
 
     def _selected_metric_names(self) -> List[str]:
         if self.model is None:
@@ -3746,10 +3832,23 @@ class SweepMetricExplorerApp:
             name=profile_name,
             label=profile_name,
             metric_weights=metric_weights,
-            description="Temporary custom profile built in the GUI.",
+            description="Custom profile built in the GUI.",
             built_in=False,
         )
-        self.model.config.profiles.append(profile)
+        selected_candidate_ids = list(self.leaderboard_tree.selection())
+        replaced = False
+        updated_profiles: List[RankingProfileSpec] = []
+        for existing in self.model.config.profiles:
+            if existing.name == profile.name:
+                if not replaced:
+                    updated_profiles.append(profile)
+                    replaced = True
+                continue
+            updated_profiles.append(existing)
+        if not replaced:
+            updated_profiles.append(profile)
+        self.model.config.profiles = updated_profiles
+        save_metric_explorer_config(self.model, config_path=self.metrics_config_path)
         profile_values = [item.name for item in self.model.config.profiles]
         self.profile_combo["values"] = profile_values
         self.profile_var.set(profile_name)
@@ -3760,8 +3859,9 @@ class SweepMetricExplorerApp:
                 profile_name=profile.name,
                 include_analysis=True,
             )
-        self.refresh_leaderboard()
+        self.refresh_leaderboard(preserve_selection=selected_candidate_ids)
         self.refresh_evaluation()
+        self._refresh_search_results_text()
 
     def _run_search(self) -> None:
         if self.model is None:
@@ -3794,13 +3894,16 @@ class SweepMetricExplorerApp:
             return
         results = search_profile_combinations(
             self.model,
-            stage_name=self.search_stage_var.get() or self.stage_var.get(),
+            stage_name=self._current_search_stage(),
             metric_names=selected,
             weight_step=step,
         )
-        self._search_results = results
-        self.model.search_results = results
-        self._set_text(self.search_results_text, _format_search_results_text(results))
+        _replace_search_results_for_stage(
+            self.model,
+            self._current_search_stage(),
+            results,
+        )
+        self._refresh_search_results_text()
 
 
 def launch_sweep_metric_explorer(
