@@ -1,3 +1,4 @@
+import csv
 import json
 from pathlib import Path
 
@@ -366,6 +367,147 @@ def test_annotations_enable_evaluation_and_search(tmp_path):
     )
     assert search_results
     assert search_results[0].pairwise_agreement is not None
+    assert [explorer._search_result_sort_key(item) for item in search_results] == sorted(
+        explorer._search_result_sort_key(item) for item in search_results
+    )
+
+
+def test_replace_search_results_preserves_quality_order_and_stage_isolation(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    model = load_sweep_metric_explorer_model(output_dir)
+    stage2_results = [
+        explorer.SearchResult(
+            stage="stage2",
+            profile_name="search_0003",
+            metric_weights={"other": 1.0},
+            pairwise_agreement=0.8,
+            top1_hit_rate=0.8,
+            mean_label_top_k=0.8,
+            spearman_correlation=0.8,
+        ),
+        explorer.SearchResult(
+            stage="stage2",
+            profile_name="search_0004",
+            metric_weights={"other": 0.5},
+            pairwise_agreement=0.7,
+            top1_hit_rate=0.7,
+            mean_label_top_k=0.7,
+            spearman_correlation=0.7,
+        ),
+    ]
+    model.search_results = list(stage2_results)
+
+    worse_name_better_quality = explorer.SearchResult(
+        stage="stage1",
+        profile_name="search_0002",
+        metric_weights={"better": 1.0},
+        pairwise_agreement=1.0,
+        top1_hit_rate=1.0,
+        mean_label_top_k=1.0,
+        spearman_correlation=1.0,
+    )
+    better_name_worse_quality = explorer.SearchResult(
+        stage="stage1",
+        profile_name="search_0001",
+        metric_weights={"worse": 1.0},
+        pairwise_agreement=0.5,
+        top1_hit_rate=1.0,
+        mean_label_top_k=1.0,
+        spearman_correlation=1.0,
+    )
+
+    explorer._replace_search_results_for_stage(
+        model,
+        "stage1",
+        [better_name_worse_quality, worse_name_better_quality],
+    )
+
+    stage1_results = [item for item in model.search_results if item.stage == "stage1"]
+    assert [item.profile_name for item in stage1_results] == ["search_0002", "search_0001"]
+    assert [item for item in model.search_results if item.stage == "stage2"] == stage2_results
+
+    replacement = explorer.SearchResult(
+        stage="stage1",
+        profile_name="search_0005",
+        metric_weights={"replacement": 1.0},
+        pairwise_agreement=0.9,
+        top1_hit_rate=0.9,
+        mean_label_top_k=0.9,
+        spearman_correlation=0.9,
+    )
+    explorer._replace_search_results_for_stage(model, "stage1", [replacement])
+    assert [item.profile_name for item in model.search_results if item.stage == "stage1"] == ["search_0005"]
+    assert [item for item in model.search_results if item.stage == "stage2"] == stage2_results
+
+
+def test_search_results_ui_helpers_preserve_stored_order(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    model = load_sweep_metric_explorer_model(output_dir)
+    model.search_results = [
+        explorer.SearchResult(
+            stage="stage1",
+            profile_name="search_0002",
+            metric_weights={"better": 1.0},
+            pairwise_agreement=1.0,
+            top1_hit_rate=1.0,
+            mean_label_top_k=1.0,
+            spearman_correlation=1.0,
+        ),
+        explorer.SearchResult(
+            stage="stage1",
+            profile_name="search_0001",
+            metric_weights={"worse": 1.0},
+            pairwise_agreement=0.5,
+            top1_hit_rate=1.0,
+            mean_label_top_k=1.0,
+            spearman_correlation=1.0,
+        ),
+    ]
+    app = explorer.SweepMetricExplorerApp.__new__(explorer.SweepMetricExplorerApp)
+    app.model = model
+
+    results = app._search_results_for_stage("stage1")
+    rendered = explorer._format_search_results_text(results)
+
+    assert [item.profile_name for item in results] == ["search_0002", "search_0001"]
+    assert '"better":1.0' in rendered.splitlines()[0]
+
+
+def test_export_search_results_csv_preserves_quality_order(tmp_path, monkeypatch):
+    output_dir = _make_modern_fixture(tmp_path)
+    model = load_sweep_metric_explorer_model(output_dir)
+    model.search_results = [
+        explorer.SearchResult(
+            stage="stage1",
+            profile_name="search_0002",
+            metric_weights={"better": 1.0},
+            pairwise_agreement=1.0,
+            top1_hit_rate=1.0,
+            mean_label_top_k=1.0,
+            spearman_correlation=1.0,
+        ),
+        explorer.SearchResult(
+            stage="stage1",
+            profile_name="search_0001",
+            metric_weights={"worse": 1.0},
+            pairwise_agreement=0.5,
+            top1_hit_rate=1.0,
+            mean_label_top_k=1.0,
+            spearman_correlation=1.0,
+        ),
+    ]
+    monkeypatch.setattr(explorer, "_hydrate_model_for_export", lambda model: None)
+
+    export_dir = tmp_path / "search_order_export"
+    export_metric_report(model, export_dir)
+
+    with (export_dir / "search_results.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert [row["profile_name"] for row in rows if row["stage"] == "stage1"] == [
+        "search_0002",
+        "search_0001",
+    ]
 
 
 def test_export_metric_report_hydrates_lazy_model(tmp_path, monkeypatch):

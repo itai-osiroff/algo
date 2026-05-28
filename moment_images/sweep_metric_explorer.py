@@ -279,6 +279,23 @@ def _compact_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _search_quality_sort_value(value: Optional[float]) -> Tuple[int, float]:
+    if value is None:
+        return (1, 0.0)
+    return (0, -float(value))
+
+
+def _search_result_sort_key(item: SearchResult) -> Tuple[object, ...]:
+    return (
+        _search_quality_sort_value(item.pairwise_agreement),
+        _search_quality_sort_value(item.top1_hit_rate),
+        _search_quality_sort_value(item.mean_label_top_k),
+        _search_quality_sort_value(item.spearman_correlation),
+        item.profile_name,
+        _compact_json(item.metric_weights),
+    )
+
+
 def _annotation_key(stage: str, candidate_id: str, dataset_id: str) -> str:
     return f"{stage}:{candidate_id}:{dataset_id}"
 
@@ -1282,9 +1299,20 @@ def _replace_search_results_for_stage(
     stage_name: str,
     results: Sequence[SearchResult],
 ) -> None:
-    model.search_results = [item for item in model.search_results if item.stage != stage_name]
-    model.search_results.extend(results)
-    model.search_results.sort(key=lambda item: (item.stage, item.profile_name))
+    insertion_index: Optional[int] = None
+    retained: List[SearchResult] = []
+    for item in model.search_results:
+        if item.stage == stage_name:
+            if insertion_index is None:
+                insertion_index = len(retained)
+            continue
+        retained.append(item)
+    ordered_results = sorted(results, key=_search_result_sort_key)
+    if insertion_index is None:
+        retained.extend(ordered_results)
+    else:
+        retained[insertion_index:insertion_index] = ordered_results
+    model.search_results = retained
 
 
 def _invalidate_annotation_dependent_stage(
@@ -1896,14 +1924,7 @@ def search_profile_combinations(
                 spearman_correlation=summary.spearman_correlation,
             )
         )
-    results.sort(
-        key=lambda item: (
-            -1.0 if item.pairwise_agreement is None else -float(item.pairwise_agreement),
-            -1.0 if item.top1_hit_rate is None else -float(item.top1_hit_rate),
-            -1.0 if item.mean_label_top_k is None else -float(item.mean_label_top_k),
-            -1.0 if item.spearman_correlation is None else -float(item.spearman_correlation),
-        )
-    )
+    results.sort(key=_search_result_sort_key)
     return results
 
 
