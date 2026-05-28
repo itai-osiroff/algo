@@ -832,7 +832,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                             view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
                         )
                         intensity_corr = gaussian_filter(
-                            ref_view * (shifted_view**3),
+                            ref_view * shifted_view,
                             sigma=gauss_sigma,
                             truncate=(gauss_size/ gauss_sigma),
                             mode="constant",

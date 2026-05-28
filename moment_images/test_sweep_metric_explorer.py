@@ -372,6 +372,116 @@ def test_annotations_enable_evaluation_and_search(tmp_path):
     )
 
 
+def test_signed_weighted_average_uses_absolute_denominator():
+    values = {"reward": 1.0, "penalty": 1.0, "missing": float("nan")}
+
+    assert explorer._weighted_average(values, {"reward": 1.0, "penalty": 1.0}) == pytest.approx(1.0)
+    assert explorer._weighted_average(values, {"reward": 1.0, "penalty": -1.0}) == pytest.approx(0.0)
+    assert explorer._weighted_average(values, {"penalty": -1.0}) == pytest.approx(-1.0)
+    assert explorer._weighted_average(values, {"missing": -1.0}) is None
+
+
+def test_config_negative_weights_require_profile_opt_in(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    _write_json(
+        output_dir / "metric_review" / "metrics_config.json",
+        {
+            "profiles": [
+                {
+                    "name": "drops_negative",
+                    "label": "Drops Negative",
+                    "metric_weights": {"saved_score": -1.0, "laplacian_variance": 1.0},
+                },
+                {
+                    "name": "keeps_negative",
+                    "label": "Keeps Negative",
+                    "allow_negative_weights": True,
+                    "metric_weights": {"saved_score": -1.0, "laplacian_variance": 1.0},
+                },
+            ]
+        },
+    )
+
+    model = load_sweep_metric_explorer_model(output_dir)
+
+    drops = next(profile for profile in model.config.profiles if profile.name == "drops_negative")
+    keeps = next(profile for profile in model.config.profiles if profile.name == "keeps_negative")
+    assert drops.metric_weights == {"laplacian_variance": 1.0}
+    assert drops.allow_negative_weights is False
+    assert keeps.metric_weights == {"saved_score": -1.0, "laplacian_variance": 1.0}
+    assert keeps.allow_negative_weights is True
+    assert any("dropped" in warning and "drops_negative" in warning for warning in model.warnings)
+
+
+def test_negative_profile_can_penalize_inverse_metric(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    model = load_sweep_metric_explorer_model(output_dir)
+    model.config.profiles.append(
+        explorer.RankingProfileSpec(
+            name="inverse_saved_score",
+            label="Inverse Saved Score",
+            metric_weights={"saved_score": -1.0},
+            allow_negative_weights=True,
+        )
+    )
+
+    results = _ensure_profile_results(
+        model,
+        stage_name="stage1",
+        profile_name="inverse_saved_score",
+        include_analysis=False,
+    )
+
+    assert results[0].candidate_id == "c_good"
+    assert results[0].contributions["saved_score"] <= 0.0
+
+
+def test_signed_search_is_opt_in(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    _write_annotations(output_dir)
+    model = load_sweep_metric_explorer_model(output_dir)
+
+    default_results = search_profile_combinations(
+        model,
+        stage_name="stage1",
+        metric_names=["saved_score", "laplacian_variance"],
+        weight_step=0.5,
+    )
+    signed_results = search_profile_combinations(
+        model,
+        stage_name="stage1",
+        metric_names=["saved_score", "laplacian_variance"],
+        weight_step=0.5,
+        allow_negative_weights=True,
+    )
+
+    assert default_results
+    assert all(weight > 0.0 for result in default_results for weight in result.metric_weights.values())
+    assert any(weight < 0.0 for result in signed_results for weight in result.metric_weights.values())
+
+
+def test_default_search_results_honor_negative_search_config(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    _write_annotations(output_dir)
+    _write_json(
+        output_dir / "metric_review" / "metrics_config.json",
+        {
+            "search_defaults": {
+                "metric_subset": ["saved_score", "laplacian_variance"],
+                "weight_step": 0.5,
+                "max_metrics": 6,
+                "allow_negative_weights": True,
+            }
+        },
+    )
+    model = load_sweep_metric_explorer_model(output_dir)
+
+    results = explorer._ensure_default_search_results_for_stage(model, stage_name="stage1")
+
+    assert results
+    assert any(weight < 0.0 for result in results for weight in result.metric_weights.values())
+
+
 def test_replace_search_results_preserves_quality_order_and_stage_isolation(tmp_path):
     output_dir = _make_modern_fixture(tmp_path)
     model = load_sweep_metric_explorer_model(output_dir)
@@ -715,6 +825,37 @@ def test_gui_custom_profile_persists_to_next_load(tmp_path):
     matches = [profile for profile in reloaded.config.profiles if profile.name == "saved_custom"]
     assert len(matches) == 1
     assert matches[0].metric_weights == weights
+
+
+def test_gui_custom_profile_negative_weights_require_opt_in(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        warnings: list[tuple[object, ...]] = []
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: warnings.append(args)
+
+        app.load_from_path(output_dir)
+        app.search_profile_name_var.set("default_signed_blocked")
+        app._set_text(app.weight_json_text, json.dumps({"saved_score": -1.0, "laplacian_variance": 1.0}))
+        app.profile_allow_negative_var.set(False)
+        app._build_json_profile()
+        blocked = next(profile for profile in app.model.config.profiles if profile.name == "default_signed_blocked")
+        assert blocked.metric_weights == {"laplacian_variance": 1.0}
+        assert blocked.allow_negative_weights is False
+        assert warnings
+
+        app.search_profile_name_var.set("signed_allowed")
+        app.profile_allow_negative_var.set(True)
+        app._build_json_profile()
+        allowed = next(profile for profile in app.model.config.profiles if profile.name == "signed_allowed")
+        assert allowed.metric_weights == {"saved_score": -1.0, "laplacian_variance": 1.0}
+        assert allowed.allow_negative_weights is True
+        root.update()
+    finally:
+        root.destroy()
 
 
 def test_gui_custom_profile_overwrites_same_name(tmp_path):

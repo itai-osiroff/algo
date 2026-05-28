@@ -307,12 +307,17 @@ Enter a JSON object such as:
 
 Then provide a profile name and click `Build JSON Profile`.
 
-This creates a temporary in-memory profile and immediately makes it available in the `Profile` dropdown.
+This saves the custom profile to `metric_review/metrics_config.json` and immediately makes it available in
+the `Profile` dropdown.
+
+By default, custom profile weights must be positive. Enable `Allow negative weights` before clicking
+`Build JSON Profile` if a metric should act as a penalty after normalization. Metric direction is still
+applied first, so negative weights penalize high values in the explorer's normal "higher is better" space.
 
 Important current behavior:
 
-- custom profiles built in the GUI are **not automatically saved** to disk
-- if you want a profile to be repeatable across sessions, use a metrics config file
+- custom profiles with the same name replace the prior profile definition
+- if you provide `--metrics-config`, custom profiles are saved to that config path instead
 
 #### Search
 
@@ -323,12 +328,14 @@ Controls:
 - `Stage`
 - `Weight Step`
 - `Max Metrics`
+- `Search negative weights`
 
 Current constraints:
 
 - the search expects a small metric subset
 - more than 6 selected metrics is intentionally blocked
 - the search only becomes useful once you have annotations
+- negative-weight search is opt-in; leaving `Search negative weights` off preserves the positive-only search
 
 The search results panel lists the best combinations found, ordered by the evaluation criteria.
 
@@ -441,7 +448,8 @@ metric_review/metrics_config.json
       "laplacian_variance"
     ],
     "weight_step": 0.1,
-    "max_metrics": 6
+    "max_metrics": 6,
+    "allow_negative_weights": false
   }
 }
 ```
@@ -449,6 +457,22 @@ metric_review/metrics_config.json
 Notes:
 
 - any profile defined here is merged with the built-in profiles
+- profile weights are positive-only unless that profile sets `"allow_negative_weights": true`
+- negative search ranges are disabled unless `search_defaults.allow_negative_weights` is `true`
+
+Example inverse metric profile:
+
+```json
+{
+  "name": "inverse_artifact_penalty",
+  "label": "Inverse Artifact Penalty",
+  "allow_negative_weights": true,
+  "metric_weights": {
+    "vollath_f4_guide": 0.7,
+    "average_intensity": -0.3
+  }
+}
+```
 - metrics not listed in `enabled_metrics` are hidden from ranking/search
 - invalid metric names are ignored
 

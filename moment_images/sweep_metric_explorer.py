@@ -11,6 +11,7 @@ import subprocess
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from itertools import product
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, cast
 
@@ -65,6 +66,7 @@ class RankingProfileSpec:
     metric_weights: Dict[str, float]
     description: str = ""
     built_in: bool = False
+    allow_negative_weights: bool = False
 
 
 @dataclass
@@ -74,6 +76,7 @@ class SearchDefaults:
     metric_subset: List[str] = field(default_factory=list)
     weight_step: float = DEFAULT_SEARCH_WEIGHT_STEP
     max_metrics: int = 6
+    allow_negative_weights: bool = False
 
 
 @dataclass
@@ -378,6 +381,42 @@ def _normalize_score(value: float, min_value: float, max_value: float) -> float:
     return float((value - min_value) / (max_value - min_value))
 
 
+def _validated_metric_weights(
+    weights: Mapping[str, object],
+    metric_registry: Mapping[str, MetricDescriptor],
+    *,
+    allow_negative_weights: bool = False,
+) -> Dict[str, float]:
+    valid: Dict[str, float] = {}
+    for name, weight in weights.items():
+        metric_name = str(name)
+        numeric = _coerce_float(weight)
+        if metric_name not in metric_registry or numeric is None or not math.isfinite(float(numeric)):
+            continue
+        numeric = float(numeric)
+        if numeric == 0.0:
+            continue
+        if numeric < 0.0 and not allow_negative_weights:
+            continue
+        valid[metric_name] = numeric
+    if sum(abs(weight) for weight in valid.values()) <= 0.0:
+        return {}
+    return valid
+
+
+def _negative_metric_weight_names(
+    weights: Mapping[str, object],
+    metric_registry: Mapping[str, MetricDescriptor],
+) -> List[str]:
+    names: List[str] = []
+    for metric_name, metric_weight in weights.items():
+        name = str(metric_name)
+        numeric = _coerce_float(metric_weight)
+        if name in metric_registry and numeric is not None and float(numeric) < 0.0:
+            names.append(name)
+    return names
+
+
 def _weighted_average(values: Mapping[str, float], weights: Mapping[str, float]) -> Optional[float]:
     weighted_sum = 0.0
     weight_sum = 0.0
@@ -386,7 +425,7 @@ def _weighted_average(values: Mapping[str, float], weights: Mapping[str, float])
         if value is None or not math.isfinite(float(value)):
             continue
         weighted_sum += float(weight) * float(value)
-        weight_sum += float(weight)
+        weight_sum += abs(float(weight))
     if weight_sum <= 0.0:
         return None
     return weighted_sum / weight_sum
@@ -638,11 +677,13 @@ def _profile_metric_names(
     profile: RankingProfileSpec,
     metric_registry: Mapping[str, MetricDescriptor],
 ) -> List[str]:
-    return [
-        name
-        for name, weight in profile.metric_weights.items()
-        if name in metric_registry and float(weight) > 0.0
-    ]
+    return list(
+        _validated_metric_weights(
+            profile.metric_weights,
+            metric_registry,
+            allow_negative_weights=profile.allow_negative_weights,
+        ).keys()
+    )
 
 
 def _default_old_metric_weights(metric_registry: Mapping[str, MetricDescriptor]) -> Dict[str, float]:
@@ -773,11 +814,19 @@ def _resolve_metric_config(
                 weights_raw = item.get("metric_weights", {})
                 if not name or not isinstance(weights_raw, dict):
                     continue
-                weights = {
-                    str(metric_name): float(metric_weight)
-                    for metric_name, metric_weight in weights_raw.items()
-                    if str(metric_name) in metric_registry and _coerce_float(metric_weight) is not None
-                }
+                allow_negative_weights = bool(item.get("allow_negative_weights", False))
+                if not allow_negative_weights:
+                    dropped_negative = _negative_metric_weight_names(weights_raw, metric_registry)
+                    if dropped_negative:
+                        warnings.append(
+                            f"Profile {name!r} has negative weights but allow_negative_weights is false; "
+                            f"dropped: {', '.join(sorted(dropped_negative))}."
+                        )
+                weights = _validated_metric_weights(
+                    weights_raw,
+                    metric_registry,
+                    allow_negative_weights=allow_negative_weights,
+                )
                 if not weights:
                     continue
                 merged[name] = RankingProfileSpec(
@@ -786,6 +835,7 @@ def _resolve_metric_config(
                     metric_weights=weights,
                     description=str(item.get("description", "")),
                     built_in=False,
+                    allow_negative_weights=allow_negative_weights,
                 )
             profiles = list(merged.values())
         default_profile_raw = payload.get("default_profile")
@@ -806,23 +856,36 @@ def _resolve_metric_config(
                 search_defaults.weight_step = float(step_raw)
             if max_metrics_raw is not None and max_metrics_raw >= 1:
                 search_defaults.max_metrics = int(max_metrics_raw)
+            search_defaults.allow_negative_weights = bool(
+                search_defaults_raw.get("allow_negative_weights", False)
+            )
 
     enabled_set = set(enabled_metrics)
-    profiles = [
-        RankingProfileSpec(
-            name=profile.name,
-            label=profile.label,
-            metric_weights={
-                metric_name: float(weight)
-                for metric_name, weight in profile.metric_weights.items()
-                if metric_name in enabled_set
-            },
-            description=profile.description,
-            built_in=profile.built_in,
+    filtered_profiles: List[RankingProfileSpec] = []
+    for profile in profiles:
+        enabled_weights = {
+            metric_name: float(weight)
+            for metric_name, weight in profile.metric_weights.items()
+            if metric_name in enabled_set
+        }
+        enabled_weights = _validated_metric_weights(
+            enabled_weights,
+            metric_registry,
+            allow_negative_weights=profile.allow_negative_weights,
         )
-        for profile in profiles
-        if any(metric_name in enabled_set for metric_name in profile.metric_weights)
-    ]
+        if not enabled_weights:
+            continue
+        filtered_profiles.append(
+            RankingProfileSpec(
+                name=profile.name,
+                label=profile.label,
+                metric_weights=enabled_weights,
+                description=profile.description,
+                built_in=profile.built_in,
+                allow_negative_weights=profile.allow_negative_weights,
+            )
+        )
+    profiles = filtered_profiles
     profile_names = {profile.name for profile in profiles}
     if default_profile not in profile_names:
         default_profile = "hybrid_default" if "hybrid_default" in profile_names else profiles[0].name
@@ -919,12 +982,15 @@ def _metrics_config_write_path(review_dir: Path, config_path: Optional[Path]) ->
 
 
 def _profile_to_config_payload(profile: RankingProfileSpec) -> Dict[str, object]:
-    return {
+    payload: Dict[str, object] = {
         "name": profile.name,
         "label": profile.label,
         "metric_weights": dict(profile.metric_weights),
         "description": profile.description,
     }
+    if profile.allow_negative_weights:
+        payload["allow_negative_weights"] = True
+    return payload
 
 
 def save_metric_explorer_config(
@@ -1498,11 +1564,11 @@ def _score_profile_for_stage(
 
     record_lookup = _record_lookup(raw_records)
     datasets = _real_datasets(model)
-    metric_weights = {
-        name: float(weight)
-        for name, weight in profile.metric_weights.items()
-        if name in metric_registry and float(weight) > 0.0
-    }
+    metric_weights = _validated_metric_weights(
+        profile.metric_weights,
+        metric_registry,
+        allow_negative_weights=profile.allow_negative_weights,
+    )
     if not metric_weights:
         return []
 
@@ -1744,6 +1810,16 @@ def _generate_weight_combinations(num_metrics: int, step: float) -> Iterable[Tup
         yield tuple(count * step for count in counts)
 
 
+def _generate_signed_weight_combinations(num_metrics: int, step: float) -> Iterable[Tuple[float, ...]]:
+    for magnitudes in _generate_weight_combinations(num_metrics, step):
+        active_indexes = [idx for idx, value in enumerate(magnitudes) if value > 0.0]
+        for signs in product((-1.0, 1.0), repeat=len(active_indexes)):
+            signed = list(magnitudes)
+            for idx, sign in zip(active_indexes, signs):
+                signed[idx] = signed[idx] * sign
+            yield tuple(signed)
+
+
 def _ensure_profile_results(
     model: SweepMetricExplorerModel,
     *,
@@ -1799,6 +1875,7 @@ def _ensure_default_search_results_for_stage(
         stage_name=stage_name,
         metric_names=subset,
         weight_step=model.config.search_defaults.weight_step,
+        allow_negative_weights=model.config.search_defaults.allow_negative_weights,
     )
     _replace_search_results_for_stage(model, stage_name, results)
     return results
@@ -1876,8 +1953,9 @@ def search_profile_combinations(
     stage_name: str,
     metric_names: Sequence[str],
     weight_step: float = DEFAULT_SEARCH_WEIGHT_STEP,
+    allow_negative_weights: bool = False,
 ) -> List[SearchResult]:
-    """Search a nonnegative simplex grid for a better profile."""
+    """Search a weight grid for a better profile."""
 
     candidate_metrics = [name for name in metric_names if name in explorer_model.metric_registry]
     if not candidate_metrics or len(candidate_metrics) > 6:
@@ -1888,16 +1966,22 @@ def search_profile_combinations(
         metric_names=candidate_metrics,
     )
     results: List[SearchResult] = []
-    for weights in _generate_weight_combinations(len(candidate_metrics), weight_step):
+    weight_combinations = (
+        _generate_signed_weight_combinations(len(candidate_metrics), weight_step)
+        if allow_negative_weights
+        else _generate_weight_combinations(len(candidate_metrics), weight_step)
+    )
+    for weights in weight_combinations:
         metric_weights = {
             name: float(weight)
             for name, weight in zip(candidate_metrics, weights)
-            if weight > 0.0
+            if abs(weight) > 0.0
         }
         profile = RankingProfileSpec(
             name=f"search_{len(results) + 1:04d}",
             label="Search",
             metric_weights=metric_weights,
+            allow_negative_weights=allow_negative_weights,
         )
         scored = _score_profile_for_stage(
             stage_name,
@@ -2183,6 +2267,7 @@ def export_metric_report(model: SweepMetricExplorerModel, output_dir: Path) -> P
                     "metric_weights": profile.metric_weights,
                     "description": profile.description,
                     "built_in": profile.built_in,
+                    "allow_negative_weights": profile.allow_negative_weights,
                 }
                 for profile in model.config.profiles
             ],
@@ -2851,6 +2936,8 @@ class SweepMetricExplorerApp:
         self.search_profile_name_var = tk.StringVar(value="custom_profile")
         self.search_step_var = tk.StringVar(value=f"{DEFAULT_SEARCH_WEIGHT_STEP:g}")
         self.search_max_metrics_var = tk.StringVar(value="6")
+        self.search_allow_negative_var = tk.BooleanVar(value=False)
+        self.profile_allow_negative_var = tk.BooleanVar(value=False)
         self.weight_json_var = tk.StringVar(value="{}")
         self._comparison_slot_a_key: Optional[ComparisonRecordKey] = None
         self._comparison_slot_b_key: Optional[ComparisonRecordKey] = None
@@ -3102,6 +3189,11 @@ class SweepMetricExplorerApp:
         self.ttk.Entry(controls, textvariable=self.search_step_var, width=6).pack(side="left", padx=4)
         self.ttk.Label(controls, text="Max Metrics").pack(side="left", padx=(8, 0))
         self.ttk.Entry(controls, textvariable=self.search_max_metrics_var, width=6).pack(side="left", padx=4)
+        self.ttk.Checkbutton(
+            controls,
+            text="Search negative weights",
+            variable=self.search_allow_negative_var,
+        ).pack(side="left", padx=(8, 4))
         self.ttk.Button(controls, text="Search", command=self._run_search).pack(side="left", padx=(10, 4))
         self.ttk.Button(controls, text="Build Equal Profile", command=self._build_equal_weight_profile).pack(side="left", padx=4)
         self.ttk.Button(controls, text="Build JSON Profile", command=self._build_json_profile).pack(side="left", padx=4)
@@ -3120,6 +3212,11 @@ class SweepMetricExplorerApp:
         editor.pack(fill="x", padx=4, pady=4)
         self.ttk.Label(editor, text="Profile Name").pack(side="left")
         self.ttk.Entry(editor, textvariable=self.search_profile_name_var, width=28).pack(side="left", padx=4)
+        self.ttk.Checkbutton(
+            editor,
+            text="Allow negative weights",
+            variable=self.profile_allow_negative_var,
+        ).pack(side="left", padx=(8, 4))
         self.weight_json_text = self.tk.Text(right, height=10, wrap="word")
         self.weight_json_text.pack(fill="x", padx=4, pady=4)
         self.search_results_text = self.tk.Text(right, wrap="word")
@@ -3319,6 +3416,10 @@ class SweepMetricExplorerApp:
             self.profile_var.set(_initial_profile_name(model))
         self.dataset_combo["values"] = _real_datasets(model.base_model)
         self.dataset_var.set((_real_datasets(model.base_model) or ["aggregate"])[0])
+        self.search_step_var.set(f"{model.config.search_defaults.weight_step:g}")
+        self.search_max_metrics_var.set(str(model.config.search_defaults.max_metrics))
+        self.search_allow_negative_var.set(model.config.search_defaults.allow_negative_weights)
+        self.profile_allow_negative_var.set(False)
         self.metric_listbox.delete(0, self.tk.END)
         for metric_name in sorted(model.metric_registry.keys()):
             self.metric_listbox.insert(self.tk.END, metric_name)
@@ -3840,13 +3941,21 @@ class SweepMetricExplorerApp:
         if not isinstance(weights, dict):
             self.messagebox.showerror("Profiles", "Weight JSON must be an object mapping metric names to weights.")
             return
-        metric_weights = {
-            str(name): float(value)
-            for name, value in weights.items()
-            if str(name) in self.model.metric_registry and _coerce_float(value) is not None and float(value) > 0.0
-        }
+        allow_negative_weights = bool(self.profile_allow_negative_var.get())
+        if not allow_negative_weights:
+            dropped_negative = _negative_metric_weight_names(weights, self.model.metric_registry)
+            if dropped_negative:
+                self.messagebox.showwarning(
+                    "Profiles",
+                    "Negative weights were ignored because Allow negative weights is disabled.",
+                )
+        metric_weights = _validated_metric_weights(
+            weights,
+            self.model.metric_registry,
+            allow_negative_weights=allow_negative_weights,
+        )
         if not metric_weights:
-            self.messagebox.showwarning("Profiles", "No valid positive weights found.")
+            self.messagebox.showwarning("Profiles", "No valid weights found.")
             return
         profile_name = self.search_profile_name_var.get().strip() or "custom_profile"
         profile = RankingProfileSpec(
@@ -3855,6 +3964,7 @@ class SweepMetricExplorerApp:
             metric_weights=metric_weights,
             description="Custom profile built in the GUI.",
             built_in=False,
+            allow_negative_weights=allow_negative_weights,
         )
         selected_candidate_ids = list(self.leaderboard_tree.selection())
         replaced = False
@@ -3918,6 +4028,7 @@ class SweepMetricExplorerApp:
             stage_name=self._current_search_stage(),
             metric_names=selected,
             weight_step=step,
+            allow_negative_weights=bool(self.search_allow_negative_var.get()),
         )
         _replace_search_results_for_stage(
             self.model,
