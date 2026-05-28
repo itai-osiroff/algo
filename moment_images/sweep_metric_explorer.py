@@ -2550,6 +2550,35 @@ def _format_search_results_text(results: Sequence[SearchResult]) -> str:
     return "\n".join(lines)
 
 
+def _contrast_preset_percentiles(mode: str) -> Optional[Tuple[float, float]]:
+    """Return low/high percentile anchors for a named contrast mode."""
+
+    if mode == "p2-p98":
+        return 2.0, 98.0
+    if mode == "p5-p95":
+        return 5.0, 95.0
+    return None
+
+
+def _contrast_percentile_limits(
+    image: np.ndarray,
+    low_percentile: float,
+    high_percentile: float,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Convert percentile bounds into imshow limits, falling back to auto on bad input."""
+
+    low_pct = min(100.0, max(0.0, float(low_percentile)))
+    high_pct = min(100.0, max(0.0, float(high_percentile)))
+    if high_pct <= low_pct:
+        return None, None
+    low, high = np.percentile(image, [low_pct, high_pct])
+    low_value = float(low)
+    high_value = float(high)
+    if not math.isfinite(low_value) or not math.isfinite(high_value) or high_value <= low_value:
+        return None, None
+    return low_value, high_value
+
+
 class _ComparisonImageInspector:
     """Interactive single-run image inspector used inside the comparison workspace."""
 
@@ -2559,11 +2588,12 @@ class _ComparisonImageInspector:
         "avg_image": "Avg Image",
         "guide_log": "Guide LoG",
     }
-    CONTRAST_OPTIONS = ("auto", "p2-p98", "p5-p95")
+    CONTRAST_OPTIONS = ("auto", "p2-p98", "p5-p95", "custom")
     CONTRAST_LABELS = {
         "auto": "Auto",
         "p2-p98": "P2-P98",
         "p5-p95": "P5-P95",
+        "custom": "Custom",
     }
 
     def __init__(
@@ -2592,11 +2622,16 @@ class _ComparisonImageInspector:
         self.warning_var = self.tk.StringVar(value="")
         self.view_var = self.tk.StringVar(value="preview")
         self.contrast_var = self.tk.StringVar(value="auto")
+        self.low_percentile_var = self.tk.DoubleVar(value=2.0)
+        self.high_percentile_var = self.tk.DoubleVar(value=98.0)
+        self.low_percentile_label_var = self.tk.StringVar(value="Low 2.0")
+        self.high_percentile_label_var = self.tk.StringVar(value="High 98.0")
 
         self._record: Optional[RawMetricRecord] = None
         self._bundle: Optional[ComparisonDisplayBundle] = None
         self._record_key: Optional[ComparisonRecordKey] = None
         self._suspend_limit_events = False
+        self._suspend_contrast_events = False
         self._last_rendered_shape: Optional[Tuple[int, int]] = None
 
         header = self.ttk.Frame(self.frame)
@@ -2631,13 +2666,36 @@ class _ComparisonImageInspector:
             values=list(self.CONTRAST_OPTIONS),
         )
         contrast_combo.pack(side="left", padx=4)
-        contrast_combo.bind("<<ComboboxSelected>>", lambda _evt: self.render(reset_view=False))
+        contrast_combo.bind("<<ComboboxSelected>>", self._handle_contrast_preset_change)
 
         self.ttk.Button(controls, text="Fit", command=self.fit_view).pack(side="left", padx=(10, 3))
         self.ttk.Button(controls, text="1:1", command=self.pixel_view).pack(side="left", padx=3)
         self.ttk.Button(controls, text="Reset", command=self.reset_view_state).pack(side="left", padx=3)
         if self.allow_open_large and self.on_open_large is not None:
             self.ttk.Button(controls, text="Open Large", command=self._open_large).pack(side="left", padx=3)
+
+        contrast_sliders = self.ttk.Frame(self.frame)
+        contrast_sliders.pack(fill="x", padx=6, pady=(0, 6))
+        self.ttk.Label(contrast_sliders, textvariable=self.low_percentile_label_var, width=8).pack(side="left")
+        self.low_percentile_scale = self.ttk.Scale(
+            contrast_sliders,
+            from_=0.0,
+            to=100.0,
+            orient="horizontal",
+            variable=self.low_percentile_var,
+            command=lambda _value: self._handle_percentile_slider_change(),
+        )
+        self.low_percentile_scale.pack(side="left", fill="x", expand=True, padx=(2, 8))
+        self.ttk.Label(contrast_sliders, textvariable=self.high_percentile_label_var, width=9).pack(side="left")
+        self.high_percentile_scale = self.ttk.Scale(
+            contrast_sliders,
+            from_=0.0,
+            to=100.0,
+            orient="horizontal",
+            variable=self.high_percentile_var,
+            command=lambda _value: self._handle_percentile_slider_change(),
+        )
+        self.high_percentile_scale.pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         self.toolbar_frame = self.ttk.Frame(self.frame)
         self.toolbar_frame.pack(fill="x", padx=6, pady=(0, 2))
@@ -2662,6 +2720,7 @@ class _ComparisonImageInspector:
             self.toolbar.pack(fill="x")
         self.axis.callbacks.connect("xlim_changed", lambda _axes: self._notify_limits_changed())
         self.axis.callbacks.connect("ylim_changed", lambda _axes: self._notify_limits_changed())
+        self._refresh_contrast_control_state()
         self._render_placeholder(f"Run {slot_name} is not set.")
 
     @property
@@ -2677,6 +2736,13 @@ class _ComparisonImageInspector:
 
     def current_contrast(self) -> str:
         return self.contrast_var.get()
+
+    def current_contrast_state(self) -> Tuple[str, float, float]:
+        return (
+            self.contrast_var.get(),
+            float(self.low_percentile_var.get()),
+            float(self.high_percentile_var.get()),
+        )
 
     def current_image_shape(self) -> Optional[Tuple[int, int]]:
         image = self.current_image()
@@ -2707,7 +2773,39 @@ class _ComparisonImageInspector:
     def set_contrast(self, contrast_mode: str, *, redraw: bool = True) -> None:
         if contrast_mode not in self.CONTRAST_OPTIONS:
             return
-        self.contrast_var.set(contrast_mode)
+        self._suspend_contrast_events = True
+        try:
+            self.contrast_var.set(contrast_mode)
+            preset = _contrast_preset_percentiles(contrast_mode)
+            if preset is not None:
+                self.low_percentile_var.set(preset[0])
+                self.high_percentile_var.set(preset[1])
+            self._update_percentile_labels()
+            self._refresh_contrast_control_state()
+        finally:
+            self._suspend_contrast_events = False
+        if redraw:
+            self.render(reset_view=False)
+
+    def set_contrast_state(
+        self,
+        contrast_mode: str,
+        low_percentile: float,
+        high_percentile: float,
+        *,
+        redraw: bool = True,
+    ) -> None:
+        if contrast_mode not in self.CONTRAST_OPTIONS:
+            contrast_mode = "auto"
+        self._suspend_contrast_events = True
+        try:
+            self.contrast_var.set(contrast_mode)
+            self.low_percentile_var.set(min(100.0, max(0.0, float(low_percentile))))
+            self.high_percentile_var.set(min(100.0, max(0.0, float(high_percentile))))
+            self._update_percentile_labels()
+            self._refresh_contrast_control_state()
+        finally:
+            self._suspend_contrast_events = False
         if redraw:
             self.render(reset_view=False)
 
@@ -2778,7 +2876,7 @@ class _ComparisonImageInspector:
         self.apply_axes_limits(full_x, full_y)
 
     def reset_view_state(self) -> None:
-        self.contrast_var.set("auto")
+        self.set_contrast("auto", redraw=False)
         self.fit_view()
         self.render(reset_view=False)
 
@@ -2804,7 +2902,8 @@ class _ComparisonImageInspector:
 
     def clone_view_state_from(self, other: "_ComparisonImageInspector") -> None:
         self.set_view(other.current_view(), emit_event=False, reset_view=True)
-        self.set_contrast(other.current_contrast(), redraw=True)
+        contrast_mode, low_percentile, high_percentile = other.current_contrast_state()
+        self.set_contrast_state(contrast_mode, low_percentile, high_percentile, redraw=True)
         xlim, ylim = other.get_axes_limits()
         if xlim is not None and ylim is not None and self.has_image():
             self.apply_axes_limits(xlim, ylim)
@@ -2853,6 +2952,29 @@ class _ComparisonImageInspector:
         if self.on_view_changed is not None:
             self.on_view_changed(self, self.view_var.get())
 
+    def _handle_contrast_preset_change(self, _event: Optional[object] = None) -> None:
+        self.set_contrast(self.contrast_var.get(), redraw=True)
+
+    def _handle_percentile_slider_change(self) -> None:
+        if self._suspend_contrast_events:
+            return
+        self.contrast_var.set("custom")
+        self._update_percentile_labels()
+        self._refresh_contrast_control_state()
+        self.render(reset_view=False)
+
+    def _update_percentile_labels(self) -> None:
+        self.low_percentile_label_var.set(f"Low {float(self.low_percentile_var.get()):.1f}")
+        self.high_percentile_label_var.set(f"High {float(self.high_percentile_var.get()):.1f}")
+
+    def _refresh_contrast_control_state(self) -> None:
+        if self.contrast_var.get() == "auto":
+            self.low_percentile_scale.state(["disabled"])
+            self.high_percentile_scale.state(["disabled"])
+        else:
+            self.low_percentile_scale.state(["!disabled"])
+            self.high_percentile_scale.state(["!disabled"])
+
     def _open_large(self) -> None:
         if self.on_open_large is not None:
             self.on_open_large(self.slot_name)
@@ -2864,17 +2986,16 @@ class _ComparisonImageInspector:
 
     def _contrast_limits(self, image: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
         mode = self.contrast_var.get()
-        if mode == "p2-p98":
-            low, high = np.percentile(image, [2.0, 98.0])
-        elif mode == "p5-p95":
-            low, high = np.percentile(image, [5.0, 95.0])
-        else:
+        preset = _contrast_preset_percentiles(mode)
+        if preset is not None:
+            return _contrast_percentile_limits(image, preset[0], preset[1])
+        if mode != "custom":
             return None, None
-        low_value = float(low)
-        high_value = float(high)
-        if not math.isfinite(low_value) or not math.isfinite(high_value) or high_value <= low_value:
-            return None, None
-        return low_value, high_value
+        return _contrast_percentile_limits(
+            image,
+            float(self.low_percentile_var.get()),
+            float(self.high_percentile_var.get()),
+        )
 
     @staticmethod
     def _bounded_limits(center: float, span: float, lower: float, upper: float) -> Tuple[float, float]:
@@ -2905,6 +3026,7 @@ class SweepMetricExplorerApp:
         self.ttk = ttk
         self.filedialog = __import__("tkinter.filedialog", fromlist=["filedialog"])
         self.messagebox = __import__("tkinter.messagebox", fromlist=["messagebox"])
+        self.simpledialog = __import__("tkinter.simpledialog", fromlist=["simpledialog"])
         backend_tkagg = __import__(
             "matplotlib.backends.backend_tkagg",
             fromlist=["FigureCanvasTkAgg", "NavigationToolbar2Tk"],
@@ -2938,6 +3060,11 @@ class SweepMetricExplorerApp:
         self.search_max_metrics_var = tk.StringVar(value="6")
         self.search_allow_negative_var = tk.BooleanVar(value=False)
         self.profile_allow_negative_var = tk.BooleanVar(value=False)
+        self.profile_editor_profile_var = tk.StringVar(value="")
+        self.profile_label_var = tk.StringVar(value="")
+        self.metric_category_filter_var = tk.StringVar(value="all")
+        self.metric_text_filter_var = tk.StringVar(value="")
+        self.profile_editor_status_var = tk.StringVar(value="")
         self.weight_json_var = tk.StringVar(value="{}")
         self._comparison_slot_a_key: Optional[ComparisonRecordKey] = None
         self._comparison_slot_b_key: Optional[ComparisonRecordKey] = None
@@ -3195,36 +3322,503 @@ class SweepMetricExplorerApp:
             variable=self.search_allow_negative_var,
         ).pack(side="left", padx=(8, 4))
         self.ttk.Button(controls, text="Search", command=self._run_search).pack(side="left", padx=(10, 4))
-        self.ttk.Button(controls, text="Build Equal Profile", command=self._build_equal_weight_profile).pack(side="left", padx=4)
-        self.ttk.Button(controls, text="Build JSON Profile", command=self._build_json_profile).pack(side="left", padx=4)
 
         main = self.ttk.Panedwindow(self.search_tab, orient="horizontal")
         main.pack(fill="both", expand=True, padx=6, pady=6)
         left = self.ttk.Frame(main)
+        center = self.ttk.Frame(main)
         right = self.ttk.Frame(main)
         main.add(left, weight=2)
+        main.add(center, weight=4)
         main.add(right, weight=3)
+
+        metric_filters = self.ttk.Frame(left)
+        metric_filters.pack(fill="x", pady=(0, 4))
+        self.ttk.Label(metric_filters, text="Category").pack(side="left")
+        self.metric_category_combo = self.ttk.Combobox(
+            metric_filters,
+            textvariable=self.metric_category_filter_var,
+            state="readonly",
+            width=8,
+            values=["all", "old", "new", "saved"],
+        )
+        self.metric_category_combo.pack(side="left", padx=4)
+        self.metric_category_combo.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_metric_listbox())
+        self.ttk.Entry(metric_filters, textvariable=self.metric_text_filter_var, width=18).pack(
+            side="left",
+            padx=4,
+            fill="x",
+            expand=True,
+        )
+        self.metric_text_filter_var.trace_add("write", lambda *_args: self._refresh_metric_listbox())
 
         self.metric_listbox = self.tk.Listbox(left, selectmode="multiple", exportselection=False)
         self.metric_listbox.pack(fill="both", expand=True)
+        metric_buttons = self.ttk.Frame(left)
+        metric_buttons.pack(fill="x", pady=(4, 0))
+        self.ttk.Button(metric_buttons, text="Add to Profile", command=self._add_selected_metrics_to_profile).pack(
+            side="left",
+            padx=(0, 3),
+        )
+        self.ttk.Button(metric_buttons, text="Remove", command=self._remove_selected_profile_metrics).pack(
+            side="left",
+            padx=3,
+        )
 
-        editor = self.ttk.Frame(right)
-        editor.pack(fill="x", padx=4, pady=4)
-        self.ttk.Label(editor, text="Profile Name").pack(side="left")
-        self.ttk.Entry(editor, textvariable=self.search_profile_name_var, width=28).pack(side="left", padx=4)
+        profile_controls = self.ttk.Frame(center)
+        profile_controls.pack(fill="x", padx=4, pady=(0, 4))
+        self.ttk.Label(profile_controls, text="Profile").pack(side="left")
+        self.profile_editor_combo = self.ttk.Combobox(
+            profile_controls,
+            textvariable=self.profile_editor_profile_var,
+            state="readonly",
+            width=24,
+        )
+        self.profile_editor_combo.pack(side="left", padx=4)
+        self.profile_editor_combo.bind("<<ComboboxSelected>>", lambda _evt: self._load_selected_profile_into_editor())
+        self.ttk.Button(profile_controls, text="Load", command=self._load_selected_profile_into_editor).pack(side="left", padx=2)
+        self.ttk.Button(profile_controls, text="Clone", command=self._clone_selected_profile).pack(side="left", padx=2)
+        self.ttk.Button(profile_controls, text="Save", command=self._save_profile_from_editor).pack(side="left", padx=2)
+        self.ttk.Button(profile_controls, text="Delete", command=self._delete_profile_from_editor).pack(side="left", padx=2)
+        self.ttk.Button(profile_controls, text="Set Default", command=self._set_default_profile_from_editor).pack(side="left", padx=2)
+
+        fields = self.ttk.Frame(center)
+        fields.pack(fill="x", padx=4, pady=4)
+        self.ttk.Label(fields, text="Name").grid(row=0, column=0, sticky="w")
+        self.ttk.Entry(fields, textvariable=self.search_profile_name_var, width=28).grid(row=0, column=1, sticky="ew", padx=4)
+        self.ttk.Label(fields, text="Label").grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self.ttk.Entry(fields, textvariable=self.profile_label_var, width=24).grid(row=0, column=3, sticky="ew", padx=4)
         self.ttk.Checkbutton(
-            editor,
+            fields,
             text="Allow negative weights",
             variable=self.profile_allow_negative_var,
-        ).pack(side="left", padx=(8, 4))
-        self.weight_json_text = self.tk.Text(right, height=10, wrap="word")
-        self.weight_json_text.pack(fill="x", padx=4, pady=4)
-        self.search_results_text = self.tk.Text(right, wrap="word")
-        self.search_results_text.pack(fill="both", expand=True, padx=4, pady=4)
+        ).grid(row=0, column=4, sticky="w", padx=(8, 4))
+        fields.columnconfigure(1, weight=1)
+        fields.columnconfigure(3, weight=1)
+
+        self.ttk.Label(center, text="Description").pack(anchor="w", padx=4)
+        self.profile_description_text = self.tk.Text(center, height=3, wrap="word")
+        self.profile_description_text.pack(fill="x", padx=4, pady=(0, 4))
+
+        profile_table_frame = self.ttk.Frame(center)
+        profile_table_frame.pack(fill="both", expand=True, padx=4, pady=4)
+        self.profile_weight_tree = self.ttk.Treeview(
+            profile_table_frame,
+            columns=("weight", "label", "category", "direction"),
+            show="tree headings",
+            selectmode="extended",
+            height=12,
+        )
+        self.profile_weight_tree.heading("#0", text="Metric")
+        self.profile_weight_tree.heading("weight", text="Weight")
+        self.profile_weight_tree.heading("label", text="Label")
+        self.profile_weight_tree.heading("category", text="Group")
+        self.profile_weight_tree.heading("direction", text="Direction")
+        self.profile_weight_tree.column("#0", width=180, anchor="w")
+        self.profile_weight_tree.column("weight", width=90, anchor="center")
+        self.profile_weight_tree.column("label", width=210, anchor="w")
+        self.profile_weight_tree.column("category", width=80, anchor="center")
+        self.profile_weight_tree.column("direction", width=80, anchor="center")
+        profile_scroll = self.ttk.Scrollbar(profile_table_frame, orient="vertical", command=self.profile_weight_tree.yview)
+        self.profile_weight_tree.configure(yscrollcommand=profile_scroll.set)
+        self.profile_weight_tree.pack(side="left", fill="both", expand=True)
+        profile_scroll.pack(side="right", fill="y")
+        self.profile_weight_tree.bind("<Double-1>", self._edit_profile_weight_from_event)
+
+        profile_buttons = self.ttk.Frame(center)
+        profile_buttons.pack(fill="x", padx=4, pady=4)
+        self.ttk.Button(profile_buttons, text="Normalize", command=self._normalize_profile_weights).pack(side="left", padx=(0, 3))
+        self.ttk.Button(profile_buttons, text="Clear Zeroes", command=self._clear_zero_profile_weights).pack(side="left", padx=3)
+        self.ttk.Button(profile_buttons, text="Equal Selected", command=self._build_equal_weight_profile).pack(side="left", padx=3)
+        self.ttk.Label(profile_buttons, textvariable=self.profile_editor_status_var).pack(side="right", padx=4)
+
+        self.ttk.Label(center, text="Advanced JSON").pack(anchor="w", padx=4)
+        self.weight_json_text = self.tk.Text(center, height=7, wrap="word")
+        self.weight_json_text.pack(fill="x", padx=4, pady=(0, 4))
+        json_buttons = self.ttk.Frame(center)
+        json_buttons.pack(fill="x", padx=4, pady=(0, 4))
+        self.ttk.Button(json_buttons, text="Refresh JSON", command=self._refresh_weight_json_from_table).pack(side="left", padx=(0, 3))
+        self.ttk.Button(json_buttons, text="Load JSON", command=self._load_profile_table_from_json).pack(side="left", padx=3)
+        self.ttk.Button(json_buttons, text="Save JSON Profile", command=self._build_json_profile).pack(side="left", padx=3)
+
+        search_table_frame = self.ttk.Frame(right)
+        search_table_frame.pack(fill="both", expand=True, padx=4, pady=4)
+        self.search_results_tree = self.ttk.Treeview(
+            search_table_frame,
+            columns=("rank", "pairwise", "top1", "topk", "spearman", "weights"),
+            show="headings",
+            selectmode="browse",
+        )
+        for column, label, width in (
+            ("rank", "#", 42),
+            ("pairwise", "Pairwise", 78),
+            ("top1", "Top1", 70),
+            ("topk", f"Top{DEFAULT_TOP_K}", 70),
+            ("spearman", "Spearman", 82),
+            ("weights", "Weights", 260),
+        ):
+            self.search_results_tree.heading(column, text=label)
+            anchor = "w" if column == "weights" else "center"
+            self.search_results_tree.column(column, width=width, anchor=anchor)
+        search_scroll = self.ttk.Scrollbar(search_table_frame, orient="vertical", command=self.search_results_tree.yview)
+        self.search_results_tree.configure(yscrollcommand=search_scroll.set)
+        self.search_results_tree.pack(side="left", fill="both", expand=True)
+        search_scroll.pack(side="right", fill="y")
+        search_buttons = self.ttk.Frame(right)
+        search_buttons.pack(fill="x", padx=4, pady=(0, 4))
+        self.ttk.Button(search_buttons, text="Load Search Result", command=self._load_selected_search_result_into_editor).pack(
+            side="left",
+            padx=(0, 3),
+        )
+        self.ttk.Button(search_buttons, text="Save Search Result as Profile", command=self._save_selected_search_result_as_profile).pack(
+            side="left",
+            padx=3,
+        )
+
+        self.search_results_text = self.tk.Text(right, height=4, wrap="word")
 
     def _set_text(self, widget: Any, text: str) -> None:
         widget.delete("1.0", self.tk.END)
         widget.insert(self.tk.END, text)
+
+    def _set_profile_status(self, text: str) -> None:
+        self.profile_editor_status_var.set(text)
+
+    def _profile_choices(self) -> List[str]:
+        if self.model is None:
+            return []
+        return [profile.name for profile in self.model.config.profiles]
+
+    def _refresh_profile_choices(self, selected: Optional[str] = None) -> None:
+        values = self._profile_choices()
+        self.profile_combo["values"] = values
+        self.profile_editor_combo["values"] = values
+        if selected and selected in values:
+            self.profile_var.set(selected)
+            self.profile_editor_profile_var.set(selected)
+        elif values:
+            current = self.profile_var.get()
+            if current not in values:
+                current = values[0]
+                self.profile_var.set(current)
+            self.profile_editor_profile_var.set(current)
+
+    def _refresh_metric_listbox(self) -> None:
+        if self.model is None or not hasattr(self, "metric_listbox"):
+            return
+        selected_names = set(self._selected_metric_names())
+        category = self.metric_category_filter_var.get() or "all"
+        needle = self.metric_text_filter_var.get().strip().lower()
+        self.metric_listbox.delete(0, self.tk.END)
+        for metric_name in sorted(self.model.metric_registry.keys()):
+            descriptor = self.model.metric_registry[metric_name]
+            if category != "all" and descriptor.category != category:
+                continue
+            if needle and needle not in metric_name.lower() and needle not in descriptor.label.lower():
+                continue
+            self.metric_listbox.insert(self.tk.END, metric_name)
+            if metric_name in selected_names:
+                self.metric_listbox.selection_set(self.metric_listbox.size() - 1)
+
+    def _profile_by_editor_selection(self) -> Optional[RankingProfileSpec]:
+        if self.model is None:
+            return None
+        profile_name = self.profile_editor_profile_var.get() or self.profile_var.get()
+        for profile in self.model.config.profiles:
+            if profile.name == profile_name:
+                return profile
+        return None
+
+    def _set_profile_weight_rows(self, weights: Mapping[str, float]) -> None:
+        self.profile_weight_tree.delete(*self.profile_weight_tree.get_children())
+        if self.model is None:
+            self._refresh_weight_json_from_table()
+            return
+        for metric_name in sorted(weights.keys()):
+            descriptor = self.model.metric_registry.get(metric_name)
+            if descriptor is None:
+                continue
+            self.profile_weight_tree.insert(
+                "",
+                "end",
+                iid=metric_name,
+                text=metric_name,
+                values=(
+                    f"{float(weights[metric_name]):g}",
+                    descriptor.label,
+                    descriptor.category,
+                    descriptor.direction,
+                ),
+            )
+        self._refresh_weight_json_from_table()
+
+    def _weights_from_profile_table(self) -> Dict[str, float]:
+        weights: Dict[str, float] = {}
+        for metric_name in self.profile_weight_tree.get_children():
+            raw_value = self.profile_weight_tree.set(metric_name, "weight")
+            numeric = _coerce_float(raw_value)
+            if numeric is None or not math.isfinite(float(numeric)):
+                continue
+            weights[str(metric_name)] = float(numeric)
+        return weights
+
+    def _refresh_weight_json_from_table(self) -> None:
+        if not hasattr(self, "weight_json_text"):
+            return
+        weights = self._weights_from_profile_table() if hasattr(self, "profile_weight_tree") else {}
+        self._set_text(self.weight_json_text, json.dumps(weights, indent=2, sort_keys=True))
+
+    def _load_profile_table_from_json(self) -> None:
+        if self.model is None:
+            return
+        try:
+            payload = json.loads(self.weight_json_text.get("1.0", self.tk.END))
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("Profiles", f"Invalid weight JSON: {exc}")
+            return
+        if not isinstance(payload, dict):
+            self.messagebox.showerror("Profiles", "Weight JSON must be an object mapping metric names to weights.")
+            return
+        weights = _validated_metric_weights(
+            payload,
+            self.model.metric_registry,
+            allow_negative_weights=bool(self.profile_allow_negative_var.get()),
+        )
+        self._set_profile_weight_rows(weights)
+        self._set_profile_status("Loaded JSON into table")
+
+    def _load_profile_into_editor(self, profile: RankingProfileSpec) -> None:
+        self.profile_editor_profile_var.set(profile.name)
+        self.search_profile_name_var.set(profile.name)
+        self.profile_label_var.set(profile.label)
+        self.profile_allow_negative_var.set(profile.allow_negative_weights)
+        self._set_text(self.profile_description_text, profile.description)
+        self._set_profile_weight_rows(profile.metric_weights)
+        self._set_profile_status("Built-in profile is read-only" if profile.built_in else "Custom profile loaded")
+
+    def _load_selected_profile_into_editor(self) -> None:
+        profile = self._profile_by_editor_selection()
+        if profile is None:
+            return
+        self._load_profile_into_editor(profile)
+
+    def _unique_profile_name(self, base_name: str) -> str:
+        existing = set(self._profile_choices())
+        candidate = base_name
+        counter = 2
+        while candidate in existing:
+            candidate = f"{base_name}_{counter}"
+            counter += 1
+        return candidate
+
+    def _clone_selected_profile(self) -> None:
+        profile = self._profile_by_editor_selection()
+        if profile is None:
+            return
+        clone_name = self._unique_profile_name(f"{profile.name}_clone")
+        clone = RankingProfileSpec(
+            name=clone_name,
+            label=f"{profile.label} Clone",
+            metric_weights=dict(profile.metric_weights),
+            description=profile.description,
+            built_in=False,
+            allow_negative_weights=profile.allow_negative_weights,
+        )
+        self._load_profile_into_editor(clone)
+        self.profile_editor_profile_var.set("")
+        self._set_profile_status("Clone ready to save")
+
+    def _add_selected_metrics_to_profile(self) -> None:
+        if self.model is None:
+            return
+        weights = self._weights_from_profile_table()
+        for metric_name in self._selected_metric_names():
+            if metric_name in self.model.metric_registry:
+                weights.setdefault(metric_name, 1.0)
+        self._set_profile_weight_rows(weights)
+
+    def _remove_selected_profile_metrics(self) -> None:
+        for metric_name in self.profile_weight_tree.selection():
+            self.profile_weight_tree.delete(metric_name)
+        self._refresh_weight_json_from_table()
+
+    def _edit_profile_weight_from_event(self, event: object) -> None:
+        row_id = self.profile_weight_tree.identify_row(getattr(event, "y", 0))
+        column_id = self.profile_weight_tree.identify_column(getattr(event, "x", 0))
+        if not row_id or column_id not in {"#0", "#1"}:
+            return
+        current = self.profile_weight_tree.set(row_id, "weight")
+        value = self.simpledialog.askfloat(
+            "Metric Weight",
+            f"Weight for {row_id}",
+            initialvalue=_coerce_float(current) or 0.0,
+            parent=self.root,
+        )
+        if value is None:
+            return
+        self.profile_weight_tree.set(row_id, "weight", f"{float(value):g}")
+        self._refresh_weight_json_from_table()
+
+    def _normalize_profile_weights(self) -> None:
+        weights = self._weights_from_profile_table()
+        total = float(sum(abs(value) for value in weights.values()))
+        if total <= 0.0:
+            self.messagebox.showwarning("Profiles", "No non-zero weights to normalize.")
+            return
+        self._set_profile_weight_rows({name: value / total for name, value in weights.items()})
+        self._set_profile_status("Weights normalized")
+
+    def _clear_zero_profile_weights(self) -> None:
+        weights = {
+            name: value
+            for name, value in self._weights_from_profile_table().items()
+            if abs(float(value)) > 1e-12
+        }
+        self._set_profile_weight_rows(weights)
+        self._set_profile_status("Zero weights removed")
+
+    def _save_profile_spec(self, profile: RankingProfileSpec) -> None:
+        if self.model is None:
+            return
+        selected_candidate_ids = list(self.leaderboard_tree.selection())
+        replaced = False
+        updated_profiles: List[RankingProfileSpec] = []
+        for existing in self.model.config.profiles:
+            if existing.name == profile.name:
+                if existing.built_in:
+                    self.messagebox.showwarning("Profiles", "Built-in profiles are read-only. Clone before saving.")
+                    return
+                if not replaced:
+                    updated_profiles.append(profile)
+                    replaced = True
+                continue
+            updated_profiles.append(existing)
+        if not replaced:
+            updated_profiles.append(profile)
+        self.model.config.profiles = updated_profiles
+        save_metric_explorer_config(self.model, config_path=self.metrics_config_path)
+        self._refresh_profile_choices(selected=profile.name)
+        self._load_profile_into_editor(profile)
+        for stage_name in self.model.base_model.stage_order:
+            _ensure_profile_results(
+                self.model,
+                stage_name=stage_name,
+                profile_name=profile.name,
+                include_analysis=True,
+            )
+        self.refresh_leaderboard(preserve_selection=selected_candidate_ids)
+        self.refresh_evaluation()
+        self._refresh_search_results_text()
+        self._set_profile_status(f"Saved {profile.name}")
+
+    def _profile_spec_from_editor(self) -> Optional[RankingProfileSpec]:
+        if self.model is None:
+            return None
+        profile_name = self.search_profile_name_var.get().strip() or "custom_profile"
+        existing = next((item for item in self.model.config.profiles if item.name == profile_name), None)
+        if existing is not None and existing.built_in:
+            self.messagebox.showwarning("Profiles", "Built-in profiles are read-only. Clone before saving.")
+            return None
+        raw_weights = self._weights_from_profile_table()
+        allow_negative_weights = bool(self.profile_allow_negative_var.get())
+        if not allow_negative_weights:
+            dropped_negative = _negative_metric_weight_names(raw_weights, self.model.metric_registry)
+            if dropped_negative:
+                self.messagebox.showwarning(
+                    "Profiles",
+                    "Negative weights were ignored because Allow negative weights is disabled.",
+                )
+        weights = _validated_metric_weights(
+            raw_weights,
+            self.model.metric_registry,
+            allow_negative_weights=allow_negative_weights,
+        )
+        if not weights:
+            self.messagebox.showwarning("Profiles", "No valid weights found.")
+            return None
+        label = self.profile_label_var.get().strip() or profile_name
+        description = self.profile_description_text.get("1.0", self.tk.END).strip()
+        return RankingProfileSpec(
+            name=profile_name,
+            label=label,
+            metric_weights=weights,
+            description=description,
+            built_in=False,
+            allow_negative_weights=allow_negative_weights,
+        )
+
+    def _save_profile_from_editor(self) -> None:
+        profile = self._profile_spec_from_editor()
+        if profile is not None:
+            self._save_profile_spec(profile)
+
+    def _delete_profile_from_editor(self) -> None:
+        if self.model is None:
+            return
+        profile_name = self.search_profile_name_var.get().strip() or self.profile_editor_profile_var.get()
+        profile = next((item for item in self.model.config.profiles if item.name == profile_name), None)
+        if profile is None:
+            return
+        if profile.built_in:
+            self.messagebox.showwarning("Profiles", "Built-in profiles cannot be deleted.")
+            return
+        self.model.config.profiles = [item for item in self.model.config.profiles if item.name != profile_name]
+        if self.model.config.default_profile == profile_name and self.model.config.profiles:
+            self.model.config.default_profile = self.model.config.profiles[0].name
+        save_metric_explorer_config(self.model, config_path=self.metrics_config_path)
+        self._refresh_profile_choices(selected=self.model.config.default_profile)
+        selected = _profile_by_name(self.model, self.profile_var.get())
+        self._load_profile_into_editor(selected)
+        self.refresh_leaderboard()
+        self.refresh_evaluation()
+        self._set_profile_status(f"Deleted {profile_name}")
+
+    def _set_default_profile_from_editor(self) -> None:
+        if self.model is None:
+            return
+        profile_name = self.search_profile_name_var.get().strip() or self.profile_editor_profile_var.get()
+        if profile_name not in self._profile_choices():
+            self.messagebox.showwarning("Profiles", "Save the profile before setting it as default.")
+            return
+        self.model.config.default_profile = profile_name
+        save_metric_explorer_config(self.model, config_path=self.metrics_config_path)
+        self._set_profile_status(f"Default profile set to {profile_name}")
+
+    def _selected_search_result(self) -> Optional[SearchResult]:
+        if not self._search_results:
+            return None
+        selection = self.search_results_tree.selection() if hasattr(self, "search_results_tree") else ()
+        if selection:
+            try:
+                return self._search_results[int(selection[0])]
+            except (ValueError, IndexError):
+                return None
+        return self._search_results[0]
+
+    def _load_search_result_into_editor(self, result: SearchResult) -> None:
+        profile_name = self._unique_profile_name(f"{result.profile_name}_profile")
+        self.profile_editor_profile_var.set("")
+        self.search_profile_name_var.set(profile_name)
+        self.profile_label_var.set(profile_name)
+        self.profile_allow_negative_var.set(any(weight < 0.0 for weight in result.metric_weights.values()))
+        self._set_text(self.profile_description_text, f"Profile created from {result.profile_name} search result.")
+        self._set_profile_weight_rows(result.metric_weights)
+        self._set_profile_status("Search result loaded into editor")
+
+    def _load_selected_search_result_into_editor(self) -> None:
+        result = self._selected_search_result()
+        if result is None:
+            self.messagebox.showwarning("Search", "Run search or select a search result first.")
+            return
+        self._load_search_result_into_editor(result)
+
+    def _save_selected_search_result_as_profile(self) -> None:
+        result = self._selected_search_result()
+        if result is None:
+            self.messagebox.showwarning("Search", "Run search or select a search result first.")
+            return
+        self._load_search_result_into_editor(result)
+        self._save_profile_from_editor()
 
     def _hydration_active(self) -> bool:
         return bool(self._hydration_queue) or self._hydration_completion is not None
@@ -3410,33 +4004,26 @@ class SweepMetricExplorerApp:
             default_stage = model.base_model.primary_stage_name
             self.stage_var.set(default_stage)
             self.search_stage_var.set(default_stage)
-        profile_values = [profile.name for profile in model.config.profiles]
-        self.profile_combo["values"] = profile_values
-        if profile_values:
-            self.profile_var.set(_initial_profile_name(model))
+        initial_profile = _initial_profile_name(model)
+        if initial_profile:
+            self.profile_var.set(initial_profile)
+        self._refresh_profile_choices(selected=initial_profile)
         self.dataset_combo["values"] = _real_datasets(model.base_model)
         self.dataset_var.set((_real_datasets(model.base_model) or ["aggregate"])[0])
         self.search_step_var.set(f"{model.config.search_defaults.weight_step:g}")
         self.search_max_metrics_var.set(str(model.config.search_defaults.max_metrics))
         self.search_allow_negative_var.set(model.config.search_defaults.allow_negative_weights)
         self.profile_allow_negative_var.set(False)
-        self.metric_listbox.delete(0, self.tk.END)
-        for metric_name in sorted(model.metric_registry.keys()):
-            self.metric_listbox.insert(self.tk.END, metric_name)
+        self.metric_category_filter_var.set("all")
+        self.metric_text_filter_var.set("")
+        self._refresh_metric_listbox()
         for metric_name in model.config.search_defaults.metric_subset:
-            try:
-                idx = sorted(model.metric_registry.keys()).index(metric_name)
-            except ValueError:
-                continue
-            self.metric_listbox.selection_set(idx)
-        self._set_text(
-            self.weight_json_text,
-            json.dumps(
-                model.config.profiles[0].metric_weights if model.config.profiles else {},
-                indent=2,
-                sort_keys=True,
-            ),
-        )
+            for idx in range(self.metric_listbox.size()):
+                if self.metric_listbox.get(idx) == metric_name:
+                    self.metric_listbox.selection_set(idx)
+                    break
+        if initial_profile:
+            self._load_profile_into_editor(_profile_by_name(model, initial_profile))
         self.refresh_leaderboard()
         self.refresh_comparison()
         self.refresh_evaluation()
@@ -3557,7 +4144,25 @@ class SweepMetricExplorerApp:
     def _refresh_search_results_text(self) -> None:
         stage_name = self._current_search_stage()
         self._search_results = self._search_results_for_stage(stage_name)
-        self._set_text(self.search_results_text, _format_search_results_text(self._search_results))
+        if hasattr(self, "search_results_text"):
+            self._set_text(self.search_results_text, _format_search_results_text(self._search_results))
+        if not hasattr(self, "search_results_tree"):
+            return
+        self.search_results_tree.delete(*self.search_results_tree.get_children())
+        for idx, result in enumerate(self._search_results[:200], start=1):
+            self.search_results_tree.insert(
+                "",
+                "end",
+                iid=str(idx - 1),
+                values=(
+                    idx,
+                    "n/a" if result.pairwise_agreement is None else f"{result.pairwise_agreement:.3f}",
+                    "n/a" if result.top1_hit_rate is None else f"{result.top1_hit_rate:.3f}",
+                    "n/a" if result.mean_label_top_k is None else f"{result.mean_label_top_k:.3f}",
+                    "n/a" if result.spearman_correlation is None else f"{result.spearman_correlation:.3f}",
+                    _compact_json(result.metric_weights),
+                ),
+            )
 
     def _on_search_stage_changed(self) -> None:
         self.refresh_evaluation()
@@ -3915,8 +4520,7 @@ class SweepMetricExplorerApp:
     def _selected_metric_names(self) -> List[str]:
         if self.model is None:
             return []
-        names = sorted(self.model.metric_registry.keys())
-        return [names[idx] for idx in self.metric_listbox.curselection()]
+        return [str(self.metric_listbox.get(idx)) for idx in self.metric_listbox.curselection()]
 
     def _build_equal_weight_profile(self) -> None:
         if self.model is None:
@@ -3927,14 +4531,16 @@ class SweepMetricExplorerApp:
             return
         weight = 1.0 / len(selected)
         weights = {name: weight for name in selected}
+        self._set_profile_weight_rows(weights)
         self._set_text(self.weight_json_text, json.dumps(weights, indent=2, sort_keys=True))
         self._build_json_profile()
 
     def _build_json_profile(self) -> None:
         if self.model is None:
             return
+        raw_json_text = self.weight_json_text.get("1.0", self.tk.END)
         try:
-            weights = json.loads(self.weight_json_text.get("1.0", self.tk.END))
+            weights = json.loads(raw_json_text)
         except Exception as exc:  # noqa: BLE001
             self.messagebox.showerror("Profiles", f"Invalid weight JSON: {exc}")
             return
@@ -3960,39 +4566,16 @@ class SweepMetricExplorerApp:
         profile_name = self.search_profile_name_var.get().strip() or "custom_profile"
         profile = RankingProfileSpec(
             name=profile_name,
-            label=profile_name,
+            label=self.profile_label_var.get().strip() or profile_name,
             metric_weights=metric_weights,
-            description="Custom profile built in the GUI.",
+            description=self.profile_description_text.get("1.0", self.tk.END).strip()
+            or "Custom profile built in the GUI.",
             built_in=False,
             allow_negative_weights=allow_negative_weights,
         )
-        selected_candidate_ids = list(self.leaderboard_tree.selection())
-        replaced = False
-        updated_profiles: List[RankingProfileSpec] = []
-        for existing in self.model.config.profiles:
-            if existing.name == profile.name:
-                if not replaced:
-                    updated_profiles.append(profile)
-                    replaced = True
-                continue
-            updated_profiles.append(existing)
-        if not replaced:
-            updated_profiles.append(profile)
-        self.model.config.profiles = updated_profiles
-        save_metric_explorer_config(self.model, config_path=self.metrics_config_path)
-        profile_values = [item.name for item in self.model.config.profiles]
-        self.profile_combo["values"] = profile_values
-        self.profile_var.set(profile_name)
-        for stage_name in self.model.base_model.stage_order:
-            _ensure_profile_results(
-                self.model,
-                stage_name=stage_name,
-                profile_name=profile.name,
-                include_analysis=True,
-            )
-        self.refresh_leaderboard(preserve_selection=selected_candidate_ids)
-        self.refresh_evaluation()
-        self._refresh_search_results_text()
+        self._set_profile_weight_rows(metric_weights)
+        self._save_profile_spec(profile)
+        self._set_text(self.weight_json_text, raw_json_text.strip())
 
     def _run_search(self) -> None:
         if self.model is None:
@@ -4001,7 +4584,12 @@ class SweepMetricExplorerApp:
         if not selected:
             self.messagebox.showwarning("Search", "Select one or more metrics first.")
             return
-        if len(selected) > int(self.search_max_metrics_var.get().strip() or "6"):
+        try:
+            max_metrics = int(self.search_max_metrics_var.get().strip() or "6")
+        except ValueError:
+            self.messagebox.showerror("Search", "Max Metrics must be an integer.")
+            return
+        if len(selected) > max_metrics:
             self.messagebox.showwarning("Search", "Selected metric count exceeds the configured max.")
             return
         try:
@@ -4021,7 +4609,7 @@ class SweepMetricExplorerApp:
                 label="Hydrating search metrics",
                 on_complete=lambda: self._run_search(),
             )
-            self._set_text(self.search_results_text, f"Hydrating metrics for search on {stage_name}...")
+            self.status_var.set(f"Hydrating metrics for search on {stage_name}...")
             return
         results = search_profile_combinations(
             self.model,

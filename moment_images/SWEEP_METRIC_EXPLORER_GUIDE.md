@@ -198,6 +198,8 @@ Each panel has:
   - `auto`
   - `p2-p98`
   - `p5-p95`
+  - `custom`
+- low/high percentile sliders for custom contrast tuning
 - `Fit`
 - `1:1`
 - `Reset`
@@ -209,7 +211,9 @@ This is the intended inspection workflow:
 - use `Fit` to jump back to the full image
 - use `1:1` when you want a truer pixel-scale view of a region
 - use `Open Large` to pop one side into a dedicated full-size viewer
-- use `Contrast` when focus differences are subtle
+- use `Contrast` presets as quick anchors, then adjust the percentile sliders when focus differences are subtle
+
+The contrast controls are independent for `Run A` and `Run B`. Selecting `p2-p98` or `p5-p95` seeds the low/high sliders from that preset. Moving either slider switches that panel to `custom`. `auto` returns to Matplotlib's automatic scaling.
 
 The comparison-level controls are:
 
@@ -282,17 +286,39 @@ This tab is usually the fastest way to answer:
 
 Open `Profiles / Search`.
 
-Select metrics from the metric list on the left, then either:
+The tab has three working areas:
 
-- click `Build Equal Profile`
-- edit the JSON weights manually and click `Build JSON Profile`
-- run `Search`
+- metric filtering and selection on the left
+- a profile manager and editable weight table in the center
+- search results on the right
 
-#### Build Equal Profile
+#### Profile manager
 
-This assigns equal weights to the selected metrics and creates a temporary custom profile in the current GUI session.
+Use the profile manager to inspect and edit profiles without hand-writing JSON:
 
-#### Build JSON Profile
+- choose an existing profile and click `Load`
+- use `Clone` to make an editable copy of a built-in or custom profile
+- edit `Name`, `Label`, `Description`, and `Allow negative weights`
+- add metrics from the left list with `Add to Profile`
+- double-click a weight cell to edit it
+- use `Normalize` to scale weights by total absolute weight
+- use `Clear Zeroes` to remove zero-weight metrics
+- use `Save` to persist a custom profile to `metric_review/metrics_config.json`
+- use `Delete` to remove a custom profile
+- use `Set Default` to update the default profile stored in the config
+
+Built-in profiles are read-only. Clone them before editing.
+
+By default, custom profile weights must be positive. Enable `Allow negative weights` before saving if a metric should act as a penalty after normalization. Metric direction is still applied first, so negative weights penalize high values in the explorer's normal "higher is better" space.
+
+Important behavior:
+
+- custom profiles with the same name replace the prior custom profile definition
+- built-in profiles cannot be overwritten or deleted
+- only custom profiles are saved to the config file
+- if you provide `--metrics-config`, custom profiles are saved to that config path instead
+
+#### Advanced JSON
 
 Enter a JSON object such as:
 
@@ -305,19 +331,7 @@ Enter a JSON object such as:
 }
 ```
 
-Then provide a profile name and click `Build JSON Profile`.
-
-This saves the custom profile to `metric_review/metrics_config.json` and immediately makes it available in
-the `Profile` dropdown.
-
-By default, custom profile weights must be positive. Enable `Allow negative weights` before clicking
-`Build JSON Profile` if a metric should act as a penalty after normalization. Metric direction is still
-applied first, so negative weights penalize high values in the explorer's normal "higher is better" space.
-
-Important current behavior:
-
-- custom profiles with the same name replace the prior profile definition
-- if you provide `--metrics-config`, custom profiles are saved to that config path instead
+Use `Load JSON` to push JSON weights into the table, `Refresh JSON` to regenerate JSON from the table, or `Save JSON Profile` to save directly from the JSON editor.
 
 #### Search
 
@@ -337,7 +351,7 @@ Current constraints:
 - the search only becomes useful once you have annotations
 - negative-weight search is opt-in; leaving `Search negative weights` off preserves the positive-only search
 
-The search results panel lists the best combinations found, ordered by the evaluation criteria.
+The search results table lists the best combinations found, ordered by the evaluation criteria. Select a row and use `Load Search Result` to inspect or edit its weights in the profile table. Use `Save Search Result as Profile` to turn the selected search result into a saved custom profile.
 
 ## Annotations and Cache
 

@@ -744,6 +744,21 @@ def test_load_comparison_display_bundle_returns_preview_avg_and_guide(tmp_path):
     assert bundle.get("guide_log").shape == bundle.get("avg_image").shape
 
 
+def test_contrast_percentile_limits_support_presets_custom_and_fallbacks():
+    image = np.arange(100, dtype=np.float64).reshape(10, 10)
+
+    assert explorer._contrast_preset_percentiles("p2-p98") == (2.0, 98.0)
+    assert explorer._contrast_preset_percentiles("p5-p95") == (5.0, 95.0)
+    assert explorer._contrast_preset_percentiles("auto") is None
+
+    low, high = explorer._contrast_percentile_limits(image, 2.0, 98.0)
+    assert low == pytest.approx(np.percentile(image, 2.0))
+    assert high == pytest.approx(np.percentile(image, 98.0))
+
+    assert explorer._contrast_percentile_limits(image, 90.0, 10.0) == (None, None)
+    assert explorer._contrast_percentile_limits(np.ones((4, 4)), 2.0, 98.0) == (None, None)
+
+
 def test_build_comparison_metric_rows_identifies_preferred_side(tmp_path):
     output_dir = _make_modern_fixture(tmp_path)
     model = load_sweep_metric_explorer_model(output_dir)
@@ -889,3 +904,136 @@ def test_gui_custom_profile_overwrites_same_name(tmp_path):
     matches = [profile for profile in reloaded.config.profiles if profile.name == "saved_custom"]
     assert len(matches) == 1
     assert matches[0].metric_weights == second_weights
+
+
+def test_gui_table_profile_edit_save_persists(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    config_path = output_dir / "metric_review" / "metrics_config.json"
+
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+        app.load_from_path(output_dir)
+        app.search_profile_name_var.set("table_custom")
+        app.profile_label_var.set("Table Custom")
+        app._set_text(app.profile_description_text, "Saved from the table editor.")
+        app._set_profile_weight_rows({"average_intensity": 0.2, "laplacian_variance": 0.8})
+        app._save_profile_from_editor()
+        root.update()
+    finally:
+        root.destroy()
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    saved = next(row for row in payload["profiles"] if row["name"] == "table_custom")
+    assert saved["label"] == "Table Custom"
+    assert saved["description"] == "Saved from the table editor."
+    assert saved["metric_weights"] == {"average_intensity": 0.2, "laplacian_variance": 0.8}
+
+
+def test_gui_builtin_profile_clone_can_be_saved(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+        app.load_from_path(output_dir)
+        app.profile_editor_profile_var.set("hybrid_default")
+        app._clone_selected_profile()
+        clone_name = app.search_profile_name_var.get()
+        assert clone_name.startswith("hybrid_default_clone")
+        app._save_profile_from_editor()
+        clone = next(profile for profile in app.model.config.profiles if profile.name == clone_name)
+        assert clone.built_in is False
+        assert clone.metric_weights
+        root.update()
+    finally:
+        root.destroy()
+
+
+def test_gui_custom_profile_delete_persists(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    config_path = output_dir / "metric_review" / "metrics_config.json"
+
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+        app.load_from_path(output_dir)
+        app.search_profile_name_var.set("delete_me")
+        app._set_profile_weight_rows({"laplacian_variance": 1.0})
+        app._save_profile_from_editor()
+        app.search_profile_name_var.set("delete_me")
+        app._delete_profile_from_editor()
+        root.update()
+    finally:
+        root.destroy()
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert all(row["name"] != "delete_me" for row in payload["profiles"])
+
+
+def test_gui_set_default_profile_persists(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    config_path = output_dir / "metric_review" / "metrics_config.json"
+
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+        app.load_from_path(output_dir)
+        app.search_profile_name_var.set("default_table_custom")
+        app._set_profile_weight_rows({"laplacian_variance": 1.0})
+        app._save_profile_from_editor()
+        app.search_profile_name_var.set("default_table_custom")
+        app._set_default_profile_from_editor()
+        root.update()
+    finally:
+        root.destroy()
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["default_profile"] == "default_table_custom"
+
+
+def test_gui_search_result_load_and_save_as_profile(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    _write_annotations(output_dir)
+
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+        app.load_from_path(output_dir)
+        assert app.model is not None
+        app.model.search_results = [
+            explorer.SearchResult(
+                stage="stage1",
+                profile_name="search_0001",
+                metric_weights={"average_intensity": 0.25, "laplacian_variance": 0.75},
+                pairwise_agreement=1.0,
+                top1_hit_rate=1.0,
+                mean_label_top_k=1.0,
+                spearman_correlation=1.0,
+            )
+        ]
+        app._refresh_search_results_text()
+        app.search_results_tree.selection_set("0")
+        app._load_selected_search_result_into_editor()
+        assert app._weights_from_profile_table() == {"average_intensity": 0.25, "laplacian_variance": 0.75}
+        saved_name = app.search_profile_name_var.get()
+        app._save_profile_from_editor()
+        assert any(profile.name == saved_name for profile in app.model.config.profiles)
+        root.update()
+    finally:
+        root.destroy()
