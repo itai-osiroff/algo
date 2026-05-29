@@ -19,6 +19,7 @@ from moment_images.reliable_io import (
     write_csv_atomic,
     write_json_atomic,
 )
+from moment_images.metric_profiles import compute_extended_image_metrics
 
 ImageMetrics = Dict[str, float]
 
@@ -190,9 +191,9 @@ def build_metric_record(
     }
 
     if result.global_avg_image is not None:
-        record["global_only_metrics"] = compute_image_metrics(result.global_avg_image)
+        record["global_only_metrics"] = compute_extended_image_metrics(result.global_avg_image)
 
-    record["global_and_local_metrics"] = compute_image_metrics(result.avg_image)
+    record["global_and_local_metrics"] = compute_extended_image_metrics(result.avg_image)
     return record
 
 

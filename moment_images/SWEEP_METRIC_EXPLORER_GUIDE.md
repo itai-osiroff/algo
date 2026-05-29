@@ -490,6 +490,29 @@ Example inverse metric profile:
 - metrics not listed in `enabled_metrics` are hidden from ranking/search
 - invalid metric names are ignored
 
+### Using a profile in `parameter_sweep.py`
+
+Custom profiles saved here can drive future sweep ranking:
+
+```json
+"scoring": {
+  "profile_name": "guide_focus_mix",
+  "profile_config_path": "metric_review/metrics_config.json",
+  "metric_scope": "global_and_local_metrics",
+  "runtime_penalty_weight": 0.0,
+  "robustness_lambda": 0.5,
+  "missing_dataset_penalty": 1.0
+}
+```
+
+You can also override a spec from the CLI:
+
+```bash
+python -m moment_images.parameter_sweep --spec sweep_spec.json --metrics-config metric_review/metrics_config.json --scoring-profile guide_focus_mix
+```
+
+`saved_original`, `saved_score`, and `saved_mean_dataset_score` are comparison-only because they depend on an already-completed sweep. Profiles that rely on them cannot be used to optimize new runs.
+
 ## Interpreting the Results
 
 A few practical rules help avoid false confidence:

@@ -279,6 +279,23 @@ Optional metric-experiment candidate generation is the cross-product of:
 
 This keeps the experiment narrative explicit: **global pre-alignment -> intensity-only baseline ranking -> optional metric-formulation experiments on shortlisted candidates -> reconstruction -> diagnostics/quality metrics -> side-by-side alpha/family comparison**.
 
+### Shared metric profiles
+
+Profiles saved by the raw metric explorer can also rank future parameter sweeps. A spec may either provide explicit `scoring.metric_weights` or reference a shared profile:
+
+```json
+"scoring": {
+  "profile_name": "guide_focus_mix",
+  "profile_config_path": "metric_review/metrics_config.json",
+  "metric_scope": "global_and_local_metrics",
+  "runtime_penalty_weight": 0.0,
+  "robustness_lambda": 0.5,
+  "missing_dataset_penalty": 1.0
+}
+```
+
+The CLI can override these with `--metrics-config path/to/metrics_config.json --scoring-profile guide_focus_mix`. `saved_score` and `saved_mean_dataset_score` remain explorer-only baselines and are rejected for future sweep ranking.
+
 ### Alpha semantics (local displacement score blending)
 
 The non-intensity displacement families are **blurred-correlation** score formulations. They use Gaussian-smoothed product scores and do **not** implement true local NCC/ZNCC normalization. Legacy aliases `ncc_gradient`, `ncc_laplacian`, and `composite` are still accepted on input, but new configs and outputs use the canonical names below.
@@ -426,6 +443,7 @@ This helper:
 - keeps the existing saved metrics and scores available as comparison baselines
 - supports manual `top` / `good` / `bad` annotations stored under `metric_review/annotations.json`
 - compares built-in and custom ranking profiles, including mixed old+new metric combinations
+- saves custom profiles in the same config format accepted by `parameter_sweep.py`
 - provides a persistent A/B comparison workspace with per-image Matplotlib toolbars, syncable zoom/pan, fit/1:1 controls, and pop-out viewers
 
 Built-in new metrics include:

@@ -219,6 +219,74 @@ def test_score_and_rank_runs_applies_missing_dataset_penalty():
     assert by_id["C"]["score"] < by_id["B"]["score"]
 
 
+def test_score_and_rank_runs_accepts_new_explorer_metric():
+    def record(candidate_id: str, metric_value: float) -> dict:
+        payload = {
+            "status": "ok",
+            "candidate_id": candidate_id,
+            "dataset_id": "d1",
+            "strategy": "pixel",
+            "config": {},
+            "params": {},
+            "runtime_seconds": 1.0,
+            "metric_record": _metric_record(0.0),
+        }
+        payload["metric_record"]["global_and_local_metrics"]["vollath_f4_guide"] = metric_value
+        return payload
+
+    rankings = score_and_rank_runs(
+        [record("low", 1.0), record("high", 10.0)],
+        SweepScoringSpec(metric_weights={"vollath_f4_guide": 1.0}),
+        dataset_ids=["d1"],
+    )
+
+    assert rankings[0]["candidate_id"] == "high"
+
+
+def test_experiment_spec_resolves_scoring_profile(tmp_path):
+    config_path = tmp_path / "metrics_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "name": "guide_focus",
+                        "label": "Guide Focus",
+                        "metric_weights": {"vollath_f4_guide": 1.0},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    spec = SweepExperimentSpec.from_dict(
+        {
+            "datasets": [{"id": "d1", "views": str(tmp_path / "views.npy")}],
+            "scoring": {
+                "profile_name": "guide_focus",
+                "profile_config_path": str(config_path),
+            },
+        }
+    )
+
+    assert spec.scoring.profile_name == "guide_focus"
+    assert spec.scoring.metric_weights == {"vollath_f4_guide": 1.0}
+
+
+def test_experiment_spec_rejects_profile_and_explicit_weights(tmp_path):
+    with pytest.raises(ValueError, match="profile_name and metric_weights"):
+        SweepExperimentSpec.from_dict(
+            {
+                "datasets": [{"id": "d1", "views": str(tmp_path / "views.npy")}],
+                "scoring": {
+                    "profile_name": "hybrid_default",
+                    "metric_weights": {"laplacian_variance": 1.0},
+                },
+            }
+        )
+
+
 def test_select_stage_worker_count_respects_memory_cap():
     tasks = [
         {"estimated_peak_bytes": 200},

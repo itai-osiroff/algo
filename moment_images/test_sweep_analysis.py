@@ -45,6 +45,8 @@ def test_build_metric_record_handles_global_and_local_metrics():
 
     assert pytest.approx(record["global_only_metrics"]["average_intensity"]) == 2.0
     assert pytest.approx(record["global_and_local_metrics"]["average_intensity"]) == 1.0
+    assert "vollath_f4_guide" in record["global_and_local_metrics"]
+    assert "ndct_shannon_avg" in record["global_only_metrics"]
     assert record["metric_formulation"]["family"] == config.displacement_metric_family
     assert "displacement_field_metrics" in record
     assert "inter_view_consistency_metrics" in record

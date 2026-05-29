@@ -28,6 +28,7 @@ from moment_images.reliable_io import (
     write_json_atomic,
 )
 from moment_images.sweep_analysis import compute_image_metrics
+from moment_images.metric_profiles import validate_profile_for_sweep
 from moment_images.sweep_visualization import (
     CandidateVisualizationRow,
     SweepVisualizationModel,
@@ -3697,6 +3698,9 @@ class SweepMetricExplorerApp:
             updated_profiles.append(profile)
         self.model.config.profiles = updated_profiles
         save_metric_explorer_config(self.model, config_path=self.metrics_config_path)
+        sweep_issues = validate_profile_for_sweep(profile, self.model.metric_registry)
+        if sweep_issues:
+            _merge_model_warnings(self.model, sweep_issues)
         self._refresh_profile_choices(selected=profile.name)
         self._load_profile_into_editor(profile)
         for stage_name in self.model.base_model.stage_order:

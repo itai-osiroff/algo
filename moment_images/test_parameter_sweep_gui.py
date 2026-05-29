@@ -100,6 +100,54 @@ def test_state_to_spec_roundtrip_with_metric_experiments(tmp_path):
     assert roundtrip.metric_experiment_rows[1].family == "blurred_composite_corr"
 
 
+def test_state_to_spec_roundtrip_with_scoring_profile(tmp_path):
+    state = _build_valid_state(tmp_path)
+    config_path = tmp_path / "metrics_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "name": "guide_focus",
+                        "label": "Guide Focus",
+                        "metric_weights": {"vollath_f4_guide": 1.0},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    state.metric_profile_config_path = str(config_path)
+    state.scoring_profile_name = "guide_focus"
+    state.metric_scope = "global_only_metrics"
+
+    issues = validate_state(state)
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    assert issues == []
+    assert payload["scoring"]["profile_name"] == "guide_focus"
+    assert payload["scoring"]["profile_config_path"] == str(config_path)
+    assert "metric_weights" not in payload["scoring"]
+    assert roundtrip.scoring_profile_name == "guide_focus"
+    assert roundtrip.metric_profile_config_path == str(config_path)
+    assert roundtrip.metric_scope == "global_only_metrics"
+
+
+def test_state_to_spec_supports_dynamic_metric_weights(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.metric_weights = {"vollath_f4_guide": "0.7", "laplacian_variance": "0.3"}
+
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    assert payload["scoring"]["metric_weights"] == {
+        "vollath_f4_guide": 0.7,
+        "laplacian_variance": 0.3,
+    }
+    assert roundtrip.metric_weights["vollath_f4_guide"] == "0.7"
+
+
 def test_validate_state_reports_duplicate_and_missing_fields(tmp_path):
     state = _build_valid_state(tmp_path)
     state.datasets = [

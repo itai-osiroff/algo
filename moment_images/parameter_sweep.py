@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from PIL import Image
@@ -62,6 +62,12 @@ from moment_images.reliable_io import (
     write_csv_atomic,
     write_json_atomic,
     write_npy_atomic,
+)
+from moment_images.metric_profiles import (
+    build_metric_registry,
+    default_profiles,
+    resolve_metric_config,
+    resolve_profile_weights_for_sweep,
 )
 from moment_images.sweep_analysis import (
     analyze_summary_data,
@@ -290,6 +296,8 @@ class SweepScoringSpec:
     robustness_lambda: float = 0.5
     missing_dataset_penalty: float = 1.0
     metric_scope: str = "global_and_local_metrics"
+    profile_name: Optional[str] = None
+    profile_config_path: Optional[str] = None
 
 
 @dataclass
@@ -572,13 +580,36 @@ class SweepExperimentSpec:
         )
 
         scoring_raw = cast(Dict[str, object], payload.get("scoring", {}))
+        profile_name_raw = scoring_raw.get("profile_name")
+        profile_name = (
+            str(profile_name_raw).strip()
+            if isinstance(profile_name_raw, str) and profile_name_raw.strip()
+            else None
+        )
+        profile_config_path_raw = scoring_raw.get("profile_config_path")
+        profile_config_path = (
+            str(profile_config_path_raw).strip()
+            if isinstance(profile_config_path_raw, str) and profile_config_path_raw.strip()
+            else None
+        )
+        if profile_name and "metric_weights" in scoring_raw:
+            raise ValueError("scoring cannot define both profile_name and metric_weights.")
         metric_weights = cast(Optional[Dict[str, float]], scoring_raw.get("metric_weights"))
+        resolved_metric_weights = dict(metric_weights) if metric_weights else dict(DEFAULT_SCORE_WEIGHTS)
+        if profile_name:
+            resolved_metric_weights, _, _ = resolve_profile_weights_for_sweep(
+                profile_name,
+                config_path=Path(profile_config_path) if profile_config_path else None,
+                scoring_weights=DEFAULT_SCORE_WEIGHTS,
+            )
         scoring = SweepScoringSpec(
-            metric_weights=dict(metric_weights) if metric_weights else dict(DEFAULT_SCORE_WEIGHTS),
+            metric_weights=resolved_metric_weights,
             runtime_penalty_weight=float(scoring_raw.get("runtime_penalty_weight", 0.0)),
             robustness_lambda=float(scoring_raw.get("robustness_lambda", 0.5)),
             missing_dataset_penalty=float(scoring_raw.get("missing_dataset_penalty", 1.0)),
             metric_scope=str(scoring_raw.get("metric_scope", "global_and_local_metrics")),
+            profile_name=profile_name,
+            profile_config_path=profile_config_path,
         )
 
         has_legacy_formulations = "metric_formulations" in payload
@@ -1125,7 +1156,20 @@ def _parse_experiment_spec(path: Path) -> SweepExperimentSpec:
     payload, _, _ = read_json_first_valid(path, validator=lambda obj: isinstance(obj, dict))
     if not isinstance(payload, dict):
         raise ValueError("Sweep spec must be a JSON object.")
-    return SweepExperimentSpec.from_dict(payload)
+    spec = SweepExperimentSpec.from_dict(payload)
+    config_path = spec.scoring.profile_config_path
+    if config_path:
+        resolved = Path(config_path)
+        if not resolved.is_absolute():
+            spec.scoring.profile_config_path = str((path.parent / resolved).resolve())
+            if spec.scoring.profile_name:
+                weights, _, _ = resolve_profile_weights_for_sweep(
+                    spec.scoring.profile_name,
+                    config_path=Path(spec.scoring.profile_config_path),
+                    scoring_weights=DEFAULT_SCORE_WEIGHTS,
+                )
+                spec.scoring.metric_weights = weights
+    return spec
 
 
 def _save_run_artifacts(
@@ -2455,9 +2499,9 @@ def score_and_rank_runs(
     metric_weights = dict(scoring.metric_weights)
     if not metric_weights:
         raise ValueError("At least one metric weight must be configured.")
-    weight_sum = float(sum(metric_weights.values()))
+    weight_sum = float(sum(abs(weight) for weight in metric_weights.values()))
     if weight_sum <= 0:
-        raise ValueError("Metric weights must sum to a positive value.")
+        raise ValueError("Metric weights must have a positive absolute sum.")
 
     dataset_metric_values: Dict[str, Dict[str, List[float]]] = {
         dataset_id: {metric: [] for metric in metric_weights.keys()} for dataset_id in dataset_ids
@@ -3112,6 +3156,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Override parallel worker count in --spec mode.",
     )
     parser.add_argument(
+        "--metrics-config",
+        help="Metric explorer config file containing shared scoring profiles.",
+    )
+    parser.add_argument(
+        "--scoring-profile",
+        help="Shared metric profile name to use for sweep ranking.",
+    )
+    parser.add_argument(
         "--views",
         help="Path to a precomputed (N, N, H, W) or (E, N, N, H, W) numpy array of views",
     )
@@ -3258,6 +3310,23 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         workers_override = getattr(args, "workers", None)
         if workers_override is not None:
             spec.stages.max_workers = int(workers_override)
+        metrics_config_override = getattr(args, "metrics_config", None)
+        scoring_profile_override = getattr(args, "scoring_profile", None)
+        if metrics_config_override is not None:
+            spec.scoring.profile_config_path = str(Path(metrics_config_override).resolve())
+        if scoring_profile_override is not None:
+            spec.scoring.profile_name = str(scoring_profile_override)
+        if scoring_profile_override is not None or (
+            metrics_config_override is not None and spec.scoring.profile_name
+        ):
+            if not spec.scoring.profile_name:
+                raise ValueError("--metrics-config requires --scoring-profile unless the spec already sets scoring.profile_name.")
+            weights, _, _ = resolve_profile_weights_for_sweep(
+                spec.scoring.profile_name,
+                config_path=Path(spec.scoring.profile_config_path) if spec.scoring.profile_config_path else None,
+                scoring_weights=DEFAULT_SCORE_WEIGHTS,
+            )
+            spec.scoring.metric_weights = weights
         return run_sweep_experiment(spec)
 
     if args.save_figures and not args.live_plot:
@@ -3461,6 +3530,17 @@ class SpecGuiState:
     weight_dwt_level2_hv_energy: str = "0.25"
     weight_sum_squared_gradient: str = "0.25"
     weight_total_variation: str = "0.25"
+    metric_weights: Dict[str, str] = field(
+        default_factory=lambda: {
+            "laplacian_variance": "0.25",
+            "dwt_level2_hv_energy": "0.25",
+            "sum_squared_gradient": "0.25",
+            "total_variation": "0.25",
+        }
+    )
+    metric_profile_config_path: str = ""
+    scoring_profile_name: str = ""
+    metric_scope: str = "global_and_local_metrics"
     runtime_penalty_weight: str = "0.0"
     robustness_lambda: str = "0.5"
     missing_dataset_penalty: str = "1.0"
@@ -3526,6 +3606,51 @@ def _parse_bool_list_csv(value: str, field_name: str) -> List[bool]:
     if not result:
         raise ValueError(f"{field_name} cannot be empty.")
     return result
+
+
+def _legacy_state_metric_weights(state: SpecGuiState) -> Dict[str, str]:
+    return {
+        "laplacian_variance": state.weight_laplacian_variance,
+        "dwt_level2_hv_energy": state.weight_dwt_level2_hv_energy,
+        "sum_squared_gradient": state.weight_sum_squared_gradient,
+        "total_variation": state.weight_total_variation,
+    }
+
+
+def _state_metric_weights(state: SpecGuiState) -> Dict[str, str]:
+    if not state.metric_weights:
+        return _legacy_state_metric_weights(state)
+    default_weights = {
+        "laplacian_variance": "0.25",
+        "dwt_level2_hv_energy": "0.25",
+        "sum_squared_gradient": "0.25",
+        "total_variation": "0.25",
+    }
+    if dict(state.metric_weights) == default_weights:
+        return _legacy_state_metric_weights(state)
+    return dict(state.metric_weights)
+
+
+def _parse_state_metric_weights(state: SpecGuiState) -> Dict[str, float]:
+    weights: Dict[str, float] = {}
+    registry = build_metric_registry(include_saved=False)
+    for name, raw in _state_metric_weights(state).items():
+        metric_name = str(name).strip()
+        if not metric_name:
+            continue
+        if metric_name not in registry:
+            raise ValueError(f"Unknown metric weight name: {metric_name}")
+        try:
+            value = float(str(raw).strip())
+        except Exception as exc:
+            raise ValueError(f"Metric weight {metric_name} must be numeric.") from exc
+        if not np.isfinite(value):
+            raise ValueError(f"Metric weight {metric_name} must be finite.")
+        if value != 0.0:
+            weights[metric_name] = value
+    if sum(abs(weight) for weight in weights.values()) <= 0.0:
+        raise ValueError("Metric weights must have a positive absolute sum.")
+    return weights
 
 
 def _list_to_csv(values: Sequence[object]) -> str:
@@ -3728,6 +3853,19 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
         except Exception:
             stage1_fraction_value = SweepStageSpec().stage1_fraction
 
+    scoring_payload: Dict[str, object] = {
+        "runtime_penalty_weight": float(state.runtime_penalty_weight.strip()),
+        "robustness_lambda": float(state.robustness_lambda.strip()),
+        "missing_dataset_penalty": float(state.missing_dataset_penalty.strip()),
+        "metric_scope": state.metric_scope.strip() or "global_and_local_metrics",
+    }
+    if state.scoring_profile_name.strip():
+        scoring_payload["profile_name"] = state.scoring_profile_name.strip()
+        if state.metric_profile_config_path.strip():
+            scoring_payload["profile_config_path"] = state.metric_profile_config_path.strip()
+    else:
+        scoring_payload["metric_weights"] = _parse_state_metric_weights(state)
+
     payload: Dict[str, object] = {
         "output_dir": state.output_dir.strip() or None,
         "strategies": strategies,
@@ -3742,21 +3880,7 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
                 int(state.max_workers.strip()) if state.max_workers.strip() else None
             ),
         },
-        "scoring": {
-            "metric_weights": {
-                "laplacian_variance": float(state.weight_laplacian_variance.strip()),
-                "dwt_level2_hv_energy": float(
-                    state.weight_dwt_level2_hv_energy.strip()
-                ),
-                "sum_squared_gradient": float(
-                    state.weight_sum_squared_gradient.strip()
-                ),
-                "total_variation": float(state.weight_total_variation.strip()),
-            },
-            "runtime_penalty_weight": float(state.runtime_penalty_weight.strip()),
-            "robustness_lambda": float(state.robustness_lambda.strip()),
-            "missing_dataset_penalty": float(state.missing_dataset_penalty.strip()),
-        },
+        "scoring": scoring_payload,
         "save_figures": bool(state.save_figures),
         "analyze": bool(state.analyze),
     }
@@ -3873,8 +3997,14 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         ) or state.global_correlation_pad_widths
 
     scoring = cast(Dict[str, object], payload.get("scoring", {}))
+    state.scoring_profile_name = str(scoring.get("profile_name") or "")
+    state.metric_profile_config_path = str(scoring.get("profile_config_path") or "")
+    state.metric_scope = str(scoring.get("metric_scope", state.metric_scope))
     metric_weights = cast(Dict[str, object], scoring.get("metric_weights", {}))
     if metric_weights:
+        state.metric_weights = {
+            str(name): str(value) for name, value in metric_weights.items()
+        }
         state.weight_laplacian_variance = str(
             metric_weights.get("laplacian_variance", state.weight_laplacian_variance)
         )
@@ -4111,17 +4241,22 @@ def validate_state(state: SpecGuiState) -> List[str]:
         except ValueError as exc:
             issues.append(str(exc))
 
-    try:
-        weights = [
-            float(state.weight_laplacian_variance.strip()),
-            float(state.weight_dwt_level2_hv_energy.strip()),
-            float(state.weight_sum_squared_gradient.strip()),
-            float(state.weight_total_variation.strip()),
-        ]
-        if sum(weights) <= 0:
-            issues.append("Metric weights must sum to a positive value.")
-    except Exception:
-        issues.append("Metric weights must be numeric.")
+    if state.scoring_profile_name.strip():
+        try:
+            resolve_profile_weights_for_sweep(
+                state.scoring_profile_name.strip(),
+                config_path=Path(state.metric_profile_config_path.strip())
+                if state.metric_profile_config_path.strip()
+                else None,
+                scoring_weights=DEFAULT_SCORE_WEIGHTS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            issues.append(f"Scoring profile is invalid: {exc}")
+    else:
+        try:
+            _parse_state_metric_weights(state)
+        except ValueError as exc:
+            issues.append(str(exc))
 
     for label, raw in [
         ("runtime penalty weight", state.runtime_penalty_weight),
@@ -4132,6 +4267,8 @@ def validate_state(state: SpecGuiState) -> List[str]:
             float(raw.strip())
         except Exception:
             issues.append(f"{label} must be numeric.")
+    if state.metric_scope.strip() not in {"global_and_local_metrics", "global_only_metrics"}:
+        issues.append("Metric scope must be global_and_local_metrics or global_only_metrics.")
 
     if state.metric_experiments_enabled:
         if not state.strategy_pixel and not state.strategy_combined:
@@ -4485,9 +4622,47 @@ class SpecGuiApp:
         self.weight_dwt_entry = self._build_labeled_entry(adv_right, 1, "Weight dwt_level2_hv_energy", "0.25")
         self.weight_grad_entry = self._build_labeled_entry(adv_right, 2, "Weight sum_squared_gradient", "0.25")
         self.weight_tv_entry = self._build_labeled_entry(adv_right, 3, "Weight total_variation", "0.25")
-        self.runtime_penalty_entry = self._build_labeled_entry(adv_right, 4, "Runtime penalty weight", "0.0")
-        self.robustness_entry = self._build_labeled_entry(adv_right, 5, "Robustness lambda", "0.5")
-        self.missing_penalty_entry = self._build_labeled_entry(adv_right, 6, "Missing dataset penalty", "1.0")
+        self.metric_scope_entry = self._build_labeled_entry(adv_right, 4, "Metric scope", "global_and_local_metrics")
+        self.runtime_penalty_entry = self._build_labeled_entry(adv_right, 5, "Runtime penalty weight", "0.0")
+        self.robustness_entry = self._build_labeled_entry(adv_right, 6, "Robustness lambda", "0.5")
+        self.missing_penalty_entry = self._build_labeled_entry(adv_right, 7, "Missing dataset penalty", "1.0")
+        self.metric_profile_config_entry = self._build_labeled_entry(adv_right, 8, "Metric profile config", "")
+        profile_btn = self.ttk.Button(adv_right, text="Browse Profiles", command=self._browse_metric_profile_config)
+        profile_btn.grid(row=9, column=1, sticky="w", padx=4, pady=2)
+        self._register_editable(profile_btn)
+        self.ttk.Label(adv_right, text="Scoring profile").grid(row=10, column=0, sticky="w", padx=2, pady=2)
+        self.scoring_profile_var = self.tk.StringVar(value="")
+        self.scoring_profile_combo = self.ttk.Combobox(
+            adv_right,
+            textvariable=self.scoring_profile_var,
+            values=[""],
+            width=28,
+        )
+        self.scoring_profile_combo.grid(row=10, column=1, sticky="ew", padx=4, pady=2)
+        self.scoring_profile_combo.bind("<<ComboboxSelected>>", lambda _event: self._load_selected_profile_weights())
+        self._register_editable(self.scoring_profile_combo)
+        self.ttk.Label(adv_right, text="Resolved metric weights").grid(row=11, column=0, sticky="nw", padx=2, pady=2)
+        self.metric_weight_tree = self.ttk.Treeview(
+            adv_right,
+            columns=("metric", "weight"),
+            show="headings",
+            height=7,
+        )
+        self.metric_weight_tree.heading("metric", text="metric")
+        self.metric_weight_tree.heading("weight", text="weight")
+        self.metric_weight_tree.column("metric", width=185, stretch=True)
+        self.metric_weight_tree.column("weight", width=80, stretch=False)
+        self.metric_weight_tree.grid(row=11, column=1, sticky="ew", padx=4, pady=2)
+        self.metric_weight_tree.bind("<Double-1>", self._edit_metric_weight_cell)
+        self._register_editable(self.metric_weight_tree)
+        metric_btns = self.ttk.Frame(adv_right)
+        metric_btns.grid(row=12, column=1, sticky="w", padx=4, pady=2)
+        add_metric_btn = self.ttk.Button(metric_btns, text="Add Weight", command=self._add_metric_weight_row)
+        add_metric_btn.pack(side="left", padx=2)
+        remove_metric_btn = self.ttk.Button(metric_btns, text="Remove Weight", command=self._remove_selected_metric_weight)
+        remove_metric_btn.pack(side="left", padx=2)
+        self._register_editable(add_metric_btn)
+        self._register_editable(remove_metric_btn)
 
         metric_exp_container = self.ttk.LabelFrame(
             self.advanced_frame, text="Experimental Metrics (Optional)"
@@ -4569,6 +4744,98 @@ class SpecGuiApp:
         else:
             self.stage1_fraction_entry.configure(state="normal")
             self.stage1_fraction_label.configure(text="Stage1 fraction")
+
+    def _metric_weights_from_table(self) -> Dict[str, str]:
+        weights: Dict[str, str] = {}
+        for item_id in self.metric_weight_tree.get_children():
+            values = self.metric_weight_tree.item(item_id, "values")
+            if len(values) < 2:
+                continue
+            metric = str(values[0]).strip()
+            weight = str(values[1]).strip()
+            if metric:
+                weights[metric] = weight
+        return weights
+
+    def _set_metric_weight_rows(self, weights: Mapping[str, object]) -> None:
+        self.metric_weight_tree.delete(*self.metric_weight_tree.get_children())
+        for metric, weight in weights.items():
+            self.metric_weight_tree.insert("", "end", values=(str(metric), str(weight)))
+
+    def _refresh_profile_choices(self, selected: str = "") -> None:
+        registry = build_metric_registry()
+        profiles = default_profiles(registry, DEFAULT_SCORE_WEIGHTS)
+        config_path = self.metric_profile_config_entry.get().strip()
+        if config_path:
+            try:
+                config, _ = resolve_metric_config(
+                    None,
+                    registry,
+                    scoring_weights=DEFAULT_SCORE_WEIGHTS,
+                    config_path=Path(config_path),
+                )
+                profiles = config.profiles
+            except Exception:
+                profiles = default_profiles(registry, DEFAULT_SCORE_WEIGHTS)
+        names = [""] + [profile.name for profile in profiles if profile.name != "saved_original"]
+        self.scoring_profile_combo.configure(values=names)
+        if selected in names:
+            self.scoring_profile_var.set(selected)
+
+    def _load_selected_profile_weights(self) -> None:
+        profile_name = self.scoring_profile_var.get().strip()
+        if not profile_name:
+            return
+        try:
+            weights, _, _ = resolve_profile_weights_for_sweep(
+                profile_name,
+                config_path=Path(self.metric_profile_config_entry.get().strip())
+                if self.metric_profile_config_entry.get().strip()
+                else None,
+                scoring_weights=DEFAULT_SCORE_WEIGHTS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showwarning("Metric Profile", str(exc))
+            return
+        self._set_metric_weight_rows(weights)
+
+    def _browse_metric_profile_config(self) -> None:
+        selected = self.filedialog.askopenfilename(
+            filetypes=[("JSON", "*.json"), ("All Files", "*.*")]
+        )
+        if not selected:
+            return
+        self.metric_profile_config_entry.delete(0, self.tk.END)
+        self.metric_profile_config_entry.insert(0, selected)
+        self._refresh_profile_choices(selected=self.scoring_profile_var.get().strip())
+        self._load_selected_profile_weights()
+
+    def _add_metric_weight_row(self) -> None:
+        registry = build_metric_registry(include_saved=False)
+        existing = set(self._metric_weights_from_table())
+        metric_name = next((name for name in registry if name not in existing), "laplacian_variance")
+        self.metric_weight_tree.insert("", "end", values=(metric_name, "0.0"))
+
+    def _remove_selected_metric_weight(self) -> None:
+        for item_id in self.metric_weight_tree.selection():
+            self.metric_weight_tree.delete(item_id)
+
+    def _edit_metric_weight_cell(self, event: object) -> None:
+        row_id = self.metric_weight_tree.identify_row(getattr(event, "y", 0))
+        column_id = self.metric_weight_tree.identify_column(getattr(event, "x", 0))
+        if not row_id or column_id not in {"#1", "#2"}:
+            return
+        values = list(self.metric_weight_tree.item(row_id, "values"))
+        if len(values) < 2:
+            return
+        current = values[0 if column_id == "#1" else 1]
+        prompt = "Metric name" if column_id == "#1" else "Metric weight"
+        simpledialog = __import__("tkinter.simpledialog", fromlist=["simpledialog"])
+        value = simpledialog.askstring("Metric Weight", prompt, initialvalue=str(current), parent=self.root)
+        if value is None:
+            return
+        values[0 if column_id == "#1" else 1] = value.strip()
+        self.metric_weight_tree.item(row_id, values=values)
 
     def _clear_dataset_rows(self) -> None:
         for row in self.dataset_rows:
@@ -4821,6 +5088,10 @@ class SpecGuiApp:
             weight_dwt_level2_hv_energy=self.weight_dwt_entry.get().strip(),
             weight_sum_squared_gradient=self.weight_grad_entry.get().strip(),
             weight_total_variation=self.weight_tv_entry.get().strip(),
+            metric_weights=self._metric_weights_from_table(),
+            metric_profile_config_path=self.metric_profile_config_entry.get().strip(),
+            scoring_profile_name=self.scoring_profile_var.get().strip(),
+            metric_scope=self.metric_scope_entry.get().strip(),
             runtime_penalty_weight=self.runtime_penalty_entry.get().strip(),
             robustness_lambda=self.robustness_entry.get().strip(),
             missing_dataset_penalty=self.missing_penalty_entry.get().strip(),
@@ -4878,6 +5149,8 @@ class SpecGuiApp:
             (self.weight_dwt_entry, state.weight_dwt_level2_hv_energy),
             (self.weight_grad_entry, state.weight_sum_squared_gradient),
             (self.weight_tv_entry, state.weight_total_variation),
+            (self.metric_scope_entry, state.metric_scope),
+            (self.metric_profile_config_entry, state.metric_profile_config_path),
             (self.runtime_penalty_entry, state.runtime_penalty_weight),
             (self.robustness_entry, state.robustness_lambda),
             (self.missing_penalty_entry, state.missing_dataset_penalty),
@@ -4885,6 +5158,11 @@ class SpecGuiApp:
         for widget, value in field_mapping:
             widget.delete(0, self.tk.END)
             widget.insert(0, value)
+        self._set_metric_weight_rows(_state_metric_weights(state))
+        self._refresh_profile_choices(selected=state.scoring_profile_name)
+        self.scoring_profile_var.set(state.scoring_profile_name)
+        if state.scoring_profile_name:
+            self._load_selected_profile_weights()
 
         self._clear_dataset_rows()
         for dataset in state.datasets:
