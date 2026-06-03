@@ -2,6 +2,10 @@
 
 This guide explains how to use `moment_images/sweep_metric_explorer.py` to re-rank an existing sweep from the raw `workspace.npz` artifacts.
 
+For running sweeps, see [PARAMETER_SWEEP_GUIDE.md](PARAMETER_SWEEP_GUIDE.md).
+For visualization exports and report regeneration, see
+[SWEEP_REPORTING_GUIDE.md](SWEEP_REPORTING_GUIDE.md).
+
 ## What This Tool Does
 
 `sweep_metric_explorer.py` is a post-processing helper for completed sweep outputs.
@@ -41,6 +45,10 @@ path/to/sweep_output/
 ```
 
 The explorer works best on the modern spec-based sweep outputs. It reuses the same folder/stage/candidate structure as `sweep_visualization.py`.
+
+If `workspace.npz` is missing for a run, the explorer may still show saved
+metadata from summaries, but raw metric recomputation for that run is not
+available.
 
 ## Launch
 

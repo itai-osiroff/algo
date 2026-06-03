@@ -4,6 +4,11 @@ This guide covers the Point Grey / FLIR (Spinnaker) acquisition path implemented
 
 After this first mention, the rest of the guide uses "Point Grey".
 
+For the main rectification, sweep, validation, and gain-calibration workflows,
+see [README.md](README.md) and [moment_images/README.md](moment_images/README.md).
+The Point Grey path is optional unless you need live camera preview or raw
+snapshot capture.
+
 ## Overview
 
 ### `acquire_images_PG.py`

@@ -1,0 +1,213 @@
+# Parameter Sweep Guide
+
+This guide covers `moment_images.parameter_sweep`, the automated runner for
+evaluating rectification settings across one or more datasets.
+
+## Recommended Command
+
+Use spec mode for new work:
+
+```bash
+python -m moment_images.parameter_sweep --spec moment_images/sweep_experiment_spec_example.json
+```
+
+Use the GUI when building or editing a spec interactively:
+
+```bash
+python -m moment_images.parameter_sweep --gui
+```
+
+Legacy single-dataset CLI flags remain available:
+
+```bash
+python -m moment_images.parameter_sweep --views path/to/views.npy --strategy pixel
+```
+
+## Spec Structure
+
+A sweep spec usually contains:
+
+- `output_dir`: sweep root directory.
+- `strategies`: any of `global`, `pixel`, `combined`.
+- `datasets`: one or more view-grid or source-image datasets.
+- `search_spaces`: strategy-specific parameter candidates.
+- `stages`: `two_stage` or `single_stage` execution settings.
+- `scoring`: metric weights or a shared profile.
+- `experimental_metric_sweep`: optional local displacement metric experiments.
+- `reporting`: alpha report and primary metric settings.
+- `save_figures`: whether to save full figure sets per run.
+- `analyze`: whether to write aggregate analysis artifacts.
+
+The tracked template is:
+
+```text
+moment_images/sweep_experiment_spec_example.json
+```
+
+## Dataset Inputs
+
+Each dataset needs a stable `id` and one input source:
+
+- `views`: path to a saved view grid shaped `(N, N, H, W)` or
+  `(E, N, N, H, W)`.
+- `source_image`: image path plus `center_x`, `center_y`, `view_radius`, and
+  optional `view_grid_size`/`view_distance`.
+- `source_image_dir`: exposure image directory for HDR view generation.
+
+Set `normalize_to_8bit` explicitly. The current default is `false`, preserving
+raw intensities during source extraction and HDR handling.
+
+## Search Spaces
+
+Common pixel/combined search fields:
+
+- `similarity_window_sizes` or `refinement_window_sizes`
+- `max_displacements`
+- `gauss_sigmas`
+- `disp_gauss_sigmas`
+- `pixel_thresholds`
+- `sub_pix_factors`
+- `pixel_sigma_pyramid`
+- `zero_fill_roll`
+
+Combined/global-specific fields:
+
+- `correlation_pad_widths`
+- `global_thresholds`
+- `combined_use_global_avg_reference`
+- `combined_reference_mode`
+
+`combined_reference_mode` may select:
+
+- `global_average`
+- `center_view`
+- `iterative_subtractive_max_rebuild`
+
+## Stages
+
+`stages.mode` controls sweep execution:
+
+- `two_stage`: coarse stage 1 followed by refinement of top candidates.
+- `single_stage`: one pass over the configured candidate grid.
+
+For `two_stage`, the default refinement method is `auto_fine`, which inserts
+midpoint and bounded edge candidates around high-ranking coarse settings.
+`neighbor` is available for the older behavior that reuses configured neighbor
+values only.
+
+## Scoring Profiles
+
+`scoring.metric_weights` can define metric weights directly. A spec can also
+reference metric explorer profiles:
+
+```json
+{
+  "scoring": {
+    "profile_name": "guide_focus_mix",
+    "profile_config_path": "metric_review/metrics_config.json",
+    "metric_scope": "global_and_local_metrics",
+    "runtime_penalty_weight": 0.0,
+    "robustness_lambda": 0.5,
+    "missing_dataset_penalty": 1.0
+  }
+}
+```
+
+CLI overrides are available:
+
+```bash
+python -m moment_images.parameter_sweep --spec sweep_spec.json --metrics-config metric_review/metrics_config.json --scoring-profile guide_focus_mix
+```
+
+Profiles that depend on `saved_score` or `saved_mean_dataset_score` are
+comparison-only and cannot rank new runs.
+
+## Optional Metric Experiments
+
+`experimental_metric_sweep` runs after baseline ranking. It expands shortlisted
+baseline candidates across local displacement metric formulations and alpha
+values.
+
+Supported formulation families:
+
+- `blurred_gradient_corr`
+- `blurred_laplacian_corr`
+- `blurred_composite_corr`
+
+For pair families, `alpha` blends intensity with the selected auxiliary score:
+
+```text
+score = alpha * intensity + (1 - alpha) * auxiliary
+```
+
+For `blurred_composite_corr`, `alpha` is the intensity weight and
+`component_weights` distribute the remaining weight across non-intensity
+components.
+
+## Resume, Extend, Merge, Dry Run
+
+Spec-mode sweeps write durable state to `run_state.json`.
+
+Common operations:
+
+```bash
+python -m moment_images.parameter_sweep --spec sweep_spec.json --output-dir path/to/sweep
+python -m moment_images.parameter_sweep --spec expanded_spec.json --output-dir path/to/sweep --extend-existing
+python -m moment_images.parameter_sweep --spec canonical_spec.json --output-dir path/to/sweep --merge-from path/to/source_a path/to/source_b
+python -m moment_images.parameter_sweep --spec sweep_spec.json --output-dir path/to/sweep --dry-run
+```
+
+- Resume reuses valid completed artifacts when the experiment fingerprint is
+  compatible.
+- `--extend-existing` is for compatible spec expansion.
+- `--merge-from` copies valid compatible completed runs from other sweep roots.
+- `--dry-run` writes a generation dry-run report without executing
+  rectification or refreshing root-level products.
+
+## Output Layout
+
+Modern sweep roots commonly contain:
+
+- `stage1_summary.json`
+- `stage2_summary.json` for `two_stage`
+- `leaderboard.json`
+- `leaderboard.csv`
+- `best_configs.json`
+- `summary.json`
+- `analysis.json` / `analysis.csv` when analysis is enabled
+- `run_state.json`
+- `experiment_manifest.json`
+- `runs/<stage>/<candidate>/<dataset>/...`
+- `generations/<generation_id>/products/...`
+
+Each run folder commonly contains:
+
+- `avg_rectified.png`
+- `rectified_views.npy`
+- `workspace.npz`
+- `workspace.mat`
+- `config.json`
+- `metric_record.json`
+
+When metric experiments are enabled, additional outputs are written under
+`metric_experiments/`, including:
+
+- `metric_phase_summary.json`
+- `leaderboard.json`
+- `leaderboard.csv`
+- `summary.json`
+- `alpha_report.json`
+- `alpha_report.csv`
+- `alpha_report_warnings.json`
+
+## Troubleshooting
+
+- Resume rejects a sweep: verify the spec, dataset paths, shapes, file sizes,
+  and modification times. Use `--extend-existing` only for compatible expansion.
+- Missing or corrupt run artifacts: the runner recomputes affected runs when
+  required artifacts fail validation.
+- Too many candidates: narrow search spaces or reduce `total_budget_per_dataset`.
+- Pixel/combined runs are slow: reduce `max_displacements`, window sizes,
+  `sub_pix_factors`, or worker count.
+- GUI does not open: use a desktop session or run spec mode from the CLI.
+

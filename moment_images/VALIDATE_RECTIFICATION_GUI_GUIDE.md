@@ -2,6 +2,9 @@
 
 This guide explains how to use `moment_images/validate_rectification.py` end-to-end.
 
+For the broader package map, see [README.md](README.md). For sweep outputs that
+feed validation, see [PARAMETER_SWEEP_GUIDE.md](PARAMETER_SWEEP_GUIDE.md).
+
 ## What This Tool Does
 
 `validate_rectification.py` lets you compare a rectified reference image against two external camera images:
@@ -273,3 +276,20 @@ No camera-specific defaults are applied automatically before editing.
 Validation and Thorcam now enter the editor through the same preprocessing path
 (same load/grayscale/intensity/scale/alignment pipeline). Use Geometry controls
 (rotate/flip/crop) to set orientation manually when needed.
+
+## Batch Validation Image Preprocessing
+
+`moment_images/batch_process_validation_images.py` provides a GUI-only helper
+for applying shared preprocessing settings to a folder of validation images:
+
+```bash
+python -m moment_images.batch_process_validation_images
+```
+
+The batch helper supports rotation, flips, optional crop coordinates, optional
+min/max intensity clipping, X/Y scaling, pre-blur before resizing, and optional
+flux-sum preservation.
+
+Current limitation: this helper does not expose a normal argparse command line
+or `--help` reference. Run it from a desktop session and configure it through
+the GUI.
