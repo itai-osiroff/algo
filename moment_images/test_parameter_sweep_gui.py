@@ -32,6 +32,8 @@ def _build_valid_state(tmp_path: Path) -> SpecGuiState:
 
 def test_state_to_spec_and_back_roundtrip(tmp_path):
     state = _build_valid_state(tmp_path)
+    state.run_mode = "extend"
+    state.dry_run = True
     state.strategy_global = True
     state.pixel_similarity_window_sizes = "11,21"
     state.combined_global_thresholds = "0.1,0.2"
@@ -41,6 +43,10 @@ def test_state_to_spec_and_back_roundtrip(tmp_path):
     payload = state_to_spec_dict(state)
     roundtrip = spec_dict_to_state(payload)
 
+    assert "run_mode" not in payload
+    assert "dry_run" not in payload
+    assert roundtrip.run_mode == "normal"
+    assert roundtrip.dry_run is False
     assert roundtrip.output_dir == state.output_dir
     assert roundtrip.strategy_pixel is True
     assert roundtrip.strategy_combined is True
@@ -193,6 +199,16 @@ def test_validate_state_reports_invalid_refinement_settings(tmp_path):
     assert any("Refinement extrapolation" in issue for issue in issues)
 
 
+def test_validate_state_extension_requires_output_dir(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.run_mode = "extend"
+    state.output_dir = ""
+
+    issues = validate_state(state)
+
+    assert any("Extend existing sweep requires an output directory" in issue for issue in issues)
+
+
 def test_validate_state_experimental_metrics_rules(tmp_path):
     state = _build_valid_state(tmp_path)
     state.strategy_pixel = False
@@ -315,7 +331,7 @@ def test_gui_run_lifecycle_success(monkeypatch, tmp_path):
     root = _make_root_or_skip()
     app = ps.SpecGuiApp(root)
 
-    app._show_completion_dialog = lambda _output: None  # type: ignore[method-assign]
+    app._show_completion_dialog = lambda _output, dry_run=False: None  # type: ignore[method-assign]
     errors = []
     app.messagebox.showerror = lambda *args, **kwargs: errors.append(args)  # type: ignore[assignment]
 
@@ -323,7 +339,13 @@ def test_gui_run_lifecycle_success(monkeypatch, tmp_path):
     app.output_dir_entry.delete(0, app.tk.END)
     app.output_dir_entry.insert(0, str(tmp_path / "out"))
 
-    monkeypatch.setattr(ps, "run_sweep_experiment", lambda spec: tmp_path / "out")
+    calls = []
+
+    def _run(spec, **kwargs):
+        calls.append(kwargs)
+        return tmp_path / "out"
+
+    monkeypatch.setattr(ps, "run_sweep_experiment", _run)
 
     app._on_run()
 
@@ -335,6 +357,127 @@ def test_gui_run_lifecycle_success(monkeypatch, tmp_path):
     assert app._is_running is False
     assert app.status_var.get() == "Completed"
     assert not errors
+    assert calls == [{"extend_existing": False, "dry_run": False}]
+    assert app.run_btn.cget("text") == "Run Sweep"
+    root.destroy()
+
+
+def test_gui_run_lifecycle_extension_passes_extend_flag(monkeypatch, tmp_path):
+    from moment_images import parameter_sweep as ps
+
+    root = _make_root_or_skip()
+    app = ps.SpecGuiApp(root)
+
+    app._show_completion_dialog = lambda _output, dry_run=False: None  # type: ignore[method-assign]
+    app.messagebox.showerror = lambda *args, **kwargs: None  # type: ignore[assignment]
+    app.messagebox.showwarning = lambda *args, **kwargs: None  # type: ignore[assignment]
+    app.messagebox.askyesno = lambda *args, **kwargs: True  # type: ignore[assignment]
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "run_state.json").write_text("{}", encoding="utf-8")
+    app.dataset_rows[0]["source_path_var"].set(str(tmp_path / "views.npy"))
+    app.output_dir_entry.delete(0, app.tk.END)
+    app.output_dir_entry.insert(0, str(out_dir))
+    app.run_mode_var.set("extend")
+    app.dry_run_var.set(False)
+    app._update_run_button_text()
+
+    calls = []
+
+    def _run(spec, **kwargs):
+        calls.append(kwargs)
+        return out_dir
+
+    monkeypatch.setattr(ps, "run_sweep_experiment", _run)
+
+    app._on_run()
+    deadline = time.time() + 5.0
+    while app._is_running and time.time() < deadline:
+        root.update()
+        time.sleep(0.05)
+
+    assert app._is_running is False
+    assert calls == [{"extend_existing": True, "dry_run": False}]
+    assert app.run_btn.cget("text") == "Extend Sweep"
+    root.destroy()
+
+
+def test_gui_run_lifecycle_extension_dry_run_passes_flags(monkeypatch, tmp_path):
+    from moment_images import parameter_sweep as ps
+
+    root = _make_root_or_skip()
+    app = ps.SpecGuiApp(root)
+
+    shown_dialogs = []
+    app._show_completion_dialog = lambda _output, dry_run=False: shown_dialogs.append(dry_run)  # type: ignore[method-assign]
+    app.messagebox.showerror = lambda *args, **kwargs: None  # type: ignore[assignment]
+    app.messagebox.showwarning = lambda *args, **kwargs: None  # type: ignore[assignment]
+    app.messagebox.askyesno = lambda *args, **kwargs: pytest.fail("dry-run extension should not ask for destructive confirmation")  # type: ignore[assignment]
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "run_state.json").write_text("{}", encoding="utf-8")
+    app.dataset_rows[0]["source_path_var"].set(str(tmp_path / "views.npy"))
+    app.output_dir_entry.delete(0, app.tk.END)
+    app.output_dir_entry.insert(0, str(out_dir))
+    app.run_mode_var.set("extend")
+    app.dry_run_var.set(True)
+    app._update_run_button_text()
+
+    calls = []
+
+    def _run(spec, **kwargs):
+        calls.append(kwargs)
+        generation_dir = out_dir / "generations" / "gen_test"
+        generation_dir.mkdir(parents=True)
+        (generation_dir / "dry_run.json").write_text("{}", encoding="utf-8")
+        return out_dir
+
+    monkeypatch.setattr(ps, "run_sweep_experiment", _run)
+
+    app._on_run()
+    deadline = time.time() + 5.0
+    while app._is_running and time.time() < deadline:
+        root.update()
+        time.sleep(0.05)
+
+    assert app._is_running is False
+    assert calls == [{"extend_existing": True, "dry_run": True}]
+    assert shown_dialogs == [True]
+    assert app.run_btn.cget("text") == "Preview Run"
+    root.destroy()
+
+
+def test_gui_extension_warns_when_output_dir_has_no_run_state(monkeypatch, tmp_path):
+    from moment_images import parameter_sweep as ps
+
+    root = _make_root_or_skip()
+    app = ps.SpecGuiApp(root)
+
+    app._show_completion_dialog = lambda _output, dry_run=False: None  # type: ignore[method-assign]
+    warnings = []
+    app.messagebox.showerror = lambda *args, **kwargs: None  # type: ignore[assignment]
+    app.messagebox.showwarning = lambda *args, **kwargs: warnings.append(args)  # type: ignore[assignment]
+    app.messagebox.askyesno = lambda *args, **kwargs: True  # type: ignore[assignment]
+
+    out_dir = tmp_path / "new_out"
+    out_dir.mkdir()
+    app.dataset_rows[0]["source_path_var"].set(str(tmp_path / "views.npy"))
+    app.output_dir_entry.delete(0, app.tk.END)
+    app.output_dir_entry.insert(0, str(out_dir))
+    app.run_mode_var.set("extend")
+    app.dry_run_var.set(False)
+
+    monkeypatch.setattr(ps, "run_sweep_experiment", lambda spec, **kwargs: out_dir)
+
+    app._on_run()
+    deadline = time.time() + 5.0
+    while app._is_running and time.time() < deadline:
+        root.update()
+        time.sleep(0.05)
+
+    assert any("run_state.json" in str(args) for args in warnings)
     root.destroy()
 
 
@@ -348,7 +491,7 @@ def test_gui_run_lifecycle_failure(monkeypatch, tmp_path):
     app.messagebox.showerror = lambda *args, **kwargs: errors.append(args)  # type: ignore[assignment]
     app.dataset_rows[0]["source_path_var"].set(str(tmp_path / "views.npy"))
 
-    def _raise(_spec):
+    def _raise(_spec, **_kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(ps, "run_sweep_experiment", _raise)

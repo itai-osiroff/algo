@@ -4659,6 +4659,8 @@ class SpecGuiMetricExperimentRowState:
 @dataclass
 class SpecGuiState:
     output_dir: str = ""
+    run_mode: str = "normal"
+    dry_run: bool = False
     strategy_pixel: bool = True
     strategy_combined: bool = True
     strategy_global: bool = False
@@ -5290,6 +5292,12 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
 def validate_state(state: SpecGuiState) -> List[str]:
     """Validate GUI state before save/run and return list of issues."""
     issues: List[str] = []
+    run_mode = state.run_mode.strip().lower() or "normal"
+    if run_mode not in {"normal", "extend"}:
+        issues.append("Run mode must be normal or extend.")
+    if run_mode == "extend" and not state.output_dir.strip():
+        issues.append("Extend existing sweep requires an output directory.")
+
     strategies = [
         strategy
         for strategy, enabled in [
@@ -5593,6 +5601,8 @@ class SpecGuiApp:
         self._is_running = False
         self.status_var = tk.StringVar(value="Idle")
         self.show_advanced_var = tk.BooleanVar(value=False)
+        self.run_mode_var = tk.StringVar(value="normal")
+        self.dry_run_var = tk.BooleanVar(value=False)
 
         self.root.title("Moment Images Sweep (Spec Mode)")
         self.root.geometry("1280x900")
@@ -5614,6 +5624,17 @@ class SpecGuiApp:
             self._toggle_stage_mode_controls()
         if enabled and hasattr(self, "metric_experiments_enabled_var"):
             self._toggle_metric_experiment_controls()
+
+    def _update_run_button_text(self) -> None:
+        if not hasattr(self, "run_btn"):
+            return
+        if bool(self.dry_run_var.get()):
+            label = "Preview Run"
+        elif self.run_mode_var.get() == "extend":
+            label = "Extend Sweep"
+        else:
+            label = "Run Sweep"
+        self.run_btn.configure(text=label)
 
     def _append_log(self, message: str) -> None:
         self.log_text.configure(state="normal")
@@ -5699,8 +5720,38 @@ class SpecGuiApp:
         browse_output_btn.grid(row=0, column=2, sticky="w", padx=4, pady=2)
         self._register_editable(browse_output_btn)
 
+        run_mode_frame = self.ttk.Frame(basic_frame)
+        run_mode_frame.grid(row=1, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        self.ttk.Label(run_mode_frame, text="Run Mode").pack(side="left", padx=(0, 8))
+        normal_radio = self.ttk.Radiobutton(
+            run_mode_frame,
+            text="New / Resume exact spec",
+            variable=self.run_mode_var,
+            value="normal",
+            command=self._update_run_button_text,
+        )
+        normal_radio.pack(side="left", padx=4)
+        self._register_editable(normal_radio)
+        extend_radio = self.ttk.Radiobutton(
+            run_mode_frame,
+            text="Extend existing sweep",
+            variable=self.run_mode_var,
+            value="extend",
+            command=self._update_run_button_text,
+        )
+        extend_radio.pack(side="left", padx=4)
+        self._register_editable(extend_radio)
+        dry_run_check = self.ttk.Checkbutton(
+            run_mode_frame,
+            text="Dry run only",
+            variable=self.dry_run_var,
+            command=self._update_run_button_text,
+        )
+        dry_run_check.pack(side="left", padx=12)
+        self._register_editable(dry_run_check)
+
         strat_frame = self.ttk.Frame(basic_frame)
-        strat_frame.grid(row=1, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        strat_frame.grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=2)
         self.ttk.Label(strat_frame, text="Strategies:").pack(side="left")
         self.strategy_pixel_var = self.tk.BooleanVar(value=True)
         self.strategy_combined_var = self.tk.BooleanVar(value=True)
@@ -6282,6 +6333,8 @@ class SpecGuiApp:
 
         return SpecGuiState(
             output_dir=self.output_dir_entry.get().strip(),
+            run_mode=self.run_mode_var.get().strip(),
+            dry_run=bool(self.dry_run_var.get()),
             strategy_pixel=bool(self.strategy_pixel_var.get()),
             strategy_combined=bool(self.strategy_combined_var.get()),
             strategy_global=bool(self.strategy_global_var.get()),
@@ -6336,6 +6389,8 @@ class SpecGuiApp:
     def _set_state(self, state: SpecGuiState) -> None:
         self.output_dir_entry.delete(0, self.tk.END)
         self.output_dir_entry.insert(0, state.output_dir)
+        self.run_mode_var.set(state.run_mode if state.run_mode in {"normal", "extend"} else "normal")
+        self.dry_run_var.set(bool(state.dry_run))
         self.strategy_pixel_var.set(state.strategy_pixel)
         self.strategy_combined_var.set(state.strategy_combined)
         self.strategy_global_var.set(state.strategy_global)
@@ -6411,6 +6466,7 @@ class SpecGuiApp:
         self.json_text.delete("1.0", self.tk.END)
         if state.json_preview:
             self.json_text.insert(self.tk.END, state.json_preview)
+        self._update_run_button_text()
 
     def _on_refresh_json_preview(self) -> None:
         try:
@@ -6483,14 +6539,37 @@ class SpecGuiApp:
         _save_spec_payload(Path(selected), payload)
         self._append_log(f"Saved spec: {selected}")
 
-    def _run_worker(self, payload: Dict[str, object]) -> None:
+    def _run_worker(self, payload: Dict[str, object], run_mode: str, dry_run: bool) -> None:
         self.log_queue.put({"type": "log", "message": "Preparing experiment spec..."})
         try:
             spec = SweepExperimentSpec.from_dict(payload)
-            self.log_queue.put({"type": "log", "message": f"Running sweep with {len(spec.datasets)} dataset(s)..."} )
-            output_dir = run_sweep_experiment(spec)
+            extend_existing = run_mode == "extend"
+            mode_label = "extend existing sweep" if extend_existing else "new/resume exact spec"
             self.log_queue.put(
-                {"type": "done", "output_dir": str(output_dir), "message": "Sweep completed successfully."}
+                {
+                    "type": "log",
+                    "message": (
+                        f"Running sweep with {len(spec.datasets)} dataset(s); "
+                        f"mode={mode_label}; dry_run={bool(dry_run)}."
+                    ),
+                }
+            )
+            output_dir = run_sweep_experiment(
+                spec,
+                extend_existing=extend_existing,
+                dry_run=bool(dry_run),
+            )
+            if dry_run:
+                message = "Dry run completed. No rectification tasks were executed."
+            else:
+                message = "Sweep completed successfully."
+            self.log_queue.put(
+                {
+                    "type": "done",
+                    "output_dir": str(output_dir),
+                    "message": message,
+                    "dry_run": bool(dry_run),
+                }
             )
         except Exception as exc:  # noqa: BLE001
             self.log_queue.put(
@@ -6515,6 +6594,28 @@ class SpecGuiApp:
         except Exception as exc:  # noqa: BLE001
             self.messagebox.showerror("Run Sweep", str(exc))
             return
+        run_mode = state.run_mode.strip().lower() or "normal"
+        dry_run = bool(state.dry_run)
+        output_dir = Path(state.output_dir.strip()) if state.output_dir.strip() else None
+        if run_mode == "extend" and output_dir is not None and not (output_dir / RUN_STATE_FILENAME).exists():
+            self.messagebox.showwarning(
+                "Extend Existing Sweep",
+                (
+                    "The selected output directory does not contain run_state.json. "
+                    "Extension is intended for an existing sweep root."
+                ),
+            )
+        if run_mode == "extend" and not dry_run:
+            confirmed = self.messagebox.askyesno(
+                "Confirm Extension",
+                (
+                    "This will extend the existing sweep, refresh root-level reports, "
+                    "and save historical products under generations/<generation_id>/products/. "
+                    "Continue?"
+                ),
+            )
+            if not confirmed:
+                return
         self.status_var.set("Running...")
         self._is_running = True
         self._set_editable_enabled(False)
@@ -6522,15 +6623,23 @@ class SpecGuiApp:
         self.log_text.delete("1.0", self.tk.END)
         self.log_text.configure(state="disabled")
         self._append_log("Starting background sweep run...")
-        self.run_thread = threading.Thread(target=self._run_worker, args=(payload,), daemon=True)
+        self.run_thread = threading.Thread(
+            target=self._run_worker,
+            args=(payload, run_mode, dry_run),
+            daemon=True,
+        )
         self.run_thread.start()
 
-    def _on_run_done(self, output_dir: str, message: str) -> None:
+    def _on_run_done(self, output_dir: str, message: str, dry_run: bool = False) -> None:
         self.status_var.set("Completed")
         self._set_editable_enabled(True)
         self._is_running = False
         self._append_log(message)
-        self._show_completion_dialog(Path(output_dir))
+        if dry_run:
+            dry_run_path = self._latest_dry_run_path(Path(output_dir))
+            if dry_run_path is not None:
+                self._append_log(f"Dry-run report: {dry_run_path}")
+        self._show_completion_dialog(Path(output_dir), dry_run=dry_run)
 
     def _on_run_error(self, message: str, trace_text: str) -> None:
         self.status_var.set("Failed")
@@ -6553,6 +6662,7 @@ class SpecGuiApp:
                 self._on_run_done(
                     str(event.get("output_dir", "")),
                     str(event.get("message", "Sweep completed.")),
+                    bool(event.get("dry_run", False)),
                 )
             elif event_type == "error":
                 self._on_run_error(
@@ -6561,12 +6671,26 @@ class SpecGuiApp:
                 )
         self.root.after(150, self._poll_logs)
 
-    def _show_completion_dialog(self, output_dir: Path) -> None:
+    def _latest_dry_run_path(self, output_dir: Path) -> Optional[Path]:
+        candidates = sorted(
+            (output_dir / "generations").glob("*/dry_run.json"),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
+
+    def _show_completion_dialog(self, output_dir: Path, dry_run: bool = False) -> None:
         dialog = self.tk.Toplevel(self.root)
-        dialog.title("Sweep Complete")
-        dialog.geometry("540x180")
+        dialog.title("Dry Run Complete" if dry_run else "Sweep Complete")
+        dialog.geometry("620x200")
+        dry_run_path = self._latest_dry_run_path(output_dir) if dry_run else None
+        message = (
+            f"Dry-run report written under:\n{output_dir}"
+            if dry_run
+            else f"Artifacts written to:\n{output_dir}"
+        )
         self.ttk.Label(
-            dialog, text=f"Artifacts written to:\n{output_dir}", wraplength=520
+            dialog, text=message, wraplength=600
         ).pack(padx=10, pady=10, anchor="w")
         button_frame = self.ttk.Frame(dialog)
         button_frame.pack(fill="x", padx=10, pady=10)
@@ -6585,8 +6709,19 @@ class SpecGuiApp:
             if not ok:
                 self.messagebox.showerror("Open Leaderboard", err or "Failed to open file.")
 
+        def open_dry_run() -> None:
+            if dry_run_path is None or not dry_run_path.exists():
+                self.messagebox.showwarning("Open Dry Run", "No dry_run.json report was found.")
+                return
+            ok, err = _open_with_system(dry_run_path)
+            if not ok:
+                self.messagebox.showerror("Open Dry Run", err or "Failed to open file.")
+
         self.ttk.Button(button_frame, text="Open Output Folder", command=open_output).pack(side="left", padx=4)
-        self.ttk.Button(button_frame, text="Open leaderboard.json", command=open_leaderboard).pack(side="left", padx=4)
+        if dry_run:
+            self.ttk.Button(button_frame, text="Open dry_run.json", command=open_dry_run).pack(side="left", padx=4)
+        else:
+            self.ttk.Button(button_frame, text="Open leaderboard.json", command=open_leaderboard).pack(side="left", padx=4)
         self.ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side="right", padx=4)
 
 
