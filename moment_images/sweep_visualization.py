@@ -42,6 +42,11 @@ DEFAULT_FALLBACK_METRICS = (
 STAGE_ORDER = ("legacy", "stage1", "stage2", "metric_phase")
 SUCCESS_STATUSES = {"ok", "skipped_valid", "recomputed"}
 DEFAULT_REPORT_TOP_K = 6
+SENSITIVITY_MIN_GROUP_COUNT = 1
+SENSITIVITY_OLS_MIN_EXTRA_ROWS = 2
+EXTENSION_MIN_ABSOLUTE_EFFECT = 0.02
+EXTENSION_MIN_RELATIVE_EFFECT = 0.15
+EXTENSION_MAX_SUGGESTIONS = 8
 
 
 @dataclass
@@ -73,6 +78,7 @@ class CandidateVisualizationRow:
     displacement_field_metrics: Dict[str, float] = field(default_factory=dict)
     inter_view_consistency_metrics: Dict[str, float] = field(default_factory=dict)
     preview_paths: Dict[str, str] = field(default_factory=dict)
+    generation_id: Optional[str] = None
 
 
 @dataclass
@@ -121,6 +127,7 @@ class RunMetricRecord:
     metric_record_path: Optional[str]
     ranking_metric_name: Optional[str]
     ranking_metric_value: Optional[float]
+    generation_id: Optional[str] = None
 
 
 @dataclass
@@ -150,6 +157,8 @@ class SweepVisualizationModel:
     warnings: List[str]
     provenance: Dict[str, object]
     experiment_metadata: Dict[str, object]
+    generation_summary: Dict[str, object]
+    previous_generation_candidates: List[CandidateVisualizationRow]
     alpha_family_summary: List[Dict[str, object]]
     alpha_ranked_runs: List[Dict[str, object]]
     diagnostic_availability: Dict[str, object]
@@ -159,6 +168,65 @@ class SweepVisualizationModel:
     metric_tensor: np.ndarray
     parameter_numeric_matrix: np.ndarray
     parameter_text_matrix: np.ndarray
+
+
+@dataclass
+class ParameterValueEffect:
+    """Grouped target values for one parameter value."""
+
+    value: str
+    numeric_value: Optional[float]
+    count: int
+    mean_value: Optional[float]
+    min_value: Optional[float]
+    max_value: Optional[float]
+    candidate_ids: List[str]
+
+
+@dataclass
+class ParameterSensitivityRow:
+    """Impact summary for one parameter under one stage/dataset/value scope."""
+
+    rank: int
+    parameter_name: str
+    stage: str
+    dataset_scope: str
+    value_option: str
+    impact_score: float
+    best_value: Optional[str]
+    worst_value: Optional[str]
+    best_mean_value: Optional[float]
+    worst_mean_value: Optional[float]
+    num_values: int
+    num_rows: int
+    min_group_count: int
+    max_group_count: int
+    coverage_warning: Optional[str]
+    ols_delta_r2: Optional[float]
+    ols_status: str
+    previous_impact_score: Optional[float] = None
+    previous_best_value: Optional[str] = None
+    generation_delta: Optional[float] = None
+    value_effects: List[ParameterValueEffect] = field(default_factory=list)
+
+
+@dataclass
+class ExtensionSuggestion:
+    """Conservative recommendation for the next sweep extension."""
+
+    rank: int
+    rule_id: str
+    priority: int
+    stage: str
+    parameter_name: Optional[str]
+    dataset_scope: str
+    title: str
+    recommendation: str
+    evidence: str
+    confidence: str
+    related_values: List[str] = field(default_factory=list)
+    generation_id: Optional[str] = None
+    previous_generation_id: Optional[str] = None
 
 
 def _utc_now_iso() -> str:
@@ -210,6 +278,13 @@ def _coerce_float(value: object) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return numeric if math.isfinite(numeric) else None
+
+
+def _coerce_optional_str(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _compact_json(value: object) -> str:
@@ -404,6 +479,126 @@ def _normalize_alpha_summary_rows(
             ranked_runs.append(row)
 
     return summary_rows, ranked_runs
+
+
+def _generation_context_from_sources(
+    run_state: Optional[Dict[str, object]],
+    experiment_manifest: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    generations_raw: List[Dict[str, object]] = []
+    if isinstance(run_state, dict):
+        for item in cast(List[object], run_state.get("spec_generations", [])):
+            if isinstance(item, dict):
+                generations_raw.append(dict(item))
+
+    active_generation_id = None
+    if isinstance(run_state, dict):
+        active_generation_id = _coerce_optional_str(run_state.get("active_generation_id"))
+    if active_generation_id is None and isinstance(experiment_manifest, dict):
+        active_generation_id = _coerce_optional_str(experiment_manifest.get("generation_id"))
+    if active_generation_id is None and generations_raw:
+        active_generation_id = _coerce_optional_str(generations_raw[-1].get("generation_id"))
+
+    ordered_generation_ids = [
+        str(item.get("generation_id"))
+        for item in generations_raw
+        if _coerce_optional_str(item.get("generation_id")) is not None
+    ]
+    previous_generation_id = None
+    if active_generation_id and active_generation_id in ordered_generation_ids:
+        active_idx = ordered_generation_ids.index(active_generation_id)
+        if active_idx > 0:
+            previous_generation_id = ordered_generation_ids[active_idx - 1]
+    elif len(ordered_generation_ids) >= 2:
+        previous_generation_id = ordered_generation_ids[-2]
+
+    status_counts: Counter[str] = Counter()
+    generation_run_counts: Counter[str] = Counter()
+    stage_status_counts: Dict[str, Counter[str]] = {}
+    if isinstance(run_state, dict):
+        runs = cast(Dict[str, object], run_state.get("runs", {}))
+        for entry in runs.values():
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("status", "unknown") or "unknown")
+            stage = str(entry.get("stage", "unknown") or "unknown")
+            generation_id = _coerce_optional_str(entry.get("generation_id")) or "unknown"
+            status_counts[status] += 1
+            generation_run_counts[generation_id] += 1
+            stage_status_counts.setdefault(stage, Counter())[status] += 1
+
+    merge_history = []
+    if isinstance(run_state, dict):
+        merge_history = [
+            dict(item)
+            for item in cast(List[object], run_state.get("merge_history", []))
+            if isinstance(item, dict)
+        ]
+
+    return {
+        "active_generation_id": active_generation_id,
+        "previous_generation_id": previous_generation_id,
+        "spec_generations": generations_raw,
+        "ordered_generation_ids": ordered_generation_ids,
+        "run_status_counts": dict(status_counts),
+        "run_generation_counts": dict(generation_run_counts),
+        "stage_status_counts": {
+            stage: dict(counts) for stage, counts in stage_status_counts.items()
+        },
+        "merge_history": merge_history,
+    }
+
+
+def _load_generation_product_candidates(
+    *,
+    experiment_root: Path,
+    generation_id: Optional[str],
+    primary_metric: str,
+    warnings: List[str],
+) -> Tuple[List[CandidateVisualizationRow], List[str]]:
+    if not generation_id:
+        return [], []
+    products_dir = experiment_root / "generations" / generation_id / "products"
+    if not products_dir.exists():
+        return [], []
+
+    rows: List[CandidateVisualizationRow] = []
+    used_files: List[str] = []
+    locations = [
+        ("stage1", products_dir / "stage1_summary.json", products_dir),
+        ("stage2", products_dir / "stage2_summary.json", products_dir),
+        (
+            "metric_phase",
+            products_dir / "metric_experiments" / "metric_phase_summary.json",
+            products_dir / "metric_experiments",
+        ),
+    ]
+    for stage_name, summary_path, base_dir in locations:
+        payload, used_path = _read_json_optional(
+            summary_path,
+            validator=lambda obj: isinstance(obj, dict),
+            warnings=warnings,
+        )
+        if used_path is not None:
+            used_files.append(str(used_path))
+        if not isinstance(payload, dict):
+            continue
+        rankings = [
+            cast(Dict[str, object], item)
+            for item in cast(List[object], payload.get("rankings", []))
+            if isinstance(item, dict)
+        ]
+        for rank, ranking in enumerate(rankings, start=1):
+            rows.append(
+                _candidate_row_from_ranking(
+                    stage_name=stage_name,
+                    ranking=ranking,
+                    base_dir=base_dir,
+                    rank_fallback=rank,
+                    primary_metric=primary_metric,
+                )
+            )
+    return rows, used_files
 
 
 def _peek_workspace_keys(path: Optional[Path]) -> List[str]:
@@ -792,6 +987,7 @@ def _candidate_row_from_ranking(
         alpha=alpha,
         formulation_id=formulation_id,
         preview_paths=preview_paths,
+        generation_id=_coerce_optional_str(ranking.get("generation_id")),
     )
 
 
@@ -841,6 +1037,7 @@ def _candidate_row_from_legacy_record(
         alpha=alpha,
         formulation_id=formulation_id,
         preview_paths=preview_paths,
+        generation_id=_coerce_optional_str(record.get("generation_id")),
     )
 
 
@@ -1071,6 +1268,11 @@ def _build_run_metric_record(
             dataset_id,
             candidate_row.mean_runtime_seconds,
         )
+    generation_id = (
+        _coerce_optional_str(metric_record.get("generation_id"))
+        or _coerce_optional_str(run_lookup.get(run_name, {}).get("generation_id"))
+        or (candidate_row.generation_id if candidate_row is not None else None)
+    )
 
     return RunMetricRecord(
         row_id=f"{stage_name}:{candidate_id}:{dataset_id}",
@@ -1105,6 +1307,7 @@ def _build_run_metric_record(
         ),
         ranking_metric_name=ranking_metric_name,
         ranking_metric_value=ranking_metric_value,
+        generation_id=generation_id,
     )
 
 
@@ -1154,6 +1357,7 @@ def _merge_run_metric_record(
             if existing.ranking_metric_value is not None
             else incoming.ranking_metric_value
         ),
+        generation_id=existing.generation_id or incoming.generation_id,
     )
 
 
@@ -1258,6 +1462,10 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         cast(Optional[Dict[str, object]], experiment_manifest),
         cast(Optional[Dict[str, object]], run_state),
         scoring_weights,
+    )
+    generation_summary = _generation_context_from_sources(
+        cast(Optional[Dict[str, object]], run_state),
+        cast(Optional[Dict[str, object]], experiment_manifest),
     )
     configured_stage_mode = _resolve_configured_stage_mode(
         cast(Optional[Dict[str, object]], experiment_manifest),
@@ -1602,6 +1810,15 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         rows.sort(key=lambda row: (row.rank, row.candidate_id))
         ordered_candidate_rows.extend(rows)
 
+    previous_generation_candidates, previous_generation_files = _load_generation_product_candidates(
+        experiment_root=experiment_root,
+        generation_id=_coerce_optional_str(generation_summary.get("previous_generation_id")),
+        primary_metric=primary_metric,
+        warnings=warnings,
+    )
+    used_files.extend(previous_generation_files)
+    generation_summary["previous_generation_candidate_count"] = len(previous_generation_candidates)
+
     candidate_ids = [row.row_id for row in ordered_candidate_rows]
     dataset_index = {dataset_id: idx for idx, dataset_id in enumerate(datasets)}
     metric_index = {metric_name: idx for idx, metric_name in enumerate(metric_names)}
@@ -1691,6 +1908,8 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         "configured_stage_mode": configured_stage_mode,
         "primary_metric_source": primary_metric_source,
         "alpha_summary_source": alpha_summary_source,
+        "active_generation_id": generation_summary.get("active_generation_id"),
+        "previous_generation_id": generation_summary.get("previous_generation_id"),
     }
     experiment_metadata.update(
         {
@@ -1702,6 +1921,8 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
             "primary_stage_name": primary_stage_name,
             "primary_metric": primary_metric,
             "primary_metric_source": primary_metric_source,
+            "active_generation_id": generation_summary.get("active_generation_id"),
+            "previous_generation_id": generation_summary.get("previous_generation_id"),
         }
     )
 
@@ -1729,6 +1950,8 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         warnings=warnings,
         provenance=provenance,
         experiment_metadata=experiment_metadata,
+        generation_summary=generation_summary,
+        previous_generation_candidates=previous_generation_candidates,
         alpha_family_summary=alpha_family_summary,
         alpha_ranked_runs=alpha_ranked_runs,
         diagnostic_availability=diagnostic_availability,
@@ -2236,6 +2459,20 @@ def _stage_parameter_rankings(
     model: SweepVisualizationModel,
     stage_name: Optional[str] = None,
 ) -> List[str]:
+    sensitivity_rows = compute_parameter_sensitivity(
+        model,
+        stage_name=stage_name or model.primary_stage_name,
+        dataset_scope="aggregate",
+        value_option="score",
+        filters={},
+    )
+    sensitivity_order = [
+        row.parameter_name
+        for row in sensitivity_rows
+        if row.num_values > 1 and row.impact_score > 0
+    ]
+    if sensitivity_order:
+        return sensitivity_order
     rows = _rows_for_stage(model, stage_name or model.primary_stage_name)
     counts: List[Tuple[int, str]] = []
     for parameter_name in model.parameter_names:
@@ -2906,6 +3143,7 @@ def _candidate_row_to_export_dict(row: CandidateVisualizationRow) -> Dict[str, o
         "family": row.family,
         "alpha": row.alpha,
         "formulation_id": row.formulation_id,
+        "generation_id": row.generation_id,
         "displacement_field_metrics": row.displacement_field_metrics,
         "inter_view_consistency_metrics": row.inter_view_consistency_metrics,
         "preview_paths": row.preview_paths,
@@ -2923,6 +3161,7 @@ def _run_metric_record_to_export_dict(record: RunMetricRecord) -> Dict[str, obje
         "family": record.family,
         "alpha": record.alpha,
         "formulation_id": record.formulation_id,
+        "generation_id": record.generation_id,
         "params": record.params,
         "config": record.config,
         "score": record.score,
@@ -3033,6 +3272,748 @@ def _candidate_metric_value_for_dataset(
         metric_name = row.ranking_metric_name or primary_metric
         metric_value = row.dataset_scores.get(dataset_id)
     return metric_name, metric_value
+
+
+def _higher_is_better_value_option(value_option: str) -> bool:
+    return value_option != "mean_runtime_seconds"
+
+
+def _candidate_sensitivity_value(
+    model: SweepVisualizationModel,
+    row: CandidateVisualizationRow,
+    *,
+    dataset_scope: str,
+    value_option: str,
+) -> Optional[float]:
+    if value_option == "score":
+        return _candidate_score_for_dataset(row, dataset_scope, model.primary_metric)
+    if value_option == "mean_dataset_score":
+        return row.mean_dataset_score
+    if value_option == "mean_runtime_seconds":
+        return _candidate_runtime_for_dataset(row, dataset_scope)
+    if value_option.startswith("metric:"):
+        metric_name = value_option.split(":", 1)[1]
+        if dataset_scope == "aggregate":
+            return row.metric_means.get(metric_name)
+        return row.dataset_metrics.get(dataset_scope, {}).get(metric_name)
+    if value_option.startswith("displacement:"):
+        return row.displacement_field_metrics.get(value_option.split(":", 1)[1])
+    if value_option.startswith("consistency:"):
+        return row.inter_view_consistency_metrics.get(value_option.split(":", 1)[1])
+    return None
+
+
+def _parse_sensitivity_filters(
+    filters: Optional[Dict[str, object]],
+) -> Tuple[str, str, str, Dict[str, str]]:
+    payload = dict(filters or {})
+    strategy_filter = str(payload.pop("strategy", "All") or "All")
+    family_filter = str(payload.pop("family", "All") or "All")
+    alpha_filter = str(payload.pop("alpha", "All") or "All")
+    parameter_filters: Dict[str, str] = {}
+    nested = payload.pop("parameters", None)
+    if isinstance(nested, dict):
+        parameter_filters.update(
+            {
+                str(key): str(value)
+                for key, value in nested.items()
+                if str(value or "All") != "All"
+            }
+        )
+    for key, value in payload.items():
+        rendered = str(value or "All")
+        if rendered != "All":
+            parameter_filters[str(key)] = rendered
+    return strategy_filter, family_filter, alpha_filter, parameter_filters
+
+
+def _candidate_rows_for_sensitivity(
+    model: SweepVisualizationModel,
+    rows: Sequence[CandidateVisualizationRow],
+    *,
+    stage_name: Optional[str],
+    dataset_scope: str,
+    value_option: str,
+    filters: Optional[Dict[str, object]],
+) -> List[Tuple[CandidateVisualizationRow, float]]:
+    strategy_filter, family_filter, alpha_filter, parameter_filters = _parse_sensitivity_filters(filters)
+    target_stage = stage_name or model.primary_stage_name
+    filtered: List[Tuple[CandidateVisualizationRow, float]] = []
+    for row in rows:
+        if target_stage != "All" and row.stage != target_stage:
+            continue
+        if strategy_filter != "All" and row.strategy != strategy_filter:
+            continue
+        if family_filter != "All" and row.family != family_filter:
+            continue
+        if alpha_filter != "All" and _alpha_filter_value(row.alpha) != alpha_filter:
+            continue
+        filter_match = True
+        for parameter_name, expected_value in parameter_filters.items():
+            if _stringify_param(row.params.get(parameter_name)) != expected_value:
+                filter_match = False
+                break
+        if not filter_match:
+            continue
+        value = _candidate_sensitivity_value(
+            model,
+            row,
+            dataset_scope=dataset_scope,
+            value_option=value_option,
+        )
+        if value is None or not math.isfinite(value):
+            continue
+        filtered.append((row, float(value)))
+    return filtered
+
+
+def _ols_r2(design: np.ndarray, target: np.ndarray) -> Optional[float]:
+    if design.size == 0 or target.size == 0:
+        return None
+    centered = target - float(np.mean(target))
+    total = float(np.dot(centered, centered))
+    if math.isclose(total, 0.0):
+        return None
+    try:
+        coefficients, *_ = np.linalg.lstsq(design, target, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    residual = target - design @ coefficients
+    residual_sum = float(np.dot(residual, residual))
+    return max(0.0, min(1.0, 1.0 - residual_sum / total))
+
+
+def _ols_delta_r2_by_parameter(
+    rows_with_values: Sequence[Tuple[CandidateVisualizationRow, float]],
+    parameter_names: Sequence[str],
+) -> Tuple[Dict[str, Optional[float]], Dict[str, str]]:
+    result = {parameter_name: None for parameter_name in parameter_names}
+    statuses = {parameter_name: "insufficient" for parameter_name in parameter_names}
+    if len(rows_with_values) < 3:
+        return result, statuses
+
+    y = np.asarray([value for _, value in rows_with_values], dtype=np.float64)
+    if not np.any(np.isfinite(y)) or math.isclose(float(np.nanmin(y)), float(np.nanmax(y))):
+        return result, {parameter_name: "constant_target" for parameter_name in parameter_names}
+
+    feature_groups: Dict[str, np.ndarray] = {}
+    for parameter_name in parameter_names:
+        labels = [_stringify_param(row.params.get(parameter_name)) for row, _ in rows_with_values]
+        unique_labels = sorted(set(labels))
+        if len(unique_labels) < 2:
+            statuses[parameter_name] = "constant_parameter"
+            continue
+        numeric_values = np.asarray(
+            [_numeric_param(row.params.get(parameter_name)) for row, _ in rows_with_values],
+            dtype=np.float64,
+        )
+        if np.all(np.isfinite(numeric_values)) and len(set(numeric_values.tolist())) > 2:
+            std = float(np.std(numeric_values))
+            if math.isclose(std, 0.0):
+                statuses[parameter_name] = "constant_parameter"
+                continue
+            feature_groups[parameter_name] = ((numeric_values - float(np.mean(numeric_values))) / std).reshape(-1, 1)
+            continue
+        columns = []
+        for label in unique_labels[1:]:
+            columns.append(np.asarray([1.0 if item == label else 0.0 for item in labels], dtype=np.float64))
+        if columns:
+            feature_groups[parameter_name] = np.column_stack(columns)
+
+    active_groups = {name: matrix for name, matrix in feature_groups.items() if matrix.size > 0}
+    if not active_groups:
+        return result, statuses
+    matrices = list(active_groups.values())
+    full_feature_matrix = np.column_stack(matrices)
+    full_design = np.column_stack([np.ones(len(rows_with_values), dtype=np.float64), full_feature_matrix])
+    if len(rows_with_values) < full_design.shape[1] + SENSITIVITY_OLS_MIN_EXTRA_ROWS:
+        return result, statuses
+
+    full_r2 = _ols_r2(full_design, y)
+    if full_r2 is None:
+        return result, statuses
+
+    for parameter_name, matrix in active_groups.items():
+        reduced_matrices = [
+            other_matrix
+            for other_name, other_matrix in active_groups.items()
+            if other_name != parameter_name
+        ]
+        if reduced_matrices:
+            reduced_design = np.column_stack(
+                [np.ones(len(rows_with_values), dtype=np.float64), *reduced_matrices]
+            )
+        else:
+            reduced_design = np.ones((len(rows_with_values), 1), dtype=np.float64)
+        reduced_r2 = _ols_r2(reduced_design, y)
+        if reduced_r2 is None:
+            reduced_r2 = 0.0
+        result[parameter_name] = max(0.0, float(full_r2 - reduced_r2))
+        statuses[parameter_name] = "ok"
+    return result, statuses
+
+
+def _compute_parameter_sensitivity_for_rows(
+    model: SweepVisualizationModel,
+    rows: Sequence[CandidateVisualizationRow],
+    *,
+    stage_name: Optional[str],
+    dataset_scope: str,
+    value_option: str,
+    filters: Optional[Dict[str, object]],
+    previous_rows: Sequence[CandidateVisualizationRow] = (),
+    attach_previous: bool = True,
+) -> List[ParameterSensitivityRow]:
+    target_stage = stage_name or model.primary_stage_name
+    rows_with_values = _candidate_rows_for_sensitivity(
+        model,
+        rows,
+        stage_name=target_stage,
+        dataset_scope=dataset_scope,
+        value_option=value_option,
+        filters=filters,
+    )
+    parameter_names = [
+        parameter_name
+        for parameter_name in model.parameter_names
+        if any(parameter_name in row.params for row, _ in rows_with_values)
+    ]
+    ols_values, ols_statuses = _ols_delta_r2_by_parameter(rows_with_values, parameter_names)
+
+    previous_lookup: Dict[str, ParameterSensitivityRow] = {}
+    if attach_previous and previous_rows:
+        previous_rows_result = _compute_parameter_sensitivity_for_rows(
+            model,
+            previous_rows,
+            stage_name=target_stage,
+            dataset_scope=dataset_scope,
+            value_option=value_option,
+            filters=filters,
+            previous_rows=(),
+            attach_previous=False,
+        )
+        previous_lookup = {row.parameter_name: row for row in previous_rows_result}
+
+    higher_is_better = _higher_is_better_value_option(value_option)
+    sensitivity_rows: List[ParameterSensitivityRow] = []
+    for parameter_name in parameter_names:
+        grouped: Dict[str, List[Tuple[CandidateVisualizationRow, float]]] = {}
+        numeric_by_label: Dict[str, float] = {}
+        for row, value in rows_with_values:
+            if parameter_name not in row.params:
+                continue
+            label = _stringify_param(row.params.get(parameter_name))
+            grouped.setdefault(label, []).append((row, value))
+            numeric_by_label[label] = _numeric_param(row.params.get(parameter_name))
+        if not grouped:
+            continue
+
+        effects: List[ParameterValueEffect] = []
+        for label, group_rows in grouped.items():
+            values = [value for _, value in group_rows if math.isfinite(value)]
+            if not values:
+                continue
+            effects.append(
+                ParameterValueEffect(
+                    value=label,
+                    numeric_value=(
+                        float(numeric_by_label[label])
+                        if math.isfinite(numeric_by_label.get(label, float("nan")))
+                        else None
+                    ),
+                    count=len(values),
+                    mean_value=float(np.mean(values)),
+                    min_value=float(np.min(values)),
+                    max_value=float(np.max(values)),
+                    candidate_ids=sorted({row.candidate_id for row, _ in group_rows}),
+                )
+            )
+        if not effects:
+            continue
+
+        means = [effect.mean_value for effect in effects if effect.mean_value is not None]
+        num_values = len(effects)
+        min_count = min(effect.count for effect in effects)
+        max_count = max(effect.count for effect in effects)
+        coverage_warning = None
+        if num_values < 2:
+            coverage_warning = "only one finite parameter value"
+            impact_score = 0.0
+        elif min_count <= SENSITIVITY_MIN_GROUP_COUNT:
+            coverage_warning = f"sparse value coverage; minimum group count is {min_count}"
+            impact_score = float(max(means) - min(means))
+        else:
+            impact_score = float(max(means) - min(means))
+
+        ranked_effects = sorted(
+            effects,
+            key=lambda effect: (
+                effect.mean_value if effect.mean_value is not None else float("-inf")
+            ),
+            reverse=higher_is_better,
+        )
+        best_effect = ranked_effects[0] if ranked_effects else None
+        worst_effect = ranked_effects[-1] if ranked_effects else None
+        previous = previous_lookup.get(parameter_name)
+        sensitivity_rows.append(
+            ParameterSensitivityRow(
+                rank=0,
+                parameter_name=parameter_name,
+                stage=target_stage,
+                dataset_scope=dataset_scope,
+                value_option=value_option,
+                impact_score=impact_score,
+                best_value=None if best_effect is None else best_effect.value,
+                worst_value=None if worst_effect is None else worst_effect.value,
+                best_mean_value=None if best_effect is None else best_effect.mean_value,
+                worst_mean_value=None if worst_effect is None else worst_effect.mean_value,
+                num_values=num_values,
+                num_rows=sum(effect.count for effect in effects),
+                min_group_count=min_count,
+                max_group_count=max_count,
+                coverage_warning=coverage_warning,
+                ols_delta_r2=ols_values.get(parameter_name),
+                ols_status=ols_statuses.get(parameter_name, "insufficient"),
+                previous_impact_score=None if previous is None else previous.impact_score,
+                previous_best_value=None if previous is None else previous.best_value,
+                generation_delta=(
+                    None
+                    if previous is None
+                    else float(impact_score - previous.impact_score)
+                ),
+                value_effects=sorted(
+                    effects,
+                    key=lambda effect: (
+                        effect.numeric_value is None,
+                        effect.numeric_value if effect.numeric_value is not None else 0.0,
+                        effect.value,
+                    ),
+                ),
+            )
+        )
+
+    sensitivity_rows.sort(
+        key=lambda row: (
+            -row.impact_score,
+            -(row.ols_delta_r2 if row.ols_delta_r2 is not None else -1.0),
+            row.parameter_name,
+        )
+    )
+    for rank, row in enumerate(sensitivity_rows, start=1):
+        row.rank = rank
+    return sensitivity_rows
+
+
+def compute_parameter_sensitivity(
+    model: SweepVisualizationModel,
+    stage_name: Optional[str] = None,
+    dataset_scope: str = "aggregate",
+    value_option: str = "score",
+    filters: Optional[Dict[str, object]] = None,
+) -> List[ParameterSensitivityRow]:
+    """Rank parameters by grouped value impact for a stage and dataset scope."""
+
+    return _compute_parameter_sensitivity_for_rows(
+        model,
+        model.candidates,
+        stage_name=stage_name or model.primary_stage_name,
+        dataset_scope=dataset_scope,
+        value_option=value_option,
+        filters=filters,
+        previous_rows=model.previous_generation_candidates,
+        attach_previous=True,
+    )
+
+
+def _stage_score_span(model: SweepVisualizationModel, stage_name: str) -> float:
+    values = [
+        float(row.score)
+        for row in _rows_for_stage(model, stage_name)
+        if row.score is not None and math.isfinite(row.score)
+    ]
+    if not values:
+        return 0.0
+    return float(max(values) - min(values))
+
+
+def _suggestion_effect_threshold(model: SweepVisualizationModel, stage_name: str) -> float:
+    return max(
+        EXTENSION_MIN_ABSOLUTE_EFFECT,
+        EXTENSION_MIN_RELATIVE_EFFECT * _stage_score_span(model, stage_name),
+    )
+
+
+def _numeric_effects(row: ParameterSensitivityRow) -> List[ParameterValueEffect]:
+    return [
+        effect
+        for effect in row.value_effects
+        if effect.numeric_value is not None and math.isfinite(effect.numeric_value)
+    ]
+
+
+def generate_next_extension_suggestions(
+    model: SweepVisualizationModel,
+    sensitivity_rows: Sequence[ParameterSensitivityRow],
+) -> List[ExtensionSuggestion]:
+    """Generate conservative next-sweep recommendations from sensitivity results."""
+
+    active_generation_id = _coerce_optional_str(model.generation_summary.get("active_generation_id"))
+    previous_generation_id = _coerce_optional_str(model.generation_summary.get("previous_generation_id"))
+    suggestions: List[ExtensionSuggestion] = []
+    primary_rows = [
+        row
+        for row in sensitivity_rows
+        if row.value_option == "score"
+        and row.dataset_scope == "aggregate"
+        and row.num_values >= 2
+    ]
+    if not primary_rows:
+        return [
+            ExtensionSuggestion(
+                rank=1,
+                rule_id="no_high_confidence",
+                priority=999,
+                stage=model.primary_stage_name,
+                parameter_name=None,
+                dataset_scope="aggregate",
+                title="No high-confidence extension suggestion",
+                recommendation="Collect more successful ranked candidates before extending the search space.",
+                evidence="No aggregate score sensitivity rows with at least two parameter values were available.",
+                confidence="low",
+                generation_id=active_generation_id,
+                previous_generation_id=previous_generation_id,
+            )
+        ]
+
+    by_parameter = {row.parameter_name: row for row in primary_rows}
+    for row in primary_rows:
+        threshold = _suggestion_effect_threshold(model, row.stage)
+        if row.impact_score < threshold:
+            continue
+        numeric_effects = _numeric_effects(row)
+        if numeric_effects and row.best_value is not None:
+            numeric_values = [cast(float, effect.numeric_value) for effect in numeric_effects]
+            best_effect = next((effect for effect in numeric_effects if effect.value == row.best_value), None)
+            if best_effect is not None and best_effect.numeric_value is not None:
+                min_numeric = min(numeric_values)
+                max_numeric = max(numeric_values)
+                if math.isclose(best_effect.numeric_value, max_numeric):
+                    suggestions.append(
+                        ExtensionSuggestion(
+                            rank=0,
+                            rule_id="boundary_winner",
+                            priority=10,
+                            stage=row.stage,
+                            parameter_name=row.parameter_name,
+                            dataset_scope="aggregate",
+                            title=f"Extend {row.parameter_name} upward",
+                            recommendation=(
+                                f"Add values above {row.best_value} for {row.parameter_name}; "
+                                "the best observed value is at the upper boundary."
+                            ),
+                            evidence=(
+                                f"Aggregate score changes by {_format_float(row.impact_score)} across "
+                                f"{row.num_values} values; best={row.best_value}, worst={row.worst_value}."
+                            ),
+                            confidence="high",
+                            related_values=[effect.value for effect in numeric_effects],
+                            generation_id=active_generation_id,
+                            previous_generation_id=previous_generation_id,
+                        )
+                    )
+                elif math.isclose(best_effect.numeric_value, min_numeric):
+                    suggestions.append(
+                        ExtensionSuggestion(
+                            rank=0,
+                            rule_id="boundary_winner",
+                            priority=10,
+                            stage=row.stage,
+                            parameter_name=row.parameter_name,
+                            dataset_scope="aggregate",
+                            title=f"Extend {row.parameter_name} downward",
+                            recommendation=(
+                                f"Add values below {row.best_value} for {row.parameter_name}; "
+                                "the best observed value is at the lower boundary."
+                            ),
+                            evidence=(
+                                f"Aggregate score changes by {_format_float(row.impact_score)} across "
+                                f"{row.num_values} values; best={row.best_value}, worst={row.worst_value}."
+                            ),
+                            confidence="high",
+                            related_values=[effect.value for effect in numeric_effects],
+                            generation_id=active_generation_id,
+                            previous_generation_id=previous_generation_id,
+                        )
+                    )
+                elif row.num_values >= 3:
+                    suggestions.append(
+                        ExtensionSuggestion(
+                            rank=0,
+                            rule_id="densify_interior",
+                            priority=30,
+                            stage=row.stage,
+                            parameter_name=row.parameter_name,
+                            dataset_scope="aggregate",
+                            title=f"Densify around {row.parameter_name}={row.best_value}",
+                            recommendation=(
+                                f"Add intermediate values around {row.best_value} for {row.parameter_name}; "
+                                "the best observed value is interior and the parameter is impactful."
+                            ),
+                            evidence=(
+                                f"Aggregate score changes by {_format_float(row.impact_score)} across "
+                                f"{row.num_values} values."
+                            ),
+                            confidence="medium",
+                            related_values=[effect.value for effect in numeric_effects],
+                            generation_id=active_generation_id,
+                            previous_generation_id=previous_generation_id,
+                        )
+                    )
+        if row.min_group_count <= SENSITIVITY_MIN_GROUP_COUNT:
+            suggestions.append(
+                ExtensionSuggestion(
+                    rank=0,
+                    rule_id="sparse_high_impact",
+                    priority=40,
+                    stage=row.stage,
+                    parameter_name=row.parameter_name,
+                    dataset_scope="aggregate",
+                    title=f"Confirm sparse {row.parameter_name} effect",
+                    recommendation=(
+                        f"Repeat or add nearby values for {row.parameter_name}; at least one value group "
+                        "has very low coverage but the apparent effect is large."
+                    ),
+                    evidence=(
+                        f"Minimum group count is {row.min_group_count}; aggregate score impact is "
+                        f"{_format_float(row.impact_score)}."
+                    ),
+                    confidence="medium",
+                    related_values=[effect.value for effect in row.value_effects],
+                    generation_id=active_generation_id,
+                    previous_generation_id=previous_generation_id,
+                )
+            )
+        if (
+            row.previous_impact_score is not None
+            and row.previous_best_value is not None
+            and row.best_value is not None
+            and row.best_value != row.previous_best_value
+        ):
+            suggestions.append(
+                ExtensionSuggestion(
+                    rank=0,
+                    rule_id="extension_delta",
+                    priority=25,
+                    stage=row.stage,
+                    parameter_name=row.parameter_name,
+                    dataset_scope="aggregate",
+                    title=f"Recheck new {row.parameter_name} winner",
+                    recommendation=(
+                        f"Explore around {row.best_value}; the active generation changed the best "
+                        f"{row.parameter_name} value from {row.previous_best_value}."
+                    ),
+                    evidence=(
+                        f"Impact changed by {_format_float(row.generation_delta)} versus the previous generation."
+                    ),
+                    confidence="medium",
+                    related_values=[row.previous_best_value, row.best_value],
+                    generation_id=active_generation_id,
+                    previous_generation_id=previous_generation_id,
+                )
+            )
+
+    suggestion_stage = primary_rows[0].stage if primary_rows else model.primary_stage_name
+    dataset_rows_by_parameter: Dict[str, Dict[str, ParameterSensitivityRow]] = {}
+    for dataset_id in model.datasets:
+        dataset_rows = compute_parameter_sensitivity(
+            model,
+            stage_name=suggestion_stage,
+            dataset_scope=dataset_id,
+            value_option="score",
+            filters={},
+        )
+        for row in dataset_rows:
+            if row.parameter_name in by_parameter:
+                dataset_rows_by_parameter.setdefault(row.parameter_name, {})[dataset_id] = row
+    for parameter_name, dataset_rows in dataset_rows_by_parameter.items():
+        aggregate = by_parameter[parameter_name]
+        if aggregate.impact_score < _suggestion_effect_threshold(model, aggregate.stage):
+            continue
+        best_by_dataset = {
+            dataset_id: row.best_value
+            for dataset_id, row in dataset_rows.items()
+            if row.best_value is not None and row.num_values >= 2
+        }
+        distinct_best = sorted({value for value in best_by_dataset.values() if value is not None})
+        if len(distinct_best) < 2:
+            continue
+        evidence = ", ".join(
+            f"{dataset_id}->{value}"
+            for dataset_id, value in sorted(best_by_dataset.items(), key=lambda item: item[0])
+        )
+        suggestions.append(
+            ExtensionSuggestion(
+                rank=0,
+                rule_id="dataset_disagreement",
+                priority=20,
+                stage=aggregate.stage,
+                parameter_name=parameter_name,
+                dataset_scope="per_dataset",
+                title=f"Resolve dataset disagreement for {parameter_name}",
+                recommendation=(
+                    f"Add values around the competing {parameter_name} optima or add representative datasets; "
+                    "different datasets prefer different values."
+                ),
+                evidence=evidence,
+                confidence="medium",
+                related_values=distinct_best,
+                generation_id=active_generation_id,
+                previous_generation_id=previous_generation_id,
+            )
+        )
+
+    if not suggestions:
+        suggestions.append(
+            ExtensionSuggestion(
+                rank=1,
+                rule_id="no_high_confidence",
+                priority=999,
+                stage=model.primary_stage_name,
+                parameter_name=None,
+                dataset_scope="aggregate",
+                title="No high-confidence extension suggestion",
+                recommendation=(
+                    "Keep the current search space or collect more candidates before extending; "
+                    "no parameter crossed the conservative effect thresholds."
+                ),
+                evidence="All aggregate score effects were below the configured threshold or lacked coverage.",
+                confidence="low",
+                generation_id=active_generation_id,
+                previous_generation_id=previous_generation_id,
+            )
+        )
+
+    suggestions.sort(key=lambda item: (item.priority, item.parameter_name or "", item.rule_id))
+    unique: List[ExtensionSuggestion] = []
+    seen = set()
+    for suggestion in suggestions:
+        key = (suggestion.rule_id, suggestion.parameter_name, suggestion.recommendation)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(suggestion)
+        if len(unique) >= EXTENSION_MAX_SUGGESTIONS:
+            break
+    for rank, suggestion in enumerate(unique, start=1):
+        suggestion.rank = rank
+    return unique
+
+
+def _parameter_value_effect_to_export_dict(effect: ParameterValueEffect) -> Dict[str, object]:
+    return {
+        "value": effect.value,
+        "numeric_value": effect.numeric_value,
+        "count": effect.count,
+        "mean_value": effect.mean_value,
+        "min_value": effect.min_value,
+        "max_value": effect.max_value,
+        "candidate_ids": effect.candidate_ids,
+    }
+
+
+def _parameter_sensitivity_to_export_dict(row: ParameterSensitivityRow) -> Dict[str, object]:
+    return {
+        "rank": row.rank,
+        "parameter_name": row.parameter_name,
+        "stage": row.stage,
+        "dataset_scope": row.dataset_scope,
+        "value_option": row.value_option,
+        "impact_score": row.impact_score,
+        "best_value": row.best_value,
+        "worst_value": row.worst_value,
+        "best_mean_value": row.best_mean_value,
+        "worst_mean_value": row.worst_mean_value,
+        "num_values": row.num_values,
+        "num_rows": row.num_rows,
+        "min_group_count": row.min_group_count,
+        "max_group_count": row.max_group_count,
+        "coverage_warning": row.coverage_warning,
+        "ols_delta_r2": row.ols_delta_r2,
+        "ols_status": row.ols_status,
+        "previous_impact_score": row.previous_impact_score,
+        "previous_best_value": row.previous_best_value,
+        "generation_delta": row.generation_delta,
+        "value_effects": [
+            _parameter_value_effect_to_export_dict(effect)
+            for effect in row.value_effects
+        ],
+    }
+
+
+def _extension_suggestion_to_export_dict(suggestion: ExtensionSuggestion) -> Dict[str, object]:
+    return {
+        "rank": suggestion.rank,
+        "rule_id": suggestion.rule_id,
+        "priority": suggestion.priority,
+        "stage": suggestion.stage,
+        "parameter_name": suggestion.parameter_name,
+        "dataset_scope": suggestion.dataset_scope,
+        "title": suggestion.title,
+        "recommendation": suggestion.recommendation,
+        "evidence": suggestion.evidence,
+        "confidence": suggestion.confidence,
+        "related_values": suggestion.related_values,
+        "generation_id": suggestion.generation_id,
+        "previous_generation_id": suggestion.previous_generation_id,
+    }
+
+
+def create_parameter_sensitivity_figure(
+    model: SweepVisualizationModel,
+    sensitivity_rows: Optional[Sequence[ParameterSensitivityRow]] = None,
+    *,
+    stage_name: Optional[str] = None,
+    dataset_scope: str = "aggregate",
+    value_option: str = "score",
+    filters: Optional[Dict[str, object]] = None,
+    top_n: int = 8,
+) -> Figure:
+    rows = list(
+        sensitivity_rows
+        if sensitivity_rows is not None
+        else compute_parameter_sensitivity(
+            model,
+            stage_name=stage_name or model.primary_stage_name,
+            dataset_scope=dataset_scope,
+            value_option=value_option,
+            filters=filters,
+        )
+    )
+    rows = rows[: max(1, top_n)]
+    fig = Figure(figsize=(11, max(4, 0.45 * max(1, len(rows)) + 2.5)))
+    ax = fig.add_subplot(111)
+    if not rows:
+        ax.text(0.5, 0.5, "No parameter sensitivity data available.", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
+    labels = [row.parameter_name for row in rows]
+    y_positions = np.arange(len(rows))
+    impacts = np.asarray([row.impact_score for row in rows], dtype=np.float64)
+    ax.barh(y_positions, impacts, color="#2a6f97")
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("grouped mean delta")
+    ax.set_title(f"{rows[0].stage}: {rows[0].dataset_scope} {rows[0].value_option} sensitivity")
+    ax.grid(True, axis="x", linestyle=":", alpha=0.4)
+    for idx, row in enumerate(rows):
+        detail = f"{row.best_value} vs {row.worst_value}"
+        if row.ols_delta_r2 is not None:
+            detail += f" | dR2={row.ols_delta_r2:.3f}"
+        ax.text(row.impact_score, idx, f"  {detail}", va="center", fontsize=8)
+    fig.tight_layout()
+    return fig
 
 
 def _find_run_metric_record(
@@ -3416,6 +4397,7 @@ def _candidate_csv_rows(model: SweepVisualizationModel) -> List[Dict[str, object
             "family": row.family,
             "alpha": row.alpha,
             "formulation_id": row.formulation_id,
+            "generation_id": row.generation_id,
             "missing_datasets": "|".join(row.missing_datasets),
             "dataset_scores_json": _compact_json(row.dataset_scores),
             "dataset_runtimes_json": _compact_json(row.dataset_runtimes),
@@ -3438,6 +4420,7 @@ def _run_metric_csv_rows(model: SweepVisualizationModel) -> List[Dict[str, objec
             "family": record.family,
             "alpha": record.alpha,
             "formulation_id": record.formulation_id,
+            "generation_id": record.generation_id,
             "score": record.score,
             "mean_dataset_score": record.mean_dataset_score,
             "mean_runtime_seconds": record.mean_runtime_seconds,
@@ -3458,6 +4441,39 @@ def _run_metric_csv_rows(model: SweepVisualizationModel) -> List[Dict[str, objec
     ]
 
 
+def _parameter_sensitivity_csv_rows(
+    rows: Sequence[ParameterSensitivityRow],
+) -> List[Dict[str, object]]:
+    return [
+        {
+            "rank": row.rank,
+            "stage": row.stage,
+            "dataset_scope": row.dataset_scope,
+            "value_option": row.value_option,
+            "parameter_name": row.parameter_name,
+            "impact_score": row.impact_score,
+            "best_value": row.best_value,
+            "best_mean_value": row.best_mean_value,
+            "worst_value": row.worst_value,
+            "worst_mean_value": row.worst_mean_value,
+            "num_values": row.num_values,
+            "num_rows": row.num_rows,
+            "min_group_count": row.min_group_count,
+            "max_group_count": row.max_group_count,
+            "coverage_warning": row.coverage_warning,
+            "ols_delta_r2": row.ols_delta_r2,
+            "ols_status": row.ols_status,
+            "previous_impact_score": row.previous_impact_score,
+            "previous_best_value": row.previous_best_value,
+            "generation_delta": row.generation_delta,
+            "value_effects_json": _compact_json(
+                [_parameter_value_effect_to_export_dict(effect) for effect in row.value_effects]
+            ),
+        }
+        for row in rows
+    ]
+
+
 def _write_candidate_leaderboard_csv(model: SweepVisualizationModel, path: Path) -> None:
     write_csv_atomic(
         path,
@@ -3475,6 +4491,7 @@ def _write_candidate_leaderboard_csv(model: SweepVisualizationModel, path: Path)
             "family",
             "alpha",
             "formulation_id",
+            "generation_id",
             "missing_datasets",
             "dataset_scores_json",
             "dataset_runtimes_json",
@@ -3499,6 +4516,7 @@ def _write_run_metric_records_csv(model: SweepVisualizationModel, path: Path) ->
             "family",
             "alpha",
             "formulation_id",
+            "generation_id",
             "score",
             "mean_dataset_score",
             "mean_runtime_seconds",
@@ -3514,6 +4532,40 @@ def _write_run_metric_records_csv(model: SweepVisualizationModel, path: Path) ->
             "metric_record_path",
         ],
         _run_metric_csv_rows(model),
+        create_backup=True,
+    )
+
+
+def _write_parameter_sensitivity_csv(
+    rows: Sequence[ParameterSensitivityRow],
+    path: Path,
+) -> None:
+    write_csv_atomic(
+        path,
+        [
+            "rank",
+            "stage",
+            "dataset_scope",
+            "value_option",
+            "parameter_name",
+            "impact_score",
+            "best_value",
+            "best_mean_value",
+            "worst_value",
+            "worst_mean_value",
+            "num_values",
+            "num_rows",
+            "min_group_count",
+            "max_group_count",
+            "coverage_warning",
+            "ols_delta_r2",
+            "ols_status",
+            "previous_impact_score",
+            "previous_best_value",
+            "generation_delta",
+            "value_effects_json",
+        ],
+        _parameter_sensitivity_csv_rows(rows),
         create_backup=True,
     )
 
@@ -3563,10 +4615,13 @@ def _build_report_html(
     report_top_k: int,
     default_component: str,
     table_files: Sequence[str],
+    data_files: Sequence[str],
     report_assets: Sequence[str],
     report_context_path: str,
     dataset_assets: Dict[str, Dict[str, object]],
     robustness_asset: Optional[str],
+    parameter_sensitivity_rows: Sequence[ParameterSensitivityRow],
+    extension_suggestions: Sequence[ExtensionSuggestion],
 ) -> str:
     top_table = _html_table(
         ["rank", "candidate", "strategy", "score", "mean score", "runtime (s)", "family", "alpha"],
@@ -3582,6 +4637,34 @@ def _build_report_html(
                 "n/a" if row.alpha is None else f"{row.alpha:g}",
             ]
             for row in top_rows
+        ],
+    )
+    sensitivity_table = _html_table(
+        ["rank", "parameter", "impact", "best", "worst", "ols dR2", "warning"],
+        [
+            [
+                str(row.rank),
+                row.parameter_name,
+                _format_float(row.impact_score),
+                f"{row.best_value or 'n/a'} ({_format_float(row.best_mean_value)})",
+                f"{row.worst_value or 'n/a'} ({_format_float(row.worst_mean_value)})",
+                _format_float(row.ols_delta_r2),
+                row.coverage_warning or "",
+            ]
+            for row in parameter_sensitivity_rows[:8]
+        ],
+    )
+    suggestions_table = _html_table(
+        ["rank", "suggestion", "parameter", "confidence", "evidence"],
+        [
+            [
+                str(suggestion.rank),
+                suggestion.recommendation,
+                suggestion.parameter_name or "n/a",
+                suggestion.confidence,
+                suggestion.evidence,
+            ]
+            for suggestion in extension_suggestions[:8]
         ],
     )
     summary_image_html = "".join(
@@ -3622,6 +4705,7 @@ def _build_report_html(
         f'<li><a href="{html.escape(path)}">{html.escape(path)}</a></li>'
         for path in [
             *table_files,
+            *data_files,
             report_context_path,
             "visualization_bundle.npz",
             "visualization_bundle.mat",
@@ -3675,6 +4759,16 @@ def _build_report_html(
   </section>
 
   <section>
+    <h2>Parameter Sensitivity</h2>
+    {sensitivity_table}
+  </section>
+
+  <section>
+    <h2>Next Extension Suggestions</h2>
+    {suggestions_table}
+  </section>
+
+  <section>
     <h2>Summary Figures</h2>
     <div class="grid">{summary_image_html}{robustness_html}</div>
   </section>
@@ -3711,11 +4805,29 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
     report_stage = model.primary_stage_name
     default_component = _default_component_name(model)
     top_rows = _top_candidates_for_stage(model, report_stage, limit=DEFAULT_REPORT_TOP_K)
+    parameter_sensitivity_rows = compute_parameter_sensitivity(
+        model,
+        stage_name=report_stage,
+        dataset_scope="aggregate",
+        value_option="score",
+        filters={},
+    )
+    extension_suggestions = generate_next_extension_suggestions(
+        model,
+        parameter_sensitivity_rows,
+    )
     plots: Dict[str, Figure] = {
         "overview.png": create_overview_figure(model),
         "coverage.png": create_coverage_figure(model),
         "progression.png": create_progression_figure(model),
         "significance.png": create_significance_figure(model),
+        "sensitivity.png": create_parameter_sensitivity_figure(
+            model,
+            parameter_sensitivity_rows,
+            stage_name=report_stage,
+            dataset_scope="aggregate",
+            value_option="score",
+        ),
     }
     if effects_x is not None:
         plots["effects_trend.png"] = create_effects_figure(
@@ -3825,9 +4937,28 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
     table_files = [
         "tables/candidate_leaderboard.csv",
         "tables/run_metric_records.csv",
+        "tables/parameter_sensitivity.csv",
     ]
     _write_candidate_leaderboard_csv(model, export_dir / table_files[0])
     _write_run_metric_records_csv(model, export_dir / table_files[1])
+    _write_parameter_sensitivity_csv(parameter_sensitivity_rows, export_dir / table_files[2])
+
+    parameter_sensitivity_rel = "data/parameter_sensitivity.json"
+    next_extension_suggestions_rel = "data/next_extension_suggestions.json"
+    write_json_atomic(
+        export_dir / parameter_sensitivity_rel,
+        [_parameter_sensitivity_to_export_dict(row) for row in parameter_sensitivity_rows],
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+    write_json_atomic(
+        export_dir / next_extension_suggestions_rel,
+        [_extension_suggestion_to_export_dict(suggestion) for suggestion in extension_suggestions],
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
 
     report_context = {
         "generated_at": _utc_now_iso(),
@@ -3837,8 +4968,17 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
         "summary_images": [*plot_files, topk_overview_rel],
         "report_assets": report_assets,
         "table_files": table_files,
+        "data_files": [parameter_sensitivity_rel, next_extension_suggestions_rel],
         "top_candidates": [_candidate_row_to_export_dict(row) for row in top_rows],
+        "parameter_sensitivity": [
+            _parameter_sensitivity_to_export_dict(row) for row in parameter_sensitivity_rows
+        ],
+        "next_extension_suggestions": [
+            _extension_suggestion_to_export_dict(suggestion)
+            for suggestion in extension_suggestions
+        ],
         "dataset_assets": dataset_assets,
+        "generation_summary": model.generation_summary,
         "warnings": model.warnings,
     }
     report_context_rel = "data/report_context.json"
@@ -3859,10 +4999,13 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
             report_top_k=DEFAULT_REPORT_TOP_K,
             default_component=default_component,
             table_files=table_files,
+            data_files=[parameter_sensitivity_rel, next_extension_suggestions_rel],
             report_assets=report_assets,
             report_context_path=report_context_rel,
             dataset_assets=dataset_assets,
             robustness_asset=robustness_rel,
+            parameter_sensitivity_rows=parameter_sensitivity_rows,
+            extension_suggestions=extension_suggestions,
         ),
         encoding="utf-8",
     )
@@ -3874,6 +5017,10 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
         "candidate_stages": np.asarray([row.stage for row in model.candidates], dtype=object),
         "candidate_strategies": np.asarray([row.strategy for row in model.candidates], dtype=object),
         "candidate_ranks": np.asarray([row.rank for row in model.candidates], dtype=np.int32),
+        "candidate_generation_ids": np.asarray(
+            [row.generation_id or "" for row in model.candidates],
+            dtype=object,
+        ),
         "candidate_scores": np.asarray(
             [row.score if row.score is not None else np.nan for row in model.candidates],
             dtype=np.float64,
@@ -3941,10 +5088,25 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
             [_compact_json(_run_metric_record_to_export_dict(record)) for record in model.run_metric_records],
             dtype=object,
         ),
+        "parameter_sensitivity_json": np.asarray(
+            [_compact_json(_parameter_sensitivity_to_export_dict(row)) for row in parameter_sensitivity_rows],
+            dtype=object,
+        ),
+        "next_extension_suggestions_json": np.asarray(
+            [
+                _compact_json(_extension_suggestion_to_export_dict(suggestion))
+                for suggestion in extension_suggestions
+            ],
+            dtype=object,
+        ),
         "warnings": np.asarray(model.warnings, dtype=object),
         "provenance_json": np.asarray(_compact_json(model.provenance), dtype=object),
         "experiment_metadata_json": np.asarray(
             _compact_json(model.experiment_metadata),
+            dtype=object,
+        ),
+        "generation_summary_json": np.asarray(
+            _compact_json(model.generation_summary),
             dtype=object,
         ),
         "diagnostic_availability_json": np.asarray(
@@ -3970,7 +5132,10 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
         "report_top_k": DEFAULT_REPORT_TOP_K,
         "default_component": default_component,
         "table_files": table_files,
+        "data_files": [parameter_sensitivity_rel, next_extension_suggestions_rel, report_context_rel],
         "report_assets": report_assets,
+        "active_generation_id": model.generation_summary.get("active_generation_id"),
+        "previous_generation_id": model.generation_summary.get("previous_generation_id"),
     }
     write_json_atomic(
         export_dir / "visualization_manifest.json",
@@ -3993,6 +5158,8 @@ def _format_overview_text(model: SweepVisualizationModel) -> str:
         f"primary stage: {model.primary_stage_name}",
         f"primary metric: {model.primary_metric} ({model.primary_metric_source})",
         f"run metric records: {len(model.run_metric_records)}",
+        f"active generation: {model.generation_summary.get('active_generation_id') or 'n/a'}",
+        f"previous generation: {model.generation_summary.get('previous_generation_id') or 'n/a'}",
         "",
         "stages:",
     ]
@@ -4179,6 +5346,52 @@ def _format_metric_diagnostics_text(record: Optional[RunMetricRecord]) -> str:
         lines.extend(["", "diagnostic keys:"])
         lines.extend(f"  {key}" for key in sorted(diagnostics.keys()))
     return "\n".join(lines)
+
+
+def _format_parameter_sensitivity_text(rows: Sequence[ParameterSensitivityRow]) -> str:
+    if not rows:
+        return "No parameter sensitivity rows available for the selected filters."
+    first = rows[0]
+    lines = [
+        f"stage: {first.stage}",
+        f"dataset scope: {first.dataset_scope}",
+        f"value: {first.value_option}",
+        f"parameters ranked: {len(rows)}",
+        "",
+    ]
+    for row in rows[:8]:
+        lines.append(
+            f"#{row.rank} {row.parameter_name}: impact={_format_float(row.impact_score)}, "
+            f"best={row.best_value or 'n/a'} ({_format_float(row.best_mean_value)}), "
+            f"worst={row.worst_value or 'n/a'} ({_format_float(row.worst_mean_value)}), "
+            f"ols={_format_float(row.ols_delta_r2)} [{row.ols_status}]"
+        )
+        if row.coverage_warning:
+            lines.append(f"  warning: {row.coverage_warning}")
+        if row.previous_impact_score is not None:
+            lines.append(
+                f"  previous generation: impact={_format_float(row.previous_impact_score)}, "
+                f"best={row.previous_best_value or 'n/a'}, delta={_format_float(row.generation_delta)}"
+            )
+    return "\n".join(lines)
+
+
+def _format_extension_suggestions_text(suggestions: Sequence[ExtensionSuggestion]) -> str:
+    if not suggestions:
+        return "No extension suggestions available."
+    lines: List[str] = []
+    for suggestion in suggestions:
+        lines.extend(
+            [
+                f"#{suggestion.rank} {suggestion.title}",
+                f"parameter: {suggestion.parameter_name or 'n/a'}",
+                f"confidence: {suggestion.confidence}",
+                f"recommendation: {suggestion.recommendation}",
+                f"evidence: {suggestion.evidence}",
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
 
 
 class SweepVisualizationApp:
@@ -4871,6 +6084,12 @@ def _sweep_visualization_app_init(
     self.coverage_strategy_var = tk.StringVar(value="All")
     self.coverage_family_var = tk.StringVar(value="All")
     self.coverage_alpha_var = tk.StringVar(value="All")
+    self.sensitivity_stage_var = tk.StringVar(value="")
+    self.sensitivity_dataset_var = tk.StringVar(value="aggregate")
+    self.sensitivity_value_var = tk.StringVar(value="score")
+    self.sensitivity_strategy_var = tk.StringVar(value="All")
+    self.sensitivity_family_var = tk.StringVar(value="All")
+    self.sensitivity_alpha_var = tk.StringVar(value="All")
     self.preview_stage_var = tk.StringVar(value="")
     self.preview_candidate_var = tk.StringVar(value="")
     self.preview_dataset_var = tk.StringVar(value="")
@@ -4886,6 +6105,8 @@ def _sweep_visualization_app_init(
     self.diagnostic_candidate_var = tk.StringVar(value="")
     self.diagnostic_dataset_var = tk.StringVar(value="")
     self.diagnostic_component_var = tk.StringVar(value="gradient")
+    self._sensitivity_row_lookup: Dict[str, ParameterSensitivityRow] = {}
+    self._extension_suggestion_lookup: Dict[str, ExtensionSuggestion] = {}
 
     self._build_ui()
     if initial_path is not None:
@@ -4913,6 +6134,8 @@ def _sweep_visualization_build_ui(self: SweepVisualizationApp) -> None:
     self.leaderboard_tab = self.ttk.Frame(self.notebook)
     self.comparison_tab = self.ttk.Frame(self.notebook)
     self.coverage_tab = self.ttk.Frame(self.notebook)
+    self.sensitivity_tab = self.ttk.Frame(self.notebook)
+    self.extensions_tab = self.ttk.Frame(self.notebook)
     self.progression_tab = self.ttk.Frame(self.notebook)
     self.significance_tab = self.ttk.Frame(self.notebook)
     self.metric_tab = self.ttk.Frame(self.notebook)
@@ -4922,6 +6145,8 @@ def _sweep_visualization_build_ui(self: SweepVisualizationApp) -> None:
     self.notebook.add(self.leaderboard_tab, text="Leaderboard")
     self.notebook.add(self.comparison_tab, text="Comparison")
     self.notebook.add(self.coverage_tab, text="Effects")
+    self.notebook.add(self.sensitivity_tab, text="Sensitivity")
+    self.notebook.add(self.extensions_tab, text="Next Extensions")
     self.notebook.add(self.progression_tab, text="Progression")
     self.notebook.add(self.significance_tab, text="Significance")
     self.notebook.add(self.diagnostics_tab, text="Metric Diagnostics")
@@ -4930,6 +6155,8 @@ def _sweep_visualization_build_ui(self: SweepVisualizationApp) -> None:
     self._build_leaderboard_tab()
     self._build_comparison_tab()
     self._build_coverage_tab()
+    self._build_sensitivity_tab()
+    self._build_extensions_tab()
     self._build_progression_tab()
     self._build_significance_tab()
     self._build_metric_tab()
@@ -5023,6 +6250,132 @@ def _sweep_visualization_build_leaderboard_tab(self: SweepVisualizationApp) -> N
 
     self.leaderboard_detail_text = self.tk.Text(self.leaderboard_tab, height=14, wrap="word")
     self.leaderboard_detail_text.pack(fill="x", padx=6, pady=6)
+
+
+def _sweep_visualization_build_sensitivity_tab(self: SweepVisualizationApp) -> None:
+    controls = self.ttk.Frame(self.sensitivity_tab)
+    controls.pack(fill="x", padx=6, pady=6)
+    for label, variable, width in (
+        ("Stage", self.sensitivity_stage_var, 14),
+        ("Dataset", self.sensitivity_dataset_var, 12),
+        ("Value", self.sensitivity_value_var, 24),
+        ("Strategy", self.sensitivity_strategy_var, 14),
+        ("Family", self.sensitivity_family_var, 16),
+        ("Alpha", self.sensitivity_alpha_var, 10),
+    ):
+        self.ttk.Label(controls, text=label).pack(side="left", padx=(0 if label == "Stage" else 8, 0))
+        combo = self.ttk.Combobox(
+            controls,
+            textvariable=variable,
+            state="readonly",
+            width=width,
+        )
+        combo.pack(side="left", padx=4)
+        combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_sensitivity())
+        if label == "Stage":
+            self.sensitivity_stage_combo = combo
+        elif label == "Dataset":
+            self.sensitivity_dataset_combo = combo
+        elif label == "Value":
+            self.sensitivity_value_combo = combo
+        elif label == "Strategy":
+            self.sensitivity_strategy_combo = combo
+        elif label == "Family":
+            self.sensitivity_family_combo = combo
+        else:
+            self.sensitivity_alpha_combo = combo
+
+    tree_frame = self.ttk.Frame(self.sensitivity_tab)
+    tree_frame.pack(fill="both", expand=True, padx=6, pady=4)
+    columns = (
+        "rank",
+        "parameter",
+        "impact",
+        "best",
+        "worst",
+        "groups",
+        "rows",
+        "min_n",
+        "ols",
+    )
+    self.sensitivity_tree = self.ttk.Treeview(
+        tree_frame,
+        columns=columns,
+        show="headings",
+        selectmode="browse",
+        height=10,
+    )
+    labels = {
+        "rank": "Rank",
+        "parameter": "Parameter",
+        "impact": "Impact",
+        "best": "Best Value",
+        "worst": "Worst Value",
+        "groups": "Values",
+        "rows": "Rows",
+        "min_n": "Min n",
+        "ols": "OLS dR2",
+    }
+    widths = {
+        "rank": 65,
+        "parameter": 210,
+        "impact": 100,
+        "best": 180,
+        "worst": 180,
+        "groups": 80,
+        "rows": 80,
+        "min_n": 80,
+        "ols": 100,
+    }
+    for column in columns:
+        self.sensitivity_tree.heading(column, text=labels[column])
+        self.sensitivity_tree.column(column, width=widths[column], anchor="w")
+    self.sensitivity_tree.pack(side="left", fill="both", expand=True)
+    tree_scroll = self.ttk.Scrollbar(tree_frame, orient="vertical", command=self.sensitivity_tree.yview)
+    self.sensitivity_tree.configure(yscrollcommand=tree_scroll.set)
+    tree_scroll.pack(side="right", fill="y")
+
+    self.sensitivity_text = self.tk.Text(self.sensitivity_tab, height=10, wrap="word")
+    self.sensitivity_text.pack(fill="x", padx=6, pady=4)
+    self.sensitivity_plot_frame = self.ttk.Frame(self.sensitivity_tab)
+    self.sensitivity_plot_frame.pack(fill="both", expand=True, padx=6, pady=6)
+
+
+def _sweep_visualization_build_extensions_tab(self: SweepVisualizationApp) -> None:
+    tree_frame = self.ttk.Frame(self.extensions_tab)
+    tree_frame.pack(fill="both", expand=True, padx=6, pady=6)
+    columns = ("rank", "rule", "parameter", "confidence", "recommendation")
+    self.extensions_tree = self.ttk.Treeview(
+        tree_frame,
+        columns=columns,
+        show="headings",
+        selectmode="browse",
+        height=10,
+    )
+    labels = {
+        "rank": "Rank",
+        "rule": "Rule",
+        "parameter": "Parameter",
+        "confidence": "Confidence",
+        "recommendation": "Recommendation",
+    }
+    widths = {
+        "rank": 70,
+        "rule": 170,
+        "parameter": 180,
+        "confidence": 110,
+        "recommendation": 620,
+    }
+    for column in columns:
+        self.extensions_tree.heading(column, text=labels[column])
+        self.extensions_tree.column(column, width=widths[column], anchor="w")
+    self.extensions_tree.pack(side="left", fill="both", expand=True)
+    tree_scroll = self.ttk.Scrollbar(tree_frame, orient="vertical", command=self.extensions_tree.yview)
+    self.extensions_tree.configure(yscrollcommand=tree_scroll.set)
+    tree_scroll.pack(side="right", fill="y")
+
+    self.extensions_text = self.tk.Text(self.extensions_tab, height=14, wrap="word")
+    self.extensions_text.pack(fill="x", padx=6, pady=6)
 
 
 def _sweep_visualization_build_comparison_tab(self: SweepVisualizationApp) -> None:
@@ -5349,6 +6702,103 @@ def _sweep_visualization_refresh_leaderboard(self: SweepVisualizationApp) -> Non
     self._on_leaderboard_selection_changed()
 
 
+def _sweep_visualization_sensitivity_filters(self: SweepVisualizationApp) -> Dict[str, object]:
+    return {
+        "strategy": self.sensitivity_strategy_var.get() or "All",
+        "family": self.sensitivity_family_var.get() or "All",
+        "alpha": self.sensitivity_alpha_var.get() or "All",
+    }
+
+
+def _sweep_visualization_refresh_sensitivity(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        return
+    stage_name = self.sensitivity_stage_var.get() or self.model.primary_stage_name
+    dataset_scope = self.sensitivity_dataset_var.get() or "aggregate"
+    value_option = self.sensitivity_value_var.get() or "score"
+    rows = compute_parameter_sensitivity(
+        self.model,
+        stage_name=stage_name,
+        dataset_scope=dataset_scope,
+        value_option=value_option,
+        filters=self._sensitivity_filters(),
+    )
+    self._sensitivity_row_lookup = {
+        f"sensitivity:{row.rank}:{row.parameter_name}": row for row in rows
+    }
+    self.sensitivity_tree.delete(*self.sensitivity_tree.get_children())
+    for item_id, row in self._sensitivity_row_lookup.items():
+        self.sensitivity_tree.insert(
+            "",
+            "end",
+            iid=item_id,
+            values=(
+                str(row.rank),
+                row.parameter_name,
+                _format_float(row.impact_score),
+                f"{row.best_value or 'n/a'} ({_format_float(row.best_mean_value)})",
+                f"{row.worst_value or 'n/a'} ({_format_float(row.worst_mean_value)})",
+                str(row.num_values),
+                str(row.num_rows),
+                str(row.min_group_count),
+                _format_float(row.ols_delta_r2),
+            ),
+        )
+    if rows:
+        self.sensitivity_tree.selection_set(next(iter(self._sensitivity_row_lookup.keys())))
+    self._set_text_widget(self.sensitivity_text, _format_parameter_sensitivity_text(rows))
+    self._draw_figure(
+        "sensitivity",
+        self.sensitivity_plot_frame,
+        create_parameter_sensitivity_figure(
+            self.model,
+            rows,
+            stage_name=stage_name,
+            dataset_scope=dataset_scope,
+            value_option=value_option,
+        ),
+    )
+    self.refresh_extension_suggestions()
+
+
+def _sweep_visualization_refresh_extension_suggestions(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        return
+    stage_name = self.model.primary_stage_name
+    rows = compute_parameter_sensitivity(
+        self.model,
+        stage_name=stage_name,
+        dataset_scope="aggregate",
+        value_option="score",
+        filters={},
+    )
+    suggestions = generate_next_extension_suggestions(self.model, rows)
+    self._extension_suggestion_lookup = {
+        f"suggestion:{suggestion.rank}:{suggestion.rule_id}:{suggestion.parameter_name or 'none'}": suggestion
+        for suggestion in suggestions
+    }
+    self.extensions_tree.delete(*self.extensions_tree.get_children())
+    for item_id, suggestion in self._extension_suggestion_lookup.items():
+        self.extensions_tree.insert(
+            "",
+            "end",
+            iid=item_id,
+            values=(
+                str(suggestion.rank),
+                suggestion.rule_id,
+                suggestion.parameter_name or "n/a",
+                suggestion.confidence,
+                suggestion.recommendation,
+            ),
+        )
+    if suggestions:
+        self.extensions_tree.selection_set(next(iter(self._extension_suggestion_lookup.keys())))
+    self._set_text_widget(
+        self.extensions_text,
+        _format_extension_suggestions_text(suggestions),
+    )
+
+
 def _sweep_visualization_comparison_rows(
     self: SweepVisualizationApp,
 ) -> List[CandidateVisualizationRow]:
@@ -5496,6 +6946,21 @@ def _sweep_visualization_populate_from_model(
     self.coverage_mode_var.set("1D Trend")
     self._rebuild_effect_filter_controls(model)
 
+    self.sensitivity_stage_combo["values"] = stage_values
+    self.sensitivity_stage_var.set(model.primary_stage_name)
+    self.sensitivity_dataset_combo["values"] = ["aggregate", *model.datasets]
+    self.sensitivity_dataset_var.set("aggregate")
+    self.sensitivity_value_combo["values"] = value_options
+    self.sensitivity_value_var.set(
+        "score" if "score" in value_options else (value_options[0] if value_options else "")
+    )
+    self.sensitivity_strategy_combo["values"] = ["All", *model.strategies]
+    self.sensitivity_strategy_var.set("All")
+    self.sensitivity_family_combo["values"] = ["All", *families]
+    self.sensitivity_family_var.set("All")
+    self.sensitivity_alpha_combo["values"] = ["All", *alpha_values]
+    self.sensitivity_alpha_var.set("All")
+
     preview_stage_values = [
         stage_name
         for stage_name in model.stage_order
@@ -5537,6 +7002,7 @@ def _sweep_visualization_populate_from_model(
 
     self._update_metric_tab_visibility(bool(model.alpha_family_summary))
     self.refresh_effects()
+    self.refresh_sensitivity()
     self.refresh_leaderboard()
     self._draw_figure("overview", self.overview_plot_frame, create_overview_figure(model))
     self._draw_figure("progression", self.progression_plot_frame, create_progression_figure(model))
@@ -5549,6 +7015,8 @@ def _sweep_visualization_populate_from_model(
 SweepVisualizationApp.__init__ = _sweep_visualization_app_init
 SweepVisualizationApp._build_ui = _sweep_visualization_build_ui
 SweepVisualizationApp._build_leaderboard_tab = _sweep_visualization_build_leaderboard_tab
+SweepVisualizationApp._build_sensitivity_tab = _sweep_visualization_build_sensitivity_tab
+SweepVisualizationApp._build_extensions_tab = _sweep_visualization_build_extensions_tab
 SweepVisualizationApp._build_comparison_tab = _sweep_visualization_build_comparison_tab
 SweepVisualizationApp._build_diagnostics_tab = _sweep_visualization_build_diagnostics_tab
 SweepVisualizationApp._leaderboard_candidate_rows = _sweep_visualization_leaderboard_candidate_rows
@@ -5561,6 +7029,9 @@ SweepVisualizationApp._on_leaderboard_sort = _sweep_visualization_on_leaderboard
 SweepVisualizationApp._seed_diagnostics_from_row = _sweep_visualization_seed_diagnostics_from_row
 SweepVisualizationApp._on_leaderboard_selection_changed = _sweep_visualization_on_leaderboard_selection_changed
 SweepVisualizationApp.refresh_leaderboard = _sweep_visualization_refresh_leaderboard
+SweepVisualizationApp._sensitivity_filters = _sweep_visualization_sensitivity_filters
+SweepVisualizationApp.refresh_sensitivity = _sweep_visualization_refresh_sensitivity
+SweepVisualizationApp.refresh_extension_suggestions = _sweep_visualization_refresh_extension_suggestions
 SweepVisualizationApp._comparison_rows = _sweep_visualization_comparison_rows
 SweepVisualizationApp.refresh_comparison = _sweep_visualization_refresh_comparison
 SweepVisualizationApp.refresh_metric_diagnostics = _sweep_visualization_refresh_metric_diagnostics

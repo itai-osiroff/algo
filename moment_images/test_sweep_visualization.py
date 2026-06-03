@@ -15,8 +15,11 @@ from moment_images.sweep_visualization import (
     create_candidate_robustness_figure,
     create_comparison_figure,
     create_effects_figure,
+    create_parameter_sensitivity_figure,
     create_progression_figure,
     export_sweep_visualization_bundle,
+    compute_parameter_sensitivity,
+    generate_next_extension_suggestions,
     load_sweep_visualization_model,
     main,
 )
@@ -658,11 +661,15 @@ def test_export_sweep_visualization_bundle_writes_bundle_and_plots(tmp_path):
     assert (export_dir / "effects_heatmap.png").exists()
     assert (export_dir / "progression.png").exists()
     assert (export_dir / "significance.png").exists()
+    assert (export_dir / "sensitivity.png").exists()
     assert (export_dir / "metric_diagnostics.png").exists()
     assert (export_dir / "index.html").exists()
     assert (export_dir / "tables" / "candidate_leaderboard.csv").exists()
     assert (export_dir / "tables" / "run_metric_records.csv").exists()
+    assert (export_dir / "tables" / "parameter_sensitivity.csv").exists()
     assert (export_dir / "data" / "report_context.json").exists()
+    assert (export_dir / "data" / "parameter_sensitivity.json").exists()
+    assert (export_dir / "data" / "next_extension_suggestions.json").exists()
     assert (export_dir / "assets" / "topk_overview.png").exists()
     assert (export_dir / "assets" / "preview_d1.png").exists()
     assert (export_dir / "assets" / "comparison_d1.png").exists()
@@ -672,6 +679,9 @@ def test_export_sweep_visualization_bundle_writes_bundle_and_plots(tmp_path):
         assert "score_matrix" in bundle.files
         assert "metric_tensor" in bundle.files
         assert "run_metric_records_json" in bundle.files
+        assert "parameter_sensitivity_json" in bundle.files
+        assert "next_extension_suggestions_json" in bundle.files
+        assert "generation_summary_json" in bundle.files
         assert "diagnostic_availability_json" in bundle.files
         assert "primary_metric_source" in bundle.files
         assert bundle["score_matrix"].shape[1] == 2
@@ -680,6 +690,7 @@ def test_export_sweep_visualization_bundle_writes_bundle_and_plots(tmp_path):
     assert manifest["index_html"] == "index.html"
     assert manifest["report_top_k"] == 6
     assert "tables/candidate_leaderboard.csv" in manifest["table_files"]
+    assert "tables/parameter_sensitivity.csv" in manifest["table_files"]
     assert "assets/topk_overview.png" in manifest["report_assets"]
 
 
@@ -732,6 +743,132 @@ def test_create_effects_figure_supports_aggregate_and_dataset_specific_grouping(
     assert any(text.get_text() == "n=2" for text in trend.axes[0].texts)
     assert "heatmap" in heatmap.axes[0].get_title().lower()
     assert any(text.get_text() == "2" for text in heatmap.axes[0].texts)
+
+
+def test_compute_parameter_sensitivity_ranks_aggregate_and_dataset_effects(tmp_path):
+    output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True)
+    datasets = ["d1", "d2"]
+    max_values = [4, 4, 8, 8, 12, 12]
+    sigma_values = [1.0, 2.0, 1.0, 2.0, 1.0, 2.0]
+    aggregate_scores = [0.10, 0.15, 0.45, 0.50, 0.90, 0.95]
+    d1_scores = [0.95, 0.90, 0.50, 0.45, 0.10, 0.05]
+    d2_scores = [0.05, 0.10, 0.50, 0.55, 0.90, 0.95]
+    rankings = []
+    for idx, (max_value, sigma_value, score) in enumerate(
+        zip(max_values, sigma_values, aggregate_scores)
+    ):
+        row = _ranking(
+            f"s1c{idx:04d}",
+            score=score,
+            rank=idx + 1,
+            datasets=datasets,
+            stage="stage1",
+            params={"max_displacement": max_value, "gauss_sigma": sigma_value},
+        )
+        row["dataset_scores"] = {"d1": d1_scores[idx], "d2": d2_scores[idx]}
+        row["mean_dataset_score"] = float(np.mean(list(row["dataset_scores"].values())))
+        row["std_dataset_score"] = float(np.std(list(row["dataset_scores"].values())))
+        rankings.append(row)
+    _write_json(output_dir / "stage1_summary.json", _stage_summary("stage1", rankings))
+
+    model = load_sweep_visualization_model(output_dir)
+    aggregate_rows = compute_parameter_sensitivity(
+        model,
+        stage_name="stage1",
+        dataset_scope="aggregate",
+        value_option="score",
+        filters={},
+    )
+    d1_rows = compute_parameter_sensitivity(
+        model,
+        stage_name="stage1",
+        dataset_scope="d1",
+        value_option="score",
+        filters={},
+    )
+    d2_rows = compute_parameter_sensitivity(
+        model,
+        stage_name="stage1",
+        dataset_scope="d2",
+        value_option="score",
+        filters={},
+    )
+    figure = create_parameter_sensitivity_figure(model, aggregate_rows)
+
+    assert aggregate_rows[0].parameter_name == "max_displacement"
+    assert aggregate_rows[0].impact_score > 0.70
+    assert aggregate_rows[0].ols_status == "ok"
+    assert aggregate_rows[0].ols_delta_r2 is not None
+    assert next(row for row in d1_rows if row.parameter_name == "max_displacement").best_value == "4"
+    assert next(row for row in d2_rows if row.parameter_name == "max_displacement").best_value == "12"
+    constant_row = next(row for row in aggregate_rows if row.parameter_name == "pixel_threshold")
+    assert constant_row.coverage_warning == "only one finite parameter value"
+    assert figure.axes[0].get_xlabel() == "grouped mean delta"
+
+
+def test_extension_suggestions_use_previous_generation_and_boundary_evidence(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+    run_state = _run_state_payload(output_dir, ["d1", "d2"], stage_mode="single_stage")
+    run_state["active_generation_id"] = "gen_new"
+    run_state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run", "created_at": "2026-04-01T00:00:00+00:00"},
+        {"generation_id": "gen_new", "action": "extend", "created_at": "2026-04-02T00:00:00+00:00"},
+    ]
+    _write_json(output_dir / "run_state.json", run_state)
+
+    datasets = ["d1", "d2"]
+    current_rankings = []
+    for idx, (max_value, score) in enumerate([(4, 0.20), (8, 0.50), (12, 0.92)]):
+        row = _ranking(
+            f"s1c{idx:04d}",
+            score=score,
+            rank=idx + 1,
+            datasets=datasets,
+            stage="stage1",
+            params={"max_displacement": max_value},
+        )
+        row["generation_id"] = "gen_new"
+        current_rankings.append(row)
+    _write_json(output_dir / "stage1_summary.json", _stage_summary("stage1", current_rankings))
+
+    previous_rankings = []
+    for idx, (max_value, score) in enumerate([(4, 0.25), (8, 0.70)]):
+        row = _ranking(
+            f"s1c_old{idx:04d}",
+            score=score,
+            rank=idx + 1,
+            datasets=datasets,
+            stage="stage1",
+            params={"max_displacement": max_value},
+        )
+        row["generation_id"] = "gen_old"
+        previous_rankings.append(row)
+    _write_json(
+        output_dir / "generations" / "gen_old" / "products" / "stage1_summary.json",
+        _stage_summary("stage1", previous_rankings),
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+    rows = compute_parameter_sensitivity(
+        model,
+        stage_name="stage1",
+        dataset_scope="aggregate",
+        value_option="score",
+        filters={},
+    )
+    suggestions = generate_next_extension_suggestions(model, rows)
+
+    max_row = next(row for row in rows if row.parameter_name == "max_displacement")
+    assert model.generation_summary["previous_generation_id"] == "gen_old"
+    assert model.generation_summary["previous_generation_candidate_count"] == 2
+    assert max_row.previous_best_value == "8"
+    assert max_row.best_value == "12"
+    assert any(suggestion.rule_id == "boundary_winner" for suggestion in suggestions)
+    assert any(suggestion.rule_id == "extension_delta" for suggestion in suggestions)
 
 
 def test_create_comparison_and_robustness_figures_render(tmp_path):
@@ -837,6 +974,8 @@ def test_gui_loads_model_and_toggles_metric_tab(tmp_path):
     assert "Leaderboard" in tab_names
     assert "Comparison" in tab_names
     assert "Effects" in tab_names
+    assert "Sensitivity" in tab_names
+    assert "Next Extensions" in tab_names
     assert "Metric Diagnostics" in tab_names
     assert "Metric Formulations" in tab_names
 
