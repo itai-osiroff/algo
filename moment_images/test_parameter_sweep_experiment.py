@@ -1,12 +1,13 @@
 import json
 from concurrent.futures.process import BrokenProcessPool
+from pathlib import Path
 import shutil
 
 import numpy as np
 import pytest
 
 import moment_images.parameter_sweep as parameter_sweep
-from moment_images.im_process import RectificationRunConfig, rectify_views_from_config
+from moment_images.im_process import RectificationResult, RectificationRunConfig, rectify_views_from_config
 from moment_images.parameter_sweep import (
     ExperimentalMetricSweepSpec,
     MetricFormulationSpec,
@@ -16,6 +17,7 @@ from moment_images.parameter_sweep import (
     SweepExperimentSpec,
     SweepScoringSpec,
     SweepSearchSpace,
+    SweepStageRefinementSpec,
     SweepStageSpec,
     generate_coarse_candidates,
     generate_refined_candidates,
@@ -72,6 +74,68 @@ def _build_eval_result(task: dict, status: str = "ok") -> dict:
     else:
         payload["error"] = "worker crashed"
     return payload
+
+
+def _install_fast_artifact_runner(monkeypatch):
+    calls: list[str] = []
+
+    def fake_run(task: dict) -> tuple[dict, bool]:
+        calls.append(str(task["run_uid"]))
+        config = RectificationRunConfig(**task["config"])
+        views_shape = tuple(int(dim) for dim in task["views_shape"])
+        rectified_shape = views_shape if len(views_shape) == 4 else views_shape[1:]
+        rectified = np.zeros(rectified_shape, dtype=np.float32)
+        avg = np.zeros(rectified_shape[-2:], dtype=np.float32)
+        result = RectificationResult(
+            avg_image=avg,
+            rectified_views=rectified,
+            similarity_data=None,
+            config=config,
+            ref_view_index=(0, 0),
+        )
+        run_dir = Path(task["run_dir"])
+        artifact_paths = parameter_sweep._artifact_paths_payload(run_dir)
+        metric_record = parameter_sweep.build_metric_record(str(task["run_uid"]), config, result)
+        metric_record.update(
+            {
+                "candidate_signature": task.get("candidate_signature"),
+                "dataset_signature": task.get("dataset_signature"),
+                "run_signature": task.get("run_signature"),
+                "generation_id": task.get("generation_id"),
+                "artifact_paths": artifact_paths,
+            }
+        )
+        parameter_sweep._save_run_artifacts(
+            Path(task["run_parent_dir"]),
+            str(task["run_name"]),
+            result,
+            metric_record=metric_record,
+        )
+        return (
+            {
+                "status": "ok",
+                "stage": task["stage"],
+                "candidate_id": task["candidate_id"],
+                "dataset_id": task["dataset_id"],
+                "strategy": task["strategy"],
+                "run_uid": task["run_uid"],
+                "run_dir": str(run_dir),
+                "runtime_seconds": 0.01,
+                "config": task["config"],
+                "params": task["params"],
+                "task_index": task["task_index"],
+                "metric_record": metric_record,
+                "candidate_signature": task.get("candidate_signature"),
+                "dataset_signature": task.get("dataset_signature"),
+                "run_signature": task.get("run_signature"),
+                "generation_id": task.get("generation_id"),
+                "artifact_paths": artifact_paths,
+            },
+            False,
+        )
+
+    monkeypatch.setattr(parameter_sweep, "_run_task_isolated", fake_run)
+    return calls
 
 
 def test_generate_coarse_candidates_global_ignores_pixel_only_dimensions():
@@ -150,6 +214,113 @@ def test_generate_refined_candidates_respects_budget_and_deduplicates():
     assert len(refined) <= 3
     signatures = {json.dumps(candidate.params, sort_keys=True) for candidate in refined}
     assert len(signatures) == len(refined)
+
+
+def test_generate_refined_candidates_auto_fine_interpolates_and_extrapolates():
+    search_space = _pixel_space(
+        similarity_window_sizes=[15, 25],
+        max_displacements=[5, 15],
+        gauss_sigmas=[1.0, 3.0],
+        disp_gauss_sigmas=[0.0, 2.0],
+        pixel_thresholds=[0.1, 0.3],
+        sub_pix_factors=[1],
+        pixel_sigma_pyramid=[False],
+        zero_fill_roll=[True],
+    )
+    coarse = generate_coarse_candidates(search_space)
+    for idx, candidate in enumerate(coarse):
+        candidate.candidate_id = f"c{idx:03d}"
+    seed = next(
+        candidate
+        for candidate in coarse
+        if candidate.params["similarity_window_size"] == 15
+        and candidate.params["max_displacement"] == 5
+        and candidate.params["gauss_sigma"] == 1.0
+        and candidate.params["pixel_threshold"] == 0.1
+    )
+    lookup = {candidate.candidate_id: candidate for candidate in coarse}
+
+    refined = generate_refined_candidates(
+        ranked_candidates=[{"candidate_id": seed.candidate_id, "score": 1.0}],
+        candidate_lookup=lookup,
+        search_spaces={"pixel": search_space},
+        top_k=1,
+        budget=None,
+    )
+
+    windows = {candidate.params["similarity_window_size"] for candidate in refined}
+    max_displacements = {candidate.params["max_displacement"] for candidate in refined}
+    gauss_sigmas = {candidate.params["gauss_sigma"] for candidate in refined}
+    thresholds = {candidate.params["pixel_threshold"] for candidate in refined}
+
+    assert {11, 15, 21}.issubset(windows)
+    assert {0, 5, 10}.issubset(max_displacements)
+    assert {0.0, 1.0, 2.0}.issubset(gauss_sigmas)
+    assert {0.0, 0.1, 0.2}.issubset(thresholds)
+    assert any(candidate.params["similarity_window_size"] not in {15, 25} for candidate in refined)
+
+
+def test_generate_refined_candidates_inside_only_skips_edge_extrapolation():
+    search_space = _pixel_space(
+        similarity_window_sizes=[15, 25],
+        max_displacements=[5, 15],
+        gauss_sigmas=[1.0],
+        disp_gauss_sigmas=[0.0],
+        pixel_thresholds=[0.1],
+        sub_pix_factors=[1],
+        pixel_sigma_pyramid=[False],
+        zero_fill_roll=[True],
+    )
+    coarse = generate_coarse_candidates(search_space)
+    for idx, candidate in enumerate(coarse):
+        candidate.candidate_id = f"c{idx:03d}"
+    seed = next(candidate for candidate in coarse if candidate.params["similarity_window_size"] == 15)
+    lookup = {candidate.candidate_id: candidate for candidate in coarse}
+
+    refined = generate_refined_candidates(
+        ranked_candidates=[{"candidate_id": seed.candidate_id, "score": 1.0}],
+        candidate_lookup=lookup,
+        search_spaces={"pixel": search_space},
+        top_k=1,
+        budget=None,
+        refinement=SweepStageRefinementSpec(extrapolation="inside_only"),
+    )
+
+    windows = {candidate.params["similarity_window_size"] for candidate in refined}
+    assert 21 in windows
+    assert 11 not in windows
+
+
+def test_generate_refined_candidates_neighbor_method_preserves_configured_values():
+    search_space = _pixel_space(
+        similarity_window_sizes=[15, 25],
+        max_displacements=[5, 15],
+        gauss_sigmas=[1.0, 3.0],
+        disp_gauss_sigmas=[0.0],
+        pixel_thresholds=[0.1],
+        sub_pix_factors=[1],
+        pixel_sigma_pyramid=[False],
+        zero_fill_roll=[True],
+    )
+    coarse = generate_coarse_candidates(search_space)
+    for idx, candidate in enumerate(coarse):
+        candidate.candidate_id = f"c{idx:03d}"
+    seed = next(candidate for candidate in coarse if candidate.params["similarity_window_size"] == 15)
+    lookup = {candidate.candidate_id: candidate for candidate in coarse}
+
+    refined = generate_refined_candidates(
+        ranked_candidates=[{"candidate_id": seed.candidate_id, "score": 1.0}],
+        candidate_lookup=lookup,
+        search_spaces={"pixel": search_space},
+        top_k=1,
+        budget=None,
+        refinement=SweepStageRefinementSpec(method="neighbor"),
+    )
+
+    windows = {candidate.params["similarity_window_size"] for candidate in refined}
+    gauss_sigmas = {candidate.params["gauss_sigma"] for candidate in refined}
+    assert windows <= {15, 25}
+    assert gauss_sigmas <= {1.0, 3.0}
 
 
 def test_score_and_rank_runs_applies_missing_dataset_penalty():
@@ -647,7 +818,9 @@ def test_run_sweep_experiment_writes_stage_and_leaderboard_outputs(tmp_path):
     assert "execution" in stage1_summary
     assert "selected_workers" in stage1_summary["execution"]
 
-    stage1_run = output_dir / "runs" / "stage1" / "s1c0000" / "d1"
+    stage1_candidate_id = str(stage1_summary["rankings"][0]["candidate_id"])
+    assert stage1_candidate_id.startswith("s1c")
+    stage1_run = output_dir / "runs" / "stage1" / stage1_candidate_id / "d1"
     assert (stage1_run / "workspace.npz").exists()
     assert (stage1_run / "rectified_views.npy").exists()
     assert (stage1_run / "avg_rectified.png").exists()
@@ -667,6 +840,44 @@ def test_run_sweep_experiment_writes_stage_and_leaderboard_outputs(tmp_path):
     direct = rectify_views_from_config(np.load(views_a_path), config)
     stored = np.load(best_run_dir / "rectified_views.npy")
     np.testing.assert_allclose(stored, direct.rectified_views)
+
+
+def test_run_sweep_experiment_stage2_uses_auto_fine_values(monkeypatch, tmp_path):
+    _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    pixel_space = _pixel_space(
+        similarity_window_sizes=[15, 25],
+        max_displacements=[0],
+        gauss_sigmas=[1.0],
+        disp_gauss_sigmas=[0.0],
+        pixel_thresholds=[0.05],
+        sub_pix_factors=[1],
+        pixel_sigma_pyramid=[False],
+        zero_fill_roll=[True],
+    )
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": pixel_space},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=4, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "auto_fine_exp"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    output_dir = run_sweep_experiment(spec)
+    stage2_summary = json.loads((output_dir / "stage2_summary.json").read_text(encoding="utf-8"))
+    stage2_windows = {
+        int(record["config"]["similarity_window_size"])
+        for record in stage2_summary["runs"]
+        if record["status"] == "ok"
+    }
+
+    assert any(window not in {15, 25} for window in stage2_windows)
 
 
 def test_parallel_and_serial_runs_have_identical_leaderboard_order(tmp_path):
@@ -925,7 +1136,10 @@ def test_run_sweep_experiment_single_stage_writes_stage1_only_outputs(tmp_path):
     assert (out_dir / "leaderboard.json").exists()
     assert (out_dir / "best_configs.json").exists()
     assert not (out_dir / "runs" / "stage2").exists()
-    assert (out_dir / "runs" / "stage1" / "s1c0000" / "d1" / "workspace.npz").exists()
+    stage1_summary = json.loads((out_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    stage1_candidate_id = str(stage1_summary["rankings"][0]["candidate_id"])
+    assert stage1_candidate_id.startswith("s1c")
+    assert (out_dir / "runs" / "stage1" / stage1_candidate_id / "d1" / "workspace.npz").exists()
 
     manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
     run_state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
@@ -991,7 +1205,9 @@ def test_run_sweep_experiment_single_stage_still_supports_metric_phase(tmp_path)
     assert manifest["baseline_displacement_mode"]["metric_formulation_id"] == "intensity_default"
 
     state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
-    assert state["schema_version"] == 1
+    assert state["schema_version"] == 2
+    assert state["active_generation_id"]
+    assert state["spec_generations"]
     assert state["runs"]
 
 
@@ -1131,6 +1347,151 @@ def test_run_sweep_resume_adopts_relocated_run_state(tmp_path):
     )
     statuses = {entry["status"] for entry in state["runs"].values()}
     assert "skipped_valid" in statuses
+
+
+def _storage_spec(tmp_path, views_path, output_name: str, windows: list[int]) -> SweepExperimentSpec:
+    return SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=windows,
+                max_displacements=[0],
+                gauss_sigmas=[1.0],
+                disp_gauss_sigmas=[0.0],
+                pixel_thresholds=[0.05],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+                zero_fill_roll=[True],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            total_budget_per_dataset=max(2, len(windows) * 2),
+            stage1_fraction=0.5,
+            top_k=1,
+            max_workers=1,
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / output_name),
+        save_figures=False,
+        analyze=False,
+    )
+
+
+def test_run_sweep_extend_existing_creates_generation_products_and_reuses_runs(monkeypatch, tmp_path):
+    calls = _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    base_spec = _storage_spec(tmp_path, views_path, "extendable", [1])
+    out_dir = run_sweep_experiment(base_spec)
+    base_state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    base_generation = base_state["active_generation_id"]
+    base_stage1 = json.loads((out_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    base_candidate_id = str(base_stage1["rankings"][0]["candidate_id"])
+    base_run_dir = out_dir / "runs" / "stage1" / base_candidate_id / "d1"
+    assert base_run_dir.exists()
+
+    calls.clear()
+    extended_spec = _storage_spec(tmp_path, views_path, "extendable", [1, 3])
+    run_sweep_experiment(extended_spec, output_dir=out_dir, extend_existing=True)
+
+    state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert state["schema_version"] == 2
+    assert state["active_generation_id"] != base_generation
+    assert len(state["spec_generations"]) >= 2
+    assert base_run_dir.exists()
+    assert "skipped_valid" in {entry["status"] for entry in state["runs"].values()}
+    assert calls
+
+    active_generation = state["active_generation_id"]
+    products_dir = out_dir / "generations" / active_generation / "products"
+    assert (products_dir / "stage1_summary.json").exists()
+    assert (products_dir / "stage2_summary.json").exists()
+    assert (products_dir / "leaderboard.json").exists()
+    assert (products_dir / "experiment_manifest.json").exists()
+
+
+def test_run_sweep_merge_from_copies_missing_and_skips_duplicates(monkeypatch, tmp_path):
+    calls = _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    source_spec = _storage_spec(tmp_path, views_path, "merge_source", [1, 3])
+    source_dir = run_sweep_experiment(source_spec)
+    canonical_base = _storage_spec(tmp_path, views_path, "merge_canonical", [1])
+    canonical_dir = run_sweep_experiment(canonical_base)
+
+    calls.clear()
+    canonical_extended = _storage_spec(tmp_path, views_path, "merge_canonical", [1, 3])
+    run_sweep_experiment(
+        canonical_extended,
+        output_dir=canonical_dir,
+        merge_from=[source_dir],
+    )
+
+    state = json.loads((canonical_dir / "run_state.json").read_text(encoding="utf-8"))
+    merge_log = json.loads(
+        (canonical_dir / "generations" / state["active_generation_id"] / "merge_log.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert merge_log["copied"]
+    assert merge_log["skipped_duplicates"]
+    assert not calls
+    for item in merge_log["copied"]:
+        assert Path(item["destination_run_dir"]).exists()
+
+
+def test_run_sweep_merge_rejects_incompatible_dataset(monkeypatch, tmp_path):
+    _install_fast_artifact_runner(monkeypatch)
+    source_views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    current_views = np.arange(100, dtype=np.float32).reshape(2, 2, 5, 5)
+    source_views_path = tmp_path / "source_views.npy"
+    current_views_path = tmp_path / "current_views.npy"
+    np.save(source_views_path, source_views)
+    np.save(current_views_path, current_views)
+
+    source_dir = run_sweep_experiment(
+        _storage_spec(tmp_path, source_views_path, "incompatible_source", [1])
+    )
+    current_spec = _storage_spec(tmp_path, current_views_path, "incompatible_current", [1])
+    current_dir = run_sweep_experiment(current_spec, merge_from=[source_dir])
+
+    state = json.loads((current_dir / "run_state.json").read_text(encoding="utf-8"))
+    merge_log = json.loads(
+        (current_dir / "generations" / state["active_generation_id"] / "merge_log.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert not merge_log["copied"]
+    assert merge_log["rejected"]
+    assert (current_dir / "leaderboard.json").exists()
+
+
+def test_run_sweep_dry_run_writes_only_generation_report(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: pytest.fail("dry run must not execute tasks"),
+    )
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = _storage_spec(tmp_path, views_path, "dry_run_root", [1])
+    out_dir = run_sweep_experiment(spec, dry_run=True)
+
+    dry_run_paths = list((out_dir / "generations").glob("*/dry_run.json"))
+    assert len(dry_run_paths) == 1
+    dry_run_payload = json.loads(dry_run_paths[0].read_text(encoding="utf-8"))
+    assert dry_run_payload["stages"]["stage1"]["dry_run"] is True
+    assert dry_run_payload["stages"]["stage1"]["pending_run_count"] == 1
+    assert not (out_dir / "run_state.json").exists()
+    assert not (out_dir / "stage1_summary.json").exists()
+    assert not (out_dir / "runs").exists()
 
 
 def test_run_sweep_experiment_with_metric_phase_outputs(tmp_path):

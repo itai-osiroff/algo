@@ -35,6 +35,8 @@ def test_state_to_spec_and_back_roundtrip(tmp_path):
     state.strategy_global = True
     state.pixel_similarity_window_sizes = "11,21"
     state.combined_global_thresholds = "0.1,0.2"
+    state.refinement_method = "neighbor"
+    state.refinement_extrapolation = "inside_only"
 
     payload = state_to_spec_dict(state)
     roundtrip = spec_dict_to_state(payload)
@@ -46,6 +48,12 @@ def test_state_to_spec_and_back_roundtrip(tmp_path):
     assert roundtrip.stage_mode == "two_stage"
     assert roundtrip.pixel_similarity_window_sizes == "11,21"
     assert roundtrip.combined_global_thresholds == "0.1,0.2"
+    assert payload["stages"]["refinement"] == {
+        "method": "neighbor",
+        "extrapolation": "inside_only",
+    }
+    assert roundtrip.refinement_method == "neighbor"
+    assert roundtrip.refinement_extrapolation == "inside_only"
     assert roundtrip.datasets[0].dataset_id == "dataset_a"
     assert roundtrip.metric_experiments_enabled is False
 
@@ -172,6 +180,17 @@ def test_validate_state_reports_duplicate_and_missing_fields(tmp_path):
     assert any("source path is required" in issue for issue in issues)
     assert any("center_x is required" in issue for issue in issues)
     assert any("view_radius is required" in issue for issue in issues)
+
+
+def test_validate_state_reports_invalid_refinement_settings(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.refinement_method = "bad-method"
+    state.refinement_extrapolation = "bad-edge-policy"
+
+    issues = validate_state(state)
+
+    assert any("Refinement method" in issue for issue in issues)
+    assert any("Refinement extrapolation" in issue for issue in issues)
 
 
 def test_validate_state_experimental_metrics_rules(tmp_path):

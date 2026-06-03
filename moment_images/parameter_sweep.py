@@ -16,6 +16,7 @@ import math
 import os
 import platform
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -271,6 +272,48 @@ class SweepSearchSpace:
 
 
 @dataclass
+class SweepStageRefinementSpec:
+    """Controls how two-stage sweeps generate stage-2 candidates."""
+
+    method: Literal["auto_fine", "neighbor"] = "auto_fine"
+    extrapolation: Literal["half_step_bounded", "inside_only", "full_step_outside"] = "half_step_bounded"
+
+    def __post_init__(self) -> None:
+        normalized_method = str(self.method).strip().lower()
+        if normalized_method not in {"auto_fine", "neighbor"}:
+            raise ValueError("stages.refinement.method must be either 'auto_fine' or 'neighbor'.")
+        self.method = cast(Literal["auto_fine", "neighbor"], normalized_method)
+
+        normalized_extrapolation = str(self.extrapolation).strip().lower()
+        if normalized_extrapolation not in {
+            "half_step_bounded",
+            "inside_only",
+            "full_step_outside",
+        }:
+            raise ValueError(
+                "stages.refinement.extrapolation must be one of "
+                "'half_step_bounded', 'inside_only', or 'full_step_outside'."
+            )
+        self.extrapolation = cast(
+            Literal["half_step_bounded", "inside_only", "full_step_outside"],
+            normalized_extrapolation,
+        )
+
+    @classmethod
+    def from_dict(cls, payload: Optional[Dict[str, object]]) -> "SweepStageRefinementSpec":
+        if payload is not None and not isinstance(payload, dict):
+            raise ValueError("stages.refinement must be an object when provided.")
+        raw = payload or {}
+        return cls(
+            method=cast(Literal["auto_fine", "neighbor"], str(raw.get("method", "auto_fine"))),
+            extrapolation=cast(
+                Literal["half_step_bounded", "inside_only", "full_step_outside"],
+                str(raw.get("extrapolation", "half_step_bounded")),
+            ),
+        )
+
+
+@dataclass
 class SweepStageSpec:
     """Controls two-stage coarse/fine search behavior."""
 
@@ -279,12 +322,17 @@ class SweepStageSpec:
     stage1_fraction: float = 0.6
     top_k: int = 8
     max_workers: Optional[int] = None
+    refinement: SweepStageRefinementSpec = field(default_factory=SweepStageRefinementSpec)
 
     def __post_init__(self) -> None:
         normalized_mode = str(self.mode).strip().lower()
         if normalized_mode not in {"two_stage", "single_stage"}:
             raise ValueError("stages.mode must be either 'two_stage' or 'single_stage'.")
         self.mode = cast(Literal["two_stage", "single_stage"], normalized_mode)
+        if not isinstance(self.refinement, SweepStageRefinementSpec):
+            self.refinement = SweepStageRefinementSpec.from_dict(
+                cast(Optional[Dict[str, object]], self.refinement)
+            )
 
 
 @dataclass
@@ -577,6 +625,9 @@ class SweepExperimentSpec:
             stage1_fraction=float(stages_raw.get("stage1_fraction", 0.6)),
             top_k=int(stages_raw.get("top_k", 8)),
             max_workers=cast(Optional[int], stages_raw.get("max_workers")),
+            refinement=SweepStageRefinementSpec.from_dict(
+                cast(Optional[Dict[str, object]], stages_raw.get("refinement"))
+            ),
         )
 
         scoring_raw = cast(Dict[str, object], payload.get("scoring", {}))
@@ -751,8 +802,20 @@ def _strategy_param_keys(strategy: str) -> List[str]:
     raise ValueError(f"Unsupported strategy: {strategy}")
 
 
+def _candidate_config_signature_payload(config_payload: Mapping[str, object]) -> Dict[str, object]:
+    return {
+        str(key): value
+        for key, value in config_payload.items()
+        if str(key) not in DATASET_CONFIG_KEYS
+    }
+
+
+def _candidate_signature_from_config_payload(config_payload: Mapping[str, object]) -> str:
+    return _hash_payload(_candidate_config_signature_payload(config_payload))
+
+
 def _candidate_signature(candidate: SweepCandidate) -> str:
-    return json.dumps(asdict(candidate.config), sort_keys=True)
+    return _candidate_signature_from_config_payload(asdict(candidate.config))
 
 
 def _limit_candidates(candidates: Sequence[SweepCandidate], budget: Optional[int]) -> List[SweepCandidate]:
@@ -778,13 +841,21 @@ def _limit_candidates(candidates: Sequence[SweepCandidate], budget: Optional[int
 
 def _assign_candidate_ids(candidates: Sequence[SweepCandidate], prefix: str) -> List[SweepCandidate]:
     assigned: List[SweepCandidate] = []
-    for idx, candidate in enumerate(candidates):
+    used_ids: Dict[str, str] = {}
+    for candidate in candidates:
+        signature = _candidate_signature(candidate)
+        hash_len = CANDIDATE_ID_HASH_LEN
+        candidate_id = f"{prefix}{signature[:hash_len]}"
+        while candidate_id in used_ids and used_ids[candidate_id] != signature:
+            hash_len += 4
+            candidate_id = f"{prefix}{signature[:hash_len]}"
         clone = SweepCandidate(
             strategy=candidate.strategy,
             params=dict(candidate.params),
             config=candidate.config,
-            candidate_id=f"{prefix}{idx:04d}",
+            candidate_id=candidate_id,
         )
+        used_ids[candidate_id] = signature
         assigned.append(clone)
     return assigned
 
@@ -1057,15 +1128,287 @@ def _neighbor_values(values: Sequence[object], current: object) -> List[object]:
     return [normalized[i] for i in indices]
 
 
-def generate_refined_candidates(
+_INT_REFINEMENT_KEYS = {
+    "similarity_window_size",
+    "refinement_window_size",
+    "max_displacement",
+    "sub_pix_factor",
+    "correlation_pad_width",
+}
+_FLOAT_REFINEMENT_KEYS = {
+    "gauss_sigma",
+    "disp_gauss_sigma",
+    "global_threshold",
+    "pixel_threshold",
+}
+_NUMERIC_REFINEMENT_KEYS = _INT_REFINEMENT_KEYS | _FLOAT_REFINEMENT_KEYS
+
+
+def _search_space_values_for_key(search_space: SweepSearchSpace, key: str) -> Sequence[object]:
+    if key == "similarity_window_size":
+        return list(search_space.similarity_window_sizes)
+    if key == "refinement_window_size":
+        return list(search_space.refinement_window_sizes)
+    if key == "max_displacement":
+        return list(search_space.max_displacements)
+    if key == "gauss_sigma":
+        return list(search_space.gauss_sigmas)
+    if key == "disp_gauss_sigma":
+        return list(search_space.disp_gauss_sigmas)
+    if key == "pixel_threshold":
+        return list(search_space.pixel_thresholds)
+    if key == "sub_pix_factor":
+        return list(search_space.sub_pix_factors)
+    if key == "pixel_sigma_pyramid":
+        return list(search_space.pixel_sigma_pyramid)
+    if key == "zero_fill_roll":
+        return list(search_space.zero_fill_roll)
+    if key == "correlation_pad_width":
+        return list(search_space.correlation_pad_widths)
+    if key == "global_threshold":
+        return list(search_space.global_thresholds)
+    if key == "combined_use_global_avg_reference":
+        return list(search_space.combined_use_global_avg_reference)
+    return cast(Sequence[object], getattr(search_space, f"{key}s", []))
+
+
+def _clean_refinement_float(value: float) -> float:
+    return float(round(float(value), 12))
+
+
+def _normalize_refinement_axis_value(key: str, value: object) -> object:
+    if key in {"pixel_sigma_pyramid", "zero_fill_roll", "combined_use_global_avg_reference"}:
+        return bool(value)
+
+    if key in _INT_REFINEMENT_KEYS:
+        numeric = int(round(float(value)))
+        if key in {"similarity_window_size", "refinement_window_size"}:
+            return _normalize_window_size(max(1, numeric))
+        if key == "max_displacement":
+            return max(0, numeric)
+        if key == "sub_pix_factor":
+            return max(1, numeric)
+        if key == "correlation_pad_width":
+            return max(0, numeric)
+        return numeric
+
+    if key in _FLOAT_REFINEMENT_KEYS:
+        numeric = _clean_refinement_float(float(value))
+        if key in {"global_threshold", "pixel_threshold"}:
+            return _clean_refinement_float(min(1.0, max(0.0, numeric)))
+        return _clean_refinement_float(max(0.0, numeric))
+
+    return value
+
+
+def _dedupe_axis_values(values: Iterable[object]) -> List[object]:
+    deduped: List[object] = []
+    seen = set()
+    for value in values:
+        key = json.dumps(value, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value)
+    return deduped
+
+
+def _numeric_axis_values(
+    values: Sequence[object],
+    current: object,
+    key: str,
+) -> List[object]:
+    normalized = [
+        _normalize_refinement_axis_value(key, value)
+        for value in values
+    ]
+    normalized.append(_normalize_refinement_axis_value(key, current))
+    deduped = _dedupe_axis_values(normalized)
+    return sorted(deduped, key=lambda item: float(cast(float | int, item)))
+
+
+def _axis_step(values: Sequence[object], current: object, key: str) -> float:
+    if key not in _NUMERIC_REFINEMENT_KEYS:
+        return 1.0
+    numeric_values = [float(cast(float | int, value)) for value in _numeric_axis_values(values, current, key)]
+    diffs = [
+        abs(right - left)
+        for left, right in zip(numeric_values[:-1], numeric_values[1:])
+        if abs(right - left) > 0.0
+    ]
+    return min(diffs) if diffs else 1.0
+
+
+def _auto_fine_axis_values(
+    values: Sequence[object],
+    current: object,
+    key: str,
+    refinement: SweepStageRefinementSpec,
+) -> List[object]:
+    current_value = _normalize_refinement_axis_value(key, current)
+    if key not in _NUMERIC_REFINEMENT_KEYS:
+        normalized_values = _dedupe_axis_values(
+            _normalize_refinement_axis_value(key, value)
+            for value in values
+        )
+        if current_value not in normalized_values:
+            return [current_value]
+        return _neighbor_values(normalized_values, current_value)
+
+    numeric_values = _numeric_axis_values(values, current_value, key)
+    if len(numeric_values) < 2:
+        return [current_value]
+
+    idx = numeric_values.index(current_value)
+    raw_generated = [float(cast(float | int, current_value))]
+    if idx > 0:
+        previous_value = float(cast(float | int, numeric_values[idx - 1]))
+        raw_generated.append((previous_value + float(cast(float | int, current_value))) / 2.0)
+    if idx < len(numeric_values) - 1:
+        next_value = float(cast(float | int, numeric_values[idx + 1]))
+        raw_generated.append((next_value + float(cast(float | int, current_value))) / 2.0)
+
+    if refinement.extrapolation != "inside_only":
+        factor = 0.5 if refinement.extrapolation == "half_step_bounded" else 1.0
+        if idx == 0 and idx < len(numeric_values) - 1:
+            next_value = float(cast(float | int, numeric_values[idx + 1]))
+            step = next_value - float(cast(float | int, current_value))
+            if step > 0.0:
+                raw_generated.append(float(cast(float | int, current_value)) - step * factor)
+        if idx == len(numeric_values) - 1 and idx > 0:
+            previous_value = float(cast(float | int, numeric_values[idx - 1]))
+            step = float(cast(float | int, current_value)) - previous_value
+            if step > 0.0:
+                raw_generated.append(float(cast(float | int, current_value)) + step * factor)
+
+    normalized_generated = [
+        _normalize_refinement_axis_value(key, value)
+        for value in raw_generated
+    ]
+    return sorted(
+        _dedupe_axis_values(normalized_generated),
+        key=lambda item: float(cast(float | int, item)),
+    )
+
+
+def _prepare_refinement_variant_params(
+    base_params: Dict[str, object],
+    variant_values: Dict[str, object],
+) -> Dict[str, object]:
+    variant = dict(base_params)
+    variant.update(variant_values)
+    variant.pop("gauss_size", None)
+    variant.pop("disp_gauss_size", None)
+    return variant
+
+
+def _refinement_sort_key(
+    candidate: SweepCandidate,
+    seed_params: Dict[str, object],
+    keys: Sequence[str],
+    axis_steps: Mapping[str, float],
+) -> Tuple[int, float, str]:
+    changed = 0
+    distance = 0.0
+    for key in keys:
+        value = candidate.params.get(key)
+        seed_value = seed_params.get(key)
+        if value != seed_value:
+            changed += 1
+        if key in _NUMERIC_REFINEMENT_KEYS and value is not None and seed_value is not None:
+            step = max(float(axis_steps.get(key, 1.0)), 1e-12)
+            distance += abs(float(cast(float | int, value)) - float(cast(float | int, seed_value))) / step
+        elif value != seed_value:
+            distance += 1.0
+    return (changed, _clean_refinement_float(distance), json.dumps(candidate.params, sort_keys=True))
+
+
+def _local_auto_fine_candidates_for_seed(
+    coarse: SweepCandidate,
+    search_space: SweepSearchSpace,
+    refinement: SweepStageRefinementSpec,
+) -> List[SweepCandidate]:
+    strategy = coarse.strategy
+    seed_params = dict(coarse.params)
+    keys = [key for key in _strategy_param_keys(strategy) if key in seed_params]
+    axis_items: List[Tuple[str, List[object]]] = []
+    axis_steps: Dict[str, float] = {}
+
+    for key in keys:
+        configured_values = _search_space_values_for_key(search_space, key)
+        axis_items.append(
+            (
+                key,
+                _auto_fine_axis_values(
+                    configured_values,
+                    seed_params[key],
+                    key,
+                    refinement,
+                ),
+            )
+        )
+        axis_steps[key] = _axis_step(configured_values, seed_params[key], key)
+
+    if not axis_items:
+        return [_build_candidate_from_params(strategy, seed_params)]
+
+    candidates: List[SweepCandidate] = []
+    seen = set()
+    axis_keys = [key for key, _ in axis_items]
+    axis_values = [values for _, values in axis_items]
+    for values_combo in product(*axis_values):
+        variant_values = dict(zip(axis_keys, values_combo))
+        variant_params = _prepare_refinement_variant_params(seed_params, variant_values)
+        candidate = _build_candidate_from_params(strategy, variant_params)
+        sig = _candidate_signature(candidate)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        candidates.append(candidate)
+
+    candidates.sort(
+        key=lambda candidate: _refinement_sort_key(candidate, seed_params, keys, axis_steps)
+    )
+    return candidates
+
+
+def _round_robin_candidate_groups(
+    groups: Sequence[Sequence[SweepCandidate]],
+    budget: Optional[int],
+) -> List[SweepCandidate]:
+    if budget is not None and budget <= 0:
+        return []
+    positions = [0 for _ in groups]
+    selected: List[SweepCandidate] = []
+    seen = set()
+
+    while True:
+        progressed = False
+        for group_idx, group in enumerate(groups):
+            while positions[group_idx] < len(group):
+                candidate = group[positions[group_idx]]
+                positions[group_idx] += 1
+                sig = _candidate_signature(candidate)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                selected.append(candidate)
+                progressed = True
+                break
+            if budget is not None and len(selected) >= budget:
+                return selected
+        if not progressed:
+            break
+    return selected
+
+
+def _generate_neighbor_refined_candidates(
     ranked_candidates: Sequence[Dict[str, object]],
     candidate_lookup: Dict[str, SweepCandidate],
     search_spaces: Dict[str, SweepSearchSpace],
     top_k: int = 8,
     budget: Optional[int] = None,
 ) -> List[SweepCandidate]:
-    """Generate neighborhood refinements around Top-K coarse candidates."""
-
     top_items = [item for item in ranked_candidates if item.get("candidate_id") in candidate_lookup][:top_k]
     generated: List[SweepCandidate] = []
     seen = set()
@@ -1086,40 +1429,12 @@ def generate_refined_candidates(
         for key in _strategy_param_keys(strategy):
             if key not in params:
                 continue
-            values_attr = f"{key}s"
-            strategy_values: Sequence[object]
-            if key == "similarity_window_size":
-                strategy_values = list(search_space.similarity_window_sizes)
-            elif key == "refinement_window_size":
-                strategy_values = list(search_space.refinement_window_sizes)
-            elif key == "max_displacement":
-                strategy_values = list(search_space.max_displacements)
-            elif key == "gauss_sigma":
-                strategy_values = list(search_space.gauss_sigmas)
-            elif key == "disp_gauss_sigma":
-                strategy_values = list(search_space.disp_gauss_sigmas)
-            elif key == "pixel_threshold":
-                strategy_values = list(search_space.pixel_thresholds)
-            elif key == "sub_pix_factor":
-                strategy_values = list(search_space.sub_pix_factors)
-            elif key == "pixel_sigma_pyramid":
-                strategy_values = list(search_space.pixel_sigma_pyramid)
-            elif key == "zero_fill_roll":
-                strategy_values = list(search_space.zero_fill_roll)
-            elif key == "correlation_pad_width":
-                strategy_values = list(search_space.correlation_pad_widths)
-            elif key == "global_threshold":
-                strategy_values = list(search_space.global_thresholds)
-            elif key == "combined_use_global_avg_reference":
-                strategy_values = list(search_space.combined_use_global_avg_reference)
-            else:
-                strategy_values = cast(Sequence[object], getattr(search_space, values_attr, []))
+            strategy_values = _search_space_values_for_key(search_space, key)
 
             for neighbor in _neighbor_values(strategy_values, params[key]):
                 if neighbor == params[key]:
                     continue
-                variant = dict(params)
-                variant[key] = neighbor
+                variant = _prepare_refinement_variant_params(params, {key: neighbor})
                 candidate = _build_candidate_from_params(strategy, variant)
                 sig = _candidate_signature(candidate)
                 if sig in seen:
@@ -1129,6 +1444,43 @@ def generate_refined_candidates(
 
     generated.sort(key=lambda item: json.dumps(item.params, sort_keys=True))
     return _limit_candidates(generated, budget)
+
+
+def generate_refined_candidates(
+    ranked_candidates: Sequence[Dict[str, object]],
+    candidate_lookup: Dict[str, SweepCandidate],
+    search_spaces: Dict[str, SweepSearchSpace],
+    top_k: int = 8,
+    budget: Optional[int] = None,
+    refinement: Optional[SweepStageRefinementSpec] = None,
+) -> List[SweepCandidate]:
+    """Generate stage-2 refinements around Top-K coarse candidates."""
+
+    refinement_spec = refinement or SweepStageRefinementSpec()
+    if refinement_spec.method == "neighbor":
+        return _generate_neighbor_refined_candidates(
+            ranked_candidates=ranked_candidates,
+            candidate_lookup=candidate_lookup,
+            search_spaces=search_spaces,
+            top_k=top_k,
+            budget=budget,
+        )
+
+    top_items = [item for item in ranked_candidates if item.get("candidate_id") in candidate_lookup][:top_k]
+    groups: List[List[SweepCandidate]] = []
+    for item in top_items:
+        candidate_id = cast(str, item.get("candidate_id"))
+        coarse = candidate_lookup[candidate_id]
+        search_space = search_spaces[coarse.strategy]
+        groups.append(
+            _local_auto_fine_candidates_for_seed(
+                coarse,
+                search_space,
+                refinement_spec,
+            )
+        )
+
+    return _round_robin_candidate_groups(groups, budget)
 
 
 def _compose_run_config(
@@ -1505,7 +1857,18 @@ def _prepare_datasets(spec: SweepExperimentSpec, output_dir: Path) -> List[Prepa
 
 
 RUN_STATE_FILENAME = "run_state.json"
-RUN_STATE_SCHEMA_VERSION = 1
+RUN_STATE_SCHEMA_VERSION = 2
+CANDIDATE_ID_HASH_LEN = 12
+DATASET_CONFIG_KEYS = {"hdr_enabled", "hdr_exposure_times", "normalize_to_8bit"}
+
+
+def _canonical_json(payload: object) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _hash_payload(payload: object, length: Optional[int] = None) -> str:
+    digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+    return digest if length is None else digest[:length]
 
 
 def _utc_now_iso() -> str:
@@ -1515,12 +1878,57 @@ def _utc_now_iso() -> str:
 def _dataset_identity_payload(dataset: PreparedDataset) -> Dict[str, object]:
     return {
         "dataset_id": dataset.dataset_id,
+        "hdr_enabled": bool(dataset.hdr_enabled),
+        "hdr_exposure_times": dataset.hdr_exposure_times,
+        "normalize_to_8bit": bool(dataset.normalize_to_8bit),
         "resolved_views_path": dataset.resolved_views_path or str(dataset.views_path.resolve()),
         "views_shape": list(dataset.views_shape),
         "views_dtype": dataset.views_dtype,
         "views_itemsize": int(dataset.views_itemsize),
         "views_file_size_bytes": dataset.views_file_size_bytes,
         "views_file_mtime_ns": dataset.views_file_mtime_ns,
+    }
+
+
+def _dataset_signature_payload(identity_payload: Mapping[str, object]) -> Dict[str, object]:
+    return {
+        "dataset_id": str(identity_payload.get("dataset_id", "")),
+        "hdr_enabled": bool(identity_payload.get("hdr_enabled", False)),
+        "hdr_exposure_times": identity_payload.get("hdr_exposure_times"),
+        "normalize_to_8bit": bool(identity_payload.get("normalize_to_8bit", False)),
+        "views_shape": list(cast(Sequence[object], identity_payload.get("views_shape", []))),
+        "views_dtype": str(identity_payload.get("views_dtype", "")),
+        "views_itemsize": int(identity_payload.get("views_itemsize", 0) or 0),
+        "views_file_size_bytes": identity_payload.get("views_file_size_bytes"),
+    }
+
+
+def _dataset_signature_from_identity_payload(identity_payload: Mapping[str, object]) -> str:
+    return _hash_payload(_dataset_signature_payload(identity_payload))
+
+
+def _dataset_signature(dataset: PreparedDataset) -> str:
+    return _dataset_signature_from_identity_payload(_dataset_identity_payload(dataset))
+
+
+def _run_signature(stage_name: str, candidate_signature: str, dataset_signature: str) -> str:
+    return _hash_payload(
+        {
+            "stage": stage_name,
+            "candidate_signature": candidate_signature,
+            "dataset_signature": dataset_signature,
+        }
+    )
+
+
+def _artifact_paths_payload(run_dir: Path) -> Dict[str, str]:
+    return {
+        "run_dir": str(run_dir),
+        "config": str(run_dir / "config.json"),
+        "metric_record": str(run_dir / "metric_record.json"),
+        "rectified_views": str(run_dir / "rectified_views.npy"),
+        "workspace": str(run_dir / "workspace.npz"),
+        "avg_rectified": str(run_dir / "avg_rectified.png"),
     }
 
 
@@ -1560,6 +1968,7 @@ def _normalize_fingerprint_payload_for_resume_compat(
     """
 
     normalized = dict(payload)
+    normalized["schema_version"] = "<schema_version>"
     if normalized.get("output_dir") is not None:
         normalized["output_dir"] = "<output_dir>"
 
@@ -1612,6 +2021,165 @@ def _fingerprint_payloads_resume_compatible(
     ) == _normalize_fingerprint_payload_for_resume_compat(current_payload)
 
 
+def _dataset_signatures_from_fingerprint_payload(
+    fingerprint_payload_raw: object,
+) -> Dict[str, str]:
+    if not isinstance(fingerprint_payload_raw, dict):
+        return {}
+    datasets_payload = fingerprint_payload_raw.get("datasets")
+    if not isinstance(datasets_payload, list):
+        return {}
+    signatures: Dict[str, str] = {}
+    for entry in datasets_payload:
+        if not isinstance(entry, dict):
+            continue
+        dataset_id = str(entry.get("dataset_id", "")).strip()
+        if not dataset_id:
+            continue
+        signatures[dataset_id] = _dataset_signature_from_identity_payload(
+            cast(Dict[str, object], entry)
+        )
+    return signatures
+
+
+def _fingerprint_payload_datasets_compatible(
+    existing_payload_raw: object,
+    current_payload: Dict[str, object],
+) -> bool:
+    existing = _dataset_signatures_from_fingerprint_payload(existing_payload_raw)
+    current = _dataset_signatures_from_fingerprint_payload(current_payload)
+    return bool(existing) and existing == current
+
+
+def _new_generation_id(action: str, fingerprint: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return f"gen_{timestamp}_{action}_{fingerprint[:8]}"
+
+
+def _generation_dir(output_dir: Path, generation_id: str) -> Path:
+    return output_dir / "generations" / generation_id
+
+
+def _ensure_unique_generation_id(output_dir: Path, generation_id: str) -> str:
+    base_id = generation_id
+    counter = 1
+    while _generation_dir(output_dir, generation_id).exists():
+        generation_id = f"{base_id}_{counter:02d}"
+        counter += 1
+    return generation_id
+
+
+def _ensure_run_state_v2(
+    state: Dict[str, object],
+    output_dir: Path,
+    fingerprint_payload: Dict[str, object],
+) -> Dict[str, object]:
+    if int(state.get("schema_version", 1) or 1) >= RUN_STATE_SCHEMA_VERSION:
+        state.setdefault("spec_generations", [])
+        state.setdefault("merge_history", [])
+        state.setdefault("active_generation_id", None)
+        return state
+
+    migrated_at = _utc_now_iso()
+    legacy_generation_id = f"gen_legacy_{migrated_at.replace(':', '').replace('-', '')}"
+    state["schema_version"] = RUN_STATE_SCHEMA_VERSION
+    state.setdefault("spec_generations", [])
+    cast(List[Dict[str, object]], state["spec_generations"]).append(
+        {
+            "generation_id": legacy_generation_id,
+            "action": "migrated_v1",
+            "created_at": migrated_at,
+            "experiment_fingerprint": state.get("experiment_fingerprint"),
+            "fingerprint_payload": state.get("fingerprint_payload", fingerprint_payload),
+        }
+    )
+    state["active_generation_id"] = legacy_generation_id
+    state.setdefault("merge_history", [])
+    runs = cast(Dict[str, Dict[str, object]], state.setdefault("runs", {}))
+    dataset_signatures = _dataset_signatures_from_fingerprint_payload(
+        state.get("fingerprint_payload", fingerprint_payload)
+    )
+    for run_uid, entry in runs.items():
+        if not isinstance(entry, dict):
+            continue
+        stage_name = str(entry.get("stage", "") or str(run_uid).split("_", 1)[0])
+        candidate_id = str(entry.get("candidate_id", ""))
+        dataset_id = str(entry.get("dataset_id", ""))
+        run_dir = Path(str(entry.get("run_dir", "")))
+        config_payload: Optional[Dict[str, object]] = None
+        if run_dir:
+            try:
+                loaded, _, _ = read_json_first_valid(
+                    run_dir / "config.json",
+                    validator=lambda obj: isinstance(obj, dict),
+                )
+                config_payload = cast(Dict[str, object], loaded)
+            except Exception:  # noqa: BLE001 - migration keeps partial state usable.
+                config_payload = None
+        if config_payload is not None:
+            entry["candidate_signature"] = _candidate_signature_from_config_payload(config_payload)
+        else:
+            entry.setdefault("candidate_signature", _hash_payload({"candidate_id": candidate_id}))
+        entry["dataset_signature"] = dataset_signatures.get(
+            dataset_id,
+            _hash_payload({"dataset_id": dataset_id}),
+        )
+        entry["run_signature"] = _run_signature(
+            stage_name,
+            str(entry["candidate_signature"]),
+            str(entry["dataset_signature"]),
+        )
+        entry["generation_id"] = legacy_generation_id
+        entry.setdefault("active", True)
+        if run_dir:
+            entry["artifact_paths"] = _artifact_paths_payload(run_dir)
+
+    path_compatibility = cast(Dict[str, object], state.setdefault("path_compatibility", {}))
+    path_compatibility.setdefault("output_dir", str(output_dir.resolve()))
+    return state
+
+
+def _register_spec_generation(
+    *,
+    state: Dict[str, object],
+    generation_id: str,
+    action: str,
+    fingerprint: str,
+    fingerprint_payload: Dict[str, object],
+    merge_sources: Sequence[Path],
+) -> None:
+    generations = cast(List[Dict[str, object]], state.setdefault("spec_generations", []))
+    if not any(str(item.get("generation_id")) == generation_id for item in generations):
+        generations.append(
+            {
+                "generation_id": generation_id,
+                "action": action,
+                "created_at": _utc_now_iso(),
+                "experiment_fingerprint": fingerprint,
+                "fingerprint_payload": fingerprint_payload,
+                "merge_sources": [str(path.resolve()) for path in merge_sources],
+            }
+        )
+    state["active_generation_id"] = generation_id
+
+
+def _select_active_generation(
+    *,
+    output_dir: Path,
+    state: Dict[str, object],
+    fingerprint: str,
+    action: str,
+) -> str:
+    if action == "resume":
+        active = state.get("active_generation_id")
+        if isinstance(active, str) and active:
+            return active
+    return _ensure_unique_generation_id(
+        output_dir,
+        _new_generation_id(action, fingerprint),
+    )
+
+
 def _persist_run_state(state_path: Path, state: Dict[str, object]) -> None:
     state["updated_at"] = _utc_now_iso()
     write_json_atomic(state_path, state, indent=2, sort_keys=False, create_backup=True)
@@ -1620,15 +2188,29 @@ def _persist_run_state(state_path: Path, state: Dict[str, object]) -> None:
 def _load_or_initialize_run_state(
     output_dir: Path,
     fingerprint_payload: Dict[str, object],
-) -> Tuple[Dict[str, object], Path]:
+    *,
+    allow_extend: bool = False,
+    allow_merge: bool = False,
+    merge_sources: Sequence[Path] = (),
+    dry_run: bool = False,
+) -> Tuple[Dict[str, object], Path, str]:
     state_path = output_dir / RUN_STATE_FILENAME
     fingerprint = _compute_experiment_fingerprint(fingerprint_payload)
+    action = "resume"
+    if allow_extend and allow_merge:
+        action = "extend_merge"
+    elif allow_extend:
+        action = "extend"
+    elif allow_merge:
+        action = "merge"
+
     if state_path.exists() or Path(f"{state_path}.bak").exists():
         loaded, _, _ = read_json_first_valid(
             state_path,
             validator=lambda obj: isinstance(obj, dict),
         )
         state = cast(Dict[str, object], loaded)
+        state = _ensure_run_state_v2(state, output_dir, fingerprint_payload)
         existing_fingerprint = str(state.get("experiment_fingerprint", ""))
         if existing_fingerprint != fingerprint:
             if _fingerprint_payloads_resume_compatible(
@@ -1642,11 +2224,24 @@ def _load_or_initialize_run_state(
                     state.setdefault("path_compatibility", {}),
                 )
                 path_compatibility["output_dir"] = str(output_dir.resolve())
-                _persist_run_state(state_path, state)
+                if not dry_run:
+                    _persist_run_state(state_path, state)
+            elif (allow_extend or allow_merge) and _fingerprint_payload_datasets_compatible(
+                state.get("fingerprint_payload"),
+                fingerprint_payload,
+            ):
+                state["experiment_fingerprint"] = fingerprint
+                state["fingerprint_payload"] = fingerprint_payload
+                path_compatibility = cast(
+                    Dict[str, object],
+                    state.setdefault("path_compatibility", {}),
+                )
+                path_compatibility["output_dir"] = str(output_dir.resolve())
             else:
                 raise ValueError(
                     "Output directory contains run_state.json with a different experiment "
-                    "fingerprint. Refusing to resume with mismatched spec/dataset/path."
+                    "fingerprint. Refusing to resume with mismatched spec/dataset/path. "
+                    "Use --extend-existing or --merge-from only when the datasets are compatible."
                 )
         existing_output_dir = str(cast(Dict[str, object], state.get("path_compatibility", {})).get("output_dir", ""))
         current_output_dir = str(output_dir.resolve())
@@ -1655,8 +2250,29 @@ def _load_or_initialize_run_state(
                 "run_state.json output path mismatch detected. "
                 f"state={existing_output_dir}, current={current_output_dir}"
             )
-        return state, state_path
+        generation_id = _select_active_generation(
+            output_dir=output_dir,
+            state=state,
+            fingerprint=fingerprint,
+            action=action,
+        )
+        if action != "resume" or not state.get("active_generation_id"):
+            _register_spec_generation(
+                state=state,
+                generation_id=generation_id,
+                action=action,
+                fingerprint=fingerprint,
+                fingerprint_payload=fingerprint_payload,
+                merge_sources=merge_sources,
+            )
+        if not dry_run:
+            _persist_run_state(state_path, state)
+        return state, state_path, generation_id
 
+    generation_id = _ensure_unique_generation_id(
+        output_dir,
+        _new_generation_id("run" if not allow_merge else action, fingerprint),
+    )
     state: Dict[str, object] = {
         "schema_version": RUN_STATE_SCHEMA_VERSION,
         "created_at": _utc_now_iso(),
@@ -1666,11 +2282,24 @@ def _load_or_initialize_run_state(
             "output_dir": str(output_dir.resolve()),
         },
         "fingerprint_payload": fingerprint_payload,
+        "active_generation_id": generation_id,
+        "spec_generations": [
+            {
+                "generation_id": generation_id,
+                "action": "run" if action == "resume" else action,
+                "created_at": _utc_now_iso(),
+                "experiment_fingerprint": fingerprint,
+                "fingerprint_payload": fingerprint_payload,
+                "merge_sources": [str(path.resolve()) for path in merge_sources],
+            }
+        ],
+        "merge_history": [],
         "stages": {},
         "runs": {},
     }
-    _persist_run_state(state_path, state)
-    return state, state_path
+    if not dry_run:
+        _persist_run_state(state_path, state)
+    return state, state_path, generation_id
 
 
 def _validate_run_artifacts(run_dir: Path) -> Dict[str, object]:
@@ -1736,6 +2365,17 @@ def _load_cached_stage_result(task: Dict[str, object], run_dir: Path) -> Dict[st
         run_dir / "metric_record.json",
         validator=lambda obj: isinstance(obj, dict),
     )
+    artifact_paths = _artifact_paths_payload(run_dir)
+    metric_record = dict(cast(Dict[str, object], metric_record))
+    for key in (
+        "candidate_signature",
+        "dataset_signature",
+        "run_signature",
+        "generation_id",
+        "artifact_paths",
+    ):
+        if key in task and key not in metric_record:
+            metric_record[key] = task[key]
     return {
         "status": "ok",
         "stage": str(task["stage"]),
@@ -1748,6 +2388,11 @@ def _load_cached_stage_result(task: Dict[str, object], run_dir: Path) -> Dict[st
         "config": config_payload,
         "params": task["params"],
         "metric_record": metric_record,
+        "candidate_signature": task.get("candidate_signature"),
+        "dataset_signature": task.get("dataset_signature"),
+        "run_signature": task.get("run_signature"),
+        "generation_id": task.get("generation_id"),
+        "artifact_paths": artifact_paths,
         "reused_artifacts": True,
     }
 
@@ -2004,6 +2649,12 @@ def _build_worker_crash_result(
         "runtime_seconds": float(elapsed_seconds),
         "config": task["config"],
         "params": task["params"],
+        "candidate_signature": task.get("candidate_signature"),
+        "dataset_signature": task.get("dataset_signature"),
+        "run_signature": task.get("run_signature"),
+        "generation_id": task.get("generation_id"),
+        "run_dir": task.get("run_dir"),
+        "artifact_paths": task.get("artifact_paths"),
         "error": f"Worker process terminated abruptly: {exc}",
         "traceback": traceback.format_exc(),
         "failure_kind": "worker_crash",
@@ -2097,6 +2748,16 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
         output_dir = Path(cast(str, task["run_parent_dir"]))
         run_name = str(task["run_name"])
         metric_record = build_metric_record(run_uid, config, result)
+        run_dir = output_dir / run_name
+        artifact_paths = _artifact_paths_payload(run_dir)
+        identity_payload = {
+            "candidate_signature": task.get("candidate_signature"),
+            "dataset_signature": task.get("dataset_signature"),
+            "run_signature": task.get("run_signature"),
+            "generation_id": task.get("generation_id"),
+            "artifact_paths": artifact_paths,
+        }
+        metric_record.update(identity_payload)
         _save_run_artifacts(output_dir, run_name, result, metric_record=metric_record)
         if bool(task.get("save_figures", False)):
             figures = generate_rectification_figures(result)
@@ -2109,11 +2770,16 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
             "dataset_id": dataset_id,
             "strategy": strategy,
             "run_uid": run_uid,
-            "run_dir": str(output_dir / run_name),
+            "run_dir": str(run_dir),
             "runtime_seconds": float(elapsed),
             "config": asdict(config),
             "params": task["params"],
             "metric_record": metric_record,
+            "candidate_signature": task.get("candidate_signature"),
+            "dataset_signature": task.get("dataset_signature"),
+            "run_signature": task.get("run_signature"),
+            "generation_id": task.get("generation_id"),
+            "artifact_paths": artifact_paths,
         }
     except Exception as exc:  # noqa: BLE001 - preserve failed run details
         elapsed = time.perf_counter() - started
@@ -2127,6 +2793,12 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
             "runtime_seconds": float(elapsed),
             "config": task["config"],
             "params": task["params"],
+            "candidate_signature": task.get("candidate_signature"),
+            "dataset_signature": task.get("dataset_signature"),
+            "run_signature": task.get("run_signature"),
+            "generation_id": task.get("generation_id"),
+            "run_dir": task.get("run_dir"),
+            "artifact_paths": task.get("artifact_paths"),
             "error": str(exc),
             "traceback": traceback.format_exc(),
         }
@@ -2212,6 +2884,222 @@ def _record_stage_task_result(
     return recomputed_count
 
 
+def _read_source_json(path: Path) -> Optional[Dict[str, object]]:
+    if not path.exists() and not Path(f"{path}.bak").exists():
+        return None
+    try:
+        payload, _, _ = read_json_first_valid(path, validator=lambda obj: isinstance(obj, dict))
+    except Exception:  # noqa: BLE001 - invalid source metadata is handled as incompatible.
+        return None
+    return cast(Dict[str, object], payload)
+
+
+def _source_experiment_root(source_root: Path) -> Path:
+    source_root = Path(source_root)
+    return source_root.parent if source_root.name == "metric_experiments" else source_root
+
+
+def _source_base_for_stage(source_root: Path, stage_name: str) -> Path:
+    root = _source_experiment_root(source_root)
+    if stage_name == "metric_phase":
+        return root / "metric_experiments"
+    return root
+
+
+def _source_dataset_signatures(source_root: Path) -> Dict[str, str]:
+    root = _source_experiment_root(source_root)
+    state_payload = _read_source_json(root / RUN_STATE_FILENAME)
+    if state_payload is not None:
+        signatures = _dataset_signatures_from_fingerprint_payload(
+            state_payload.get("fingerprint_payload")
+        )
+        if signatures:
+            return signatures
+    manifest_payload = _read_source_json(root / "experiment_manifest.json")
+    if manifest_payload is not None:
+        datasets = manifest_payload.get("datasets")
+        if isinstance(datasets, list):
+            return {
+                str(entry.get("dataset_id")): _dataset_signature_from_identity_payload(
+                    cast(Dict[str, object], entry)
+                )
+                for entry in datasets
+                if isinstance(entry, dict) and entry.get("dataset_id") is not None
+            }
+    return {}
+
+
+def _copy_run_artifacts_dir(source_run_dir: Path, destination_run_dir: Path) -> None:
+    destination_run_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_run_dir, destination_run_dir)
+
+
+def _merge_artifacts_for_tasks(
+    *,
+    tasks: Sequence[Dict[str, object]],
+    stage_name: str,
+    output_dir: Path,
+    merge_sources: Sequence[Path],
+    merge_log: Optional[Dict[str, object]],
+    dry_run: bool,
+) -> None:
+    if not merge_sources:
+        return
+
+    task_by_identity = {
+        (
+            str(task.get("candidate_signature", "")),
+            str(task.get("dataset_signature", "")),
+        ): task
+        for task in tasks
+    }
+    copied = cast(List[Dict[str, object]], (merge_log or {}).setdefault("copied", []))
+    would_copy = cast(List[Dict[str, object]], (merge_log or {}).setdefault("would_copy", []))
+    skipped = cast(List[Dict[str, object]], (merge_log or {}).setdefault("skipped_duplicates", []))
+    rejected = cast(List[Dict[str, object]], (merge_log or {}).setdefault("rejected", []))
+    conflicts = cast(List[Dict[str, object]], (merge_log or {}).setdefault("conflicts", []))
+    source_summaries = cast(List[Dict[str, object]], (merge_log or {}).setdefault("sources", []))
+
+    for raw_source in merge_sources:
+        source_root = Path(raw_source)
+        source_base = _source_base_for_stage(source_root, stage_name)
+        source_summary = {
+            "source_root": str(source_root.resolve()),
+            "stage": stage_name,
+            "source_base": str(source_base.resolve()),
+        }
+        source_summaries.append(source_summary)
+        source_dataset_signatures = _source_dataset_signatures(source_root)
+        if not source_dataset_signatures:
+            rejected.append(
+                {
+                    "source_root": str(source_root),
+                    "stage": stage_name,
+                    "reason": "missing_dataset_identity_metadata",
+                }
+            )
+            continue
+
+        for source_run_dir in sorted((source_base / "runs" / stage_name).glob("*/*")):
+            if not source_run_dir.is_dir():
+                continue
+            source_validation = _validate_run_artifacts(source_run_dir)
+            if not bool(source_validation.get("valid", False)):
+                rejected.append(
+                    {
+                        "source_run_dir": str(source_run_dir),
+                        "stage": stage_name,
+                        "reason": "invalid_source_artifacts",
+                        "artifact_validation": source_validation,
+                    }
+                )
+                continue
+            dataset_id = source_run_dir.name
+            dataset_signature = source_dataset_signatures.get(dataset_id)
+            if not dataset_signature:
+                rejected.append(
+                    {
+                        "source_run_dir": str(source_run_dir),
+                        "stage": stage_name,
+                        "dataset_id": dataset_id,
+                        "reason": "unknown_source_dataset",
+                    }
+                )
+                continue
+            config_payload = _read_source_json(source_run_dir / "config.json")
+            if config_payload is None:
+                rejected.append(
+                    {
+                        "source_run_dir": str(source_run_dir),
+                        "stage": stage_name,
+                        "dataset_id": dataset_id,
+                        "reason": "unreadable_source_config",
+                    }
+                )
+                continue
+            candidate_signature = _candidate_signature_from_config_payload(config_payload)
+            task = task_by_identity.get((candidate_signature, dataset_signature))
+            if task is None:
+                rejected.append(
+                    {
+                        "source_run_dir": str(source_run_dir),
+                        "stage": stage_name,
+                        "dataset_id": dataset_id,
+                        "candidate_signature": candidate_signature,
+                        "dataset_signature": dataset_signature,
+                        "reason": "not_in_active_plan_or_dataset_mismatch",
+                    }
+                )
+                continue
+
+            destination_run_dir = Path(cast(str, task["run_dir"]))
+            destination_validation = _validate_run_artifacts(destination_run_dir)
+            log_payload = {
+                "source_run_dir": str(source_run_dir),
+                "destination_run_dir": str(destination_run_dir),
+                "stage": stage_name,
+                "candidate_id": task.get("candidate_id"),
+                "dataset_id": task.get("dataset_id"),
+                "candidate_signature": candidate_signature,
+                "dataset_signature": dataset_signature,
+                "run_signature": task.get("run_signature"),
+            }
+            if bool(destination_validation.get("valid", False)):
+                skipped.append({**log_payload, "reason": "destination_already_valid"})
+                continue
+            if destination_run_dir.exists():
+                conflicts.append(
+                    {
+                        **log_payload,
+                        "reason": "destination_exists_but_is_not_valid",
+                        "artifact_validation": destination_validation,
+                    }
+                )
+                continue
+            if dry_run:
+                would_copy.append(log_payload)
+                continue
+            _copy_run_artifacts_dir(source_run_dir, destination_run_dir)
+            copied.append(log_payload)
+
+
+def _adopt_existing_signature_artifacts(
+    *,
+    tasks: Sequence[Dict[str, object]],
+    state_runs: Dict[str, Dict[str, object]],
+) -> None:
+    """Copy valid artifacts from older run IDs into the current deterministic path."""
+
+    entries_by_signature: Dict[str, Dict[str, object]] = {}
+    for entry in state_runs.values():
+        if not isinstance(entry, dict):
+            continue
+        run_signature = str(entry.get("run_signature", ""))
+        if run_signature and run_signature not in entries_by_signature:
+            entries_by_signature[run_signature] = entry
+
+    for task in tasks:
+        run_uid = str(task["run_uid"])
+        if run_uid in state_runs:
+            continue
+        run_signature = str(task.get("run_signature", ""))
+        source_entry = entries_by_signature.get(run_signature)
+        if source_entry is None:
+            continue
+        source_run_dir_raw = source_entry.get("run_dir")
+        if not source_run_dir_raw:
+            continue
+        source_run_dir = Path(str(source_run_dir_raw))
+        destination_run_dir = Path(cast(str, task["run_dir"]))
+        if source_run_dir == destination_run_dir:
+            continue
+        if not bool(_validate_run_artifacts(source_run_dir).get("valid", False)):
+            continue
+        if destination_run_dir.exists():
+            continue
+        _copy_run_artifacts_dir(source_run_dir, destination_run_dir)
+
+
 def _evaluate_stage(
     stage_name: str,
     candidates: Sequence[SweepCandidate],
@@ -2221,14 +3109,22 @@ def _evaluate_stage(
     requested_workers: int,
     run_state: Optional[Dict[str, object]] = None,
     run_state_path: Optional[Path] = None,
+    generation_id: Optional[str] = None,
+    merge_sources: Sequence[Path] = (),
+    merge_log: Optional[Dict[str, object]] = None,
+    dry_run: bool = False,
 ) -> StageEvaluationResult:
     tasks: List[Dict[str, object]] = []
     for candidate in candidates:
         candidate_root = output_dir / "runs" / stage_name / candidate.candidate_id
+        candidate_signature = _candidate_signature(candidate)
         for dataset in datasets:
             config = _compose_run_config(candidate, dataset)
             run_name = dataset.dataset_id
             run_uid = f"{stage_name}_{candidate.candidate_id}_{dataset.dataset_id}"
+            dataset_signature = _dataset_signature(dataset)
+            run_signature = _run_signature(stage_name, candidate_signature, dataset_signature)
+            run_dir = candidate_root / run_name
             tasks.append(
                 {
                     "stage": stage_name,
@@ -2238,6 +3134,7 @@ def _evaluate_stage(
                     "run_uid": run_uid,
                     "run_name": run_name,
                     "run_parent_dir": str(candidate_root),
+                    "run_dir": str(run_dir),
                     "views_path": str(dataset.views_path),
                     "config": asdict(config),
                     "params": dict(candidate.params),
@@ -2245,13 +3142,17 @@ def _evaluate_stage(
                     "views_shape": list(dataset.views_shape),
                     "views_dtype": dataset.views_dtype,
                     "views_itemsize": int(dataset.views_itemsize),
+                    "candidate_signature": candidate_signature,
+                    "dataset_signature": dataset_signature,
+                    "run_signature": run_signature,
+                    "generation_id": generation_id,
+                    "artifact_paths": _artifact_paths_payload(run_dir),
                 }
             )
     tasks.sort(key=lambda item: (str(item["candidate_id"]), str(item["dataset_id"])))
     for idx, task in enumerate(tasks):
         task["task_index"] = idx
         task["estimated_peak_bytes"] = int(_estimate_task_peak_bytes(task))
-        task["run_dir"] = str(Path(cast(str, task["run_parent_dir"])) / str(task["run_name"]))
 
     if not tasks:
         return StageEvaluationResult(
@@ -2268,6 +3169,7 @@ def _evaluate_stage(
                 "isolated_crash_count": 0,
                 "skipped_valid_count": 0,
                 "recomputed_count": 0,
+                "dry_run": bool(dry_run),
             },
         )
 
@@ -2280,12 +3182,23 @@ def _evaluate_stage(
         if run_state is not None
         else {}
     )
+    if state_runs and not dry_run:
+        _adopt_existing_signature_artifacts(tasks=tasks, state_runs=state_runs)
+    _merge_artifacts_for_tasks(
+        tasks=tasks,
+        stage_name=stage_name,
+        output_dir=output_dir,
+        merge_sources=merge_sources,
+        merge_log=merge_log,
+        dry_run=dry_run,
+    )
     if run_state is not None:
         stages_state = cast(Dict[str, Dict[str, object]], run_state.setdefault("stages", {}))
         stage_slot = cast(Dict[str, object], stages_state.setdefault(stage_name, {}))
         stage_slot["planned_runs"] = len(tasks)
         stage_slot["last_started_at"] = _utc_now_iso()
-        if run_state_path is not None:
+        stage_slot["generation_id"] = generation_id
+        if run_state_path is not None and not dry_run:
             _persist_run_state(run_state_path, run_state)
 
     for task in tasks:
@@ -2298,12 +3211,26 @@ def _evaluate_stage(
                 "stage": str(task["stage"]),
                 "candidate_id": str(task["candidate_id"]),
                 "dataset_id": str(task["dataset_id"]),
+                "candidate_signature": task.get("candidate_signature"),
+                "dataset_signature": task.get("dataset_signature"),
+                "run_signature": task.get("run_signature"),
+                "generation_id": generation_id,
+                "active": True,
                 "status": "pending",
                 "run_dir": str(run_dir),
+                "artifact_paths": task.get("artifact_paths"),
                 "attempts": [],
                 "artifact_validation": {},
             }
             state_runs[run_uid] = entry
+        elif entry is not None:
+            entry["candidate_signature"] = task.get("candidate_signature")
+            entry["dataset_signature"] = task.get("dataset_signature")
+            entry["run_signature"] = task.get("run_signature")
+            entry["generation_id"] = generation_id
+            entry["active"] = True
+            entry["run_dir"] = str(run_dir)
+            entry["artifact_paths"] = task.get("artifact_paths")
         previous_status = str(entry.get("status", "pending")) if entry is not None else "pending"
         if entry is not None and previous_status == "running":
             entry["status"] = "pending"
@@ -2345,6 +3272,34 @@ def _evaluate_stage(
         skipped_valid_count=skipped_valid_count,
         recomputed_count=recomputed_count,
     )
+    if run_state is not None and run_state_path is not None:
+        if dry_run:
+            pass
+        else:
+            _persist_run_state(run_state_path, run_state)
+
+    if dry_run:
+        pending_count = len(tasks_to_execute)
+        execution = {
+            "requested_workers": int(max(1, requested_workers)),
+            "selected_workers": 0,
+            "available_memory_bytes": _get_available_memory_bytes(),
+            "max_task_peak_bytes": max(int(task["estimated_peak_bytes"]) for task in tasks),
+            "memory_cap_workers": None,
+            "safety_fraction": MEMORY_SAFETY_FRACTION,
+            "degrade_events": [],
+            "pool_crash_count": 0,
+            "isolated_crash_count": 0,
+            "completed_runs": len(stage_results),
+            "skipped_valid_count": int(skipped_valid_count),
+            "recomputed_count": 0,
+            "pending_run_count": int(pending_count),
+            "dry_run": True,
+            "planned_run_uids": [str(task["run_uid"]) for task in tasks],
+            "pending_run_uids": [str(task["run_uid"]) for task in tasks_to_execute],
+        }
+        return StageEvaluationResult(stage_results=stage_results, execution=execution)
+
     if run_state is not None and run_state_path is not None:
         _persist_run_state(run_state_path, run_state)
 
@@ -2461,6 +3416,13 @@ def _evaluate_stage(
     execution["skipped_valid_count"] = int(skipped_valid_count)
     execution["recomputed_count"] = int(recomputed_count)
     execution["used_isolated_mode"] = bool(isolated_crash_count > 0 or current_workers == 1)
+    if run_state is not None:
+        active_run_uids = {str(task["run_uid"]) for task in tasks}
+        for run_uid, entry in state_runs.items():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("stage")) == stage_name:
+                entry["active"] = run_uid in active_run_uids
     _update_stage_progress_state(
         run_state=run_state,
         stage_name=stage_name,
@@ -2567,14 +3529,22 @@ def score_and_rank_runs(
                 "strategy": record["strategy"],
                 "config": record["config"],
                 "params": record["params"],
+                "candidate_signature": record.get("candidate_signature"),
+                "generation_id": record.get("generation_id"),
                 "dataset_scores": {},
                 "dataset_metrics": {},
                 "runtime_seconds": {},
+                "run_signatures": {},
+                "run_dirs": {},
+                "artifact_paths": {},
             },
         )
         cast(Dict[str, float], slot["dataset_scores"])[dataset_id] = float(dataset_score)
         cast(Dict[str, Dict[str, float]], slot["dataset_metrics"])[dataset_id] = metrics
         cast(Dict[str, float], slot["runtime_seconds"])[dataset_id] = runtime
+        cast(Dict[str, object], slot["run_signatures"])[dataset_id] = record.get("run_signature")
+        cast(Dict[str, object], slot["run_dirs"])[dataset_id] = record.get("run_dir")
+        cast(Dict[str, object], slot["artifact_paths"])[dataset_id] = record.get("artifact_paths")
 
     rankings: List[Dict[str, object]] = []
     expected_datasets = list(dataset_ids)
@@ -2596,6 +3566,8 @@ def score_and_rank_runs(
                 "strategy": slot["strategy"],
                 "config": slot["config"],
                 "params": slot["params"],
+                "candidate_signature": slot.get("candidate_signature"),
+                "generation_id": slot.get("generation_id"),
                 "score": float(robust),
                 "mean_dataset_score": float(mean_score),
                 "std_dataset_score": float(std_score),
@@ -2603,6 +3575,9 @@ def score_and_rank_runs(
                 "dataset_scores": slot["dataset_scores"],
                 "runtime_seconds": slot["runtime_seconds"],
                 "dataset_metrics": slot["dataset_metrics"],
+                "run_signatures": slot["run_signatures"],
+                "run_dirs": slot["run_dirs"],
+                "artifact_paths": slot["artifact_paths"],
             }
         )
 
@@ -2643,11 +3618,13 @@ def _write_stage_outputs(
     rankings: Sequence[Dict[str, object]],
     output_dir: Path,
     execution: Optional[Dict[str, object]] = None,
+    generation_id: Optional[str] = None,
 ) -> None:
     successful = [record for record in stage_results if record.get("status") == "ok"]
     failed = [record for record in stage_results if record.get("status") != "ok"]
     payload = {
         "stage": stage_name,
+        "generation_id": generation_id,
         "num_runs": len(stage_results),
         "num_successful": len(successful),
         "num_failed": len(failed),
@@ -2728,6 +3705,7 @@ def _write_phase_summary_artifacts(
     execution: Optional[Dict[str, object]],
     reporting: SweepReportingSpec,
     analyze: bool,
+    generation_id: Optional[str] = None,
 ) -> None:
     _write_stage_outputs(
         stage_name,
@@ -2735,6 +3713,7 @@ def _write_phase_summary_artifacts(
         rankings,
         output_dir,
         execution=execution,
+        generation_id=generation_id,
     )
     write_json_atomic(
         output_dir / "leaderboard.json",
@@ -2775,7 +3754,58 @@ def _write_phase_summary_artifacts(
         )
 
 
-def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] = None) -> Path:
+def _copy_product_if_exists(source: Path, destination: Path) -> None:
+    if not source.exists() and not Path(f"{source}.bak").exists():
+        return
+    source_to_copy = source if source.exists() else Path(f"{source}.bak")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_to_copy, destination)
+
+
+def _snapshot_generation_products(output_dir: Path, generation_id: str) -> Path:
+    products_dir = _generation_dir(output_dir, generation_id) / "products"
+    for filename in (
+        "stage1_summary.json",
+        "stage2_summary.json",
+        "leaderboard.json",
+        "leaderboard.csv",
+        "best_configs.json",
+        "summary.json",
+        "analysis.json",
+        "analysis.csv",
+        "experiment_manifest.json",
+    ):
+        _copy_product_if_exists(output_dir / filename, products_dir / filename)
+
+    metric_dir = output_dir / "metric_experiments"
+    if metric_dir.exists():
+        metric_products_dir = products_dir / "metric_experiments"
+        for filename in (
+            "metric_phase_summary.json",
+            "leaderboard.json",
+            "leaderboard.csv",
+            "best_configs.json",
+            "summary.json",
+            "analysis.json",
+            "analysis.csv",
+            "alpha_report.json",
+            "alpha_report.csv",
+            "alpha_report_warnings.json",
+            "alpha_report_primary_vs_alpha.png",
+            "alpha_report_displacement_vs_alpha.png",
+        ):
+            _copy_product_if_exists(metric_dir / filename, metric_products_dir / filename)
+    return products_dir
+
+
+def run_sweep_experiment(
+    spec: SweepExperimentSpec,
+    output_dir: Optional[Path] = None,
+    *,
+    extend_existing: bool = False,
+    merge_from: Optional[Sequence[Path]] = None,
+    dry_run: bool = False,
+) -> Path:
     """Run a staged or single-stage, multi-dataset sweep experiment."""
 
     resolved_output_dir = (
@@ -2796,10 +3826,29 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         prepared_datasets=prepared_datasets,
         output_dir=resolved_output_dir,
     )
-    run_state, run_state_path = _load_or_initialize_run_state(
+    merge_sources = [Path(path) for path in (merge_from or [])]
+    run_state, run_state_path, generation_id = _load_or_initialize_run_state(
         output_dir=resolved_output_dir,
         fingerprint_payload=fingerprint_payload,
+        allow_extend=extend_existing,
+        allow_merge=bool(merge_sources),
+        merge_sources=merge_sources,
+        dry_run=dry_run,
     )
+    generation_root = _generation_dir(resolved_output_dir, generation_id)
+    generation_root.mkdir(parents=True, exist_ok=True)
+    merge_log: Dict[str, object] = {
+        "generation_id": generation_id,
+        "created_at": _utc_now_iso(),
+        "canonical_output_dir": str(resolved_output_dir.resolve()),
+        "merge_sources": [str(path.resolve()) for path in merge_sources],
+        "sources": [],
+        "copied": [],
+        "would_copy": [],
+        "skipped_duplicates": [],
+        "rejected": [],
+        "conflicts": [],
+    }
 
     stage_mode = spec.stages.mode
     stage1_budget, stage2_budget = _stage_budgets(spec.stages)
@@ -2830,16 +3879,22 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         requested_workers=requested_workers,
         run_state=run_state,
         run_state_path=run_state_path,
+        generation_id=generation_id,
+        merge_sources=merge_sources,
+        merge_log=merge_log,
+        dry_run=dry_run,
     )
     stage1_results = stage1_eval.stage_results
     stage1_rankings = score_and_rank_runs(stage1_results, spec.scoring, dataset_ids=dataset_ids)
-    _write_stage_outputs(
-        "stage1",
-        stage1_results,
-        stage1_rankings,
-        resolved_output_dir,
-        execution=stage1_eval.execution,
-    )
+    if not dry_run:
+        _write_stage_outputs(
+            "stage1",
+            stage1_results,
+            stage1_rankings,
+            resolved_output_dir,
+            execution=stage1_eval.execution,
+            generation_id=generation_id,
+        )
 
     refined_lookup: Dict[str, SweepCandidate] = {}
     stage2_results: List[Dict[str, object]] = []
@@ -2851,6 +3906,7 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
             search_spaces=spec.search_spaces,
             top_k=spec.stages.top_k,
             budget=stage2_budget,
+            refinement=spec.stages.refinement,
         )
         if not refined_candidates and stage1_rankings:
             # Fallback: keep exploring with the best stage-1 candidate if refinement is empty.
@@ -2869,16 +3925,49 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
             requested_workers=requested_workers,
             run_state=run_state,
             run_state_path=run_state_path,
+            generation_id=generation_id,
+            merge_sources=merge_sources,
+            merge_log=merge_log,
+            dry_run=dry_run,
         )
         stage2_results = stage2_eval.stage_results
         stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
-        _write_stage_outputs(
-            "stage2",
-            stage2_results,
-            stage2_rankings,
-            resolved_output_dir,
-            execution=stage2_eval.execution,
+        if not dry_run:
+            _write_stage_outputs(
+                "stage2",
+                stage2_results,
+                stage2_rankings,
+                resolved_output_dir,
+                execution=stage2_eval.execution,
+                generation_id=generation_id,
+            )
+
+    if dry_run:
+        dry_run_payload = {
+            "generation_id": generation_id,
+            "generated_at": _utc_now_iso(),
+            "canonical_output_dir": str(resolved_output_dir.resolve()),
+            "extend_existing": bool(extend_existing),
+            "merge_sources": [str(path.resolve()) for path in merge_sources],
+            "stages": {
+                "stage1": stage1_eval.execution,
+                **(
+                    {"stage2": stage2_eval.execution}
+                    if stage_mode == "two_stage" and "stage2_eval" in locals()
+                    else {}
+                ),
+            },
+            "merge_log": merge_log,
+        }
+        write_json_atomic(
+            generation_root / "dry_run.json",
+            dry_run_payload,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
         )
+        print(f"Dry run written to {generation_root / 'dry_run.json'}")
+        return resolved_output_dir
 
     final_rankings = stage2_rankings if stage2_rankings else stage1_rankings
 
@@ -2950,6 +4039,10 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
             requested_workers=requested_workers,
             run_state=run_state,
             run_state_path=run_state_path,
+            generation_id=generation_id,
+            merge_sources=merge_sources,
+            merge_log=merge_log,
+            dry_run=False,
         )
         metric_results = metric_eval.stage_results
         metric_rankings = score_and_rank_runs(
@@ -2963,6 +4056,7 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
             execution=metric_eval.execution,
             reporting=spec.reporting,
             analyze=spec.analyze,
+            generation_id=generation_id,
         )
         metric_phase_manifest = {
             "enabled": True,
@@ -2980,6 +4074,7 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
         {
             "generated_at": _utc_now_iso(),
             "output_dir": str(resolved_output_dir.resolve()),
+            "generation_id": generation_id,
             "strategies": list(spec.strategies),
             "baseline_displacement_mode": {
                 "family": RectificationRunConfig().displacement_metric_family,
@@ -2997,12 +4092,42 @@ def run_sweep_experiment(spec: SweepExperimentSpec, output_dir: Optional[Path] =
             "scoring": asdict(spec.scoring),
             "reporting": asdict(spec.reporting),
             "run_state_path": str(run_state_path),
+            "generation_products_dir": str((_generation_dir(resolved_output_dir, generation_id) / "products").resolve()),
         },
         indent=2,
         sort_keys=False,
         create_backup=True,
     )
 
+    if merge_sources:
+        write_json_atomic(
+            generation_root / "merge_log.json",
+            merge_log,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
+        )
+        write_json_atomic(
+            generation_root / "products" / "merge_log.json",
+            merge_log,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
+        )
+        merge_history = cast(List[Dict[str, object]], run_state.setdefault("merge_history", []))
+        merge_history.append(
+            {
+                "generation_id": generation_id,
+                "timestamp": _utc_now_iso(),
+                "merge_sources": [str(path.resolve()) for path in merge_sources],
+                "copied": len(cast(List[object], merge_log.get("copied", []))),
+                "skipped_duplicates": len(cast(List[object], merge_log.get("skipped_duplicates", []))),
+                "rejected": len(cast(List[object], merge_log.get("rejected", []))),
+                "conflicts": len(cast(List[object], merge_log.get("conflicts", []))),
+            }
+        )
+
+    _snapshot_generation_products(resolved_output_dir, generation_id)
     _persist_run_state(run_state_path, run_state)
     return resolved_output_dir
 
@@ -3162,6 +4287,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--scoring-profile",
         help="Shared metric profile name to use for sweep ranking.",
+    )
+    parser.add_argument(
+        "--extend-existing",
+        action="store_true",
+        help=(
+            "Allow a changed spec to extend an existing --output-dir when dataset "
+            "identities are compatible. Creates a new generation and reuses valid runs."
+        ),
+    )
+    parser.add_argument(
+        "--merge-from",
+        nargs="+",
+        default=None,
+        help=(
+            "One or more completed sweep roots to merge into --output-dir before "
+            "running missing compatible spec-mode tasks."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "In spec mode, write generations/<id>/dry_run.json with planned reused, "
+            "merged, rejected, and pending runs without executing rectification."
+        ),
     )
     parser.add_argument(
         "--views",
@@ -3327,7 +4477,21 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
                 scoring_weights=DEFAULT_SCORE_WEIGHTS,
             )
             spec.scoring.metric_weights = weights
-        return run_sweep_experiment(spec)
+        return run_sweep_experiment(
+            spec,
+            extend_existing=bool(getattr(args, "extend_existing", False)),
+            merge_from=[
+                Path(item) for item in (getattr(args, "merge_from", None) or [])
+            ],
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+
+    if (
+        bool(getattr(args, "extend_existing", False))
+        or bool(getattr(args, "dry_run", False))
+        or bool(getattr(args, "merge_from", None))
+    ):
+        raise SystemExit("--extend-existing, --merge-from, and --dry-run are supported only with --spec.")
 
     if args.save_figures and not args.live_plot:
         plt.switch_backend("Agg")
@@ -3503,6 +4667,8 @@ class SpecGuiState:
     stage1_fraction: str = "0.6"
     top_k: str = "8"
     max_workers: str = ""
+    refinement_method: str = "auto_fine"
+    refinement_extrapolation: str = "half_step_bounded"
     analyze: bool = True
     save_figures: bool = False
     pixel_similarity_window_sizes: str = "15,25,35"
@@ -3845,6 +5011,19 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
     stage_mode = state.stage_mode.strip().lower() or "two_stage"
     if stage_mode not in {"two_stage", "single_stage"}:
         raise ValueError("Execution mode must be either 'two_stage' or 'single_stage'.")
+    refinement_method = state.refinement_method.strip().lower() or "auto_fine"
+    if refinement_method not in {"auto_fine", "neighbor"}:
+        raise ValueError("Refinement method must be either 'auto_fine' or 'neighbor'.")
+    refinement_extrapolation = state.refinement_extrapolation.strip().lower() or "half_step_bounded"
+    if refinement_extrapolation not in {
+        "half_step_bounded",
+        "inside_only",
+        "full_step_outside",
+    }:
+        raise ValueError(
+            "Refinement extrapolation must be one of 'half_step_bounded', "
+            "'inside_only', or 'full_step_outside'."
+        )
     if stage_mode == "two_stage":
         stage1_fraction_value = float(state.stage1_fraction.strip())
     else:
@@ -3879,6 +5058,10 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             "max_workers": (
                 int(state.max_workers.strip()) if state.max_workers.strip() else None
             ),
+            "refinement": {
+                "method": refinement_method,
+                "extrapolation": refinement_extrapolation,
+            },
         },
         "scoring": scoring_payload,
         "save_figures": bool(state.save_figures),
@@ -3919,6 +5102,11 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
     state.top_k = str(stages.get("top_k", state.top_k))
     state.max_workers = (
         "" if stages.get("max_workers") is None else str(stages.get("max_workers"))
+    )
+    refinement = cast(Dict[str, object], stages.get("refinement", {}))
+    state.refinement_method = str(refinement.get("method", state.refinement_method))
+    state.refinement_extrapolation = str(
+        refinement.get("extrapolation", state.refinement_extrapolation)
     )
     state.save_figures = bool(payload.get("save_figures", state.save_figures))
     state.analyze = bool(payload.get("analyze", state.analyze))
@@ -4117,6 +5305,21 @@ def validate_state(state: SpecGuiState) -> List[str]:
     stage_mode = state.stage_mode.strip().lower() or "two_stage"
     if stage_mode not in {"two_stage", "single_stage"}:
         issues.append("Execution mode must be either 'two_stage' or 'single_stage'.")
+
+    refinement_method = state.refinement_method.strip().lower() or "auto_fine"
+    if refinement_method not in {"auto_fine", "neighbor"}:
+        issues.append("Refinement method must be either 'auto_fine' or 'neighbor'.")
+
+    refinement_extrapolation = state.refinement_extrapolation.strip().lower() or "half_step_bounded"
+    if refinement_extrapolation not in {
+        "half_step_bounded",
+        "inside_only",
+        "full_step_outside",
+    }:
+        issues.append(
+            "Refinement extrapolation must be one of 'half_step_bounded', "
+            "'inside_only', or 'full_step_outside'."
+        )
 
     try:
         if int(state.total_budget_per_dataset.strip()) < 1:
@@ -4545,6 +5748,28 @@ class SpecGuiApp:
         self.max_workers_entry = self.ttk.Entry(stage_frame, width=8)
         self.max_workers_entry.grid(row=0, column=9, padx=4)
         self._register_editable(self.max_workers_entry)
+        self.ttk.Label(stage_frame, text="Refinement").grid(row=1, column=0, sticky="w")
+        self.refinement_method_var = self.tk.StringVar(value="auto_fine")
+        self.refinement_method_combo = self.ttk.Combobox(
+            stage_frame,
+            textvariable=self.refinement_method_var,
+            values=["auto_fine", "neighbor"],
+            width=14,
+            state="readonly",
+        )
+        self.refinement_method_combo.grid(row=1, column=1, padx=4, pady=2)
+        self._register_editable(self.refinement_method_combo)
+        self.ttk.Label(stage_frame, text="Edge policy").grid(row=1, column=2, sticky="w")
+        self.refinement_extrapolation_var = self.tk.StringVar(value="half_step_bounded")
+        self.refinement_extrapolation_combo = self.ttk.Combobox(
+            stage_frame,
+            textvariable=self.refinement_extrapolation_var,
+            values=["half_step_bounded", "inside_only", "full_step_outside"],
+            width=18,
+            state="readonly",
+        )
+        self.refinement_extrapolation_combo.grid(row=1, column=3, padx=4, pady=2)
+        self._register_editable(self.refinement_extrapolation_combo)
 
         toggles_frame = self.ttk.Frame(basic_frame)
         toggles_frame.grid(row=3, column=0, columnspan=3, sticky="w", padx=4, pady=2)
@@ -4741,9 +5966,13 @@ class SpecGuiApp:
         if stage_mode == "single_stage":
             self.stage1_fraction_entry.configure(state="disabled")
             self.stage1_fraction_label.configure(text="Stage1 fraction (unused)")
+            self.refinement_method_combo.configure(state="disabled")
+            self.refinement_extrapolation_combo.configure(state="disabled")
         else:
             self.stage1_fraction_entry.configure(state="normal")
             self.stage1_fraction_label.configure(text="Stage1 fraction")
+            self.refinement_method_combo.configure(state="readonly")
+            self.refinement_extrapolation_combo.configure(state="readonly")
 
     def _metric_weights_from_table(self) -> Dict[str, str]:
         weights: Dict[str, str] = {}
@@ -5061,6 +6290,8 @@ class SpecGuiApp:
             stage1_fraction=self.stage1_fraction_entry.get().strip(),
             top_k=self.top_k_entry.get().strip(),
             max_workers=self.max_workers_entry.get().strip(),
+            refinement_method=self.refinement_method_var.get().strip(),
+            refinement_extrapolation=self.refinement_extrapolation_var.get().strip(),
             analyze=bool(self.analyze_var.get()),
             save_figures=bool(self.save_figures_var.get()),
             pixel_similarity_window_sizes=self.pixel_window_entry.get().strip(),
@@ -5117,6 +6348,8 @@ class SpecGuiApp:
         self.top_k_entry.insert(0, state.top_k)
         self.max_workers_entry.delete(0, self.tk.END)
         self.max_workers_entry.insert(0, state.max_workers)
+        self.refinement_method_var.set(state.refinement_method)
+        self.refinement_extrapolation_var.set(state.refinement_extrapolation)
         self.analyze_var.set(state.analyze)
         self.save_figures_var.set(state.save_figures)
         self.metric_experiments_enabled_var.set(state.metric_experiments_enabled)

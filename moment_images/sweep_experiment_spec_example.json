@@ -98,7 +98,11 @@
     "total_budget_per_dataset": 320,
     "stage1_fraction": 0.6,
     "top_k": 8,
-    "max_workers": 4
+    "max_workers": 4,
+    "refinement": {
+      "method": "auto_fine",
+      "extrapolation": "half_step_bounded"
+    }
   },
   "scoring": {
     "metric_weights": {
