@@ -154,6 +154,7 @@ Common operations:
 python -m moment_images.parameter_sweep --spec sweep_spec.json --output-dir path/to/sweep
 python -m moment_images.parameter_sweep --spec expanded_spec.json --output-dir path/to/sweep --extend-existing
 python -m moment_images.parameter_sweep --spec canonical_spec.json --output-dir path/to/sweep --merge-from path/to/source_a path/to/source_b
+python -m moment_images.parameter_sweep --spec moved_spec.json --relocate-path old/root=new/root --adopt-relocated --dry-run
 python -m moment_images.parameter_sweep --spec sweep_spec.json --output-dir path/to/sweep --dry-run
 ```
 
@@ -161,8 +162,30 @@ python -m moment_images.parameter_sweep --spec sweep_spec.json --output-dir path
   compatible.
 - `--extend-existing` is for compatible spec expansion.
 - `--merge-from` copies valid compatible completed runs from other sweep roots.
+- `--relocate-path OLD=NEW` rewrites spec paths before loading datasets and
+  scoring profiles. Repeat it for multiple moved roots.
+- `--adopt-relocated` updates copied `run_state.json` path metadata only when
+  the normalized experiment fingerprint is compatible. Start with `--dry-run`
+  to preview reused and pending runs before refreshing root-level products.
 - `--dry-run` writes a generation dry-run report without executing
   rectification or refreshing root-level products.
+
+When a sweep root and its inputs were moved together, use explicit root
+mappings instead of editing `run_state.json` by hand:
+
+```bash
+python -m moment_images.parameter_sweep \
+  --spec sweep_spec.json \
+  --relocate-path C:/old/sweep_root=D:/new/sweep_root \
+  --relocate-path C:/old/datasets=D:/new/datasets \
+  --adopt-relocated \
+  --dry-run
+```
+
+If the dry-run report under `generations/<generation_id>/dry_run.json` looks
+right, rerun the same command without `--dry-run`. Datasets generated from
+`source_image` or `source_image_dir` can resume from copied cached views under
+`datasets/<dataset_id>/` when those views match the saved dataset identity.
 
 ## Output Layout
 

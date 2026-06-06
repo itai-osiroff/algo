@@ -1,4 +1,5 @@
 import json
+import argparse
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 import shutil
@@ -1337,16 +1338,241 @@ def test_run_sweep_resume_adopts_relocated_run_state(tmp_path):
         analyze=False,
     )
 
-    out_dir = run_sweep_experiment(relocated_spec, output_dir=relocated_output_dir)
+    relocation_rules = parameter_sweep._parse_path_relocation_rules(
+        [f"{tmp_path / 'original_run'}={relocated_output_dir}"]
+    )
+    out_dir = run_sweep_experiment(
+        relocated_spec,
+        output_dir=relocated_output_dir,
+        adopt_relocated=True,
+        relocation_rules=relocation_rules,
+    )
 
     state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
     assert state["path_compatibility"]["output_dir"] == str(relocated_output_dir.resolve())
+    assert state["relocation_history"]
     assert (
         state["experiment_fingerprint"]
         == parameter_sweep._compute_experiment_fingerprint(state["fingerprint_payload"])
     )
     statuses = {entry["status"] for entry in state["runs"].values()}
     assert "skipped_valid" in statuses
+
+
+def test_parse_experiment_spec_relocates_output_dataset_and_profile_config(tmp_path):
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    new_root.mkdir()
+    views_path = new_root / "views.npy"
+    np.save(views_path, np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4))
+    config_path = new_root / "metrics_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "name": "guide_focus",
+                        "metric_weights": {"vollath_f4_guide": 1.0},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "output_dir": str(old_root / "sweep"),
+                "datasets": [{"id": "d1", "views": str(old_root / "views.npy")}],
+                "scoring": {
+                    "profile_name": "guide_focus",
+                    "profile_config_path": str(old_root / "metrics_config.json"),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rules = parameter_sweep._parse_path_relocation_rules([f"{old_root}={new_root}"])
+    spec, report = parameter_sweep._parse_experiment_spec(spec_path, relocation_rules=rules)
+
+    assert spec.output_dir == str((new_root / "sweep").resolve())
+    assert spec.datasets[0].views_path == str(views_path.resolve())
+    assert spec.scoring.profile_config_path == str(config_path.resolve())
+    assert spec.scoring.metric_weights == {"vollath_f4_guide": 1.0}
+    assert {item["field"] for item in report["applied"]} >= {
+        "output_dir",
+        "datasets[d1].views",
+        "scoring.profile_config_path",
+    }
+
+
+def test_run_sweep_rejects_relocated_state_without_adopt_flag(tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    old_views_path = tmp_path / "old_views.npy"
+    new_views_path = tmp_path / "new_views.npy"
+    np.save(old_views_path, views)
+    np.save(new_views_path, views)
+    original_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(old_views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "original"),
+        save_figures=False,
+        analyze=False,
+    )
+    original_dir = run_sweep_experiment(original_spec)
+    relocated_dir = tmp_path / "relocated"
+    shutil.copytree(original_dir, relocated_dir)
+    relocated_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(new_views_path))],
+        search_spaces=original_spec.search_spaces,
+        strategies=original_spec.strategies,
+        stages=original_spec.stages,
+        scoring=original_spec.scoring,
+        output_dir=str(relocated_dir),
+        save_figures=False,
+        analyze=False,
+    )
+
+    with pytest.raises(ValueError, match="adopt-relocated"):
+        run_sweep_experiment(relocated_spec, output_dir=relocated_dir)
+
+
+def test_run_sweep_relocated_source_image_uses_matching_copied_cache(monkeypatch, tmp_path):
+    _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    source_path = tmp_path / "old_source.png"
+    source_path.write_bytes(b"placeholder")
+
+    def fake_generate_views(*, cache_dir: Path, **_kwargs):
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / "generated_views.npy"
+        np.save(cache_path, views)
+        return views, cache_path
+
+    monkeypatch.setattr(parameter_sweep, "_generate_views", fake_generate_views)
+    base_spec = SweepExperimentSpec(
+        datasets=[
+            SweepDatasetSpec(
+                dataset_id="d1",
+                source_image=str(source_path),
+                center_x=2,
+                center_y=2,
+                view_radius=1,
+            )
+        ],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "source_original"),
+        save_figures=False,
+        analyze=False,
+    )
+    original_dir = run_sweep_experiment(base_spec)
+    relocated_dir = tmp_path / "source_relocated"
+    shutil.copytree(original_dir, relocated_dir)
+    source_path.unlink()
+
+    relocated_spec = SweepExperimentSpec(
+        datasets=base_spec.datasets,
+        search_spaces=base_spec.search_spaces,
+        strategies=base_spec.strategies,
+        stages=base_spec.stages,
+        scoring=base_spec.scoring,
+        output_dir=str(relocated_dir),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(
+        relocated_spec,
+        output_dir=relocated_dir,
+        adopt_relocated=True,
+    )
+
+    state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert "skipped_valid" in {entry["status"] for entry in state["runs"].values()}
+
+
+def test_run_sweep_adopt_relocated_rejects_incompatible_dataset(tmp_path):
+    old_views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    new_views = np.arange(100, dtype=np.float32).reshape(2, 2, 5, 5)
+    old_views_path = tmp_path / "old_views.npy"
+    new_views_path = tmp_path / "new_views.npy"
+    np.save(old_views_path, old_views)
+    np.save(new_views_path, new_views)
+    base_spec = _storage_spec(tmp_path, old_views_path, "incompatible_reloc_old", [1])
+    original_dir = run_sweep_experiment(base_spec)
+    relocated_dir = tmp_path / "incompatible_reloc_new"
+    shutil.copytree(original_dir, relocated_dir)
+    relocated_spec = _storage_spec(tmp_path, new_views_path, "incompatible_reloc_new", [1])
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        run_sweep_experiment(
+            relocated_spec,
+            output_dir=relocated_dir,
+            adopt_relocated=True,
+        )
+
+
+def test_run_from_namespace_relocation_dry_run_writes_preview_without_run_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: pytest.fail("dry run must not execute tasks"),
+    )
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    new_root.mkdir()
+    views_path = new_root / "views.npy"
+    np.save(views_path, np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4))
+    spec_path = tmp_path / "reloc_spec.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "output_dir": str(old_root / "sweep"),
+                "strategies": ["pixel"],
+                "datasets": [{"id": "d1", "views": str(old_root / "views.npy")}],
+                "search_spaces": {
+                    "pixel": {
+                        "similarity_window_sizes": [1],
+                        "max_displacements": [0],
+                        "sub_pix_factors": [1],
+                        "pixel_sigma_pyramid": [False],
+                    }
+                },
+                "stages": {"total_budget_per_dataset": 2, "stage1_fraction": 0.5, "top_k": 1, "max_workers": 1},
+                "scoring": {"metric_weights": {"laplacian_variance": 1.0}},
+                "analyze": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        spec=str(spec_path),
+        output_dir=None,
+        workers=None,
+        metrics_config=None,
+        scoring_profile=None,
+        extend_existing=False,
+        merge_from=None,
+        relocate_path=[f"{old_root}={new_root}"],
+        adopt_relocated=False,
+        dry_run=True,
+    )
+
+    out_dir = parameter_sweep._run_from_namespace(args)
+
+    assert out_dir == (new_root / "sweep").resolve()
+    dry_run_paths = list((out_dir / "generations").glob("*/dry_run.json"))
+    assert len(dry_run_paths) == 1
+    dry_run_payload = json.loads(dry_run_paths[0].read_text(encoding="utf-8"))
+    assert dry_run_payload["relocation"]["applied"]
+    assert not (out_dir / "run_state.json").exists()
 
 
 def _storage_spec(tmp_path, views_path, output_name: str, windows: list[int]) -> SweepExperimentSpec:

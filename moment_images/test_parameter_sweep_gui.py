@@ -7,6 +7,7 @@ import pytest
 from moment_images.parameter_sweep import (
     SpecGuiDatasetState,
     SpecGuiMetricExperimentRowState,
+    SpecGuiRelocationRuleState,
     SpecGuiState,
     _load_spec_payload,
     _save_spec_payload,
@@ -146,6 +147,38 @@ def test_state_to_spec_roundtrip_with_scoring_profile(tmp_path):
     assert roundtrip.scoring_profile_name == "guide_focus"
     assert roundtrip.metric_profile_config_path == str(config_path)
     assert roundtrip.metric_scope == "global_only_metrics"
+
+
+def test_state_to_spec_roundtrip_with_relocation(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.adopt_relocated = True
+    state.relocation_rules = [
+        SpecGuiRelocationRuleState(
+            old_root=str(tmp_path / "old"),
+            new_root=str(tmp_path / "new"),
+        )
+    ]
+
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    assert payload["relocation"]["adopt_relocated"] is True
+    assert payload["relocation"]["path_mappings"][0]["old"] == str((tmp_path / "old").resolve())
+    assert payload["relocation"]["path_mappings"][0]["new"] == str((tmp_path / "new").resolve())
+    assert roundtrip.adopt_relocated is True
+    assert roundtrip.relocation_rules[0].old_root == str((tmp_path / "old").resolve())
+    assert roundtrip.relocation_rules[0].new_root == str((tmp_path / "new").resolve())
+
+
+def test_validate_state_reports_invalid_relocation_mapping(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.relocation_rules = [
+        SpecGuiRelocationRuleState(old_root=str(tmp_path / "old"), new_root="")
+    ]
+
+    issues = validate_state(state)
+
+    assert any("Relocation row" in issue for issue in issues)
 
 
 def test_state_to_spec_supports_dynamic_metric_weights(tmp_path):
@@ -446,6 +479,50 @@ def test_gui_run_lifecycle_extension_dry_run_passes_flags(monkeypatch, tmp_path)
     assert calls == [{"extend_existing": True, "dry_run": True}]
     assert shown_dialogs == [True]
     assert app.run_btn.cget("text") == "Preview Run"
+    root.destroy()
+
+
+def test_gui_run_lifecycle_passes_relocation_options(monkeypatch, tmp_path):
+    from moment_images import parameter_sweep as ps
+
+    root = _make_root_or_skip()
+    app = ps.SpecGuiApp(root)
+
+    app._show_completion_dialog = lambda _output, dry_run=False: None  # type: ignore[method-assign]
+    app.messagebox.showerror = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    app.dataset_rows[0]["source_path_var"].set(str(old_root / "views.npy"))
+    app.output_dir_entry.delete(0, app.tk.END)
+    app.output_dir_entry.insert(0, str(old_root / "out"))
+    app._add_relocation_row(
+        SpecGuiRelocationRuleState(old_root=str(old_root), new_root=str(new_root))
+    )
+    app.adopt_relocated_var.set(True)
+
+    calls = []
+
+    def _run(spec, **kwargs):
+        calls.append((spec, kwargs))
+        return new_root / "out"
+
+    monkeypatch.setattr(ps, "run_sweep_experiment", _run)
+
+    app._on_run()
+    deadline = time.time() + 5.0
+    while app._is_running and time.time() < deadline:
+        root.update()
+        time.sleep(0.05)
+
+    assert app._is_running is False
+    spec, kwargs = calls[0]
+    assert spec.output_dir == str((new_root / "out").resolve())
+    assert spec.datasets[0].views_path == str((new_root / "views.npy").resolve())
+    assert kwargs["adopt_relocated"] is True
+    assert kwargs["relocation_rules"][0].old_root == str(old_root.resolve())
+    assert kwargs["relocation_rules"][0].new_root == str(new_root.resolve())
+    assert kwargs["relocation_report"]["applied"]
     root.destroy()
 
 

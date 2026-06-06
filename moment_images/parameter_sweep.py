@@ -720,6 +720,165 @@ class SweepExperimentSpec:
         )
 
 
+@dataclass(frozen=True)
+class PathRelocationRule:
+    """Map paths from an old root to a new root when resuming copied sweeps."""
+
+    old_root: str
+    new_root: str
+
+
+def _path_norm_for_compare(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _path_from_user_text(value: str) -> Path:
+    return Path(os.path.expanduser(str(value).strip())).resolve(strict=False)
+
+
+def _parse_path_relocation_rules(raw_rules: Optional[Sequence[str]]) -> List[PathRelocationRule]:
+    parsed: List[PathRelocationRule] = []
+    seen_old: set[str] = set()
+    for raw in raw_rules or []:
+        text = str(raw).strip()
+        if "=" not in text:
+            raise ValueError(
+                f"Invalid relocation mapping '{raw}'. Expected OLD=NEW."
+            )
+        old_raw, new_raw = text.split("=", 1)
+        old_root = old_raw.strip()
+        new_root = new_raw.strip()
+        if not old_root or not new_root:
+            raise ValueError(
+                f"Invalid relocation mapping '{raw}'. OLD and NEW must be non-empty."
+            )
+        old_path = _path_from_user_text(old_root)
+        new_path = _path_from_user_text(new_root)
+        old_key = _path_norm_for_compare(old_path)
+        if old_key in seen_old:
+            raise ValueError(f"Duplicate relocation old root: {old_root}")
+        seen_old.add(old_key)
+        parsed.append(
+            PathRelocationRule(old_root=str(old_path), new_root=str(new_path))
+        )
+    parsed.sort(key=lambda rule: len(_path_norm_for_compare(Path(rule.old_root))), reverse=True)
+    return parsed
+
+
+def _relocation_rules_to_payload(
+    rules: Sequence[PathRelocationRule],
+) -> List[Dict[str, str]]:
+    return [{"old": rule.old_root, "new": rule.new_root} for rule in rules]
+
+
+def _parse_relocation_rules_payload(payload: object) -> List[PathRelocationRule]:
+    if payload is None:
+        return []
+    if not isinstance(payload, list):
+        raise ValueError("relocation.path_mappings must be a list.")
+    raw_rules: List[str] = []
+    for idx, item in enumerate(payload, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"relocation.path_mappings[{idx}] must be an object.")
+        old_root = str(item.get("old") or item.get("old_root") or "").strip()
+        new_root = str(item.get("new") or item.get("new_root") or "").strip()
+        if not old_root or not new_root:
+            raise ValueError(
+                f"relocation.path_mappings[{idx}] must define old and new."
+            )
+        raw_rules.append(f"{old_root}={new_root}")
+    return _parse_path_relocation_rules(raw_rules)
+
+
+def _relocate_path_string(
+    value: object,
+    rules: Sequence[PathRelocationRule],
+) -> Tuple[object, Optional[Dict[str, str]]]:
+    if not isinstance(value, str) or not value.strip() or not rules:
+        return value, None
+    try:
+        candidate = _path_from_user_text(value)
+    except Exception:
+        return value, None
+    candidate_norm = _path_norm_for_compare(candidate)
+    for rule in rules:
+        old_root = _path_from_user_text(rule.old_root)
+        new_root = _path_from_user_text(rule.new_root)
+        old_norm = _path_norm_for_compare(old_root)
+        if candidate_norm != old_norm and not candidate_norm.startswith(old_norm + os.sep):
+            continue
+        try:
+            suffix = candidate.relative_to(old_root)
+        except ValueError:
+            suffix_text = candidate_norm[len(old_norm) :].lstrip("\\/")
+            suffix = Path(suffix_text)
+        relocated = new_root / suffix
+        return str(relocated), {"from": str(value), "to": str(relocated)}
+    return value, None
+
+
+def _relocation_options_from_spec_payload(
+    payload: Mapping[str, object],
+) -> Tuple[List[PathRelocationRule], bool]:
+    relocation = payload.get("relocation")
+    if not isinstance(relocation, dict):
+        return [], False
+    rules = _parse_relocation_rules_payload(relocation.get("path_mappings"))
+    adopt = bool(relocation.get("adopt_relocated", False))
+    return rules, adopt
+
+
+def _apply_relocation_to_spec_payload(
+    payload: Mapping[str, object],
+    rules: Sequence[PathRelocationRule],
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    relocated = json.loads(json.dumps(payload))
+    applied: List[Dict[str, str]] = []
+
+    def apply_field(container: Dict[str, object], key: str, label: str) -> None:
+        new_value, change = _relocate_path_string(container.get(key), rules)
+        if change is not None:
+            container[key] = new_value
+            applied.append({"field": label, **change})
+
+    apply_field(relocated, "output_dir", "output_dir")
+
+    scoring = relocated.get("scoring")
+    if isinstance(scoring, dict):
+        apply_field(cast(Dict[str, object], scoring), "profile_config_path", "scoring.profile_config_path")
+
+    datasets = relocated.get("datasets")
+    if isinstance(datasets, list):
+        for idx, entry in enumerate(datasets):
+            if not isinstance(entry, dict):
+                continue
+            dataset_id = str(entry.get("id") or entry.get("dataset_id") or idx)
+            dataset_entry = cast(Dict[str, object], entry)
+            for key in ("views", "views_path", "source_image", "source_image_dir"):
+                apply_field(dataset_entry, key, f"datasets[{dataset_id}].{key}")
+
+    report: Dict[str, object] = {
+        "rules": _relocation_rules_to_payload(rules),
+        "applied": applied,
+    }
+    return relocated, report
+
+
+def _resolve_spec_relative_paths_payload(
+    payload: Dict[str, object],
+    spec_path: Path,
+) -> Dict[str, object]:
+    resolved = json.loads(json.dumps(payload))
+    scoring = resolved.get("scoring")
+    if isinstance(scoring, dict):
+        profile_config_path_raw = scoring.get("profile_config_path")
+        if isinstance(profile_config_path_raw, str) and profile_config_path_raw.strip():
+            profile_config_path = Path(profile_config_path_raw)
+            if not profile_config_path.is_absolute():
+                scoring["profile_config_path"] = str((spec_path.parent / profile_config_path).resolve())
+    return resolved
+
+
 @dataclass
 class PreparedDataset:
     """Runtime-ready dataset after views have been validated/generated once."""
@@ -1502,26 +1661,21 @@ def _stage_budgets(stage_spec: SweepStageSpec) -> Tuple[int, int]:
     return stage1, stage2
 
 
-def _parse_experiment_spec(path: Path) -> SweepExperimentSpec:
+def _parse_experiment_spec(
+    path: Path,
+    relocation_rules: Sequence[PathRelocationRule] = (),
+) -> Tuple[SweepExperimentSpec, Dict[str, object]]:
     if not path.exists() and not Path(f"{path}.bak").exists():
         raise FileNotFoundError(f"Sweep spec file not found: {path}")
     payload, _, _ = read_json_first_valid(path, validator=lambda obj: isinstance(obj, dict))
     if not isinstance(payload, dict):
         raise ValueError("Sweep spec must be a JSON object.")
-    spec = SweepExperimentSpec.from_dict(payload)
-    config_path = spec.scoring.profile_config_path
-    if config_path:
-        resolved = Path(config_path)
-        if not resolved.is_absolute():
-            spec.scoring.profile_config_path = str((path.parent / resolved).resolve())
-            if spec.scoring.profile_name:
-                weights, _, _ = resolve_profile_weights_for_sweep(
-                    spec.scoring.profile_name,
-                    config_path=Path(spec.scoring.profile_config_path),
-                    scoring_weights=DEFAULT_SCORE_WEIGHTS,
-                )
-                spec.scoring.metric_weights = weights
-    return spec
+    resolved_payload = _resolve_spec_relative_paths_payload(cast(Dict[str, object], payload), path)
+    relocated_payload, relocation_report = _apply_relocation_to_spec_payload(
+        resolved_payload,
+        relocation_rules,
+    )
+    return SweepExperimentSpec.from_dict(relocated_payload), relocation_report
 
 
 def _save_run_artifacts(
@@ -1705,9 +1859,99 @@ def _generate_exposure_views(
     return exposure_views_arr, cache_path
 
 
-def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDataset:
+def _read_dataset_identity_payloads(output_dir: Path) -> Dict[str, Dict[str, object]]:
+    for metadata_path in (
+        output_dir / RUN_STATE_FILENAME,
+        Path(f"{output_dir / RUN_STATE_FILENAME}.bak"),
+        output_dir / "experiment_manifest.json",
+        Path(f"{output_dir / 'experiment_manifest.json'}.bak"),
+    ):
+        if not metadata_path.exists():
+            continue
+        try:
+            payload, _, _ = read_json_first_valid(
+                metadata_path,
+                validator=lambda obj: isinstance(obj, dict),
+            )
+        except Exception:
+            continue
+        root = cast(Dict[str, object], payload)
+        if metadata_path.name.startswith(RUN_STATE_FILENAME):
+            fingerprint_payload = root.get("fingerprint_payload")
+            datasets_payload = (
+                fingerprint_payload.get("datasets")
+                if isinstance(fingerprint_payload, dict)
+                else None
+            )
+        else:
+            datasets_payload = root.get("datasets")
+        if not isinstance(datasets_payload, list):
+            continue
+        identities: Dict[str, Dict[str, object]] = {}
+        for entry in datasets_payload:
+            if not isinstance(entry, dict):
+                continue
+            dataset_id = str(entry.get("dataset_id", "")).strip()
+            if dataset_id:
+                identities[dataset_id] = cast(Dict[str, object], entry)
+        if identities:
+            return identities
+    return {}
+
+
+def _cached_prepared_dataset(
+    *,
+    dataset: SweepDatasetSpec,
+    cache_path: Path,
+    expected_identity: Optional[Mapping[str, object]],
+    hdr_enabled: bool,
+) -> Optional[PreparedDataset]:
+    if expected_identity is None or not cache_path.exists():
+        return None
+    views_arr = _load_views(cache_path)
+    if hdr_enabled and views_arr.ndim != 5:
+        return None
+    if not hdr_enabled and views_arr.ndim == 5:
+        return None
+    if (
+        dataset.hdr_exposure_times is not None
+        and hdr_enabled
+        and len(dataset.hdr_exposure_times) != views_arr.shape[0]
+    ):
+        raise ValueError(
+            f"Dataset '{dataset.dataset_id}' exposure time count does not match cached exposure axis."
+        )
+    stat = cache_path.stat()
+    prepared = PreparedDataset(
+        dataset_id=dataset.dataset_id,
+        views_path=cache_path,
+        hdr_enabled=bool(hdr_enabled),
+        hdr_exposure_times=dataset.hdr_exposure_times,
+        normalize_to_8bit=dataset.normalize_to_8bit,
+        views_shape=tuple(int(dim) for dim in views_arr.shape),
+        views_dtype=str(views_arr.dtype),
+        views_itemsize=int(views_arr.dtype.itemsize),
+        resolved_views_path=str(cache_path.resolve()),
+        views_file_size_bytes=int(stat.st_size),
+        views_file_mtime_ns=int(stat.st_mtime_ns),
+    )
+    if _dataset_signature(prepared) != _dataset_signature_from_identity_payload(expected_identity):
+        return None
+    return prepared
+
+
+def _prepare_dataset(
+    dataset: SweepDatasetSpec,
+    output_dir: Path,
+    dataset_identities: Optional[Mapping[str, Mapping[str, object]]] = None,
+) -> PreparedDataset:
     dataset_dir = output_dir / "datasets" / dataset.dataset_id
     dataset_dir.mkdir(parents=True, exist_ok=True)
+    expected_identity = (
+        dataset_identities.get(dataset.dataset_id)
+        if dataset_identities is not None
+        else None
+    )
 
     data_sources = [
         dataset.views_path is not None,
@@ -1753,6 +1997,20 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
         )
 
     if dataset.source_image is not None:
+        source_image_path = Path(dataset.source_image)
+        if not source_image_path.exists():
+            cached = _cached_prepared_dataset(
+                dataset=dataset,
+                cache_path=dataset_dir / "generated_views.npy",
+                expected_identity=expected_identity,
+                hdr_enabled=False,
+            )
+            if cached is not None:
+                return cached
+            raise FileNotFoundError(
+                f"Dataset '{dataset.dataset_id}' source_image not found after relocation: "
+                f"{source_image_path}"
+            )
         missing = [
             name
             for name, present in [
@@ -1767,7 +2025,7 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
                 f"Dataset '{dataset.dataset_id}' source_image requires fields: {', '.join(missing)}"
             )
         views_arr, views_path = _generate_views(
-            image_path=Path(dataset.source_image),
+            image_path=source_image_path,
             center_x=int(dataset.center_x),
             center_y=int(dataset.center_y),
             radius=int(dataset.view_radius),
@@ -1796,6 +2054,20 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
         )
 
     # source_image_dir branch
+    source_image_dir_path = Path(cast(str, dataset.source_image_dir))
+    if not source_image_dir_path.exists():
+        cached = _cached_prepared_dataset(
+            dataset=dataset,
+            cache_path=dataset_dir / "generated_exposure_views.npy",
+            expected_identity=expected_identity,
+            hdr_enabled=True if dataset.hdr_enabled is None else bool(dataset.hdr_enabled),
+        )
+        if cached is not None:
+            return cached
+        raise FileNotFoundError(
+            f"Dataset '{dataset.dataset_id}' source_image_dir not found after relocation: "
+            f"{source_image_dir_path}"
+        )
     missing = [
         name
         for name, present in [
@@ -1810,7 +2082,7 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
             f"Dataset '{dataset.dataset_id}' source_image_dir requires fields: {', '.join(missing)}"
         )
     views_arr, views_path = _generate_exposure_views(
-        image_dir=Path(cast(str, dataset.source_image_dir)),
+        image_dir=source_image_dir_path,
         center_x=int(dataset.center_x),
         center_y=int(dataset.center_y),
         radius=int(dataset.view_radius),
@@ -1844,14 +2116,24 @@ def _prepare_dataset(dataset: SweepDatasetSpec, output_dir: Path) -> PreparedDat
     )
 
 
-def _prepare_datasets(spec: SweepExperimentSpec, output_dir: Path) -> List[PreparedDataset]:
+def _prepare_datasets(
+    spec: SweepExperimentSpec,
+    output_dir: Path,
+    dataset_identities: Optional[Mapping[str, Mapping[str, object]]] = None,
+) -> List[PreparedDataset]:
     seen: set[str] = set()
     prepared: List[PreparedDataset] = []
     for dataset in spec.datasets:
         if dataset.dataset_id in seen:
             raise ValueError(f"Duplicate dataset id '{dataset.dataset_id}' in experiment spec.")
         seen.add(dataset.dataset_id)
-        prepared.append(_prepare_dataset(dataset, output_dir=output_dir))
+        prepared.append(
+            _prepare_dataset(
+                dataset,
+                output_dir=output_dir,
+                dataset_identities=dataset_identities,
+            )
+        )
     prepared.sort(key=lambda item: item.dataset_id)
     return prepared
 
@@ -2163,6 +2445,28 @@ def _register_spec_generation(
     state["active_generation_id"] = generation_id
 
 
+def _record_relocation_history(
+    *,
+    state: Dict[str, object],
+    old_output_dir: str,
+    new_output_dir: str,
+    relocation_rules: Sequence[PathRelocationRule],
+    relocation_report: Optional[Mapping[str, object]],
+) -> None:
+    if not old_output_dir or old_output_dir == new_output_dir:
+        return
+    history = cast(List[Dict[str, object]], state.setdefault("relocation_history", []))
+    history.append(
+        {
+            "timestamp": _utc_now_iso(),
+            "old_output_dir": old_output_dir,
+            "new_output_dir": new_output_dir,
+            "path_mappings": _relocation_rules_to_payload(relocation_rules),
+            "applied": list(cast(Sequence[object], (relocation_report or {}).get("applied", []))),
+        }
+    )
+
+
 def _select_active_generation(
     *,
     output_dir: Path,
@@ -2191,6 +2495,9 @@ def _load_or_initialize_run_state(
     *,
     allow_extend: bool = False,
     allow_merge: bool = False,
+    adopt_relocated: bool = False,
+    relocation_rules: Sequence[PathRelocationRule] = (),
+    relocation_report: Optional[Mapping[str, object]] = None,
     merge_sources: Sequence[Path] = (),
     dry_run: bool = False,
 ) -> Tuple[Dict[str, object], Path, str]:
@@ -2211,17 +2518,37 @@ def _load_or_initialize_run_state(
         )
         state = cast(Dict[str, object], loaded)
         state = _ensure_run_state_v2(state, output_dir, fingerprint_payload)
+        path_compatibility = cast(
+            Dict[str, object],
+            state.setdefault("path_compatibility", {}),
+        )
+        existing_output_dir = str(path_compatibility.get("output_dir", ""))
+        current_output_dir = str(output_dir.resolve())
         existing_fingerprint = str(state.get("experiment_fingerprint", ""))
         if existing_fingerprint != fingerprint:
             if _fingerprint_payloads_resume_compatible(
                 state.get("fingerprint_payload"),
                 fingerprint_payload,
             ):
+                if (
+                    existing_output_dir
+                    and existing_output_dir != current_output_dir
+                    and not adopt_relocated
+                ):
+                    raise ValueError(
+                        "run_state.json output path mismatch detected for a relocated sweep. "
+                        f"state={existing_output_dir}, current={current_output_dir}. "
+                        "Use --adopt-relocated with --relocate-path OLD=NEW after verifying "
+                        "the copied sweep root and dataset paths."
+                    )
                 state["experiment_fingerprint"] = fingerprint
                 state["fingerprint_payload"] = fingerprint_payload
-                path_compatibility = cast(
-                    Dict[str, object],
-                    state.setdefault("path_compatibility", {}),
+                _record_relocation_history(
+                    state=state,
+                    old_output_dir=existing_output_dir,
+                    new_output_dir=current_output_dir,
+                    relocation_rules=relocation_rules,
+                    relocation_report=relocation_report,
                 )
                 path_compatibility["output_dir"] = str(output_dir.resolve())
                 if not dry_run:
@@ -2232,10 +2559,6 @@ def _load_or_initialize_run_state(
             ):
                 state["experiment_fingerprint"] = fingerprint
                 state["fingerprint_payload"] = fingerprint_payload
-                path_compatibility = cast(
-                    Dict[str, object],
-                    state.setdefault("path_compatibility", {}),
-                )
                 path_compatibility["output_dir"] = str(output_dir.resolve())
             else:
                 raise ValueError(
@@ -2243,13 +2566,23 @@ def _load_or_initialize_run_state(
                     "fingerprint. Refusing to resume with mismatched spec/dataset/path. "
                     "Use --extend-existing or --merge-from only when the datasets are compatible."
                 )
-        existing_output_dir = str(cast(Dict[str, object], state.get("path_compatibility", {})).get("output_dir", ""))
-        current_output_dir = str(output_dir.resolve())
+        existing_output_dir = str(path_compatibility.get("output_dir", ""))
         if existing_output_dir and existing_output_dir != current_output_dir:
-            raise ValueError(
-                "run_state.json output path mismatch detected. "
-                f"state={existing_output_dir}, current={current_output_dir}"
+            if not adopt_relocated:
+                raise ValueError(
+                    "run_state.json output path mismatch detected. "
+                    f"state={existing_output_dir}, current={current_output_dir}. "
+                    "Use --adopt-relocated with --relocate-path OLD=NEW after verifying "
+                    "the copied sweep root and dataset paths."
+                )
+            _record_relocation_history(
+                state=state,
+                old_output_dir=existing_output_dir,
+                new_output_dir=current_output_dir,
+                relocation_rules=relocation_rules,
+                relocation_report=relocation_report,
             )
+            path_compatibility["output_dir"] = current_output_dir
         generation_id = _select_active_generation(
             output_dir=output_dir,
             state=state,
@@ -3804,6 +4137,9 @@ def run_sweep_experiment(
     *,
     extend_existing: bool = False,
     merge_from: Optional[Sequence[Path]] = None,
+    adopt_relocated: bool = False,
+    relocation_rules: Sequence[PathRelocationRule] = (),
+    relocation_report: Optional[Mapping[str, object]] = None,
     dry_run: bool = False,
 ) -> Path:
     """Run a staged or single-stage, multi-dataset sweep experiment."""
@@ -3819,7 +4155,12 @@ def run_sweep_experiment(
     )
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
-    prepared_datasets = _prepare_datasets(spec, resolved_output_dir)
+    dataset_identities = _read_dataset_identity_payloads(resolved_output_dir)
+    prepared_datasets = _prepare_datasets(
+        spec,
+        resolved_output_dir,
+        dataset_identities=dataset_identities,
+    )
     dataset_ids = [dataset.dataset_id for dataset in prepared_datasets]
     fingerprint_payload = _build_experiment_fingerprint_payload(
         spec=spec,
@@ -3832,6 +4173,9 @@ def run_sweep_experiment(
         fingerprint_payload=fingerprint_payload,
         allow_extend=extend_existing,
         allow_merge=bool(merge_sources),
+        adopt_relocated=bool(adopt_relocated),
+        relocation_rules=relocation_rules,
+        relocation_report=relocation_report,
         merge_sources=merge_sources,
         dry_run=dry_run,
     )
@@ -3949,6 +4293,11 @@ def run_sweep_experiment(
             "canonical_output_dir": str(resolved_output_dir.resolve()),
             "extend_existing": bool(extend_existing),
             "merge_sources": [str(path.resolve()) for path in merge_sources],
+            "relocation": relocation_report
+            or {
+                "rules": _relocation_rules_to_payload(relocation_rules),
+                "applied": [],
+            },
             "stages": {
                 "stage1": stage1_eval.execution,
                 **(
@@ -4306,6 +4655,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--relocate-path",
+        action="append",
+        default=None,
+        metavar="OLD=NEW",
+        help=(
+            "Relocate spec paths from OLD root to NEW root before running. "
+            "May be provided multiple times; spec mode only."
+        ),
+    )
+    parser.add_argument(
+        "--adopt-relocated",
+        action="store_true",
+        help=(
+            "Allow a copied sweep root to update run_state.json path metadata "
+            "when the normalized experiment fingerprint is compatible."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
@@ -4454,7 +4821,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _run_from_namespace(args: argparse.Namespace) -> Path:
     spec_path = getattr(args, "spec", None)
     if spec_path:
-        spec = _parse_experiment_spec(Path(spec_path))
+        relocation_rules = _parse_path_relocation_rules(
+            cast(Optional[Sequence[str]], getattr(args, "relocate_path", None))
+        )
+        spec, relocation_report = _parse_experiment_spec(
+            Path(spec_path),
+            relocation_rules=relocation_rules,
+        )
         if args.output_dir is not None:
             spec.output_dir = args.output_dir
         workers_override = getattr(args, "workers", None)
@@ -4483,6 +4856,9 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
             merge_from=[
                 Path(item) for item in (getattr(args, "merge_from", None) or [])
             ],
+            adopt_relocated=bool(getattr(args, "adopt_relocated", False)),
+            relocation_rules=relocation_rules,
+            relocation_report=relocation_report,
             dry_run=bool(getattr(args, "dry_run", False)),
         )
 
@@ -4490,8 +4866,13 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         bool(getattr(args, "extend_existing", False))
         or bool(getattr(args, "dry_run", False))
         or bool(getattr(args, "merge_from", None))
+        or bool(getattr(args, "relocate_path", None))
+        or bool(getattr(args, "adopt_relocated", False))
     ):
-        raise SystemExit("--extend-existing, --merge-from, and --dry-run are supported only with --spec.")
+        raise SystemExit(
+            "--extend-existing, --merge-from, --relocate-path, --adopt-relocated, "
+            "and --dry-run are supported only with --spec."
+        )
 
     if args.save_figures and not args.live_plot:
         plt.switch_backend("Agg")
@@ -4657,10 +5038,18 @@ class SpecGuiMetricExperimentRowState:
 
 
 @dataclass
+class SpecGuiRelocationRuleState:
+    old_root: str = ""
+    new_root: str = ""
+
+
+@dataclass
 class SpecGuiState:
     output_dir: str = ""
     run_mode: str = "normal"
     dry_run: bool = False
+    adopt_relocated: bool = False
+    relocation_rules: List[SpecGuiRelocationRuleState] = field(default_factory=list)
     strategy_pixel: bool = True
     strategy_combined: bool = True
     strategy_global: bool = False
@@ -4892,6 +5281,21 @@ def _metric_formulation_payload_to_state_row(
     )
 
 
+def _state_relocation_rules(state: SpecGuiState) -> List[PathRelocationRule]:
+    raw_rules: List[str] = []
+    for idx, rule in enumerate(state.relocation_rules, start=1):
+        old_root = rule.old_root.strip()
+        new_root = rule.new_root.strip()
+        if not old_root and not new_root:
+            continue
+        if not old_root or not new_root:
+            raise ValueError(
+                f"Relocation row {idx} must define both old root and new root."
+            )
+        raw_rules.append(f"{old_root}={new_root}")
+    return _parse_path_relocation_rules(raw_rules)
+
+
 def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
     """Convert GUI state into canonical JSON payload for SweepExperimentSpec."""
     strategies: List[str] = []
@@ -5082,6 +5486,12 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
                 for idx, row in enumerate(state.metric_experiment_rows)
             ],
         }
+    relocation_rules = _state_relocation_rules(state)
+    if relocation_rules or state.adopt_relocated:
+        payload["relocation"] = {
+            "path_mappings": _relocation_rules_to_payload(relocation_rules),
+            "adopt_relocated": bool(state.adopt_relocated),
+        }
     return payload
 
 
@@ -5089,6 +5499,16 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
     """Convert JSON payload into GUI state using tolerant defaults."""
     state = SpecGuiState()
     state.output_dir = str(payload.get("output_dir") or "")
+    relocation = payload.get("relocation")
+    if isinstance(relocation, dict):
+        state.adopt_relocated = bool(relocation.get("adopt_relocated", False))
+        state.relocation_rules = [
+            SpecGuiRelocationRuleState(
+                old_root=rule.old_root,
+                new_root=rule.new_root,
+            )
+            for rule in _parse_relocation_rules_payload(relocation.get("path_mappings"))
+        ]
 
     strategies = [str(item).lower() for item in cast(List[object], payload.get("strategies", []))]
     state.strategy_pixel = "pixel" in strategies or not strategies
@@ -5297,6 +5717,12 @@ def validate_state(state: SpecGuiState) -> List[str]:
         issues.append("Run mode must be normal or extend.")
     if run_mode == "extend" and not state.output_dir.strip():
         issues.append("Extend existing sweep requires an output directory.")
+    try:
+        _state_relocation_rules(state)
+    except ValueError as exc:
+        issues.append(str(exc))
+    if state.adopt_relocated and not state.output_dir.strip():
+        issues.append("Adopt relocated sweep requires an output directory.")
 
     strategies = [
         strategy
@@ -5595,6 +6021,7 @@ class SpecGuiApp:
         self.state = SpecGuiState()
         self.dataset_rows: List[Dict[str, Any]] = []
         self.metric_experiment_rows: List[Dict[str, Any]] = []
+        self.relocation_rows: List[Dict[str, Any]] = []
         self.editable_widgets: List[Any] = []
         self.log_queue: "queue.Queue[Dict[str, object]]" = queue.Queue()
         self.run_thread: Optional[threading.Thread] = None
@@ -5603,6 +6030,7 @@ class SpecGuiApp:
         self.show_advanced_var = tk.BooleanVar(value=False)
         self.run_mode_var = tk.StringVar(value="normal")
         self.dry_run_var = tk.BooleanVar(value=False)
+        self.adopt_relocated_var = tk.BooleanVar(value=False)
 
         self.root.title("Moment Images Sweep (Spec Mode)")
         self.root.geometry("1280x900")
@@ -5750,8 +6178,43 @@ class SpecGuiApp:
         dry_run_check.pack(side="left", padx=12)
         self._register_editable(dry_run_check)
 
+        relocation_frame = self.ttk.LabelFrame(basic_frame, text="Relocation")
+        relocation_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+        relocation_btns = self.ttk.Frame(relocation_frame)
+        relocation_btns.pack(fill="x", padx=4, pady=3)
+        add_reloc_btn = self.ttk.Button(
+            relocation_btns,
+            text="Add Mapping",
+            command=self._add_relocation_row,
+        )
+        add_reloc_btn.pack(side="left", padx=2)
+        self._register_editable(add_reloc_btn)
+        preview_reloc_btn = self.ttk.Button(
+            relocation_btns,
+            text="Preview",
+            command=self._on_preview_relocation,
+        )
+        preview_reloc_btn.pack(side="left", padx=2)
+        self._register_editable(preview_reloc_btn)
+        apply_reloc_btn = self.ttk.Button(
+            relocation_btns,
+            text="Apply",
+            command=self._on_apply_relocation,
+        )
+        apply_reloc_btn.pack(side="left", padx=2)
+        self._register_editable(apply_reloc_btn)
+        adopt_check = self.ttk.Checkbutton(
+            relocation_btns,
+            text="Adopt relocated sweep",
+            variable=self.adopt_relocated_var,
+        )
+        adopt_check.pack(side="left", padx=12)
+        self._register_editable(adopt_check)
+        self.relocation_rows_frame = self.ttk.Frame(relocation_frame)
+        self.relocation_rows_frame.pack(fill="x", padx=4, pady=3)
+
         strat_frame = self.ttk.Frame(basic_frame)
-        strat_frame.grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        strat_frame.grid(row=3, column=0, columnspan=3, sticky="w", padx=4, pady=2)
         self.ttk.Label(strat_frame, text="Strategies:").pack(side="left")
         self.strategy_pixel_var = self.tk.BooleanVar(value=True)
         self.strategy_combined_var = self.tk.BooleanVar(value=True)
@@ -5766,7 +6229,7 @@ class SpecGuiApp:
             self._register_editable(chk)
 
         stage_frame = self.ttk.Frame(basic_frame)
-        stage_frame.grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        stage_frame.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=2)
         self.ttk.Label(stage_frame, text="Execution mode").grid(row=0, column=0, sticky="w")
         self.stage_mode_var = self.tk.StringVar(value="two_stage")
         self.stage_mode_combo = self.ttk.Combobox(
@@ -6281,6 +6744,52 @@ class SpecGuiApp:
                 del self.metric_experiment_rows[idx]
                 break
 
+    def _clear_relocation_rows(self) -> None:
+        for row in self.relocation_rows:
+            row["frame"].destroy()
+        self.relocation_rows = []
+
+    def _add_relocation_row(
+        self,
+        initial: Optional[SpecGuiRelocationRuleState] = None,
+    ) -> None:
+        initial_state = initial or SpecGuiRelocationRuleState()
+        row_frame = self.ttk.Frame(self.relocation_rows_frame)
+        row_frame.pack(fill="x", pady=2)
+        old_var = self.tk.StringVar(value=initial_state.old_root)
+        new_var = self.tk.StringVar(value=initial_state.new_root)
+
+        self.ttk.Label(row_frame, text="Old root").pack(side="left", padx=2)
+        old_entry = self.ttk.Entry(row_frame, textvariable=old_var, width=38)
+        old_entry.pack(side="left", padx=2)
+        self._register_editable(old_entry)
+        self.ttk.Label(row_frame, text="New root").pack(side="left", padx=2)
+        new_entry = self.ttk.Entry(row_frame, textvariable=new_var, width=38)
+        new_entry.pack(side="left", padx=2)
+        self._register_editable(new_entry)
+        remove_btn = self.ttk.Button(
+            row_frame,
+            text="Remove",
+            command=lambda frame=row_frame: self._remove_relocation_row(frame),
+        )
+        remove_btn.pack(side="left", padx=4)
+        self._register_editable(remove_btn)
+
+        self.relocation_rows.append(
+            {
+                "frame": row_frame,
+                "old_var": old_var,
+                "new_var": new_var,
+            }
+        )
+
+    def _remove_relocation_row(self, frame: Any) -> None:
+        for idx, row in enumerate(self.relocation_rows):
+            if row["frame"] == frame:
+                row["frame"].destroy()
+                del self.relocation_rows[idx]
+                break
+
     def _browse_dataset_path(self, source_type_var: Any, path_var: Any) -> None:
         source_type = source_type_var.get()
         if source_type == "views":
@@ -6331,10 +6840,21 @@ class SpecGuiApp:
                 )
             )
 
+        relocation_rules: List[SpecGuiRelocationRuleState] = []
+        for row in self.relocation_rows:
+            relocation_rules.append(
+                SpecGuiRelocationRuleState(
+                    old_root=row["old_var"].get().strip(),
+                    new_root=row["new_var"].get().strip(),
+                )
+            )
+
         return SpecGuiState(
             output_dir=self.output_dir_entry.get().strip(),
             run_mode=self.run_mode_var.get().strip(),
             dry_run=bool(self.dry_run_var.get()),
+            adopt_relocated=bool(self.adopt_relocated_var.get()),
+            relocation_rules=relocation_rules,
             strategy_pixel=bool(self.strategy_pixel_var.get()),
             strategy_combined=bool(self.strategy_combined_var.get()),
             strategy_global=bool(self.strategy_global_var.get()),
@@ -6391,6 +6911,7 @@ class SpecGuiApp:
         self.output_dir_entry.insert(0, state.output_dir)
         self.run_mode_var.set(state.run_mode if state.run_mode in {"normal", "extend"} else "normal")
         self.dry_run_var.set(bool(state.dry_run))
+        self.adopt_relocated_var.set(bool(state.adopt_relocated))
         self.strategy_pixel_var.set(state.strategy_pixel)
         self.strategy_combined_var.set(state.strategy_combined)
         self.strategy_global_var.set(state.strategy_global)
@@ -6455,6 +6976,9 @@ class SpecGuiApp:
         self._clear_dataset_rows()
         for dataset in state.datasets:
             self._add_dataset_row(dataset)
+        self._clear_relocation_rows()
+        for rule in state.relocation_rules:
+            self._add_relocation_row(rule)
         self._clear_metric_experiment_rows()
         for metric_row in state.metric_experiment_rows:
             self._add_metric_experiment_row(metric_row)
@@ -6496,6 +7020,37 @@ class SpecGuiApp:
                 )
         except Exception as exc:  # noqa: BLE001
             self.messagebox.showerror("JSON Preview", str(exc))
+
+    def _relocated_payload_from_current_state(self) -> Tuple[Dict[str, object], Dict[str, object]]:
+        state = self._get_state()
+        payload = state_to_spec_dict(state)
+        rules, _ = _relocation_options_from_spec_payload(payload)
+        return _apply_relocation_to_spec_payload(payload, rules)
+
+    def _on_preview_relocation(self) -> None:
+        try:
+            relocated_payload, report = self._relocated_payload_from_current_state()
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("Relocation Preview", str(exc))
+            return
+        applied = cast(List[object], report.get("applied", []))
+        self.json_text.delete("1.0", self.tk.END)
+        self.json_text.insert(self.tk.END, json.dumps(relocated_payload, indent=2))
+        self.messagebox.showinfo(
+            "Relocation Preview",
+            f"Relocation preview applied {len(applied)} path change(s).",
+        )
+
+    def _on_apply_relocation(self) -> None:
+        try:
+            relocated_payload, report = self._relocated_payload_from_current_state()
+            state = spec_dict_to_state(relocated_payload)
+            self._set_state(state)
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("Apply Relocation", str(exc))
+            return
+        applied = cast(List[object], report.get("applied", []))
+        self._append_log(f"Applied relocation to {len(applied)} path(s).")
 
     def _on_load_spec(self) -> None:
         selected = self.filedialog.askopenfilename(
@@ -6542,7 +7097,12 @@ class SpecGuiApp:
     def _run_worker(self, payload: Dict[str, object], run_mode: str, dry_run: bool) -> None:
         self.log_queue.put({"type": "log", "message": "Preparing experiment spec..."})
         try:
-            spec = SweepExperimentSpec.from_dict(payload)
+            relocation_rules, adopt_relocated = _relocation_options_from_spec_payload(payload)
+            relocated_payload, relocation_report = _apply_relocation_to_spec_payload(
+                payload,
+                relocation_rules,
+            )
+            spec = SweepExperimentSpec.from_dict(relocated_payload)
             extend_existing = run_mode == "extend"
             mode_label = "extend existing sweep" if extend_existing else "new/resume exact spec"
             self.log_queue.put(
@@ -6554,10 +7114,18 @@ class SpecGuiApp:
                     ),
                 }
             )
+            kwargs: Dict[str, object] = {
+                "extend_existing": extend_existing,
+                "dry_run": bool(dry_run),
+            }
+            if relocation_rules:
+                kwargs["relocation_rules"] = relocation_rules
+                kwargs["relocation_report"] = relocation_report
+            if adopt_relocated:
+                kwargs["adopt_relocated"] = True
             output_dir = run_sweep_experiment(
                 spec,
-                extend_existing=extend_existing,
-                dry_run=bool(dry_run),
+                **kwargs,
             )
             if dry_run:
                 message = "Dry run completed. No rectification tasks were executed."
@@ -6590,7 +7158,9 @@ class SpecGuiApp:
             return
         try:
             payload = state_to_spec_dict(state)
-            SweepExperimentSpec.from_dict(payload)
+            relocation_rules, _ = _relocation_options_from_spec_payload(payload)
+            relocated_payload, _ = _apply_relocation_to_spec_payload(payload, relocation_rules)
+            SweepExperimentSpec.from_dict(relocated_payload)
         except Exception as exc:  # noqa: BLE001
             self.messagebox.showerror("Run Sweep", str(exc))
             return
