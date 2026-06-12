@@ -13,7 +13,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from matplotlib.figure import Figure
@@ -47,6 +47,27 @@ SENSITIVITY_OLS_MIN_EXTRA_ROWS = 2
 EXTENSION_MIN_ABSOLUTE_EFFECT = 0.02
 EXTENSION_MIN_RELATIVE_EFFECT = 0.15
 EXTENSION_MAX_SUGGESTIONS = 8
+RECTIFICATION_VIEW_CHANNELS = (
+    "preview",
+    "displacement_magnitude",
+    "blended_score",
+    "component_score",
+    "global_final_delta",
+)
+RECTIFICATION_VIEW_LABELS = {
+    "preview": "Preview",
+    "displacement_magnitude": "Displacement Magnitude",
+    "blended_score": "Blended Score",
+    "component_score": "Component Score",
+    "global_final_delta": "Global - Final",
+}
+RECTIFICATION_VIEW_CMAPS = {
+    "preview": "gray",
+    "displacement_magnitude": "viridis",
+    "blended_score": "viridis",
+    "component_score": "viridis",
+    "global_final_delta": "coolwarm",
+}
 
 
 @dataclass
@@ -128,6 +149,51 @@ class RunMetricRecord:
     ranking_metric_name: Optional[str]
     ranking_metric_value: Optional[float]
     generation_id: Optional[str] = None
+
+
+RectificationResultKey = Tuple[str, str, str]
+
+
+@dataclass(frozen=True)
+class RectificationViewSelection:
+    """A stage/candidate/dataset selection for interactive rectification viewing."""
+
+    stage: str
+    candidate_id: str
+    dataset_id: str
+    component_name: Optional[str] = None
+
+    @property
+    def key(self) -> RectificationResultKey:
+        return self.stage, self.candidate_id, self.dataset_id
+
+
+@dataclass
+class RectificationDisplayBundle:
+    """Display-ready rectification result channels for one candidate/dataset."""
+
+    selection: RectificationViewSelection
+    preview_path: Optional[str]
+    workspace_path: Optional[str]
+    preview: Optional[np.ndarray]
+    displacement_magnitude: Optional[np.ndarray]
+    blended_score: Optional[np.ndarray]
+    component_score: Optional[np.ndarray]
+    global_final_delta: Optional[np.ndarray]
+    warnings: List[str] = field(default_factory=list)
+
+    def get(self, channel_name: str) -> Optional[np.ndarray]:
+        if channel_name == "preview":
+            return self.preview
+        if channel_name == "displacement_magnitude":
+            return self.displacement_magnitude
+        if channel_name == "blended_score":
+            return self.blended_score
+        if channel_name == "component_score":
+            return self.component_score
+        if channel_name == "global_final_delta":
+            return self.global_final_delta
+        return None
 
 
 @dataclass
@@ -4047,6 +4113,18 @@ def _load_preview_array(path: Optional[str]) -> Optional[np.ndarray]:
         return None
 
 
+def _load_preview_array_with_warnings(path: Optional[str]) -> Tuple[Optional[np.ndarray], List[str]]:
+    if not path:
+        return None, ["Preview image unavailable."]
+    preview_path = Path(path)
+    if not preview_path.exists():
+        return None, [f"Preview image not found: {preview_path}"]
+    try:
+        return np.asarray(Image.open(preview_path).convert("L"), dtype=np.float64), []
+    except Exception as exc:  # noqa: BLE001
+        return None, [f"Failed to read preview image: {type(exc).__name__}: {exc}"]
+
+
 def _collapse_image_like(array: Optional[np.ndarray]) -> Optional[np.ndarray]:
     if not isinstance(array, np.ndarray):
         return None
@@ -4056,6 +4134,113 @@ def _collapse_image_like(array: Optional[np.ndarray]) -> Optional[np.ndarray]:
     while arr.ndim > 2:
         arr = np.nanmean(arr, axis=-1)
     return arr
+
+
+def _finite_2d_channel(array: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    arr = _collapse_image_like(array)
+    if not isinstance(arr, np.ndarray) or arr.ndim != 2 or arr.size == 0:
+        return None
+    return np.asarray(arr, dtype=np.float64)
+
+
+def _rectification_candidate_row(
+    model: SweepVisualizationModel,
+    selection: RectificationViewSelection,
+) -> Optional[CandidateVisualizationRow]:
+    return next(
+        (
+            row
+            for row in model.candidates
+            if row.stage == selection.stage and row.candidate_id == selection.candidate_id
+        ),
+        None,
+    )
+
+
+def _rectification_record(
+    model: SweepVisualizationModel,
+    selection: RectificationViewSelection,
+) -> Optional[RunMetricRecord]:
+    return _find_run_metric_record(
+        model,
+        stage_name=selection.stage,
+        candidate_id=selection.candidate_id,
+        dataset_id=selection.dataset_id,
+    )
+
+
+def _rectification_preview_path(
+    row: Optional[CandidateVisualizationRow],
+    record: Optional[RunMetricRecord],
+    dataset_id: str,
+) -> Optional[str]:
+    if row is not None:
+        preview_path = row.preview_paths.get(dataset_id) or row.preview_paths.get("aggregate")
+        if preview_path:
+            return preview_path
+    return None if record is None else record.preview_path
+
+
+def load_rectification_display_bundle(
+    model: SweepVisualizationModel,
+    selection: RectificationViewSelection,
+) -> RectificationDisplayBundle:
+    """Load display-ready image channels for one rectification result."""
+
+    row = _rectification_candidate_row(model, selection)
+    record = _rectification_record(model, selection)
+    preview_path = _rectification_preview_path(row, record, selection.dataset_id)
+    preview, warnings = _load_preview_array_with_warnings(preview_path)
+    workspace_path = None if record is None else record.workspace_path
+    payload: Dict[str, np.ndarray] = {}
+    if workspace_path:
+        payload, workspace_warnings = _load_workspace_diagnostics(Path(workspace_path))
+        warnings.extend(workspace_warnings)
+    else:
+        warnings.append("workspace.npz unavailable")
+
+    disp_x = _finite_2d_channel(cast(Optional[np.ndarray], payload.get("pixel_displacements_x")))
+    disp_y = _finite_2d_channel(cast(Optional[np.ndarray], payload.get("pixel_displacements_y")))
+    displacement_magnitude = None
+    if disp_x is not None and disp_y is not None:
+        if disp_x.shape == disp_y.shape:
+            displacement_magnitude = np.sqrt(np.square(disp_x) + np.square(disp_y))
+        else:
+            warnings.append(
+                "Displacement map shapes do not match: "
+                f"x={disp_x.shape}, y={disp_y.shape}"
+            )
+
+    component_name = selection.component_name or "gradient"
+    blended_score = _finite_2d_channel(cast(Optional[np.ndarray], payload.get("pixel_blended_scores")))
+    component_score = _finite_2d_channel(
+        cast(Optional[np.ndarray], payload.get(f"pixel_component_score_{component_name}"))
+    )
+    global_avg = _finite_2d_channel(
+        cast(Optional[np.ndarray], payload.get("average_rectified_global_image"))
+    )
+    final_avg = _finite_2d_channel(cast(Optional[np.ndarray], payload.get("average_rectified_image")))
+    global_final_delta = None
+    if global_avg is not None and final_avg is not None:
+        if global_avg.shape == final_avg.shape:
+            global_final_delta = global_avg - final_avg
+        else:
+            warnings.append(
+                "Global/final average shapes do not match: "
+                f"global={global_avg.shape}, final={final_avg.shape}"
+            )
+
+    return RectificationDisplayBundle(
+        selection=selection,
+        preview_path=preview_path,
+        workspace_path=workspace_path,
+        preview=preview,
+        displacement_magnitude=displacement_magnitude,
+        blended_score=blended_score,
+        component_score=component_score,
+        global_final_delta=global_final_delta,
+        warnings=_sorted_unique(warnings),
+    )
 
 
 def _comparison_artifacts_for_candidate(
@@ -4141,7 +4326,7 @@ def _draw_image_panel(
         ax.axis("off")
         ax.set_title(title)
         return
-    image = ax.imshow(arr, aspect="auto", cmap=cmap)
+    image = ax.imshow(arr, aspect="equal", cmap=cmap, interpolation="nearest")
     ax.set_title(title)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -5394,6 +5579,202 @@ def _format_extension_suggestions_text(suggestions: Sequence[ExtensionSuggestion
     return "\n".join(lines).strip()
 
 
+class _RectificationImageInspector:
+    """Interactive zoomable image panel for one rectification result."""
+
+    def __init__(
+        self,
+        app: "SweepVisualizationApp",
+        parent: Any,
+        *,
+        slot_name: str,
+        on_channel_changed: Optional[Callable[["_RectificationImageInspector", str], None]] = None,
+        on_limits_changed: Optional[Callable[["_RectificationImageInspector"], None]] = None,
+    ) -> None:
+        self.app = app
+        self.slot_name = slot_name
+        self.on_channel_changed = on_channel_changed
+        self.on_limits_changed = on_limits_changed
+        self.bundle: Optional[RectificationDisplayBundle] = None
+        self._last_rendered_shape: Optional[Tuple[int, int]] = None
+        self._suspend_limit_events = False
+
+        self.frame = self.app.ttk.LabelFrame(parent, text=f"Result {slot_name}")
+        controls = self.app.ttk.Frame(self.frame)
+        controls.pack(fill="x", padx=6, pady=4)
+        self.app.ttk.Label(controls, text="Channel").pack(side="left")
+        self.channel_var = self.app.tk.StringVar(value=RECTIFICATION_VIEW_LABELS["preview"])
+        self.channel_combo = self.app.ttk.Combobox(
+            controls,
+            textvariable=self.channel_var,
+            state="readonly",
+            values=[RECTIFICATION_VIEW_LABELS[name] for name in RECTIFICATION_VIEW_CHANNELS],
+            width=24,
+        )
+        self.channel_combo.pack(side="left", padx=4)
+        self.channel_combo.bind("<<ComboboxSelected>>", lambda _evt: self._handle_channel_changed())
+        self.app.ttk.Button(controls, text="Fit", command=self.fit_view).pack(side="left", padx=4)
+        self.status_var = self.app.tk.StringVar(value="not set")
+        self.app.ttk.Label(controls, textvariable=self.status_var).pack(side="left", padx=8)
+
+        self.toolbar_frame = self.app.ttk.Frame(self.frame)
+        self.toolbar_frame.pack(fill="x", padx=6, pady=(0, 2))
+        self.canvas_frame = self.app.ttk.Frame(self.frame)
+        self.canvas_frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        self.figure = Figure(figsize=(6.2, 5.8))
+        self.axis = self.figure.add_subplot(111)
+        self.canvas = self.app.FigureCanvasTkAgg(self.figure, master=self.canvas_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        try:
+            self.toolbar = self.app.NavigationToolbar2Tk(
+                self.canvas,
+                self.toolbar_frame,
+                pack_toolbar=False,
+            )
+        except TypeError:
+            self.toolbar = self.app.NavigationToolbar2Tk(self.canvas, self.toolbar_frame)
+        self.toolbar.update()
+        if hasattr(self.toolbar, "pack"):
+            self.toolbar.pack(fill="x")
+        self.axis.callbacks.connect("xlim_changed", lambda _axes: self._notify_limits_changed())
+        self.axis.callbacks.connect("ylim_changed", lambda _axes: self._notify_limits_changed())
+        self._render_placeholder(f"Result {slot_name} is not set.")
+
+    def current_channel(self) -> str:
+        label = self.channel_var.get()
+        for channel_name, channel_label in RECTIFICATION_VIEW_LABELS.items():
+            if label == channel_label or label == channel_name:
+                return channel_name
+        return "preview"
+
+    def set_channel(self, channel_name: str, *, emit_event: bool = False, reset_view: bool = False) -> None:
+        if channel_name not in RECTIFICATION_VIEW_CHANNELS:
+            channel_name = "preview"
+        self.channel_var.set(RECTIFICATION_VIEW_LABELS[channel_name])
+        self.render(reset_view=reset_view)
+        if emit_event and self.on_channel_changed is not None:
+            self.on_channel_changed(self, channel_name)
+
+    def current_image(self) -> Optional[np.ndarray]:
+        if self.bundle is None:
+            return None
+        image = self.bundle.get(self.current_channel())
+        if isinstance(image, np.ndarray) and image.ndim == 2 and image.size:
+            return np.asarray(image, dtype=np.float64)
+        return None
+
+    def has_image(self) -> bool:
+        return self.current_image() is not None
+
+    def set_bundle(
+        self,
+        bundle: Optional[RectificationDisplayBundle],
+        *,
+        reset_view: bool = True,
+    ) -> None:
+        previous_key = None if self.bundle is None else self.bundle.selection.key
+        self.bundle = bundle
+        if bundle is None:
+            self.status_var.set("not set")
+            self._render_placeholder(f"Result {self.slot_name} is not set.")
+            return
+        self.status_var.set(
+            f"{bundle.selection.candidate_id} / {bundle.selection.dataset_id} / {bundle.selection.stage}"
+        )
+        self.render(reset_view=reset_view or bundle.selection.key != previous_key)
+
+    def get_axes_limits(self) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
+        if not self.axis.images:
+            return None, None
+        xlim = cast(Tuple[float, float], tuple(float(value) for value in self.axis.get_xlim()))
+        ylim = cast(Tuple[float, float], tuple(float(value) for value in self.axis.get_ylim()))
+        return xlim, ylim
+
+    def apply_axes_limits(
+        self,
+        x_limits: Tuple[float, float],
+        y_limits: Tuple[float, float],
+    ) -> None:
+        self._suspend_limit_events = True
+        try:
+            self.axis.set_xlim(*x_limits)
+            self.axis.set_ylim(*y_limits)
+        finally:
+            self._suspend_limit_events = False
+        self.canvas.draw_idle()
+
+    def clone_view_state_from(self, other: "_RectificationImageInspector") -> None:
+        self.set_channel(other.current_channel(), emit_event=False, reset_view=False)
+        xlim, ylim = other.get_axes_limits()
+        if xlim is not None and ylim is not None and self.has_image():
+            self.apply_axes_limits(xlim, ylim)
+
+    def fit_view(self) -> None:
+        image = self.current_image()
+        if image is None:
+            return
+        height, width = image.shape
+        self._suspend_limit_events = True
+        try:
+            self.axis.set_xlim(-0.5, width - 0.5)
+            self.axis.set_ylim(height - 0.5, -0.5)
+        finally:
+            self._suspend_limit_events = False
+        self.canvas.draw_idle()
+        self._notify_limits_changed()
+
+    def render(self, *, reset_view: bool) -> None:
+        image = self.current_image()
+        previous_shape = self._last_rendered_shape
+        previous_limits = self.get_axes_limits()
+        channel_name = self.current_channel()
+        title = RECTIFICATION_VIEW_LABELS.get(channel_name, channel_name)
+        if image is None:
+            self._render_placeholder(f"{title} unavailable.")
+            return
+        self.axis.clear()
+        self.axis.imshow(
+            image,
+            cmap=RECTIFICATION_VIEW_CMAPS.get(channel_name, "gray"),
+            aspect="equal",
+            interpolation="nearest",
+        )
+        self.axis.set_title(title)
+        self.axis.set_xticks([])
+        self.axis.set_yticks([])
+        self._last_rendered_shape = (int(image.shape[0]), int(image.shape[1]))
+        if reset_view or previous_limits[0] is None or previous_shape != image.shape:
+            self.fit_view()
+        else:
+            self.apply_axes_limits(
+                cast(Tuple[float, float], previous_limits[0]),
+                cast(Tuple[float, float], previous_limits[1]),
+            )
+        self.canvas.draw_idle()
+
+    def _render_placeholder(self, text: str) -> None:
+        self.axis.clear()
+        self.axis.text(0.5, 0.5, text, ha="center", va="center")
+        self.axis.set_xticks([])
+        self.axis.set_yticks([])
+        self.axis.set_title(RECTIFICATION_VIEW_LABELS.get(self.current_channel(), self.current_channel()))
+        self._last_rendered_shape = None
+        self.canvas.draw_idle()
+
+    def _handle_channel_changed(self) -> None:
+        channel_name = self.current_channel()
+        self.render(reset_view=False)
+        if self.on_channel_changed is not None:
+            self.on_channel_changed(self, channel_name)
+
+    def _notify_limits_changed(self) -> None:
+        if self._suspend_limit_events or self.on_limits_changed is None:
+            return
+        self.on_limits_changed(self)
+
+
 class SweepVisualizationApp:
     """Tkinter GUI for loading, browsing, previewing, and exporting sweep results."""
 
@@ -6056,16 +6437,24 @@ def _sweep_visualization_app_init(
     self.ttk = ttk
     self.filedialog = __import__("tkinter.filedialog", fromlist=["filedialog"])
     self.messagebox = __import__("tkinter.messagebox", fromlist=["messagebox"])
-    self.FigureCanvasTkAgg = __import__(
+    backend_tkagg = __import__(
         "matplotlib.backends.backend_tkagg",
-        fromlist=["FigureCanvasTkAgg"],
-    ).FigureCanvasTkAgg
+        fromlist=["FigureCanvasTkAgg", "NavigationToolbar2Tk"],
+    )
+    self.FigureCanvasTkAgg = backend_tkagg.FigureCanvasTkAgg
+    self.NavigationToolbar2Tk = backend_tkagg.NavigationToolbar2Tk
 
     self.root.title("Sweep Results Visualizer")
     self.root.geometry("1380x980")
     self.model = None
     self._canvases = {}
     self._preview_image_ref = None
+    self._rectification_bundle_cache: Dict[Tuple[str, str, str, str], RectificationDisplayBundle] = {}
+    self._comparison_slot_a_key: Optional[RectificationResultKey] = None
+    self._comparison_slot_b_key: Optional[RectificationResultKey] = None
+    self._comparison_slots_cleared = False
+    self._comparison_sync_in_progress = False
+    self._comparison_channel_sync_in_progress = False
     self._metric_tab_visible = False
     self._effect_filter_vars = {}
     self._effect_filter_combos = {}
@@ -6101,6 +6490,10 @@ def _sweep_visualization_app_init(
     self.comparison_stage_var = tk.StringVar(value="")
     self.comparison_dataset_var = tk.StringVar(value="")
     self.comparison_component_var = tk.StringVar(value="gradient")
+    self.comparison_sync_var = tk.BooleanVar(value=True)
+    self.comparison_lock_channel_var = tk.BooleanVar(value=True)
+    self.comparison_slot_a_var = tk.StringVar(value="A: not set")
+    self.comparison_slot_b_var = tk.StringVar(value="B: not set")
     self.diagnostic_stage_var = tk.StringVar(value="")
     self.diagnostic_candidate_var = tk.StringVar(value="")
     self.diagnostic_dataset_var = tk.StringVar(value="")
@@ -6381,6 +6774,11 @@ def _sweep_visualization_build_extensions_tab(self: SweepVisualizationApp) -> No
 def _sweep_visualization_build_comparison_tab(self: SweepVisualizationApp) -> None:
     controls = self.ttk.Frame(self.comparison_tab)
     controls.pack(fill="x", padx=6, pady=6)
+    self.ttk.Button(controls, text="Set A", command=lambda: self._set_comparison_slot("A")).pack(side="left", padx=(0, 3))
+    self.ttk.Button(controls, text="Set B", command=lambda: self._set_comparison_slot("B")).pack(side="left", padx=3)
+    self.ttk.Button(controls, text="Use 2 Selected", command=self._assign_comparison_slots_from_selection).pack(side="left", padx=3)
+    self.ttk.Button(controls, text="Swap", command=self._swap_comparison_slots).pack(side="left", padx=3)
+    self.ttk.Button(controls, text="Clear", command=self._clear_comparison_slots).pack(side="left", padx=3)
     self.ttk.Label(controls, text="Stage").pack(side="left")
     self.comparison_stage_combo = self.ttk.Combobox(
         controls,
@@ -6408,11 +6806,51 @@ def _sweep_visualization_build_comparison_tab(self: SweepVisualizationApp) -> No
     )
     self.comparison_component_combo.pack(side="left", padx=4)
     self.comparison_component_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_comparison())
+    self.ttk.Checkbutton(
+        controls,
+        text="Sync Zoom/Pan",
+        variable=self.comparison_sync_var,
+    ).pack(side="left", padx=(12, 4))
+    self.ttk.Checkbutton(
+        controls,
+        text="Lock Channel",
+        variable=self.comparison_lock_channel_var,
+    ).pack(side="left", padx=4)
 
-    self.comparison_text = self.tk.Text(self.comparison_tab, height=12, wrap="word")
-    self.comparison_text.pack(fill="x", padx=6, pady=6)
-    self.comparison_plot_frame = self.ttk.Frame(self.comparison_tab)
-    self.comparison_plot_frame.pack(fill="both", expand=True, padx=6, pady=4)
+    slot_frame = self.ttk.Frame(self.comparison_tab)
+    slot_frame.pack(fill="x", padx=6, pady=(0, 4))
+    self.ttk.Label(slot_frame, textvariable=self.comparison_slot_a_var).pack(side="left", padx=(0, 16))
+    self.ttk.Label(slot_frame, textvariable=self.comparison_slot_b_var).pack(side="left")
+
+    comparison_split = self.ttk.Panedwindow(self.comparison_tab, orient="vertical")
+    comparison_split.pack(fill="both", expand=True, padx=6, pady=4)
+    inspector_frame = self.ttk.Frame(comparison_split)
+    details_frame = self.ttk.Frame(comparison_split)
+    comparison_split.add(inspector_frame, weight=5)
+    comparison_split.add(details_frame, weight=2)
+
+    inspector_frame.columnconfigure(0, weight=1)
+    inspector_frame.columnconfigure(1, weight=1)
+    inspector_frame.rowconfigure(0, weight=1)
+    self.comparison_inspector_a = _RectificationImageInspector(
+        self,
+        inspector_frame,
+        slot_name="A",
+        on_channel_changed=self._on_comparison_channel_changed,
+        on_limits_changed=self._on_comparison_limits_changed,
+    )
+    self.comparison_inspector_b = _RectificationImageInspector(
+        self,
+        inspector_frame,
+        slot_name="B",
+        on_channel_changed=self._on_comparison_channel_changed,
+        on_limits_changed=self._on_comparison_limits_changed,
+    )
+    self.comparison_inspector_a.frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+    self.comparison_inspector_b.frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+    self.comparison_text = self.tk.Text(details_frame, height=8, wrap="word")
+    self.comparison_text.pack(fill="x", padx=0, pady=(0, 4))
     self.comparison_robustness_plot_frame = self.ttk.Frame(self.comparison_tab)
     self.comparison_robustness_plot_frame.pack(fill="both", expand=True, padx=6, pady=4)
 
@@ -6678,6 +7116,10 @@ def _sweep_visualization_on_leaderboard_selection_changed(
     )
     if selected_rows and self.model is not None:
         self.comparison_stage_var.set(selected_rows[0].stage)
+        if self._comparison_slot_a_key is None and self._comparison_slot_b_key is None and not self._comparison_slots_cleared:
+            self._comparison_slot_a_key = self._selection_for_row(selected_rows[0]).key
+            if len(selected_rows) > 1:
+                self._comparison_slot_b_key = self._selection_for_row(selected_rows[1]).key
         self._seed_diagnostics_from_row(
             selected_rows[0],
             dataset_hint=self.comparison_dataset_var.get() or _default_comparison_dataset(self.model),
@@ -6799,11 +7241,199 @@ def _sweep_visualization_refresh_extension_suggestions(self: SweepVisualizationA
     )
 
 
+def _sweep_visualization_comparison_dataset(self: SweepVisualizationApp) -> str:
+    if self.model is None:
+        return self.comparison_dataset_var.get() or "aggregate"
+    return self.comparison_dataset_var.get() or _default_comparison_dataset(self.model)
+
+
+def _sweep_visualization_selection_for_row(
+    self: SweepVisualizationApp,
+    row: CandidateVisualizationRow,
+) -> RectificationViewSelection:
+    return RectificationViewSelection(
+        stage=row.stage,
+        candidate_id=row.candidate_id,
+        dataset_id=self._comparison_dataset(),
+        component_name=self.comparison_component_var.get() or _default_component_name(self.model) if self.model else None,
+    )
+
+
+def _sweep_visualization_row_for_key(
+    self: SweepVisualizationApp,
+    key: Optional[RectificationResultKey],
+) -> Optional[CandidateVisualizationRow]:
+    if self.model is None or key is None:
+        return None
+    stage_name, candidate_id, _dataset_id = key
+    return next(
+        (
+            row
+            for row in self.model.candidates
+            if row.stage == stage_name and row.candidate_id == candidate_id
+        ),
+        None,
+    )
+
+
+def _sweep_visualization_key_label(
+    self: SweepVisualizationApp,
+    key: Optional[RectificationResultKey],
+) -> str:
+    if key is None:
+        return "not set"
+    stage_name, candidate_id, dataset_id = key
+    return f"{candidate_id} / {dataset_id} / {stage_name}"
+
+
+def _sweep_visualization_bundle_for_key(
+    self: SweepVisualizationApp,
+    key: Optional[RectificationResultKey],
+) -> Optional[RectificationDisplayBundle]:
+    if self.model is None or key is None:
+        return None
+    stage_name, candidate_id, dataset_id = key
+    component_name = self.comparison_component_var.get() or _default_component_name(self.model)
+    cache_key = (stage_name, candidate_id, dataset_id, component_name)
+    cached = self._rectification_bundle_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    bundle = load_rectification_display_bundle(
+        self.model,
+        RectificationViewSelection(
+            stage=stage_name,
+            candidate_id=candidate_id,
+            dataset_id=dataset_id,
+            component_name=component_name,
+        ),
+    )
+    self._rectification_bundle_cache[cache_key] = bundle
+    return bundle
+
+
+def _sweep_visualization_refresh_comparison_slot_labels(self: SweepVisualizationApp) -> None:
+    self.comparison_slot_a_var.set(f"A: {self._comparison_key_label(self._comparison_slot_a_key)}")
+    self.comparison_slot_b_var.set(f"B: {self._comparison_key_label(self._comparison_slot_b_key)}")
+
+
+def _sweep_visualization_set_comparison_slot(
+    self: SweepVisualizationApp,
+    slot_name: str,
+) -> None:
+    selected = self._selected_leaderboard_rows()
+    if not selected:
+        self.messagebox.showwarning("Comparison", "Select a leaderboard row first.")
+        return
+    row = selected[0] if slot_name == "A" or len(selected) == 1 else selected[1]
+    key = self._selection_for_row(row).key
+    if slot_name == "A":
+        self._comparison_slot_a_key = key
+    else:
+        self._comparison_slot_b_key = key
+    self._comparison_slots_cleared = False
+    self.refresh_comparison()
+
+
+def _sweep_visualization_assign_comparison_slots_from_selection(self: SweepVisualizationApp) -> None:
+    selected = self._selected_leaderboard_rows()
+    if len(selected) < 2:
+        self.messagebox.showwarning("Comparison", "Select two leaderboard rows to compare.")
+        return
+    self._comparison_slot_a_key = self._selection_for_row(selected[0]).key
+    self._comparison_slot_b_key = self._selection_for_row(selected[1]).key
+    self._comparison_slots_cleared = False
+    self.refresh_comparison()
+
+
+def _sweep_visualization_swap_comparison_slots(self: SweepVisualizationApp) -> None:
+    self._comparison_slot_a_key, self._comparison_slot_b_key = (
+        self._comparison_slot_b_key,
+        self._comparison_slot_a_key,
+    )
+    self.refresh_comparison()
+
+
+def _sweep_visualization_clear_comparison_slots(self: SweepVisualizationApp) -> None:
+    self._comparison_slot_a_key = None
+    self._comparison_slot_b_key = None
+    self._comparison_slots_cleared = True
+    self.refresh_comparison()
+
+
+def _sweep_visualization_update_comparison_dataset_keys(self: SweepVisualizationApp) -> None:
+    dataset_id = self._comparison_dataset()
+    if self._comparison_slot_a_key is not None:
+        stage_name, candidate_id, _old_dataset = self._comparison_slot_a_key
+        self._comparison_slot_a_key = (stage_name, candidate_id, dataset_id)
+    if self._comparison_slot_b_key is not None:
+        stage_name, candidate_id, _old_dataset = self._comparison_slot_b_key
+        self._comparison_slot_b_key = (stage_name, candidate_id, dataset_id)
+
+
+def _sweep_visualization_ensure_default_comparison_slots(self: SweepVisualizationApp) -> None:
+    if (
+        self.model is None
+        or self._comparison_slots_cleared
+        or self._comparison_slot_a_key is not None
+        or self._comparison_slot_b_key is not None
+    ):
+        return
+    rows = self._comparison_rows()
+    if rows:
+        self._comparison_slot_a_key = self._selection_for_row(rows[0]).key
+    if len(rows) > 1:
+        self._comparison_slot_b_key = self._selection_for_row(rows[1]).key
+
+
+def _sweep_visualization_on_comparison_channel_changed(
+    self: SweepVisualizationApp,
+    source: _RectificationImageInspector,
+    channel_name: str,
+) -> None:
+    if not self.comparison_lock_channel_var.get() or self._comparison_channel_sync_in_progress:
+        return
+    other = self.comparison_inspector_b if source is self.comparison_inspector_a else self.comparison_inspector_a
+    self._comparison_channel_sync_in_progress = True
+    try:
+        other.set_channel(channel_name, emit_event=False, reset_view=False)
+    finally:
+        self._comparison_channel_sync_in_progress = False
+
+
+def _sweep_visualization_on_comparison_limits_changed(
+    self: SweepVisualizationApp,
+    source: _RectificationImageInspector,
+) -> None:
+    if not self.comparison_sync_var.get() or self._comparison_sync_in_progress:
+        return
+    other = self.comparison_inspector_b if source is self.comparison_inspector_a else self.comparison_inspector_a
+    if not source.has_image() or not other.has_image():
+        return
+    xlim, ylim = source.get_axes_limits()
+    if xlim is None or ylim is None:
+        return
+    self._comparison_sync_in_progress = True
+    try:
+        other.apply_axes_limits(xlim, ylim)
+    finally:
+        self._comparison_sync_in_progress = False
+
+
 def _sweep_visualization_comparison_rows(
     self: SweepVisualizationApp,
 ) -> List[CandidateVisualizationRow]:
     if self.model is None:
         return []
+    keyed_rows = [
+        row
+        for row in (
+            self._row_for_comparison_key(self._comparison_slot_a_key),
+            self._row_for_comparison_key(self._comparison_slot_b_key),
+        )
+        if row is not None
+    ]
+    if keyed_rows:
+        return keyed_rows
     stage_name = self.comparison_stage_var.get() or self.model.primary_stage_name
     selected = [row for row in self._selected_leaderboard_rows() if row.stage == stage_name]
     unique_rows: List[CandidateVisualizationRow] = []
@@ -6813,29 +7443,37 @@ def _sweep_visualization_comparison_rows(
             continue
         seen.add(row.row_id)
         unique_rows.append(row)
-    if 2 <= len(unique_rows) <= DEFAULT_REPORT_TOP_K:
-        return unique_rows[:DEFAULT_REPORT_TOP_K]
-    return _top_candidates_for_stage(self.model, stage_name, limit=DEFAULT_REPORT_TOP_K)
+    if unique_rows:
+        return unique_rows[:2]
+    return _top_candidates_for_stage(self.model, stage_name, limit=2)
 
 
 def _sweep_visualization_refresh_comparison(self: SweepVisualizationApp) -> None:
     if self.model is None:
         return
-    dataset_id = self.comparison_dataset_var.get() or _default_comparison_dataset(self.model)
+    current_stage = self.comparison_stage_var.get() or self.model.primary_stage_name
+    if self._comparison_slot_a_key is not None and self._comparison_slot_a_key[0] != current_stage:
+        self._comparison_slot_a_key = None
+    if self._comparison_slot_b_key is not None and self._comparison_slot_b_key[0] != current_stage:
+        self._comparison_slot_b_key = None
+    self._update_comparison_dataset_keys()
+    self._ensure_default_comparison_slots()
+    dataset_id = self._comparison_dataset()
     rows = self._comparison_rows()
+    bundle_a = self._bundle_for_comparison_key(self._comparison_slot_a_key)
+    bundle_b = self._bundle_for_comparison_key(self._comparison_slot_b_key)
+    self.comparison_inspector_a.set_bundle(bundle_a, reset_view=False)
+    self.comparison_inspector_b.set_bundle(bundle_b, reset_view=False)
+    if self.comparison_lock_channel_var.get() and bundle_a is not None and bundle_b is not None:
+        self.comparison_inspector_b.set_channel(
+            self.comparison_inspector_a.current_channel(),
+            emit_event=False,
+            reset_view=False,
+        )
+    self._refresh_comparison_slot_labels()
     self._set_text_widget(
         self.comparison_text,
         _format_comparison_text(self.model, rows, dataset_id=dataset_id),
-    )
-    self._draw_figure(
-        "comparison_main",
-        self.comparison_plot_frame,
-        create_comparison_figure(
-            self.model,
-            rows,
-            dataset_id=dataset_id,
-            component_name=self.comparison_component_var.get() or _default_component_name(self.model),
-        ),
     )
     self._draw_figure(
         "comparison_robustness",
@@ -6860,15 +7498,73 @@ def _sweep_visualization_refresh_metric_diagnostics(self: SweepVisualizationApp)
     )
 
 
+def _sweep_visualization_open_rectification_viewer(
+    self: SweepVisualizationApp,
+    bundle: RectificationDisplayBundle,
+    *,
+    title: str,
+) -> None:
+    viewer = self.tk.Toplevel(self.root)
+    viewer.title(title)
+    viewer.geometry("980x860")
+    inspector = _RectificationImageInspector(self, viewer, slot_name="Viewer")
+    inspector.frame.pack(fill="both", expand=True)
+    inspector.set_bundle(bundle, reset_view=True)
+    viewer._rectification_inspector = inspector
+    if bundle.warnings:
+        warning_text = self.tk.Text(viewer, height=min(5, max(2, len(bundle.warnings))), wrap="word")
+        warning_text.insert(self.tk.END, "\n".join(bundle.warnings[:8]))
+        warning_text.configure(state="disabled")
+        warning_text.pack(fill="x", padx=6, pady=(0, 6))
+    self._preview_image_ref = inspector
+
+
+def _sweep_visualization_open_preview(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        return
+    stage_name = self.preview_stage_var.get()
+    candidate_id = self.preview_candidate_var.get()
+    dataset_id = self.preview_dataset_var.get()
+    if not stage_name or not candidate_id or not dataset_id:
+        self.messagebox.showwarning("Preview", "Select a stage, candidate, and dataset first.")
+        return
+    selection = RectificationViewSelection(
+        stage=stage_name,
+        candidate_id=candidate_id,
+        dataset_id=dataset_id,
+        component_name=self.comparison_component_var.get() or _default_component_name(self.model),
+    )
+    bundle = load_rectification_display_bundle(self.model, selection)
+    if bundle.preview is None and not any(bundle.get(channel) is not None for channel in RECTIFICATION_VIEW_CHANNELS):
+        self.messagebox.showwarning("Preview", "No displayable image found for the selected result.")
+        return
+    self._open_rectification_viewer(
+        bundle,
+        title=f"{candidate_id} / {dataset_id}",
+    )
+
+
 def _sweep_visualization_open_selected_diagnostic_preview(self: SweepVisualizationApp) -> None:
     record = self._selected_diagnostic_record()
-    preview_path = None if record is None else record.preview_path
-    if not preview_path:
-        self.messagebox.showwarning("Preview", "No preview image available for the selected run.")
+    if record is None or self.model is None:
+        self.messagebox.showwarning("Preview", "No diagnostic run is selected.")
         return
-    ok, err = _open_with_system(Path(preview_path))
-    if not ok:
-        self.messagebox.showerror("Preview", err or "Failed to open preview.")
+    bundle = load_rectification_display_bundle(
+        self.model,
+        RectificationViewSelection(
+            stage=record.stage,
+            candidate_id=record.candidate_id,
+            dataset_id=record.dataset_id,
+            component_name=self.diagnostic_component_var.get() or _default_component_name(self.model),
+        ),
+    )
+    if bundle.preview is None and not any(bundle.get(channel) is not None for channel in RECTIFICATION_VIEW_CHANNELS):
+        self.messagebox.showwarning("Preview", "No displayable image found for the selected run.")
+        return
+    self._open_rectification_viewer(
+        bundle,
+        title=f"{record.candidate_id} / {record.dataset_id}",
+    )
 
 
 def _sweep_visualization_open_selected_diagnostic_folder(self: SweepVisualizationApp) -> None:
@@ -6902,6 +7598,10 @@ def _sweep_visualization_populate_from_model(
     self: SweepVisualizationApp,
     model: SweepVisualizationModel,
 ) -> None:
+    self._rectification_bundle_cache.clear()
+    self._comparison_slot_a_key = None
+    self._comparison_slot_b_key = None
+    self._comparison_slots_cleared = False
     self._set_text_widget(self.overview_text, _format_overview_text(model))
     self._set_text_widget(self.progression_text, "\n".join(_progression_summary_lines(model)))
     self._set_text_widget(self.significance_text, _format_significance_text(model))
@@ -7032,9 +7732,25 @@ SweepVisualizationApp.refresh_leaderboard = _sweep_visualization_refresh_leaderb
 SweepVisualizationApp._sensitivity_filters = _sweep_visualization_sensitivity_filters
 SweepVisualizationApp.refresh_sensitivity = _sweep_visualization_refresh_sensitivity
 SweepVisualizationApp.refresh_extension_suggestions = _sweep_visualization_refresh_extension_suggestions
+SweepVisualizationApp._comparison_dataset = _sweep_visualization_comparison_dataset
+SweepVisualizationApp._selection_for_row = _sweep_visualization_selection_for_row
+SweepVisualizationApp._row_for_comparison_key = _sweep_visualization_row_for_key
+SweepVisualizationApp._comparison_key_label = _sweep_visualization_key_label
+SweepVisualizationApp._bundle_for_comparison_key = _sweep_visualization_bundle_for_key
+SweepVisualizationApp._refresh_comparison_slot_labels = _sweep_visualization_refresh_comparison_slot_labels
+SweepVisualizationApp._set_comparison_slot = _sweep_visualization_set_comparison_slot
+SweepVisualizationApp._assign_comparison_slots_from_selection = _sweep_visualization_assign_comparison_slots_from_selection
+SweepVisualizationApp._swap_comparison_slots = _sweep_visualization_swap_comparison_slots
+SweepVisualizationApp._clear_comparison_slots = _sweep_visualization_clear_comparison_slots
+SweepVisualizationApp._update_comparison_dataset_keys = _sweep_visualization_update_comparison_dataset_keys
+SweepVisualizationApp._ensure_default_comparison_slots = _sweep_visualization_ensure_default_comparison_slots
+SweepVisualizationApp._on_comparison_channel_changed = _sweep_visualization_on_comparison_channel_changed
+SweepVisualizationApp._on_comparison_limits_changed = _sweep_visualization_on_comparison_limits_changed
 SweepVisualizationApp._comparison_rows = _sweep_visualization_comparison_rows
 SweepVisualizationApp.refresh_comparison = _sweep_visualization_refresh_comparison
 SweepVisualizationApp.refresh_metric_diagnostics = _sweep_visualization_refresh_metric_diagnostics
+SweepVisualizationApp._open_rectification_viewer = _sweep_visualization_open_rectification_viewer
+SweepVisualizationApp._open_preview = _sweep_visualization_open_preview
 SweepVisualizationApp._open_selected_diagnostic_preview = _sweep_visualization_open_selected_diagnostic_preview
 SweepVisualizationApp._open_selected_diagnostic_folder = _sweep_visualization_open_selected_diagnostic_folder
 SweepVisualizationApp._open_selected_metric_record = _sweep_visualization_open_selected_metric_record

@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 from moment_images.sweep_visualization import (
+    RectificationViewSelection,
     SweepVisualizationApp,
     create_candidate_robustness_figure,
     create_comparison_figure,
@@ -20,6 +21,7 @@ from moment_images.sweep_visualization import (
     export_sweep_visualization_bundle,
     compute_parameter_sensitivity,
     generate_next_extension_suggestions,
+    load_rectification_display_bundle,
     load_sweep_visualization_model,
     main,
 )
@@ -83,6 +85,8 @@ def _write_workspace(path: Path) -> None:
         pixel_component_score_laplacian=np.full((4, 4), 0.55, dtype=np.float64),
         pixel_displacements_x=np.full((4, 4), 0.4, dtype=np.float64),
         pixel_displacements_y=np.full((4, 4), 0.3, dtype=np.float64),
+        average_rectified_global_image=np.full((4, 4), 3.0, dtype=np.float64),
+        average_rectified_image=np.full((4, 4), 1.25, dtype=np.float64),
     )
 
 
@@ -467,6 +471,91 @@ def test_load_sweep_visualization_model_supports_full_modern_outputs(tmp_path):
     assert model.score_matrix.shape[1] == 2
     assert model.candidates[0].preview_paths
     assert not model.alpha_family_summary
+
+
+def test_rectification_display_bundle_loads_preview_only_result(tmp_path):
+    output_dir = _create_legacy_fixture(tmp_path)
+    model = load_sweep_visualization_model(output_dir)
+    row = model.candidates[0]
+
+    bundle = load_rectification_display_bundle(
+        model,
+        RectificationViewSelection(
+            stage=row.stage,
+            candidate_id=row.candidate_id,
+            dataset_id="aggregate",
+            component_name="gradient",
+        ),
+    )
+
+    assert bundle.preview is not None
+    assert bundle.preview.shape == (16, 16)
+    assert bundle.displacement_magnitude is None
+    assert bundle.blended_score is None
+    assert any("workspace.npz unavailable" in warning for warning in bundle.warnings)
+
+
+def test_rectification_display_bundle_loads_workspace_channels(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_workspace=True,
+    )
+    model = load_sweep_visualization_model(output_dir)
+
+    bundle = load_rectification_display_bundle(
+        model,
+        RectificationViewSelection(
+            stage="stage1",
+            candidate_id="s1c0000",
+            dataset_id="d1",
+            component_name="gradient",
+        ),
+    )
+
+    assert bundle.preview is not None
+    assert bundle.blended_score is not None
+    assert bundle.component_score is not None
+    assert bundle.displacement_magnitude is not None
+    np.testing.assert_allclose(bundle.displacement_magnitude, np.full((4, 4), 0.5))
+    assert bundle.global_final_delta is not None
+    np.testing.assert_allclose(bundle.global_final_delta, np.full((4, 4), 1.75))
+
+
+def test_rectification_display_bundle_warns_on_bad_inputs(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_workspace=True,
+    )
+    preview_path = output_dir / "runs" / "stage1" / "s1c0000" / "d1" / "avg_rectified.png"
+    preview_path.write_bytes(b"not an image")
+    workspace_path = output_dir / "runs" / "stage1" / "s1c0000" / "d1" / "workspace.npz"
+    np.savez_compressed(
+        workspace_path,
+        pixel_displacements_x=np.zeros((2, 3), dtype=np.float64),
+        pixel_displacements_y=np.zeros((3, 2), dtype=np.float64),
+        average_rectified_global_image=np.zeros((2, 2), dtype=np.float64),
+        average_rectified_image=np.zeros((3, 3), dtype=np.float64),
+    )
+    model = load_sweep_visualization_model(output_dir)
+
+    bundle = load_rectification_display_bundle(
+        model,
+        RectificationViewSelection(
+            stage="stage1",
+            candidate_id="s1c0000",
+            dataset_id="d1",
+            component_name="gradient",
+        ),
+    )
+
+    assert bundle.preview is None
+    assert bundle.displacement_magnitude is None
+    assert bundle.global_final_delta is None
+    assert any("Failed to read preview image" in warning for warning in bundle.warnings)
+    assert any("Displacement map shapes do not match" in warning for warning in bundle.warnings)
+    assert any("Global/final average shapes do not match" in warning for warning in bundle.warnings)
 
 
 def test_load_sweep_visualization_model_supports_partial_modern_outputs(tmp_path):
@@ -1011,6 +1100,80 @@ def test_gui_leaderboard_selection_drives_comparison_and_diagnostics(tmp_path):
     assert "candidate:" in detail_text
     assert "dataset:" in comparison_text
     assert "run:" in diagnostics_text
+    root.destroy()
+
+
+def test_gui_comparison_slots_channel_lock_and_sync(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_workspace=True,
+    )
+    for dataset_id in ("d1", "d2"):
+        _write_preview(output_dir / "runs" / "stage1" / "s1c0001" / dataset_id / "avg_rectified.png")
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root, initial_path=output_dir)
+    app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+    root.update()
+
+    app.leaderboard_stage_var.set("stage1")
+    app.refresh_leaderboard()
+    children = app.leaderboard_tree.get_children()
+    assert len(children) >= 2
+    app.leaderboard_tree.selection_set(children[:2])
+    app._assign_comparison_slots_from_selection()
+    root.update()
+
+    assert app._comparison_slot_a_key is not None
+    assert app._comparison_slot_b_key is not None
+    assert app.comparison_inspector_a.has_image()
+    assert app.comparison_inspector_b.has_image()
+
+    app.comparison_inspector_b.set_channel("component_score", emit_event=False, reset_view=False)
+    app.comparison_inspector_a.set_channel("preview", emit_event=True, reset_view=False)
+    assert app.comparison_inspector_b.current_channel() == "preview"
+
+    app.comparison_inspector_a.apply_axes_limits((0.0, 5.0), (5.0, 0.0))
+    app._on_comparison_limits_changed(app.comparison_inspector_a)
+    assert app.comparison_inspector_b.get_axes_limits() == ((0.0, 5.0), (5.0, 0.0))
+
+    app.comparison_sync_var.set(False)
+    app.comparison_inspector_a.apply_axes_limits((1.0, 4.0), (4.0, 1.0))
+    app._on_comparison_limits_changed(app.comparison_inspector_a)
+    assert app.comparison_inspector_b.get_axes_limits() == ((0.0, 5.0), (5.0, 0.0))
+    root.destroy()
+
+
+def test_gui_preview_actions_use_zoomable_viewer(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_workspace=True,
+    )
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root, initial_path=output_dir)
+    app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+    captures = []
+    app._open_rectification_viewer = lambda bundle, *, title: captures.append((bundle, title))
+    root.update()
+
+    app.preview_stage_var.set("stage1")
+    app._refresh_preview_candidates()
+    app.preview_candidate_var.set("s1c0000")
+    app._refresh_preview_datasets()
+    app.preview_dataset_var.set("d1")
+    app._open_preview()
+
+    app.diagnostic_stage_var.set("stage1")
+    app._refresh_diagnostic_candidates()
+    app.diagnostic_candidate_var.set("s1c0000")
+    app._refresh_diagnostic_datasets()
+    app.diagnostic_dataset_var.set("d1")
+    app._open_selected_diagnostic_preview()
+
+    assert len(captures) == 2
+    assert captures[0][0].selection.candidate_id == "s1c0000"
+    assert captures[1][0].selection.dataset_id == "d1"
     root.destroy()
 
 
