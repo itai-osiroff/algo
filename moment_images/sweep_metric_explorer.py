@@ -43,6 +43,7 @@ DEFAULT_TOP_K = 5
 ANNOTATION_LABEL_SCORES = {"bad": 0.0, "good": 1.0, "top": 2.0}
 HYDRATE_MODE_EAGER = "eager"
 HYDRATE_MODE_LAZY = "lazy"
+PERCENTILE_SLIDER_GAMMA = 3.0
 
 
 @dataclass(frozen=True)
@@ -215,6 +216,7 @@ class ComparisonDisplayBundle:
     preview: Optional[np.ndarray]
     avg_image: Optional[np.ndarray]
     guide_log: Optional[np.ndarray]
+    reference: Optional[np.ndarray] = None
     warnings: List[str] = field(default_factory=list)
 
     def get(self, view_name: str) -> Optional[np.ndarray]:
@@ -224,7 +226,18 @@ class ComparisonDisplayBundle:
             return self.avg_image
         if view_name == "guide_log":
             return self.guide_log
+        if view_name == "reference":
+            return self.reference
         return None
+
+
+@dataclass
+class ComparisonReferenceImage:
+    """Session-only visual reference image for the comparison tab."""
+
+    path: Path
+    image: np.ndarray
+    warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2561,6 +2574,34 @@ def _contrast_preset_percentiles(mode: str) -> Optional[Tuple[float, float]]:
     return None
 
 
+def _slider_position_to_percentile(position: float, *, role: str, exponential: bool) -> float:
+    """Map a 0-100 slider position to an actual percentile value."""
+
+    pos = min(100.0, max(0.0, float(position)))
+    if not exponential:
+        return pos
+    t = pos / 100.0
+    if role == "low":
+        return 100.0 * (t ** PERCENTILE_SLIDER_GAMMA)
+    if role == "high":
+        return 100.0 * (1.0 - ((1.0 - t) ** PERCENTILE_SLIDER_GAMMA))
+    raise ValueError(f"Unknown percentile slider role: {role}")
+
+
+def _percentile_to_slider_position(percentile: float, *, role: str, exponential: bool) -> float:
+    """Map an actual percentile value to its 0-100 slider position."""
+
+    pct = min(100.0, max(0.0, float(percentile)))
+    if not exponential:
+        return pct
+    t = pct / 100.0
+    if role == "low":
+        return 100.0 * (t ** (1.0 / PERCENTILE_SLIDER_GAMMA))
+    if role == "high":
+        return 100.0 * (1.0 - ((1.0 - t) ** (1.0 / PERCENTILE_SLIDER_GAMMA)))
+    raise ValueError(f"Unknown percentile slider role: {role}")
+
+
 def _contrast_percentile_limits(
     image: np.ndarray,
     low_percentile: float,
@@ -2578,6 +2619,18 @@ def _contrast_percentile_limits(
     if not math.isfinite(low_value) or not math.isfinite(high_value) or high_value <= low_value:
         return None, None
     return low_value, high_value
+
+
+def load_comparison_reference_image(path: Path) -> ComparisonReferenceImage:
+    """Load a session-only visual reference image for the comparison tab."""
+
+    reference_path = Path(path)
+    warnings: List[str] = []
+    with Image.open(reference_path) as image:
+        array = np.asarray(image.convert("L"), dtype=np.float64)
+    if array.ndim != 2 or not array.size:
+        warnings.append(f"Reference image {reference_path.name} did not contain a usable grayscale image.")
+    return ComparisonReferenceImage(path=reference_path, image=array, warnings=warnings)
 
 
 class _ComparisonImageInspector:
@@ -2603,6 +2656,9 @@ class _ComparisonImageInspector:
         parent: Any,
         *,
         slot_name: str,
+        view_options: Optional[Sequence[str]] = None,
+        view_labels: Optional[Mapping[str, str]] = None,
+        title_prefix: str = "Run",
         on_view_changed: Optional[Any] = None,
         on_limits_changed: Optional[Any] = None,
         on_open_large: Optional[Any] = None,
@@ -2612,25 +2668,35 @@ class _ComparisonImageInspector:
         self.tk = app.tk
         self.ttk = app.ttk
         self.slot_name = slot_name
+        self.view_options = tuple(view_options) if view_options is not None else self.VIEW_OPTIONS
+        self.view_labels = dict(self.VIEW_LABELS)
+        if view_labels is not None:
+            self.view_labels.update(view_labels)
+        self.title_prefix = title_prefix
         self.on_view_changed = on_view_changed
         self.on_limits_changed = on_limits_changed
         self.on_open_large = on_open_large
         self.allow_open_large = allow_open_large
 
         self.frame = self.ttk.Frame(parent)
-        self.title_var = self.tk.StringVar(value=f"Run {slot_name}")
+        initial_title = f"{self.title_prefix} {slot_name}".strip()
+        self.title_var = self.tk.StringVar(value=initial_title)
         self.meta_var = self.tk.StringVar(value=f"Set slot {slot_name} from the leaderboard.")
         self.warning_var = self.tk.StringVar(value="")
-        self.view_var = self.tk.StringVar(value="preview")
+        self.view_var = self.tk.StringVar(value=self.view_options[0])
         self.contrast_var = self.tk.StringVar(value="auto")
         self.low_percentile_var = self.tk.DoubleVar(value=2.0)
         self.high_percentile_var = self.tk.DoubleVar(value=98.0)
+        self.low_slider_position_var = self.tk.DoubleVar(value=2.0)
+        self.high_slider_position_var = self.tk.DoubleVar(value=98.0)
+        self.exponential_contrast_var = self.tk.BooleanVar(value=False)
         self.low_percentile_label_var = self.tk.StringVar(value="Low 2.0")
         self.high_percentile_label_var = self.tk.StringVar(value="High 98.0")
 
         self._record: Optional[RawMetricRecord] = None
         self._bundle: Optional[ComparisonDisplayBundle] = None
         self._record_key: Optional[ComparisonRecordKey] = None
+        self._reference_path: Optional[Path] = None
         self._suspend_limit_events = False
         self._suspend_contrast_events = False
         self._last_rendered_shape: Optional[Tuple[int, int]] = None
@@ -2653,7 +2719,7 @@ class _ComparisonImageInspector:
             textvariable=self.view_var,
             state="readonly",
             width=12,
-            values=list(self.VIEW_OPTIONS),
+            values=list(self.view_options),
         )
         view_combo.pack(side="left", padx=4)
         view_combo.bind("<<ComboboxSelected>>", self._handle_view_change)
@@ -2668,6 +2734,12 @@ class _ComparisonImageInspector:
         )
         contrast_combo.pack(side="left", padx=4)
         contrast_combo.bind("<<ComboboxSelected>>", self._handle_contrast_preset_change)
+        self.ttk.Checkbutton(
+            controls,
+            text="Exponential sliders",
+            variable=self.exponential_contrast_var,
+            command=self._handle_contrast_scale_mode_change,
+        ).pack(side="left", padx=(6, 3))
 
         self.ttk.Button(controls, text="Fit", command=self.fit_view).pack(side="left", padx=(10, 3))
         self.ttk.Button(controls, text="1:1", command=self.pixel_view).pack(side="left", padx=3)
@@ -2683,7 +2755,7 @@ class _ComparisonImageInspector:
             from_=0.0,
             to=100.0,
             orient="horizontal",
-            variable=self.low_percentile_var,
+            variable=self.low_slider_position_var,
             command=lambda _value: self._handle_percentile_slider_change(),
         )
         self.low_percentile_scale.pack(side="left", fill="x", expand=True, padx=(2, 8))
@@ -2693,7 +2765,7 @@ class _ComparisonImageInspector:
             from_=0.0,
             to=100.0,
             orient="horizontal",
-            variable=self.high_percentile_var,
+            variable=self.high_slider_position_var,
             command=lambda _value: self._handle_percentile_slider_change(),
         )
         self.high_percentile_scale.pack(side="left", fill="x", expand=True, padx=(2, 0))
@@ -2722,7 +2794,7 @@ class _ComparisonImageInspector:
         self.axis.callbacks.connect("xlim_changed", lambda _axes: self._notify_limits_changed())
         self.axis.callbacks.connect("ylim_changed", lambda _axes: self._notify_limits_changed())
         self._refresh_contrast_control_state()
-        self._render_placeholder(f"Run {slot_name} is not set.")
+        self._render_placeholder(f"{initial_title} is not set.")
 
     @property
     def record(self) -> Optional[RawMetricRecord]:
@@ -2738,11 +2810,12 @@ class _ComparisonImageInspector:
     def current_contrast(self) -> str:
         return self.contrast_var.get()
 
-    def current_contrast_state(self) -> Tuple[str, float, float]:
+    def current_contrast_state(self) -> Tuple[str, float, float, bool]:
         return (
             self.contrast_var.get(),
             float(self.low_percentile_var.get()),
             float(self.high_percentile_var.get()),
+            bool(self.exponential_contrast_var.get()),
         )
 
     def current_image_shape(self) -> Optional[Tuple[int, int]]:
@@ -2763,7 +2836,7 @@ class _ComparisonImageInspector:
         return self.current_image() is not None
 
     def set_view(self, view_name: str, *, emit_event: bool = False, reset_view: bool = False) -> None:
-        if view_name not in self.VIEW_OPTIONS:
+        if view_name not in self.view_options:
             return
         changed = self.view_var.get() != view_name
         self.view_var.set(view_name)
@@ -2781,6 +2854,7 @@ class _ComparisonImageInspector:
             if preset is not None:
                 self.low_percentile_var.set(preset[0])
                 self.high_percentile_var.set(preset[1])
+                self._sync_slider_positions_from_percentiles()
             self._update_percentile_labels()
             self._refresh_contrast_control_state()
         finally:
@@ -2794,6 +2868,7 @@ class _ComparisonImageInspector:
         low_percentile: float,
         high_percentile: float,
         *,
+        exponential: bool = False,
         redraw: bool = True,
     ) -> None:
         if contrast_mode not in self.CONTRAST_OPTIONS:
@@ -2801,8 +2876,10 @@ class _ComparisonImageInspector:
         self._suspend_contrast_events = True
         try:
             self.contrast_var.set(contrast_mode)
+            self.exponential_contrast_var.set(bool(exponential))
             self.low_percentile_var.set(min(100.0, max(0.0, float(low_percentile))))
             self.high_percentile_var.set(min(100.0, max(0.0, float(high_percentile))))
+            self._sync_slider_positions_from_percentiles()
             self._update_percentile_labels()
             self._refresh_contrast_control_state()
         finally:
@@ -2821,11 +2898,12 @@ class _ComparisonImageInspector:
         self._record = record
         self._bundle = bundle
         self._record_key = _metric_row_key(record) if record is not None else None
+        self._reference_path = None
         if record is None:
-            self.title_var.set(f"Run {self.slot_name}")
+            self.title_var.set(f"{self.title_prefix} {self.slot_name}".strip())
             self.meta_var.set(f"Set slot {self.slot_name} from the leaderboard.")
             self.warning_var.set("")
-            self._render_placeholder(f"Run {self.slot_name} is not set.")
+            self._render_placeholder(f"{self.title_prefix} {self.slot_name}".strip() + " is not set.")
             return
 
         self.title_var.set(
@@ -2846,6 +2924,35 @@ class _ComparisonImageInspector:
             warning_text = f"Warnings: {' | '.join(bundle.warnings[:3])}"
         self.warning_var.set(warning_text)
         self.render(reset_view=previous_key != self._record_key)
+
+    def set_reference_image(self, reference: Optional[ComparisonReferenceImage]) -> None:
+        previous_path = self._reference_path
+        self._record = None
+        self._record_key = None
+        if reference is None:
+            self._bundle = None
+            self._reference_path = None
+            self.title_var.set("Reference")
+            self.meta_var.set("Load a validation image to compare visually.")
+            self.warning_var.set("")
+            self._render_placeholder("Reference image is not loaded.")
+            return
+
+        self._reference_path = reference.path
+        self._bundle = ComparisonDisplayBundle(
+            preview=None,
+            avg_image=None,
+            guide_log=None,
+            reference=np.asarray(reference.image, dtype=np.float64),
+            warnings=list(reference.warnings),
+        )
+        height, width = reference.image.shape
+        self.title_var.set("Reference")
+        self.meta_var.set(f"{reference.path} | shape={width}x{height}")
+        self.warning_var.set(
+            "" if not reference.warnings else f"Warnings: {' | '.join(reference.warnings[:3])}"
+        )
+        self.render(reset_view=previous_path != reference.path)
 
     def fit_view(self) -> None:
         shape = self.current_image_shape()
@@ -2903,8 +3010,14 @@ class _ComparisonImageInspector:
 
     def clone_view_state_from(self, other: "_ComparisonImageInspector") -> None:
         self.set_view(other.current_view(), emit_event=False, reset_view=True)
-        contrast_mode, low_percentile, high_percentile = other.current_contrast_state()
-        self.set_contrast_state(contrast_mode, low_percentile, high_percentile, redraw=True)
+        contrast_mode, low_percentile, high_percentile, exponential = other.current_contrast_state()
+        self.set_contrast_state(
+            contrast_mode,
+            low_percentile,
+            high_percentile,
+            exponential=exponential,
+            redraw=True,
+        )
         xlim, ylim = other.get_axes_limits()
         if xlim is not None and ylim is not None and self.has_image():
             self.apply_axes_limits(xlim, ylim)
@@ -2914,7 +3027,7 @@ class _ComparisonImageInspector:
         previous_shape = self._last_rendered_shape
         previous_limits = self.get_axes_limits()
         if image is None:
-            placeholder = self.VIEW_LABELS.get(self.view_var.get(), self.view_var.get())
+            placeholder = self.view_labels.get(self.view_var.get(), self.view_var.get())
             self._render_placeholder(f"{placeholder} unavailable.")
             return
 
@@ -2931,7 +3044,7 @@ class _ComparisonImageInspector:
         )
         self.axis.set_xticks([])
         self.axis.set_yticks([])
-        self.axis.set_title(self.VIEW_LABELS.get(self.view_var.get(), self.view_var.get()))
+        self.axis.set_title(self.view_labels.get(self.view_var.get(), self.view_var.get()))
         if reset_view or previous_limits[0] is None or previous_shape != image.shape:
             self.fit_view()
         else:
@@ -2944,7 +3057,7 @@ class _ComparisonImageInspector:
         self.axis.text(0.5, 0.5, text, ha="center", va="center")
         self.axis.set_xticks([])
         self.axis.set_yticks([])
-        self.axis.set_title(self.VIEW_LABELS.get(self.view_var.get(), self.view_var.get()))
+        self.axis.set_title(self.view_labels.get(self.view_var.get(), self.view_var.get()))
         self._last_rendered_shape = None
         self.canvas.draw_idle()
 
@@ -2959,10 +3072,44 @@ class _ComparisonImageInspector:
     def _handle_percentile_slider_change(self) -> None:
         if self._suspend_contrast_events:
             return
+        self.low_percentile_var.set(
+            _slider_position_to_percentile(
+                float(self.low_slider_position_var.get()),
+                role="low",
+                exponential=bool(self.exponential_contrast_var.get()),
+            )
+        )
+        self.high_percentile_var.set(
+            _slider_position_to_percentile(
+                float(self.high_slider_position_var.get()),
+                role="high",
+                exponential=bool(self.exponential_contrast_var.get()),
+            )
+        )
         self.contrast_var.set("custom")
         self._update_percentile_labels()
         self._refresh_contrast_control_state()
         self.render(reset_view=False)
+
+    def _handle_contrast_scale_mode_change(self) -> None:
+        self._sync_slider_positions_from_percentiles()
+        self._update_percentile_labels()
+
+    def _sync_slider_positions_from_percentiles(self) -> None:
+        self.low_slider_position_var.set(
+            _percentile_to_slider_position(
+                float(self.low_percentile_var.get()),
+                role="low",
+                exponential=bool(self.exponential_contrast_var.get()),
+            )
+        )
+        self.high_slider_position_var.set(
+            _percentile_to_slider_position(
+                float(self.high_percentile_var.get()),
+                role="high",
+                exponential=bool(self.exponential_contrast_var.get()),
+            )
+        )
 
     def _update_percentile_labels(self) -> None:
         self.low_percentile_label_var.set(f"Low {float(self.low_percentile_var.get()):.1f}")
@@ -3055,6 +3202,7 @@ class SweepMetricExplorerApp:
         self.comparison_summary_var = tk.StringVar(value="Set A and B from the leaderboard to begin.")
         self.comparison_slot_a_var = tk.StringVar(value="A: not set")
         self.comparison_slot_b_var = tk.StringVar(value="B: not set")
+        self.comparison_reference_var = tk.StringVar(value="Reference: not loaded")
         self.search_stage_var = tk.StringVar(value="")
         self.search_profile_name_var = tk.StringVar(value="custom_profile")
         self.search_step_var = tk.StringVar(value=f"{DEFAULT_SEARCH_WEIGHT_STEP:g}")
@@ -3069,6 +3217,7 @@ class SweepMetricExplorerApp:
         self.weight_json_var = tk.StringVar(value="{}")
         self._comparison_slot_a_key: Optional[ComparisonRecordKey] = None
         self._comparison_slot_b_key: Optional[ComparisonRecordKey] = None
+        self._comparison_reference: Optional[ComparisonReferenceImage] = None
 
         self._leaderboard_rows: List[ProfileCandidateScore] = []
         self._leaderboard_row_lookup: Dict[str, ProfileCandidateScore] = {}
@@ -3183,6 +3332,14 @@ class SweepMetricExplorerApp:
         )
         self.ttk.Button(controls, text="Swap", command=self._swap_comparison_slots).pack(side="left", padx=3)
         self.ttk.Button(controls, text="Clear Slots", command=self._clear_comparison_slots).pack(side="left", padx=3)
+        self.ttk.Button(controls, text="Load Reference", command=self._on_load_comparison_reference).pack(
+            side="left",
+            padx=(10, 3),
+        )
+        self.ttk.Button(controls, text="Clear Reference", command=self._clear_comparison_reference).pack(
+            side="left",
+            padx=3,
+        )
         self.ttk.Label(controls, text="Layout").pack(side="left", padx=(12, 0))
         self.comparison_layout_combo = self.ttk.Combobox(
             controls,
@@ -3208,6 +3365,7 @@ class SweepMetricExplorerApp:
         slot_frame.pack(fill="x", padx=6, pady=(0, 4))
         self.ttk.Label(slot_frame, textvariable=self.comparison_slot_a_var).pack(side="left", padx=(0, 16))
         self.ttk.Label(slot_frame, textvariable=self.comparison_slot_b_var).pack(side="left")
+        self.ttk.Label(slot_frame, textvariable=self.comparison_reference_var).pack(side="left", padx=(16, 0))
         self.ttk.Label(
             slot_frame,
             text="Use the Matplotlib toolbars under each image for zoom, pan, back, and home.",
@@ -3235,6 +3393,17 @@ class SweepMetricExplorerApp:
             self.comparison_inspector_grid,
             slot_name="B",
             on_view_changed=self._on_inspector_view_changed,
+            on_limits_changed=self._on_inspector_limits_changed,
+            on_open_large=self._open_single_inspector_window,
+        )
+        self.comparison_reference_inspector = _ComparisonImageInspector(
+            self,
+            self.comparison_inspector_grid,
+            slot_name="Reference",
+            view_options=("reference",),
+            view_labels={"reference": "Reference"},
+            title_prefix="",
+            on_view_changed=None,
             on_limits_changed=self._on_inspector_limits_changed,
             on_open_large=self._open_single_inspector_window,
         )
@@ -3998,8 +4167,12 @@ class SweepMetricExplorerApp:
         self._comparison_image_cache.clear()
         self._comparison_slot_a_key = None
         self._comparison_slot_b_key = None
+        self._comparison_reference = None
+        self.comparison_reference_var.set("Reference: not loaded")
+        self.comparison_reference_inspector.set_reference_image(None)
         self._close_comparison_popouts()
         self._update_comparison_slot_labels()
+        self._refresh_comparison_layout()
         stage_values = list(model.base_model.stage_order)
         self.stage_combo["values"] = stage_values
         self.evaluation_stage_combo["values"] = stage_values
@@ -4090,26 +4263,68 @@ class SweepMetricExplorerApp:
         self._update_comparison_slot_labels()
         self.refresh_comparison()
 
+    def _on_load_comparison_reference(self) -> None:
+        selection = self.filedialog.askopenfilename(
+            title="Load Comparison Reference Image",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if selection:
+            self._load_comparison_reference_from_path(Path(selection))
+
+    def _load_comparison_reference_from_path(self, path: Path) -> None:
+        try:
+            reference = load_comparison_reference_image(Path(path))
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("Comparison Reference", str(exc))
+            return
+        self._comparison_reference = reference
+        self.comparison_reference_var.set(f"Reference: {reference.path.name}")
+        self.comparison_reference_inspector.set_reference_image(reference)
+        self._refresh_comparison_layout()
+        self._refresh_open_comparison_popouts()
+
+    def _clear_comparison_reference(self) -> None:
+        self._comparison_reference = None
+        self.comparison_reference_var.set("Reference: not loaded")
+        self.comparison_reference_inspector.set_reference_image(None)
+        popout = self._comparison_popouts.pop("Reference", None)
+        if popout is not None:
+            window = popout.get("window")
+            if window is not None and window.winfo_exists():
+                window.destroy()
+        self._refresh_comparison_layout()
+
     def _refresh_comparison_layout(self) -> None:
         if not hasattr(self, "comparison_inspector_a"):
             return
         for child in self.comparison_inspector_grid.winfo_children():
             child.grid_forget()
+        for idx in range(3):
+            self.comparison_inspector_grid.rowconfigure(idx, weight=0)
+            self.comparison_inspector_grid.columnconfigure(idx, weight=0)
         orientation = self.comparison_layout_var.get()
+        has_reference = self._comparison_reference is not None
         if orientation == "Vertical":
             self.comparison_inspector_grid.rowconfigure(0, weight=1)
             self.comparison_inspector_grid.rowconfigure(1, weight=1)
+            self.comparison_inspector_grid.rowconfigure(2, weight=1 if has_reference else 0)
             self.comparison_inspector_grid.columnconfigure(0, weight=1)
-            self.comparison_inspector_grid.columnconfigure(1, weight=0)
             self.comparison_inspector_a.frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
             self.comparison_inspector_b.frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+            if has_reference:
+                self.comparison_reference_inspector.frame.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
         else:
             self.comparison_inspector_grid.rowconfigure(0, weight=1)
-            self.comparison_inspector_grid.rowconfigure(1, weight=0)
             self.comparison_inspector_grid.columnconfigure(0, weight=1)
             self.comparison_inspector_grid.columnconfigure(1, weight=1)
+            self.comparison_inspector_grid.columnconfigure(2, weight=1 if has_reference else 0)
             self.comparison_inspector_a.frame.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
             self.comparison_inspector_b.frame.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
+            if has_reference:
+                self.comparison_reference_inspector.frame.grid(row=0, column=2, sticky="nsew", padx=4, pady=4)
 
     def _record_for_key(self, key: Optional[ComparisonRecordKey]) -> Optional[RawMetricRecord]:
         if self.model is None or key is None:
@@ -4342,7 +4557,11 @@ class SweepMetricExplorerApp:
         self._refresh_open_comparison_popouts()
 
     def _on_inspector_view_changed(self, source: _ComparisonImageInspector, view_name: str) -> None:
-        if not self.comparison_lock_views_var.get() or self._comparison_view_sync_in_progress:
+        if (
+            source not in (self.comparison_inspector_a, self.comparison_inspector_b)
+            or not self.comparison_lock_views_var.get()
+            or self._comparison_view_sync_in_progress
+        ):
             return
         other = self.comparison_inspector_b if source is self.comparison_inspector_a else self.comparison_inspector_a
         self._comparison_view_sync_in_progress = True
@@ -4355,23 +4574,48 @@ class SweepMetricExplorerApp:
     def _on_inspector_limits_changed(self, source: _ComparisonImageInspector) -> None:
         if not self.comparison_sync_var.get() or self._comparison_sync_in_progress:
             return
-        other = self.comparison_inspector_b if source is self.comparison_inspector_a else self.comparison_inspector_a
-        if not source.has_image() or not other.has_image():
+        if not source.has_image():
             return
         xlim, ylim = source.get_axes_limits()
         if xlim is None or ylim is None:
             return
+        source_shape = source.current_image_shape()
+        if source_shape is None:
+            return
         self._comparison_sync_in_progress = True
         try:
-            other.apply_axes_limits(xlim, ylim)
+            for inspector in self._active_comparison_inspectors():
+                if inspector is source or not inspector.has_image():
+                    continue
+                if inspector.current_image_shape() != source_shape:
+                    continue
+                inspector.apply_axes_limits(xlim, ylim)
         finally:
             self._comparison_sync_in_progress = False
         self._refresh_open_comparison_popouts()
 
+    def _active_comparison_inspectors(self) -> List[_ComparisonImageInspector]:
+        inspectors = [self.comparison_inspector_a, self.comparison_inspector_b]
+        if self._comparison_reference is not None:
+            inspectors.append(self.comparison_reference_inspector)
+        return inspectors
+
+    def _comparison_inspector_for_slot(self, slot_name: str) -> _ComparisonImageInspector:
+        if slot_name == "A":
+            return self.comparison_inspector_a
+        if slot_name == "B":
+            return self.comparison_inspector_b
+        if slot_name == "Reference":
+            return self.comparison_reference_inspector
+        raise ValueError(f"Unknown comparison slot: {slot_name}")
+
     def _open_single_inspector_window(self, slot_name: str) -> None:
-        source = self.comparison_inspector_a if slot_name == "A" else self.comparison_inspector_b
-        if source.record is None:
-            self.messagebox.showwarning("Comparison Viewer", f"Set slot {slot_name} first.")
+        source = self._comparison_inspector_for_slot(slot_name)
+        if slot_name == "Reference" and not source.has_image():
+            self.messagebox.showwarning("Comparison Viewer", "Load a reference image first.")
+            return
+        if slot_name != "Reference" and source.record is None:
+            self.messagebox.showwarning("Comparison Viewer", f"Load slot {slot_name} first.")
             return
         existing = self._comparison_popouts.get(slot_name)
         if existing is not None:
@@ -4383,12 +4627,17 @@ class SweepMetricExplorerApp:
                 window.focus_force()
                 return
         viewer = self.tk.Toplevel(self.root)
-        viewer.title(f"Run {slot_name} Viewer")
+        viewer.title(f"{slot_name} Viewer" if slot_name == "Reference" else f"Run {slot_name} Viewer")
         viewer.geometry("1200x980")
+        view_options = ("reference",) if slot_name == "Reference" else None
+        view_labels = {"reference": "Reference"} if slot_name == "Reference" else None
         inspector = _ComparisonImageInspector(
             self,
             viewer,
             slot_name=slot_name,
+            view_options=view_options,
+            view_labels=view_labels,
+            title_prefix="" if slot_name == "Reference" else "Run",
             on_view_changed=None,
             on_limits_changed=None,
             on_open_large=None,
@@ -4409,7 +4658,12 @@ class SweepMetricExplorerApp:
         if popout is None:
             return
         target = cast(_ComparisonImageInspector, popout["inspector"])
-        source = self.comparison_inspector_a if slot_name == "A" else self.comparison_inspector_b
+        source = self._comparison_inspector_for_slot(slot_name)
+        if slot_name == "Reference":
+            target.set_reference_image(self._comparison_reference)
+            if self._comparison_reference is not None:
+                target.clone_view_state_from(source)
+            return
         target.set_record(
             source.record,
             self._display_bundle_for_record(source.record),

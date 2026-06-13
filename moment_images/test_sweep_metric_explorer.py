@@ -759,6 +759,43 @@ def test_contrast_percentile_limits_support_presets_custom_and_fallbacks():
     assert explorer._contrast_percentile_limits(np.ones((4, 4)), 2.0, 98.0) == (None, None)
 
 
+def test_exponential_percentile_slider_mapping_round_trips_and_expands_useful_edges():
+    for value in (90.0, 98.0, 99.5, 100.0):
+        position = explorer._percentile_to_slider_position(value, role="high", exponential=True)
+        assert explorer._slider_position_to_percentile(position, role="high", exponential=True) == pytest.approx(value)
+
+    for value in (0.0, 0.5, 2.0, 10.0):
+        position = explorer._percentile_to_slider_position(value, role="low", exponential=True)
+        assert explorer._slider_position_to_percentile(position, role="low", exponential=True) == pytest.approx(value)
+
+    assert explorer._slider_position_to_percentile(98.0, role="high", exponential=False) == pytest.approx(98.0)
+    assert explorer._percentile_to_slider_position(2.0, role="low", exponential=False) == pytest.approx(2.0)
+
+    high_90_pos = explorer._percentile_to_slider_position(90.0, role="high", exponential=True)
+    high_100_pos = explorer._percentile_to_slider_position(100.0, role="high", exponential=True)
+    assert high_100_pos - high_90_pos > 10.0
+
+    low_0_pos = explorer._percentile_to_slider_position(0.0, role="low", exponential=True)
+    low_10_pos = explorer._percentile_to_slider_position(10.0, role="low", exponential=True)
+    assert low_10_pos - low_0_pos > 10.0
+
+
+def test_load_comparison_reference_image_returns_grayscale_float64(tmp_path):
+    path = tmp_path / "reference.png"
+    rgb = np.zeros((6, 8, 3), dtype=np.uint8)
+    rgb[..., 0] = 30
+    rgb[..., 1] = 120
+    rgb[..., 2] = 240
+    Image.fromarray(rgb).save(path)
+
+    reference = explorer.load_comparison_reference_image(path)
+
+    assert reference.path == path
+    assert reference.image.shape == (6, 8)
+    assert reference.image.dtype == np.float64
+    assert reference.warnings == []
+
+
 def test_build_comparison_metric_rows_identifies_preferred_side(tmp_path):
     output_dir = _make_modern_fixture(tmp_path)
     model = load_sweep_metric_explorer_model(output_dir)
@@ -807,6 +844,99 @@ def test_gui_labeling_preserves_filters_and_selection(tmp_path):
         assert app.leaderboard_tree.selection() == ("c_good",)
         assert app.model is not None
         assert app.model.annotations[explorer._annotation_key("stage1", "c_good", "d2")].label == "top"
+    finally:
+        root.destroy()
+
+
+def test_gui_reference_image_load_clear_preserves_comparison_slots(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    reference_path = tmp_path / "reference.png"
+    _write_preview(reference_path, np.arange(64, dtype=np.uint8).reshape(8, 8))
+
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+        app.load_from_path(output_dir)
+        root.update()
+
+        app.leaderboard_tree.selection_set("c_good")
+        app._set_comparison_slot("A")
+        app.leaderboard_tree.selection_set("c_bad")
+        app._set_comparison_slot("B")
+        slot_a = app._comparison_slot_a_key
+        slot_b = app._comparison_slot_b_key
+
+        app._load_comparison_reference_from_path(reference_path)
+        root.update()
+
+        assert app._comparison_slot_a_key == slot_a
+        assert app._comparison_slot_b_key == slot_b
+        assert app._comparison_reference is not None
+        assert app.comparison_reference_inspector.has_image()
+        assert reference_path.name in app.comparison_reference_var.get()
+        assert app.comparison_reference_inspector.frame.grid_info()
+
+        app._clear_comparison_reference()
+        root.update()
+
+        assert app._comparison_reference is None
+        assert not app.comparison_reference_inspector.has_image()
+        assert not app.comparison_reference_inspector.frame.grid_info()
+        assert app._comparison_slot_a_key == slot_a
+        assert app._comparison_slot_b_key == slot_b
+    finally:
+        root.destroy()
+
+
+def test_gui_comparison_clone_preserves_exponential_contrast_state(tmp_path):
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        source = app.comparison_inspector_a
+        target = app.comparison_inspector_b
+
+        source.set_contrast_state("custom", 4.0, 99.5, exponential=True, redraw=False)
+        target.clone_view_state_from(source)
+
+        mode, low, high, exponential = target.current_contrast_state()
+        assert mode == "custom"
+        assert low == pytest.approx(4.0)
+        assert high == pytest.approx(99.5)
+        assert exponential is True
+    finally:
+        root.destroy()
+
+
+def test_gui_shape_mismatched_reference_is_not_zoom_synced(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    reference_path = tmp_path / "small_reference.png"
+    _write_preview(reference_path, np.arange(64, dtype=np.uint8).reshape(8, 8))
+
+    root = _make_root_or_skip()
+    try:
+        app = explorer.SweepMetricExplorerApp(root)
+        app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+        app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+
+        app.load_from_path(output_dir)
+        root.update()
+        app.leaderboard_tree.selection_set("c_good")
+        app._set_comparison_slot("A")
+        app.leaderboard_tree.selection_set("c_bad")
+        app._set_comparison_slot("B")
+        app._load_comparison_reference_from_path(reference_path)
+        root.update()
+
+        app.comparison_reference_inspector.fit_view()
+        before = app.comparison_reference_inspector.get_axes_limits()
+        app.comparison_inspector_a.apply_axes_limits((2.0, 9.0), (9.0, 2.0))
+        app._on_inspector_limits_changed(app.comparison_inspector_a)
+        after = app.comparison_reference_inspector.get_axes_limits()
+
+        assert before == after
     finally:
         root.destroy()
 

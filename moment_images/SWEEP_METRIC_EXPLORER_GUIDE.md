@@ -207,6 +207,7 @@ Each panel has:
   - `p2-p98`
   - `p5-p95`
   - `custom`
+- `Exponential sliders`
 - low/high percentile sliders for custom contrast tuning
 - `Fit`
 - `1:1`
@@ -223,6 +224,8 @@ This is the intended inspection workflow:
 
 The contrast controls are independent for `Run A` and `Run B`. Selecting `p2-p98` or `p5-p95` seeds the low/high sliders from that preset. Moving either slider switches that panel to `custom`. `auto` returns to Matplotlib's automatic scaling.
 
+Use `Exponential sliders` when the useful range is crowded near one end of the percentile scale. It gives the low slider more resolution near `0` and the high slider more resolution near `100`, so values like `98`, `99`, and `99.5` are easier to tune than on the linear scale. The labels still show the actual percentile values.
+
 The comparison-level controls are:
 
 - `Set A`
@@ -230,6 +233,8 @@ The comparison-level controls are:
 - `Use 2 Selected`
 - `Swap`
 - `Clear Slots`
+- `Load Reference`
+- `Clear Reference`
 - `Layout`
   - `Horizontal`
   - `Vertical`
@@ -243,6 +248,17 @@ Use `Lock Views` when switching one panel from `preview` to `avg_image` or `guid
 The lower comparison table now shows metric-by-metric A/B deltas and which side each metric prefers.
 
 Use this tab to sanity-check whether a metric is rewarding genuinely sharper images or just boosting contrast/noise artifacts.
+
+### Comparing against a validation image
+
+If you have a validation or ground-truth image for visual inspection:
+
+1. Load A/B runs in the comparison tab.
+2. Click `Load Reference` and choose the validation image.
+3. Switch A/B to `avg_image` when you want to inspect rectification results against the reference pane.
+4. Use `Sync Zoom/Pan` when the reference image dimensions match the run images.
+
+The reference pane is visual-only in this version. It is not saved to `metrics_config.json`, not included in ranking profiles, and does not add similarity metrics. The reference image is session-only and is cleared when you load a different sweep directory.
 
 ### Comparing two runs directly
 
