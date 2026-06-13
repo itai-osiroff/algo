@@ -2259,6 +2259,12 @@ def _normalize_fingerprint_payload_for_resume_compat(
         spec_snapshot = dict(spec_payload)
         if spec_snapshot.get("output_dir") is not None:
             spec_snapshot["output_dir"] = "<output_dir>"
+        scoring_snapshot = spec_snapshot.get("scoring")
+        if isinstance(scoring_snapshot, dict):
+            normalized_scoring = dict(scoring_snapshot)
+            if normalized_scoring.get("profile_config_path") is not None:
+                normalized_scoring["profile_config_path"] = "<profile_config_path>"
+            spec_snapshot["scoring"] = normalized_scoring
         datasets_snapshot = spec_snapshot.get("datasets")
         if isinstance(datasets_snapshot, list):
             normalized_datasets: List[object] = []

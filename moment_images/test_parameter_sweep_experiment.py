@@ -1359,6 +1359,67 @@ def test_run_sweep_resume_adopts_relocated_run_state(tmp_path):
     assert "skipped_valid" in statuses
 
 
+def test_run_sweep_dry_run_adopts_relocated_profile_config_path(monkeypatch, tmp_path):
+    _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    old_root = tmp_path / "old"
+    new_root = tmp_path / "new"
+    old_root.mkdir()
+    new_root.mkdir()
+    old_views_path = old_root / "views.npy"
+    new_views_path = new_root / "views.npy"
+    np.save(old_views_path, views)
+    np.save(new_views_path, views)
+    old_config_path = old_root / "metrics_config.json"
+    new_config_path = new_root / "metrics_config.json"
+    old_config_path.write_text("{}", encoding="utf-8")
+    new_config_path.write_text("{}", encoding="utf-8")
+
+    base_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(old_views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(
+            metric_weights={"laplacian_variance": 1.0},
+            profile_config_path=str(old_config_path),
+        ),
+        output_dir=str(old_root / "run"),
+        save_figures=False,
+        analyze=False,
+    )
+    original_out_dir = run_sweep_experiment(base_spec)
+    relocated_output_dir = new_root / "run"
+    shutil.copytree(original_out_dir, relocated_output_dir)
+
+    relocated_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(new_views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(total_budget_per_dataset=2, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(
+            metric_weights={"laplacian_variance": 1.0},
+            profile_config_path=str(new_config_path),
+        ),
+        output_dir=str(relocated_output_dir),
+        save_figures=False,
+        analyze=False,
+    )
+
+    relocation_rules = parameter_sweep._parse_path_relocation_rules(
+        [f"{old_root}={new_root}"]
+    )
+    out_dir = run_sweep_experiment(
+        relocated_spec,
+        output_dir=relocated_output_dir,
+        adopt_relocated=True,
+        relocation_rules=relocation_rules,
+        dry_run=True,
+    )
+
+    assert out_dir == relocated_output_dir
+
+
 def test_parse_experiment_spec_relocates_output_dataset_and_profile_config(tmp_path):
     old_root = tmp_path / "old"
     new_root = tmp_path / "new"
