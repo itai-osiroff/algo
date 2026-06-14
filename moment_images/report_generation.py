@@ -101,18 +101,68 @@ def _active_generation_id(run_state: Optional[Dict[str, object]]) -> Optional[st
     return None
 
 
-def _resolve_entry_run_dir(entry: Dict[str, object], output_dir: Path, stage_name: str) -> Path:
+def _path_relative_to(path: Path, root: Path) -> Optional[Path]:
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+
+
+def _relocated_run_dir_candidates(
+    *,
+    run_dir: Path,
+    output_dir: Path,
+    stage_name: str,
+    candidate_id: str,
+    dataset_id: str,
+    run_state: Optional[Dict[str, object]],
+) -> List[Path]:
+    candidates: List[Path] = []
+    if isinstance(run_state, dict):
+        compatibility = run_state.get("path_compatibility")
+        if isinstance(compatibility, dict):
+            old_output_dir = _coerce_nonempty_str(compatibility.get("output_dir"))
+            if old_output_dir is not None:
+                suffix = _path_relative_to(run_dir, Path(old_output_dir))
+                if suffix is not None:
+                    candidates.append(output_dir / suffix)
+
+    parts = list(run_dir.parts)
+    if "runs" in parts:
+        runs_index = len(parts) - 1 - parts[::-1].index("runs")
+        candidates.append(output_dir / Path(*parts[runs_index:]))
+
+    candidates.append(output_dir / "runs" / stage_name / candidate_id / dataset_id)
+    return candidates
+
+
+def _resolve_entry_run_dir(
+    entry: Dict[str, object],
+    output_dir: Path,
+    stage_name: str,
+    run_state: Optional[Dict[str, object]],
+) -> Path:
+    candidate_id = str(entry.get("candidate_id", ""))
+    dataset_id = str(entry.get("dataset_id", ""))
     run_dir_text = _coerce_nonempty_str(entry.get("run_dir"))
     if run_dir_text:
         run_dir = Path(run_dir_text)
-        if run_dir.is_absolute() or run_dir.exists():
+        if run_dir.exists():
             return run_dir
         scoped = output_dir / run_dir
         if scoped.exists():
             return scoped
+        for relocated in _relocated_run_dir_candidates(
+            run_dir=run_dir,
+            output_dir=output_dir,
+            stage_name=stage_name,
+            candidate_id=candidate_id,
+            dataset_id=dataset_id,
+            run_state=run_state,
+        ):
+            if relocated.exists():
+                return relocated
 
-    candidate_id = str(entry.get("candidate_id", ""))
-    dataset_id = str(entry.get("dataset_id", ""))
     return output_dir / "runs" / stage_name / candidate_id / dataset_id
 
 
@@ -122,6 +172,7 @@ def _run_result_from_entry(
     stage_name: str,
     entry: Dict[str, object],
     active_generation_id: Optional[str],
+    run_state: Optional[Dict[str, object]],
 ) -> Optional[Dict[str, object]]:
     if str(entry.get("stage", "")) != stage_name:
         return None
@@ -135,7 +186,7 @@ def _run_result_from_entry(
     if candidate_id is None or dataset_id is None:
         return None
 
-    run_dir = _resolve_entry_run_dir(entry, output_dir, stage_name)
+    run_dir = _resolve_entry_run_dir(entry, output_dir, stage_name, run_state)
     metric_record_path = run_dir / "metric_record.json"
     config_path = run_dir / "config.json"
     if not metric_record_path.exists() or not config_path.exists():
@@ -200,6 +251,7 @@ def _discover_stage_results_from_run_state(
             stage_name=stage_name,
             entry=cast(Dict[str, object], entry),
             active_generation_id=active_generation,
+            run_state=run_state,
         )
         if result is not None:
             results.append(result)

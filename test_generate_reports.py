@@ -389,3 +389,56 @@ def test_rebuild_summaries_snapshots_metric_phase_generation_products(tmp_path, 
     assert metric_summary["generation_id"] == "gen_new"
     assert {row["generation_id"] for row in metric_summary["rankings"]} == {"gen_new"}
     assert product_summary["generation_id"] == "gen_new"
+
+
+def test_rebuild_summaries_resolves_relocated_run_state_paths(tmp_path, monkeypatch):
+    original_dir = tmp_path / "original" / "experiment"
+    relocated_dir = tmp_path / "relocated" / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        relocated_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    stale_run_dir = _run_dir(original_dir, "stage1", "c_active", "d1")
+    _write_run_state(
+        relocated_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=stale_run_dir,
+                generation_id="gen_new",
+            )
+        },
+    )
+    state = json.loads((relocated_dir / "run_state.json").read_text(encoding="utf-8"))
+    state["path_compatibility"] = {"output_dir": str(original_dir)}
+    _write_json(relocated_dir / "run_state.json", state)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_reports.py",
+            str(relocated_dir),
+            "--spec",
+            str(spec_path),
+            "--rebuild-summaries",
+        ],
+    )
+
+    generate_reports.main()
+
+    leaderboard = json.loads((relocated_dir / "leaderboard.json").read_text(encoding="utf-8"))
+    stage_summary = json.loads((relocated_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    assert [row["candidate_id"] for row in leaderboard] == ["c_active"]
+    assert stage_summary["generation_id"] == "gen_new"
