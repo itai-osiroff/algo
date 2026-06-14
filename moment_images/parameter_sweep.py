@@ -6292,7 +6292,7 @@ class SpecGuiApp:
         self._register_editable(self.refinement_extrapolation_combo)
 
         toggles_frame = self.ttk.Frame(basic_frame)
-        toggles_frame.grid(row=3, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        toggles_frame.grid(row=5, column=0, columnspan=3, sticky="w", padx=4, pady=2)
         self.analyze_var = self.tk.BooleanVar(value=True)
         self.save_figures_var = self.tk.BooleanVar(value=False)
         analyze_chk = self.ttk.Checkbutton(toggles_frame, text="Analyze", variable=self.analyze_var)
