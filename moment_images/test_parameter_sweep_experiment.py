@@ -139,6 +139,92 @@ def _install_fast_artifact_runner(monkeypatch):
     return calls
 
 
+def _structured_avg_image(window_size: int) -> np.ndarray:
+    if int(window_size) == 1:
+        return np.arange(64, dtype=np.float32).reshape(8, 8)
+    if int(window_size) == 3:
+        image = np.zeros((8, 8), dtype=np.float32)
+        image[3:5, 3:5] = 10.0
+        return image
+    return np.indices((8, 8)).sum(axis=0).astype(np.float32) % 2
+
+
+def _install_structured_artifact_runner(monkeypatch):
+    calls: list[dict] = []
+
+    def fake_run(task: dict) -> tuple[dict, bool]:
+        config = RectificationRunConfig(**task["config"])
+        window_size = int(config.similarity_window_size)
+        calls.append(
+            {
+                "run_uid": str(task["run_uid"]),
+                "stage": str(task["stage"]),
+                "window": window_size,
+            }
+        )
+        avg = _structured_avg_image(window_size)
+        rectified = np.broadcast_to(avg, (2, 2, *avg.shape)).astype(np.float32)
+        result = RectificationResult(
+            avg_image=avg,
+            rectified_views=rectified,
+            similarity_data=None,
+            config=config,
+            ref_view_index=(0, 0),
+        )
+        run_dir = Path(task["run_dir"])
+        artifact_paths = parameter_sweep._artifact_paths_payload(run_dir)
+        metric_record = parameter_sweep.build_metric_record(str(task["run_uid"]), config, result)
+        metric_record.update(
+            {
+                "candidate_signature": task.get("candidate_signature"),
+                "dataset_signature": task.get("dataset_signature"),
+                "run_signature": task.get("run_signature"),
+                "generation_id": task.get("generation_id"),
+                "artifact_paths": artifact_paths,
+            }
+        )
+        parameter_sweep._save_run_artifacts(
+            Path(task["run_parent_dir"]),
+            str(task["run_name"]),
+            result,
+            metric_record=metric_record,
+        )
+        return (
+            {
+                "status": "ok",
+                "stage": task["stage"],
+                "candidate_id": task["candidate_id"],
+                "dataset_id": task["dataset_id"],
+                "strategy": task["strategy"],
+                "run_uid": task["run_uid"],
+                "run_dir": str(run_dir),
+                "runtime_seconds": 0.01,
+                "config": task["config"],
+                "params": task["params"],
+                "task_index": task["task_index"],
+                "metric_record": metric_record,
+                "candidate_signature": task.get("candidate_signature"),
+                "dataset_signature": task.get("dataset_signature"),
+                "run_signature": task.get("run_signature"),
+                "generation_id": task.get("generation_id"),
+                "artifact_paths": artifact_paths,
+            },
+            False,
+        )
+
+    monkeypatch.setattr(parameter_sweep, "_run_task_isolated", fake_run)
+    return calls
+
+
+def _remove_metric_from_run_records(output_dir: Path, metric_name: str) -> None:
+    for path in output_dir.glob("runs/*/*/*/metric_record.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        metrics = payload.get("global_and_local_metrics")
+        if isinstance(metrics, dict):
+            metrics.pop(metric_name, None)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def test_generate_coarse_candidates_global_ignores_pixel_only_dimensions():
     search_space = SweepSearchSpace(
         strategy="global",
@@ -879,6 +965,176 @@ def test_run_sweep_experiment_stage2_uses_auto_fine_values(monkeypatch, tmp_path
     }
 
     assert any(window not in {15, 25} for window in stage2_windows)
+
+
+def test_run_sweep_backfills_missing_scoring_metrics_for_reused_artifacts(monkeypatch, tmp_path):
+    calls = _install_structured_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    base_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1, 3], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(mode="single_stage", total_budget_per_dataset=2, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "backfill_reuse"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(base_spec)
+    _remove_metric_from_run_records(out_dir, "gini_avg")
+
+    calls.clear()
+    updated_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces=base_spec.search_spaces,
+        strategies=["pixel"],
+        stages=base_spec.stages,
+        scoring=SweepScoringSpec(metric_weights={"gini_avg": 1.0}),
+        output_dir=str(out_dir),
+        save_figures=False,
+        analyze=False,
+    )
+    run_sweep_experiment(updated_spec, output_dir=out_dir, extend_existing=True)
+
+    assert calls == []
+    summary = json.loads((out_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    assert summary["execution"]["metric_backfilled_count"] == 2
+    assert summary["execution"]["metric_backfill_failed_count"] == 0
+    for path in sorted(out_dir.glob("runs/stage1/*/d1/metric_record.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert "gini_avg" in payload["global_and_local_metrics"]
+        assert payload["metric_backfilled"] is True
+        assert "gini_avg" in payload["metric_backfilled_names"]
+
+
+def test_run_sweep_dry_run_reports_metric_backfill_without_writing(monkeypatch, tmp_path):
+    _install_structured_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    base_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(mode="single_stage", total_budget_per_dataset=1, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "backfill_dry_run"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(base_spec)
+    _remove_metric_from_run_records(out_dir, "gini_avg")
+    metric_record_path = next(out_dir.glob("runs/stage1/*/d1/metric_record.json"))
+    before = metric_record_path.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: pytest.fail("dry run must not execute tasks"),
+    )
+    dry_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces=base_spec.search_spaces,
+        strategies=["pixel"],
+        stages=base_spec.stages,
+        scoring=SweepScoringSpec(metric_weights={"gini_avg": 1.0}),
+        output_dir=str(out_dir),
+        save_figures=False,
+        analyze=False,
+    )
+    run_sweep_experiment(dry_spec, output_dir=out_dir, extend_existing=True, dry_run=True)
+
+    dry_run_path = next((out_dir / "generations").glob("*/dry_run.json"))
+    dry_run_payload = json.loads(dry_run_path.read_text(encoding="utf-8"))
+    assert dry_run_payload["stages"]["stage1"]["metric_backfilled_count"] == 1
+    assert metric_record_path.read_text(encoding="utf-8") == before
+
+
+def test_run_sweep_backfilled_metric_guides_stage2_seed(monkeypatch, tmp_path):
+    calls = _install_structured_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    single_stage_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1, 3], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(mode="single_stage", total_budget_per_dataset=2, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "backfill_stage2_seed"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(single_stage_spec)
+    _remove_metric_from_run_records(out_dir, "gini_avg")
+
+    calls.clear()
+    two_stage_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces=single_stage_spec.search_spaces,
+        strategies=["pixel"],
+        stages=SweepStageSpec(mode="two_stage", total_budget_per_dataset=4, stage1_fraction=0.5, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"gini_avg": 1.0}),
+        output_dir=str(out_dir),
+        save_figures=False,
+        analyze=False,
+    )
+    run_sweep_experiment(two_stage_spec, output_dir=out_dir, extend_existing=True)
+
+    assert not [call for call in calls if call["stage"] == "stage1"]
+    stage1_summary = json.loads((out_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    assert stage1_summary["rankings"][0]["config"]["similarity_window_size"] == 3
+    stage2_summary = json.loads((out_dir / "stage2_summary.json").read_text(encoding="utf-8"))
+    stage2_windows = {
+        int(record["config"]["similarity_window_size"])
+        for record in stage2_summary["runs"]
+        if record["status"] == "ok"
+    }
+    assert stage2_windows == {3, 5}
+
+
+def test_run_sweep_recomputes_when_missing_metric_workspace_is_corrupt(monkeypatch, tmp_path):
+    calls = _install_structured_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(mode="single_stage", total_budget_per_dataset=1, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "backfill_corrupt_workspace"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(spec)
+    _remove_metric_from_run_records(out_dir, "gini_avg")
+    workspace_path = next(out_dir.glob("runs/stage1/*/d1/workspace.npz"))
+    workspace_path.write_text("corrupted", encoding="utf-8")
+
+    calls.clear()
+    updated_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces=spec.search_spaces,
+        strategies=["pixel"],
+        stages=spec.stages,
+        scoring=SweepScoringSpec(metric_weights={"gini_avg": 1.0}),
+        output_dir=str(out_dir),
+        save_figures=False,
+        analyze=False,
+    )
+    run_sweep_experiment(updated_spec, output_dir=out_dir, extend_existing=True)
+
+    assert calls
+    state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert "recomputed" in {entry["status"] for entry in state["runs"].values()}
 
 
 def test_parallel_and_serial_runs_have_identical_leaderboard_order(tmp_path):

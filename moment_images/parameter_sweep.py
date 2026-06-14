@@ -66,6 +66,7 @@ from moment_images.reliable_io import (
 )
 from moment_images.metric_profiles import (
     build_metric_registry,
+    compute_extended_image_metrics,
     default_profiles,
     resolve_metric_config,
     resolve_profile_weights_for_sweep,
@@ -2736,6 +2737,124 @@ def _load_cached_stage_result(task: Dict[str, object], run_dir: Path) -> Dict[st
     }
 
 
+def _scoring_metric_names(scoring: Optional[SweepScoringSpec]) -> List[str]:
+    if scoring is None:
+        return []
+    names: List[str] = []
+    for metric_name, weight in scoring.metric_weights.items():
+        try:
+            numeric = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(numeric) or numeric == 0.0:
+            continue
+        names.append(str(metric_name))
+    return names
+
+
+def _metric_value_is_available(metrics: Mapping[str, object], metric_name: str) -> bool:
+    try:
+        value = float(cast(float, metrics.get(metric_name)))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value)
+
+
+def _effective_metric_scope(metric_record: Mapping[str, object], scoring: SweepScoringSpec) -> str:
+    metrics = metric_record.get(scoring.metric_scope)
+    if isinstance(metrics, dict):
+        return scoring.metric_scope
+    return "global_and_local_metrics"
+
+
+def _workspace_metric_image_for_scope(workspace_path: Path, metric_scope: str) -> np.ndarray:
+    payload, _, _ = read_npz_first_valid(
+        workspace_path,
+        allow_pickle=True,
+        validator=lambda obj: "rectified_views" in obj and "average_rectified_image" in obj,
+    )
+    image_key = (
+        "average_rectified_global_image"
+        if metric_scope == "global_only_metrics"
+        else "average_rectified_image"
+    )
+    image = cast(Optional[np.ndarray], payload.get(image_key))
+    if not isinstance(image, np.ndarray):
+        raise ValueError(f"workspace.npz missing {image_key}.")
+    return np.asarray(image, dtype=np.float64)
+
+
+def _backfill_cached_stage_result_metrics(
+    cached_result: Dict[str, object],
+    run_dir: Path,
+    scoring: Optional[SweepScoringSpec],
+    *,
+    dry_run: bool,
+) -> Tuple[bool, List[str]]:
+    """Populate missing scoring metrics in a reused run's metric record."""
+
+    if scoring is None:
+        return False, []
+    required_metrics = _scoring_metric_names(scoring)
+    if not required_metrics:
+        return False, []
+
+    metric_record = cast(Dict[str, object], cached_result["metric_record"])
+    metric_scope = _effective_metric_scope(metric_record, scoring)
+    scope_metrics_raw = metric_record.get(metric_scope)
+    scope_metrics: Dict[str, object] = (
+        dict(cast(Dict[str, object], scope_metrics_raw))
+        if isinstance(scope_metrics_raw, dict)
+        else {}
+    )
+    missing_metrics = [
+        metric_name
+        for metric_name in required_metrics
+        if not _metric_value_is_available(scope_metrics, metric_name)
+    ]
+    if not missing_metrics:
+        return False, []
+
+    computed_metrics = compute_extended_image_metrics(
+        _workspace_metric_image_for_scope(run_dir / "workspace.npz", metric_scope)
+    )
+    backfilled_names: List[str] = []
+    for metric_name in missing_metrics:
+        value = computed_metrics.get(metric_name)
+        if value is None or not math.isfinite(float(value)):
+            continue
+        scope_metrics[metric_name] = float(value)
+        backfilled_names.append(metric_name)
+
+    if not backfilled_names:
+        return False, []
+
+    metric_record[metric_scope] = scope_metrics
+    metric_record["metric_backfilled"] = True
+    metric_record["metric_backfilled_at"] = _utc_now_iso()
+    metric_record["metric_backfilled_names"] = sorted(
+        set(
+            [str(name) for name in metric_record.get("metric_backfilled_names", [])]
+            if isinstance(metric_record.get("metric_backfilled_names"), list)
+            else []
+        )
+        | set(backfilled_names)
+    )
+    cached_result["metric_record"] = metric_record
+    cached_result["metric_backfilled"] = True
+    cached_result["metric_backfilled_names"] = list(backfilled_names)
+
+    if not dry_run:
+        write_json_atomic(
+            run_dir / "metric_record.json",
+            metric_record,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
+        )
+    return True, backfilled_names
+
+
 def _set_parallel_thread_limits() -> None:
     for env_var in THREAD_LIMIT_ENV_VARS:
         os.environ[env_var] = "1"
@@ -3446,6 +3565,7 @@ def _evaluate_stage(
     output_dir: Path,
     save_figures_flag: bool,
     requested_workers: int,
+    scoring: Optional[SweepScoringSpec] = None,
     run_state: Optional[Dict[str, object]] = None,
     run_state_path: Optional[Path] = None,
     generation_id: Optional[str] = None,
@@ -3508,6 +3628,8 @@ def _evaluate_stage(
                 "isolated_crash_count": 0,
                 "skipped_valid_count": 0,
                 "recomputed_count": 0,
+                "metric_backfilled_count": 0,
+                "metric_backfill_failed_count": 0,
                 "dry_run": bool(dry_run),
             },
         )
@@ -3516,6 +3638,8 @@ def _evaluate_stage(
     tasks_to_execute: List[Dict[str, object]] = []
     skipped_valid_count = 0
     recomputed_count = 0
+    metric_backfilled_count = 0
+    metric_backfill_failed_count = 0
     state_runs = (
         cast(Dict[str, Dict[str, object]], run_state.setdefault("runs", {}))
         if run_state is not None
@@ -3585,18 +3709,33 @@ def _evaluate_stage(
                 task["_recompute_after_invalid"] = previous_status in {"ok", "recomputed", "skipped_valid"}
                 tasks_to_execute.append(task)
                 continue
+            try:
+                backfilled, backfilled_names = _backfill_cached_stage_result_metrics(
+                    cached_result,
+                    run_dir,
+                    scoring,
+                    dry_run=dry_run,
+                )
+            except Exception:
+                metric_backfill_failed_count += 1
+                task["_recompute_after_invalid"] = previous_status in {"ok", "recomputed", "skipped_valid"}
+                tasks_to_execute.append(task)
+                continue
             cached_result["task_index"] = task["task_index"]
             stage_results.append(cached_result)
             skipped_valid_count += 1
+            if backfilled:
+                metric_backfilled_count += 1
             if entry is not None:
                 attempts = cast(List[Dict[str, object]], entry.setdefault("attempts", []))
-                attempts.append(
-                    {
-                        "timestamp": _utc_now_iso(),
-                        "status": "skipped_valid",
-                        "reason": "artifacts_valid",
-                    }
-                )
+                attempt = {
+                    "timestamp": _utc_now_iso(),
+                    "status": "skipped_valid",
+                    "reason": "artifacts_valid",
+                }
+                if backfilled:
+                    attempt["metric_backfilled_names"] = list(backfilled_names)
+                attempts.append(attempt)
                 entry["status"] = "skipped_valid"
             continue
 
@@ -3632,6 +3771,8 @@ def _evaluate_stage(
             "completed_runs": len(stage_results),
             "skipped_valid_count": int(skipped_valid_count),
             "recomputed_count": 0,
+            "metric_backfilled_count": int(metric_backfilled_count),
+            "metric_backfill_failed_count": int(metric_backfill_failed_count),
             "pending_run_count": int(pending_count),
             "dry_run": True,
             "planned_run_uids": [str(task["run_uid"]) for task in tasks],
@@ -3754,6 +3895,8 @@ def _evaluate_stage(
     execution["completed_runs"] = len(stage_results)
     execution["skipped_valid_count"] = int(skipped_valid_count)
     execution["recomputed_count"] = int(recomputed_count)
+    execution["metric_backfilled_count"] = int(metric_backfilled_count)
+    execution["metric_backfill_failed_count"] = int(metric_backfill_failed_count)
     execution["used_isolated_mode"] = bool(isolated_crash_count > 0 or current_workers == 1)
     if run_state is not None:
         active_run_uids = {str(task["run_uid"]) for task in tasks}
@@ -4227,6 +4370,7 @@ def run_sweep_experiment(
         output_dir=resolved_output_dir,
         save_figures_flag=spec.save_figures,
         requested_workers=requested_workers,
+        scoring=spec.scoring,
         run_state=run_state,
         run_state_path=run_state_path,
         generation_id=generation_id,
@@ -4273,6 +4417,7 @@ def run_sweep_experiment(
             output_dir=resolved_output_dir,
             save_figures_flag=spec.save_figures,
             requested_workers=requested_workers,
+            scoring=spec.scoring,
             run_state=run_state,
             run_state_path=run_state_path,
             generation_id=generation_id,
@@ -4392,6 +4537,7 @@ def run_sweep_experiment(
             output_dir=metric_output_dir,
             save_figures_flag=spec.save_figures,
             requested_workers=requested_workers,
+            scoring=spec.scoring,
             run_state=run_state,
             run_state_path=run_state_path,
             generation_id=generation_id,
