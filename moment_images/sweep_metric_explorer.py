@@ -32,6 +32,8 @@ from moment_images.metric_profiles import validate_profile_for_sweep
 from moment_images.sweep_visualization import (
     CandidateVisualizationRow,
     SweepVisualizationModel,
+    candidate_rows_for_generation_scope,
+    generation_scope_options,
     load_sweep_visualization_model,
 )
 
@@ -100,6 +102,7 @@ class QualityAnnotation:
     candidate_id: str
     dataset_id: str
     label: str
+    generation_id: Optional[str] = None
     note: str = ""
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -113,6 +116,7 @@ class RawMetricRecord:
     """Raw per-dataset metrics recomputed from ``workspace.npz``."""
 
     row_id: str
+    generation_id: Optional[str]
     stage: str
     candidate_id: str
     dataset_id: str
@@ -132,6 +136,8 @@ class RawMetricRecord:
 class ProfileCandidateScore:
     """Ranked score for one candidate under a selected profile."""
 
+    row_id: str
+    generation_id: Optional[str]
     profile_name: str
     stage: str
     candidate_id: str
@@ -259,6 +265,7 @@ class SweepMetricExplorerModel:
     search_results: List[SearchResult]
     warnings: List[str]
     scoring_config: Dict[str, float]
+    generation_scope: str = "All"
     hydrate_mode: str = HYDRATE_MODE_EAGER
 
 
@@ -313,8 +320,54 @@ def _search_result_sort_key(item: SearchResult) -> Tuple[object, ...]:
     )
 
 
-def _annotation_key(stage: str, candidate_id: str, dataset_id: str) -> str:
+def _annotation_key(
+    stage: str,
+    candidate_id: str,
+    dataset_id: str,
+    generation_id: Optional[str] = None,
+) -> str:
+    if generation_id:
+        return f"{stage}:{generation_id}:{candidate_id}:{dataset_id}"
     return f"{stage}:{candidate_id}:{dataset_id}"
+
+
+def _active_generation_id(model: SweepMetricExplorerModel) -> Optional[str]:
+    value = model.base_model.generation_summary.get("active_generation_id")
+    return str(value) if value is not None and str(value).strip() else None
+
+
+def _annotation_for_candidate(
+    model: SweepMetricExplorerModel,
+    *,
+    stage: str,
+    candidate_id: str,
+    dataset_id: str,
+    generation_id: Optional[str],
+) -> Optional[QualityAnnotation]:
+    scoped = model.annotations.get(_annotation_key(stage, candidate_id, dataset_id, generation_id))
+    if scoped is not None:
+        return scoped
+    active_generation_id = _active_generation_id(model)
+    if generation_id is None or generation_id == active_generation_id:
+        return model.annotations.get(_annotation_key(stage, candidate_id, dataset_id))
+    return None
+
+
+def _annotation_from_mapping(
+    annotations: Mapping[str, QualityAnnotation],
+    *,
+    stage: str,
+    candidate_id: str,
+    dataset_id: str,
+    generation_id: Optional[str],
+    active_generation_id: Optional[str],
+) -> Optional[QualityAnnotation]:
+    scoped = annotations.get(_annotation_key(stage, candidate_id, dataset_id, generation_id))
+    if scoped is not None:
+        return scoped
+    if generation_id is None or generation_id == active_generation_id:
+        return annotations.get(_annotation_key(stage, candidate_id, dataset_id))
+    return None
 
 
 def _real_datasets(model: SweepVisualizationModel) -> List[str]:
@@ -322,7 +375,7 @@ def _real_datasets(model: SweepVisualizationModel) -> List[str]:
 
 
 def _metric_row_key(record: RawMetricRecord) -> Tuple[str, str, str]:
-    return record.stage, record.candidate_id, record.dataset_id
+    return record.stage, record.row_id, record.dataset_id
 
 
 def _stable_unique_strings(values: Iterable[str]) -> List[str]:
@@ -342,7 +395,15 @@ def _candidate_lookup(rows: Sequence[CandidateVisualizationRow]) -> Dict[Tuple[s
 
 
 def _record_lookup(records: Sequence[RawMetricRecord]) -> Dict[Tuple[str, str, str], RawMetricRecord]:
-    return {_metric_row_key(record): record for record in records}
+    lookup: Dict[Tuple[str, str, str], RawMetricRecord] = {}
+    for record in records:
+        lookup[_metric_row_key(record)] = record
+        dataset_suffix = f":{record.dataset_id}"
+        if record.row_id.endswith(dataset_suffix):
+            candidate_row_id = record.row_id[: -len(dataset_suffix)]
+            lookup.setdefault((record.stage, candidate_row_id, record.dataset_id), record)
+        lookup.setdefault((record.stage, record.candidate_id, record.dataset_id), record)
+    return lookup
 
 
 def _record_key_to_text(key: Optional[ComparisonRecordKey]) -> str:
@@ -967,6 +1028,7 @@ def _load_annotations(path: Path) -> Dict[str, QualityAnnotation]:
         stage = str(row.get("stage", "")).strip()
         candidate_id = str(row.get("candidate_id", "")).strip()
         dataset_id = str(row.get("dataset_id", "")).strip()
+        generation_id = str(row.get("generation_id", "")).strip() or None
         label = str(row.get("label", "")).strip().lower()
         if not stage or not candidate_id or not dataset_id or label not in ANNOTATION_LABEL_SCORES:
             continue
@@ -975,10 +1037,11 @@ def _load_annotations(path: Path) -> Dict[str, QualityAnnotation]:
             candidate_id=candidate_id,
             dataset_id=dataset_id,
             label=label,
+            generation_id=generation_id,
             note=str(row.get("note", "")),
             updated_at=str(row.get("updated_at", _utc_now_iso())),
         )
-        annotations[_annotation_key(stage, candidate_id, dataset_id)] = annotation
+        annotations[_annotation_key(stage, candidate_id, dataset_id, generation_id)] = annotation
     return annotations
 
 
@@ -1276,10 +1339,10 @@ def _build_raw_records(
     raw_records: List[RawMetricRecord] = []
     run_record_lookup = _run_metric_record_lookup(model)
 
-    for row in model.candidates:
+    for row in candidate_rows_for_generation_scope(model, None):
         dataset_ids = _candidate_dataset_ids(row, model)
         for dataset_id in dataset_ids:
-            row_id = _annotation_key(row.stage, row.candidate_id, dataset_id)
+            row_id = f"{row.row_id}:{dataset_id}"
             workspace_path = _workspace_path_for_row(model, row, dataset_id)
             preview_path = _preview_path_for_row(model, row, dataset_id)
             run_record = run_record_lookup.get((row.stage, row.candidate_id, dataset_id))
@@ -1289,6 +1352,7 @@ def _build_raw_records(
             valid_entry = _valid_cache_entry_for_record(
                 RawMetricRecord(
                     row_id=row_id,
+                    generation_id=row.generation_id,
                     stage=row.stage,
                     candidate_id=row.candidate_id,
                     dataset_id=dataset_id,
@@ -1316,7 +1380,8 @@ def _build_raw_records(
             formulation_id = row.formulation_id
             raw_records.append(
                 RawMetricRecord(
-                    row_id=_annotation_key(row.stage, row.candidate_id, dataset_id),
+                    row_id=row_id,
+                    generation_id=row.generation_id,
                     stage=row.stage,
                     candidate_id=row.candidate_id,
                     dataset_id=dataset_id,
@@ -1546,6 +1611,8 @@ def _saved_original_profile_result(
     std_score = row.std_dataset_score if row.std_dataset_score is not None else 0.0
     score = row.score if row.score is not None else mean_score
     return ProfileCandidateScore(
+        row_id=row.row_id,
+        generation_id=row.generation_id,
         profile_name="saved_original",
         stage=row.stage,
         candidate_id=row.candidate_id,
@@ -1570,7 +1637,11 @@ def _score_profile_for_stage(
     metric_registry: Mapping[str, MetricDescriptor],
     scoring_config: Mapping[str, float],
 ) -> List[ProfileCandidateScore]:
-    stage_rows = [row for row in model.candidates if row.stage == stage_name]
+    stage_rows = [
+        row
+        for row in candidate_rows_for_generation_scope(model, None)
+        if row.stage == stage_name
+    ]
     if not stage_rows:
         return []
     if profile.name == "saved_original":
@@ -1595,7 +1666,7 @@ def _score_profile_for_stage(
         for metric_name in metric_weights:
             metric_values: List[float] = []
             for row in stage_rows:
-                record = record_lookup.get((stage_name, row.candidate_id, dataset_id))
+                record = record_lookup.get((stage_name, row.row_id, dataset_id))
                 if record is None:
                     continue
                 numeric = record.metrics.get(metric_name)
@@ -1627,7 +1698,7 @@ def _score_profile_for_stage(
         contributions_accumulator: Dict[str, List[float]] = {}
         missing: List[str] = []
         for dataset_id in datasets:
-            record = record_lookup.get((stage_name, row.candidate_id, dataset_id))
+            record = record_lookup.get((stage_name, row.row_id, dataset_id))
             if record is None:
                 missing.append(dataset_id)
                 continue
@@ -1678,6 +1749,8 @@ def _score_profile_for_stage(
         }
         scored_rows.append(
             ProfileCandidateScore(
+                row_id=row.row_id,
+                generation_id=row.generation_id,
                 profile_name=profile.name,
                 stage=stage_name,
                 candidate_id=row.candidate_id,
@@ -1706,12 +1779,20 @@ def _evaluate_profile_for_stage(
     results: Sequence[ProfileCandidateScore],
     annotations: Mapping[str, QualityAnnotation],
     *,
+    active_generation_id: Optional[str] = None,
     top_k: int = DEFAULT_TOP_K,
 ) -> ProfileEvaluationSummary:
     dataset_to_rows: Dict[str, List[Tuple[ProfileCandidateScore, QualityAnnotation]]] = {}
     for result in results:
         for dataset_id in result.dataset_scores.keys():
-            annotation = annotations.get(_annotation_key(stage_name, result.candidate_id, dataset_id))
+            annotation = _annotation_from_mapping(
+                annotations,
+                stage=stage_name,
+                candidate_id=result.candidate_id,
+                dataset_id=dataset_id,
+                generation_id=result.generation_id,
+                active_generation_id=active_generation_id,
+            )
             if annotation is None:
                 continue
             dataset_to_rows.setdefault(dataset_id, []).append((result, annotation))
@@ -1769,11 +1850,20 @@ def _build_disagreements(
     profile_name: str,
     results: Sequence[ProfileCandidateScore],
     annotations: Mapping[str, QualityAnnotation],
+    *,
+    active_generation_id: Optional[str] = None,
 ) -> List[DisagreementRecord]:
     rows_by_dataset: Dict[str, List[Tuple[ProfileCandidateScore, QualityAnnotation]]] = {}
     for result in results:
         for dataset_id in result.dataset_scores.keys():
-            annotation = annotations.get(_annotation_key(stage_name, result.candidate_id, dataset_id))
+            annotation = _annotation_from_mapping(
+                annotations,
+                stage=stage_name,
+                candidate_id=result.candidate_id,
+                dataset_id=dataset_id,
+                generation_id=result.generation_id,
+                active_generation_id=active_generation_id,
+            )
             if annotation is None:
                 continue
             rows_by_dataset.setdefault(dataset_id, []).append((result, annotation))
@@ -1852,6 +1942,7 @@ def _ensure_profile_results(
         model.metric_registry,
         model.scoring_config,
     )
+    model.profile_results[(model.generation_scope, stage_name, profile.name)] = scored
     model.profile_results[(stage_name, profile.name)] = scored
     if include_analysis:
         summary = _evaluate_profile_for_stage(
@@ -1859,13 +1950,20 @@ def _ensure_profile_results(
             profile.name,
             scored,
             model.annotations,
+            active_generation_id=_active_generation_id(model),
         )
         _replace_evaluation_summary(model, summary)
         _replace_disagreements(
             model,
             stage_name,
             profile.name,
-            _build_disagreements(stage_name, profile.name, scored, model.annotations),
+            _build_disagreements(
+                stage_name,
+                profile.name,
+                scored,
+                model.annotations,
+                active_generation_id=_active_generation_id(model),
+            ),
         )
     return scored
 
@@ -1905,7 +2003,7 @@ def _prime_summary_backed_profiles(model: SweepMetricExplorerModel) -> None:
                 metric_names=metric_names,
             ):
                 continue
-            model.profile_results[(stage_name, profile.name)] = _score_profile_for_stage(
+            scored = _score_profile_for_stage(
                 stage_name,
                 profile,
                 model.base_model,
@@ -1913,6 +2011,8 @@ def _prime_summary_backed_profiles(model: SweepMetricExplorerModel) -> None:
                 model.metric_registry,
                 model.scoring_config,
             )
+            model.profile_results[(model.generation_scope, stage_name, profile.name)] = scored
+            model.profile_results[(stage_name, profile.name)] = scored
 
 
 def _hydrate_model_for_export(model: SweepMetricExplorerModel) -> None:
@@ -2010,6 +2110,7 @@ def search_profile_combinations(
             profile.name,
             scored,
             explorer_model.annotations,
+            active_generation_id=_active_generation_id(explorer_model),
         )
         results.append(
             SearchResult(
@@ -2085,6 +2186,8 @@ def load_sweep_metric_explorer_model(
 def _raw_metric_fieldnames(model: SweepMetricExplorerModel) -> List[str]:
     metric_names = sorted(model.metric_registry.keys())
     return [
+        "row_id",
+        "generation_id",
         "stage",
         "candidate_id",
         "dataset_id",
@@ -2103,10 +2206,20 @@ def _raw_metric_fieldnames(model: SweepMetricExplorerModel) -> List[str]:
 
 def _profile_result_rows(model: SweepMetricExplorerModel) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
-    for (stage_name, profile_name), results in sorted(model.profile_results.items()):
+    for key, results in sorted(model.profile_results.items()):
+        if len(key) == 3:
+            generation_scope, stage_name, profile_name = key
+        else:
+            if (model.generation_scope, key[0], key[1]) in model.profile_results:
+                continue
+            generation_scope = model.generation_scope
+            stage_name, profile_name = key
         for result in results:
             rows.append(
                 {
+                    "generation_scope": generation_scope,
+                    "row_id": result.row_id,
+                    "generation_id": result.generation_id,
                     "stage": stage_name,
                     "profile_name": profile_name,
                     "candidate_id": result.candidate_id,
@@ -2195,6 +2308,8 @@ def export_metric_report(model: SweepMetricExplorerModel, output_dir: Path) -> P
         (
             {
                 **{
+                    "row_id": record.row_id,
+                    "generation_id": record.generation_id,
                     "stage": record.stage,
                     "candidate_id": record.candidate_id,
                     "dataset_id": record.dataset_id,
@@ -2217,6 +2332,9 @@ def export_metric_report(model: SweepMetricExplorerModel, output_dir: Path) -> P
     write_csv_atomic(
         profile_results_path,
         [
+            "generation_scope",
+            "row_id",
+            "generation_id",
             "stage",
             "profile_name",
             "candidate_id",
@@ -2424,7 +2542,13 @@ def create_channel_comparison_figure(
 
 
 def _format_record_metric_lines(model: SweepMetricExplorerModel, record: RawMetricRecord) -> str:
-    label = model.annotations.get(_annotation_key(record.stage, record.candidate_id, record.dataset_id))
+    label = _annotation_for_candidate(
+        model,
+        stage=record.stage,
+        candidate_id=record.candidate_id,
+        dataset_id=record.dataset_id,
+        generation_id=record.generation_id,
+    )
     lines = [
         f"stage: {record.stage}",
         f"candidate: {record.candidate_id}",
@@ -2521,11 +2645,13 @@ def _resolve_comparison_records(
             records.append(record_lookup[key])
         return records
 
-    records = [
-        record_lookup[(row.stage, row.candidate_id, dataset_id)]
-        for row in selected_rows
-        if (row.stage, row.candidate_id, dataset_id) in record_lookup
-    ]
+    records = []
+    for row in selected_rows:
+        key = (row.stage, row.row_id, dataset_id)
+        legacy_key = (row.stage, row.candidate_id, dataset_id)
+        record = record_lookup.get(key) or record_lookup.get(legacy_key)
+        if record is not None:
+            records.append(record)
     return records
 
 
@@ -3193,6 +3319,7 @@ class SweepMetricExplorerApp:
 
         self.path_var = tk.StringVar(value=str(initial_path) if initial_path else "")
         self.status_var = tk.StringVar(value="Idle")
+        self.generation_scope_var = tk.StringVar(value="All")
         self.stage_var = tk.StringVar(value="")
         self.profile_var = tk.StringVar(value="")
         self.dataset_var = tk.StringVar(value="")
@@ -3246,6 +3373,16 @@ class SweepMetricExplorerApp:
         self.ttk.Button(top, text="Reload", command=self._on_reload).pack(side="left", padx=3)
         self.ttk.Button(top, text="Export...", command=self._on_export_dialog).pack(side="left", padx=3)
         self.ttk.Button(top, text="Open Folder", command=self._on_open_folder).pack(side="left", padx=3)
+        self.ttk.Label(top, text="Generation").pack(side="left", padx=(10, 3))
+        self.generation_scope_combo = self.ttk.Combobox(
+            top,
+            textvariable=self.generation_scope_var,
+            state="readonly",
+            width=16,
+            values=["All"],
+        )
+        self.generation_scope_combo.pack(side="left", padx=3)
+        self.generation_scope_combo.bind("<<ComboboxSelected>>", lambda _evt: self._on_generation_scope_changed())
         self.ttk.Label(top, textvariable=self.status_var).pack(side="right", padx=8)
 
         self.notebook = self.ttk.Notebook(self.root)
@@ -4163,6 +4300,23 @@ class SweepMetricExplorerApp:
         self.status_var.set(_loaded_status_text(model))
         self._populate_from_model(model)
 
+    def _on_generation_scope_changed(self) -> None:
+        if self.model is None:
+            return
+        scope = self.generation_scope_var.get() or "All"
+        options = generation_scope_options(self.model.base_model)
+        if scope not in options:
+            scope = "All" if "All" in options else (options[0] if options else "All")
+        self.model.generation_scope = scope
+        self.model.base_model.default_generation_scope = scope
+        self._comparison_image_cache.clear()
+        self._comparison_slot_a_key = None
+        self._comparison_slot_b_key = None
+        self._update_comparison_slot_labels()
+        self.refresh_leaderboard()
+        self.refresh_evaluation()
+        self._refresh_search_results_text()
+
     def _populate_from_model(self, model: SweepMetricExplorerModel) -> None:
         self._comparison_image_cache.clear()
         self._comparison_slot_a_key = None
@@ -4173,6 +4327,12 @@ class SweepMetricExplorerApp:
         self._close_comparison_popouts()
         self._update_comparison_slot_labels()
         self._refresh_comparison_layout()
+        generation_values = generation_scope_options(model.base_model)
+        self.generation_scope_combo["values"] = generation_values
+        if model.generation_scope not in generation_values:
+            model.generation_scope = "All" if "All" in generation_values else (generation_values[0] if generation_values else "All")
+        model.base_model.default_generation_scope = model.generation_scope
+        self.generation_scope_var.set(model.generation_scope)
         stage_values = list(model.base_model.stage_order)
         self.stage_combo["values"] = stage_values
         self.evaluation_stage_combo["values"] = stage_values
@@ -4228,7 +4388,7 @@ class SweepMetricExplorerApp:
             return
         dataset_id = self.dataset_var.get() or (_real_datasets(self.model.base_model)[0])
         row = selected[0]
-        key = (row.stage, row.candidate_id, dataset_id)
+        key = (row.stage, row.row_id, dataset_id)
         self._set_comparison_slot_key(slot_name, key)
         self._update_comparison_slot_labels()
         self.refresh_comparison()
@@ -4243,9 +4403,9 @@ class SweepMetricExplorerApp:
         dataset_id = self.dataset_var.get() or (_real_datasets(self.model.base_model)[0])
         ordered = selected[:2]
         if ordered:
-            self._comparison_slot_a_key = (ordered[0].stage, ordered[0].candidate_id, dataset_id)
+            self._comparison_slot_a_key = (ordered[0].stage, ordered[0].row_id, dataset_id)
         if len(ordered) > 1:
-            self._comparison_slot_b_key = (ordered[1].stage, ordered[1].candidate_id, dataset_id)
+            self._comparison_slot_b_key = (ordered[1].stage, ordered[1].row_id, dataset_id)
         self._update_comparison_slot_labels()
         self.refresh_comparison()
 
@@ -4347,8 +4507,11 @@ class SweepMetricExplorerApp:
             return []
         return list(
             self.model.profile_results.get(
-                (self.stage_var.get(), self.profile_var.get()),
-                [],
+                (self.model.generation_scope, self.stage_var.get(), self.profile_var.get()),
+                self.model.profile_results.get(
+                    (self.stage_var.get(), self.profile_var.get()),
+                    [],
+                ),
             )
         )
 
@@ -4406,21 +4569,40 @@ class SweepMetricExplorerApp:
             return
         self._leaderboard_rows = self._current_profile_results()
         candidate_rows = {
-            row.candidate_id: row
-            for row in self.model.base_model.candidates
+            row.row_id: row
+            for row in candidate_rows_for_generation_scope(
+                self.model.base_model,
+                self.model.generation_scope,
+            )
             if row.stage == self.stage_var.get()
         }
         saved_rows = {
-            row.candidate_id: row.rank
-            for row in self.model.base_model.candidates
+            row.row_id: row.rank
+            for row in candidate_rows.values()
             if row.stage == self.stage_var.get()
         }
-        self._leaderboard_row_lookup = {row.candidate_id: row for row in self._leaderboard_rows}
+        candidate_id_counts: Dict[str, int] = {}
+        for row in self._leaderboard_rows:
+            candidate_id_counts[row.candidate_id] = candidate_id_counts.get(row.candidate_id, 0) + 1
+        row_tree_ids = {
+            row.row_id: (row.row_id if candidate_id_counts.get(row.candidate_id, 0) > 1 else row.candidate_id)
+            for row in self._leaderboard_rows
+        }
+        self._leaderboard_row_lookup = {
+            row_tree_ids[row.row_id]: row
+            for row in self._leaderboard_rows
+        }
         self.leaderboard_tree.delete(*self.leaderboard_tree.get_children())
         dataset_id = self.dataset_var.get() or (_real_datasets(self.model.base_model)[0])
         for row in self._leaderboard_rows:
-            saved_rank = saved_rows.get(row.candidate_id)
-            label = self.model.annotations.get(_annotation_key(row.stage, row.candidate_id, dataset_id))
+            saved_rank = saved_rows.get(row.row_id)
+            label = _annotation_for_candidate(
+                self.model,
+                stage=row.stage,
+                candidate_id=row.candidate_id,
+                dataset_id=dataset_id,
+                generation_id=row.generation_id,
+            )
             dataset_score = row.dataset_scores.get(dataset_id, row.score)
             delta = ""
             if saved_rank is not None:
@@ -4428,10 +4610,10 @@ class SweepMetricExplorerApp:
             self.leaderboard_tree.insert(
                 "",
                 "end",
-                iid=row.candidate_id,
+                iid=row_tree_ids[row.row_id],
                 values=(
                     row.rank,
-                    row.candidate_id,
+                    row.row_id if self.model.generation_scope == "All" else row.candidate_id,
                     f"{dataset_score:.4f}",
                     delta,
                     saved_rank if saved_rank is not None else "n/a",
@@ -4439,11 +4621,11 @@ class SweepMetricExplorerApp:
                     label.label if label is not None else "",
                 ),
             )
-        restorable = [candidate_id for candidate_id in selected_ids if candidate_id in self._leaderboard_row_lookup]
+        restorable = [row_id for row_id in selected_ids if row_id in self._leaderboard_row_lookup]
         if restorable:
             self.leaderboard_tree.selection_set(restorable)
         elif self._leaderboard_rows:
-            self.leaderboard_tree.selection_set(self._leaderboard_rows[0].candidate_id)
+            self.leaderboard_tree.selection_set(row_tree_ids[self._leaderboard_rows[0].row_id])
         self._on_leaderboard_selection_changed()
 
     def _selected_leaderboard_rows(self) -> List[ProfileCandidateScore]:
@@ -4464,7 +4646,9 @@ class SweepMetricExplorerApp:
         record_lookup = _record_lookup(self.model.raw_records)
         lines = []
         for row in selected:
-            record = record_lookup.get((row.stage, row.candidate_id, dataset_id))
+            record = record_lookup.get((row.stage, row.row_id, dataset_id)) or record_lookup.get(
+                (row.stage, row.candidate_id, dataset_id)
+            )
             if record is None:
                 lines.append(f"{row.candidate_id}: no raw record for dataset {dataset_id}")
                 continue
@@ -4476,8 +4660,12 @@ class SweepMetricExplorerApp:
     def _comparison_annotation_label(self, record: Optional[RawMetricRecord]) -> str:
         if self.model is None or record is None:
             return ""
-        annotation = self.model.annotations.get(
-            _annotation_key(record.stage, record.candidate_id, record.dataset_id)
+        annotation = _annotation_for_candidate(
+            self.model,
+            stage=record.stage,
+            candidate_id=record.candidate_id,
+            dataset_id=record.dataset_id,
+            generation_id=record.generation_id,
         )
         return annotation.label if annotation is not None else ""
 
@@ -4742,15 +4930,16 @@ class SweepMetricExplorerApp:
         if not selected_rows:
             return
         dataset_id = self.dataset_var.get() or (_real_datasets(self.model.base_model)[0])
-        selected_candidate_ids = [row.candidate_id for row in selected_rows]
+        selected_candidate_ids = list(self.leaderboard_tree.selection())
         stage_name = selected_rows[0].stage
         for row in selected_rows:
-            key = _annotation_key(row.stage, row.candidate_id, dataset_id)
+            key = _annotation_key(row.stage, row.candidate_id, dataset_id, row.generation_id)
             self.model.annotations[key] = QualityAnnotation(
                 stage=row.stage,
                 candidate_id=row.candidate_id,
                 dataset_id=dataset_id,
                 label=label,
+                generation_id=row.generation_id,
             )
         save_annotations(self.model)
         self._refresh_after_annotation_change(
@@ -4765,10 +4954,12 @@ class SweepMetricExplorerApp:
         if not selected_rows:
             return
         dataset_id = self.dataset_var.get() or (_real_datasets(self.model.base_model)[0])
-        selected_candidate_ids = [row.candidate_id for row in selected_rows]
+        selected_candidate_ids = list(self.leaderboard_tree.selection())
         stage_name = selected_rows[0].stage
         for row in selected_rows:
-            self.model.annotations.pop(_annotation_key(row.stage, row.candidate_id, dataset_id), None)
+            self.model.annotations.pop(_annotation_key(row.stage, row.candidate_id, dataset_id, row.generation_id), None)
+            if row.generation_id == _active_generation_id(self.model):
+                self.model.annotations.pop(_annotation_key(row.stage, row.candidate_id, dataset_id), None)
         save_annotations(self.model)
         self._refresh_after_annotation_change(
             stage_name=stage_name,

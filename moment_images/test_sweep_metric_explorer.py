@@ -299,6 +299,40 @@ def test_load_sweep_metric_explorer_model_recomputes_metrics_and_profiles(tmp_pa
     assert good_d1.metrics["hoyer_avg"] > bad_d2.metrics["hoyer_avg"]
 
 
+def test_metric_explorer_scores_all_generation_occurrences_by_default(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    state = json.loads((output_dir / "run_state.json").read_text(encoding="utf-8"))
+    state["active_generation_id"] = "gen_new"
+    state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run"},
+        {"generation_id": "gen_new", "action": "extend"},
+    ]
+    _write_json(output_dir / "run_state.json", state)
+
+    current_summary = json.loads((output_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    old_rankings = []
+    for item in current_summary["rankings"]:
+        row = dict(item)
+        row["generation_id"] = "gen_old"
+        old_rankings.append(row)
+    _write_json(
+        output_dir / "generations" / "gen_old" / "products" / "stage1_summary.json",
+        {
+            **current_summary,
+            "generation_id": "gen_old",
+            "rankings": old_rankings,
+        },
+    )
+
+    model = load_sweep_metric_explorer_model(output_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+
+    saved = model.profile_results[("stage1", "saved_original")]
+    assert len(saved) == 4
+    assert len({row.row_id for row in saved}) == 4
+    assert sorted(row.generation_id for row in saved) == ["gen_new", "gen_new", "gen_old", "gen_old"]
+    assert ("All", "stage1", "saved_original") in model.profile_results
+
+
 def test_lazy_load_defers_workspace_metrics_until_profile_is_requested(tmp_path, monkeypatch):
     output_dir = _make_modern_fixture(tmp_path)
     calls: list[Path] = []

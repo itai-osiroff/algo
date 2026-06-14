@@ -10,7 +10,7 @@ import platform
 import re
 import subprocess
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, cast
@@ -42,6 +42,8 @@ DEFAULT_FALLBACK_METRICS = (
 STAGE_ORDER = ("legacy", "stage1", "stage2", "metric_phase")
 SUCCESS_STATUSES = {"ok", "skipped_valid", "recomputed"}
 DEFAULT_REPORT_TOP_K = 6
+GENERATION_SCOPE_ALL = "All"
+GENERATION_SCOPE_ACTIVE = "Active"
 SENSITIVITY_MIN_GROUP_COUNT = 1
 SENSITIVITY_OLS_MIN_EXTRA_ROWS = 2
 EXTENSION_MIN_ABSOLUTE_EFFECT = 0.02
@@ -151,7 +153,7 @@ class RunMetricRecord:
     generation_id: Optional[str] = None
 
 
-RectificationResultKey = Tuple[str, str, str]
+RectificationResultKey = Tuple[str, str, str, Optional[str]]
 
 
 @dataclass(frozen=True)
@@ -161,11 +163,12 @@ class RectificationViewSelection:
     stage: str
     candidate_id: str
     dataset_id: str
+    generation_id: Optional[str] = None
     component_name: Optional[str] = None
 
     @property
     def key(self) -> RectificationResultKey:
-        return self.stage, self.candidate_id, self.dataset_id
+        return self.stage, self.candidate_id, self.dataset_id, self.generation_id
 
 
 @dataclass
@@ -225,6 +228,9 @@ class SweepVisualizationModel:
     experiment_metadata: Dict[str, object]
     generation_summary: Dict[str, object]
     previous_generation_candidates: List[CandidateVisualizationRow]
+    all_generation_candidates: List[CandidateVisualizationRow]
+    all_generation_run_metric_records: List[RunMetricRecord]
+    default_generation_scope: str
     alpha_family_summary: List[Dict[str, object]]
     alpha_ranked_runs: List[Dict[str, object]]
     diagnostic_availability: Dict[str, object]
@@ -665,6 +671,164 @@ def _load_generation_product_candidates(
                 )
             )
     return rows, used_files
+
+
+def _with_generation_candidate_identity(
+    row: CandidateVisualizationRow,
+    generation_id: Optional[str],
+) -> CandidateVisualizationRow:
+    generation_text = generation_id or row.generation_id or "unknown"
+    base_row_id = row.row_id
+    if base_row_id.startswith(f"{generation_text}:"):
+        qualified_row_id = base_row_id
+    else:
+        qualified_row_id = f"{generation_text}:{base_row_id}"
+    return replace(
+        row,
+        row_id=qualified_row_id,
+        display_name=f"{generation_text}:{row.stage}:{row.candidate_id}",
+        generation_id=generation_text,
+    )
+
+
+def _with_generation_record_identity(
+    record: RunMetricRecord,
+    generation_id: Optional[str],
+) -> RunMetricRecord:
+    generation_text = generation_id or record.generation_id or "unknown"
+    base_row_id = record.row_id
+    if base_row_id.startswith(f"{generation_text}:"):
+        qualified_row_id = base_row_id
+    else:
+        qualified_row_id = f"{generation_text}:{base_row_id}"
+    return replace(record, row_id=qualified_row_id, generation_id=generation_text)
+
+
+def _candidate_lookup_by_generation_rows(
+    rows: Sequence[CandidateVisualizationRow],
+) -> Dict[Tuple[str, str], CandidateVisualizationRow]:
+    return {(row.stage, row.candidate_id): row for row in rows}
+
+
+def _load_generation_product_run_records(
+    *,
+    experiment_root: Path,
+    generation_id: Optional[str],
+    primary_metric: str,
+    candidate_rows: Sequence[CandidateVisualizationRow],
+    warnings: List[str],
+) -> Tuple[List[RunMetricRecord], List[str]]:
+    if not generation_id:
+        return [], []
+    products_dir = experiment_root / "generations" / generation_id / "products"
+    if not products_dir.exists():
+        return [], []
+
+    used_files: List[str] = []
+    records_by_id: Dict[str, RunMetricRecord] = {}
+    candidate_lookup = _candidate_lookup_by_generation_rows(candidate_rows)
+    locations: List[Tuple[Optional[str], Path, Path]] = [
+        (None, products_dir / "summary.json", products_dir),
+        (
+            "metric_phase",
+            products_dir / "metric_experiments" / "summary.json",
+            products_dir / "metric_experiments",
+        ),
+    ]
+    for stage_hint, summary_path, base_dir in locations:
+        payload, used_path = _read_json_optional(
+            summary_path,
+            validator=lambda obj: isinstance(obj, list),
+            warnings=warnings,
+        )
+        if used_path is not None:
+            used_files.append(str(used_path))
+        if not isinstance(payload, list):
+            continue
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            record = _build_run_metric_record(
+                metric_record=cast(Dict[str, object], item),
+                primary_metric=primary_metric,
+                stage_hint=stage_hint,
+                base_dir=base_dir,
+                run_lookup={},
+                candidate_lookup=candidate_lookup,
+            )
+            if record is not None:
+                _register_run_metric_record(
+                    records_by_id,
+                    _with_generation_record_identity(record, generation_id),
+                )
+    return list(records_by_id.values()), used_files
+
+
+def _build_all_generation_collections(
+    *,
+    experiment_root: Path,
+    generation_summary: Dict[str, object],
+    active_candidates: Sequence[CandidateVisualizationRow],
+    active_run_metric_records: Sequence[RunMetricRecord],
+    primary_metric: str,
+    warnings: List[str],
+) -> Tuple[List[CandidateVisualizationRow], List[RunMetricRecord], List[str]]:
+    active_generation_id = _coerce_optional_str(generation_summary.get("active_generation_id"))
+    ordered_generation_ids = [
+        generation_id
+        for generation_id in cast(List[object], generation_summary.get("ordered_generation_ids", []))
+        if _coerce_optional_str(generation_id) is not None
+        for generation_id in [str(generation_id)]
+    ]
+    if active_generation_id and active_generation_id not in ordered_generation_ids:
+        ordered_generation_ids.append(active_generation_id)
+
+    used_files: List[str] = []
+    candidates_by_generation: Dict[str, List[CandidateVisualizationRow]] = {}
+    records_by_generation: Dict[str, List[RunMetricRecord]] = {}
+
+    for generation_id in ordered_generation_ids:
+        if generation_id == active_generation_id:
+            candidates_by_generation[generation_id] = [
+                _with_generation_candidate_identity(row, generation_id)
+                for row in active_candidates
+            ]
+            records_by_generation[generation_id] = [
+                _with_generation_record_identity(record, generation_id)
+                for record in active_run_metric_records
+            ]
+            continue
+        generation_candidates, candidate_files = _load_generation_product_candidates(
+            experiment_root=experiment_root,
+            generation_id=generation_id,
+            primary_metric=primary_metric,
+            warnings=warnings,
+        )
+        used_files.extend(candidate_files)
+        qualified_candidates = [
+            _with_generation_candidate_identity(row, generation_id)
+            for row in generation_candidates
+        ]
+        candidates_by_generation[generation_id] = qualified_candidates
+        generation_records, record_files = _load_generation_product_run_records(
+            experiment_root=experiment_root,
+            generation_id=generation_id,
+            primary_metric=primary_metric,
+            candidate_rows=qualified_candidates,
+            warnings=warnings,
+        )
+        used_files.extend(record_files)
+        records_by_generation[generation_id] = generation_records
+
+    if not ordered_generation_ids:
+        return list(active_candidates), list(active_run_metric_records), used_files
+
+    all_candidates: List[CandidateVisualizationRow] = []
+    all_records: List[RunMetricRecord] = []
+    for generation_id in ordered_generation_ids:
+        all_candidates.extend(candidates_by_generation.get(generation_id, []))
+        all_records.extend(records_by_generation.get(generation_id, []))
+    return all_candidates, all_records, used_files
 
 
 def _peek_workspace_keys(path: Optional[Path]) -> List[str]:
@@ -1884,6 +2048,17 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
     )
     used_files.extend(previous_generation_files)
     generation_summary["previous_generation_candidate_count"] = len(previous_generation_candidates)
+    all_generation_candidates, all_generation_run_metric_records, all_generation_files = _build_all_generation_collections(
+        experiment_root=experiment_root,
+        generation_summary=generation_summary,
+        active_candidates=ordered_candidate_rows,
+        active_run_metric_records=run_metric_records,
+        primary_metric=primary_metric,
+        warnings=warnings,
+    )
+    used_files.extend(all_generation_files)
+    generation_summary["all_generation_candidate_count"] = len(all_generation_candidates)
+    generation_summary["all_generation_run_record_count"] = len(all_generation_run_metric_records)
 
     candidate_ids = [row.row_id for row in ordered_candidate_rows]
     dataset_index = {dataset_id: idx for idx, dataset_id in enumerate(datasets)}
@@ -2018,6 +2193,9 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         experiment_metadata=experiment_metadata,
         generation_summary=generation_summary,
         previous_generation_candidates=previous_generation_candidates,
+        all_generation_candidates=all_generation_candidates,
+        all_generation_run_metric_records=all_generation_run_metric_records,
+        default_generation_scope=GENERATION_SCOPE_ALL,
         alpha_family_summary=alpha_family_summary,
         alpha_ranked_runs=alpha_ranked_runs,
         diagnostic_availability=diagnostic_availability,
@@ -2371,9 +2549,106 @@ def load_sweep_visualization_model(path: Path) -> SweepVisualizationModel:
     )
 
 
+def generation_scope_options(model: SweepVisualizationModel) -> List[str]:
+    generation_ids = [
+        str(generation_id)
+        for generation_id in cast(List[object], model.generation_summary.get("ordered_generation_ids", []))
+        if _coerce_optional_str(generation_id) is not None
+    ]
+    active_generation_id = _coerce_optional_str(model.generation_summary.get("active_generation_id"))
+    if active_generation_id and active_generation_id not in generation_ids:
+        generation_ids.append(active_generation_id)
+    values = [GENERATION_SCOPE_ALL, GENERATION_SCOPE_ACTIVE]
+    values.extend(generation_id for generation_id in generation_ids if generation_id not in values)
+    return values
+
+
+def _normalize_generation_scope(model: SweepVisualizationModel, scope: Optional[str]) -> str:
+    if not scope:
+        return model.default_generation_scope
+    if scope in {GENERATION_SCOPE_ALL, GENERATION_SCOPE_ACTIVE}:
+        return scope
+    return str(scope)
+
+
+def _rows_matching_generation_scope(
+    rows: Sequence[Any],
+    *,
+    active_rows: Sequence[Any],
+    scope: str,
+    active_generation_id: Optional[str],
+) -> List[Any]:
+    if scope == GENERATION_SCOPE_ALL:
+        return list(rows)
+    if scope == GENERATION_SCOPE_ACTIVE:
+        return list(active_rows)
+    return [row for row in rows if getattr(row, "generation_id", None) == scope]
+
+
+def _sort_key_for_scope_rank(row: CandidateVisualizationRow) -> Tuple[float, int, str]:
+    score = row.score
+    if score is None or not math.isfinite(float(score)):
+        score_value = -float("inf")
+    else:
+        score_value = float(score)
+    return (-score_value, row.rank, row.row_id)
+
+
+def _recompute_scoped_candidate_ranks(
+    rows: Sequence[CandidateVisualizationRow],
+) -> List[CandidateVisualizationRow]:
+    grouped: Dict[str, List[CandidateVisualizationRow]] = {}
+    for row in rows:
+        grouped.setdefault(row.stage, []).append(row)
+    result: List[CandidateVisualizationRow] = []
+    for stage_name in [stage for stage in STAGE_ORDER if stage in grouped] + sorted(
+        stage for stage in grouped if stage not in STAGE_ORDER
+    ):
+        stage_rows = sorted(grouped[stage_name], key=_sort_key_for_scope_rank)
+        for rank, row in enumerate(stage_rows, start=1):
+            result.append(replace(row, rank=rank))
+    return result
+
+
+def candidate_rows_for_generation_scope(
+    model: SweepVisualizationModel,
+    scope: Optional[str],
+) -> List[CandidateVisualizationRow]:
+    normalized_scope = _normalize_generation_scope(model, scope)
+    active_generation_id = _coerce_optional_str(model.generation_summary.get("active_generation_id"))
+    rows = _rows_matching_generation_scope(
+        model.all_generation_candidates,
+        active_rows=model.candidates,
+        scope=normalized_scope,
+        active_generation_id=active_generation_id,
+    )
+    return _recompute_scoped_candidate_ranks(cast(List[CandidateVisualizationRow], rows))
+
+
+def run_records_for_generation_scope(
+    model: SweepVisualizationModel,
+    scope: Optional[str],
+) -> List[RunMetricRecord]:
+    normalized_scope = _normalize_generation_scope(model, scope)
+    active_generation_id = _coerce_optional_str(model.generation_summary.get("active_generation_id"))
+    return cast(
+        List[RunMetricRecord],
+        _rows_matching_generation_scope(
+            model.all_generation_run_metric_records,
+            active_rows=model.run_metric_records,
+            scope=normalized_scope,
+            active_generation_id=active_generation_id,
+        ),
+    )
+
+
 def _rows_for_stage(model: SweepVisualizationModel, stage_name: Optional[str]) -> List[CandidateVisualizationRow]:
     target_stage = stage_name or model.primary_stage_name
-    return [row for row in model.candidates if row.stage == target_stage]
+    return [
+        row
+        for row in candidate_rows_for_generation_scope(model, model.default_generation_scope)
+        if row.stage == target_stage
+    ]
 
 
 @dataclass
@@ -2614,9 +2889,9 @@ def create_effects_figure(
     filters = dict(parameter_filters or {})
 
     base_rows = (
-        _candidate_rows_to_effect_rows(model.candidates)
+        _candidate_rows_to_effect_rows(candidate_rows_for_generation_scope(model, model.default_generation_scope))
         if dataset_scope == "aggregate"
-        else _run_records_to_effect_rows(model.run_metric_records)
+        else _run_records_to_effect_rows(run_records_for_generation_scope(model, model.default_generation_scope))
     )
     filtered_rows = _filter_effect_rows(
         base_rows,
@@ -3255,21 +3530,23 @@ def _default_export_effect_parameters(model: SweepVisualizationModel) -> Tuple[O
 
 
 def _default_metric_diagnostics_record(model: SweepVisualizationModel) -> Optional[RunMetricRecord]:
-    preferred_stage = "metric_phase" if any(record.stage == "metric_phase" for record in model.run_metric_records) else model.primary_stage_name
+    scoped_records = run_records_for_generation_scope(model, model.default_generation_scope)
+    scoped_candidates = candidate_rows_for_generation_scope(model, model.default_generation_scope)
+    preferred_stage = "metric_phase" if any(record.stage == "metric_phase" for record in scoped_records) else model.primary_stage_name
     candidate_order = {
-        (row.stage, row.candidate_id): idx
-        for idx, row in enumerate(model.candidates)
+        (row.stage, row.candidate_id, row.generation_id): idx
+        for idx, row in enumerate(scoped_candidates)
     }
     eligible = [
         record
-        for record in model.run_metric_records
+        for record in scoped_records
         if record.stage == preferred_stage and (record.workspace_path or record.displacement_score_diagnostics)
     ]
     if not eligible:
         return None
     eligible.sort(
         key=lambda record: (
-            candidate_order.get((record.stage, record.candidate_id), len(candidate_order)),
+            candidate_order.get((record.stage, record.candidate_id, record.generation_id), len(candidate_order)),
             record.dataset_id,
         )
     )
@@ -3681,7 +3958,7 @@ def compute_parameter_sensitivity(
 
     return _compute_parameter_sensitivity_for_rows(
         model,
-        model.candidates,
+        candidate_rows_for_generation_scope(model, model.default_generation_scope),
         stage_name=stage_name or model.primary_stage_name,
         dataset_scope=dataset_scope,
         value_option=value_option,
@@ -4088,17 +4365,29 @@ def _find_run_metric_record(
     stage_name: str,
     candidate_id: str,
     dataset_id: str,
+    generation_id: Optional[str] = None,
 ) -> Optional[RunMetricRecord]:
     return next(
         (
             record
-            for record in model.run_metric_records
+            for record in run_records_for_generation_scope(model, model.default_generation_scope)
             if record.stage == stage_name
             and record.candidate_id == candidate_id
             and record.dataset_id == dataset_id
+            and (generation_id is None or record.generation_id == generation_id)
         ),
         None,
     )
+
+
+def _unpack_rectification_key(
+    key: RectificationResultKey | Tuple[str, str, str],
+) -> Tuple[str, str, str, Optional[str]]:
+    if len(key) == 4:
+        stage_name, candidate_id, dataset_id, generation_id = key
+        return stage_name, candidate_id, dataset_id, generation_id
+    stage_name, candidate_id, dataset_id = cast(Tuple[str, str, str], key)
+    return stage_name, candidate_id, dataset_id, None
 
 
 def _load_preview_array(path: Optional[str]) -> Optional[np.ndarray]:
@@ -4150,8 +4439,9 @@ def _rectification_candidate_row(
     return next(
         (
             row
-            for row in model.candidates
+            for row in candidate_rows_for_generation_scope(model, model.default_generation_scope)
             if row.stage == selection.stage and row.candidate_id == selection.candidate_id
+            and (selection.generation_id is None or row.generation_id == selection.generation_id)
         ),
         None,
     )
@@ -4166,6 +4456,7 @@ def _rectification_record(
         stage_name=selection.stage,
         candidate_id=selection.candidate_id,
         dataset_id=selection.dataset_id,
+        generation_id=selection.generation_id,
     )
 
 
@@ -4567,8 +4858,11 @@ def create_candidate_robustness_figure(
 
 
 def _candidate_csv_rows(model: SweepVisualizationModel) -> List[Dict[str, object]]:
+    generation_scope = model.default_generation_scope
     return [
         {
+            "generation_scope": generation_scope,
+            "row_id": row.row_id,
             "stage": row.stage,
             "candidate_id": row.candidate_id,
             "rank": row.rank,
@@ -4590,13 +4884,16 @@ def _candidate_csv_rows(model: SweepVisualizationModel) -> List[Dict[str, object
             "params_json": _compact_json(row.params),
             "config_json": _compact_json(row.config),
         }
-        for row in model.candidates
+        for row in candidate_rows_for_generation_scope(model, generation_scope)
     ]
 
 
 def _run_metric_csv_rows(model: SweepVisualizationModel) -> List[Dict[str, object]]:
+    generation_scope = model.default_generation_scope
     return [
         {
+            "generation_scope": generation_scope,
+            "row_id": record.row_id,
             "stage": record.stage,
             "candidate_id": record.candidate_id,
             "dataset_id": record.dataset_id,
@@ -4622,7 +4919,7 @@ def _run_metric_csv_rows(model: SweepVisualizationModel) -> List[Dict[str, objec
             "workspace_path": record.workspace_path,
             "metric_record_path": record.metric_record_path,
         }
-        for record in model.run_metric_records
+        for record in run_records_for_generation_scope(model, generation_scope)
     ]
 
 
@@ -4663,6 +4960,8 @@ def _write_candidate_leaderboard_csv(model: SweepVisualizationModel, path: Path)
     write_csv_atomic(
         path,
         [
+            "generation_scope",
+            "row_id",
             "stage",
             "candidate_id",
             "rank",
@@ -4693,6 +4992,8 @@ def _write_run_metric_records_csv(model: SweepVisualizationModel, path: Path) ->
     write_csv_atomic(
         path,
         [
+            "generation_scope",
+            "row_id",
             "stage",
             "candidate_id",
             "dataset_id",
@@ -4986,6 +5287,9 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
     tables_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    generation_scope = model.default_generation_scope
+    scoped_candidates = candidate_rows_for_generation_scope(model, generation_scope)
+    scoped_run_records = run_records_for_generation_scope(model, generation_scope)
     effects_x, effects_y = _default_export_effect_parameters(model)
     report_stage = model.primary_stage_name
     default_component = _default_component_name(model)
@@ -5147,6 +5451,7 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
 
     report_context = {
         "generated_at": _utc_now_iso(),
+        "generation_scope": generation_scope,
         "report_stage": report_stage,
         "report_top_k": DEFAULT_REPORT_TOP_K,
         "default_component": default_component,
@@ -5196,42 +5501,82 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
     )
 
     stage_names = model.stage_order
+    dataset_index = {dataset_id: idx for idx, dataset_id in enumerate(model.datasets)}
+    metric_index = {metric_name: idx for idx, metric_name in enumerate(model.metric_names)}
+    parameter_index = {name: idx for idx, name in enumerate(model.parameter_names)}
+    scoped_score_matrix = np.full((len(scoped_candidates), len(model.datasets)), np.nan, dtype=np.float64)
+    scoped_runtime_matrix = np.full((len(scoped_candidates), len(model.datasets)), np.nan, dtype=np.float64)
+    scoped_metric_tensor = np.full(
+        (len(scoped_candidates), len(model.datasets), len(model.metric_names)),
+        np.nan,
+        dtype=np.float64,
+    )
+    scoped_parameter_numeric_matrix = np.full(
+        (len(scoped_candidates), len(model.parameter_names)),
+        np.nan,
+        dtype=np.float64,
+    )
+    scoped_parameter_text_matrix = np.empty(
+        (len(scoped_candidates), len(model.parameter_names)),
+        dtype=object,
+    )
+    scoped_parameter_text_matrix[:] = ""
+    for row_idx, row in enumerate(scoped_candidates):
+        for dataset_id, value in row.dataset_scores.items():
+            if dataset_id in dataset_index and value is not None:
+                scoped_score_matrix[row_idx, dataset_index[dataset_id]] = float(value)
+        for dataset_id, value in row.dataset_runtimes.items():
+            if dataset_id in dataset_index and value is not None:
+                scoped_runtime_matrix[row_idx, dataset_index[dataset_id]] = float(value)
+        for dataset_id, metrics in row.dataset_metrics.items():
+            if dataset_id not in dataset_index:
+                continue
+            for metric_name, value in metrics.items():
+                if metric_name in metric_index and value is not None:
+                    scoped_metric_tensor[row_idx, dataset_index[dataset_id], metric_index[metric_name]] = float(value)
+        for parameter_name, param_value in row.params.items():
+            if parameter_name not in parameter_index:
+                continue
+            param_idx = parameter_index[parameter_name]
+            scoped_parameter_numeric_matrix[row_idx, param_idx] = _numeric_param(param_value)
+            scoped_parameter_text_matrix[row_idx, param_idx] = _stringify_param(param_value)
     bundle_payload: Dict[str, object] = {
-        "candidate_ids": np.asarray(model.candidate_ids, dtype=object),
-        "candidate_labels": np.asarray([row.display_name for row in model.candidates], dtype=object),
-        "candidate_stages": np.asarray([row.stage for row in model.candidates], dtype=object),
-        "candidate_strategies": np.asarray([row.strategy for row in model.candidates], dtype=object),
-        "candidate_ranks": np.asarray([row.rank for row in model.candidates], dtype=np.int32),
+        "generation_scope": np.asarray(generation_scope, dtype=object),
+        "candidate_ids": np.asarray([row.row_id for row in scoped_candidates], dtype=object),
+        "candidate_labels": np.asarray([row.display_name for row in scoped_candidates], dtype=object),
+        "candidate_stages": np.asarray([row.stage for row in scoped_candidates], dtype=object),
+        "candidate_strategies": np.asarray([row.strategy for row in scoped_candidates], dtype=object),
+        "candidate_ranks": np.asarray([row.rank for row in scoped_candidates], dtype=np.int32),
         "candidate_generation_ids": np.asarray(
-            [row.generation_id or "" for row in model.candidates],
+            [row.generation_id or "" for row in scoped_candidates],
             dtype=object,
         ),
         "candidate_scores": np.asarray(
-            [row.score if row.score is not None else np.nan for row in model.candidates],
+            [row.score if row.score is not None else np.nan for row in scoped_candidates],
             dtype=np.float64,
         ),
         "candidate_mean_dataset_scores": np.asarray(
             [
                 row.mean_dataset_score if row.mean_dataset_score is not None else np.nan
-                for row in model.candidates
+                for row in scoped_candidates
             ],
             dtype=np.float64,
         ),
         "candidate_std_dataset_scores": np.asarray(
             [
                 row.std_dataset_score if row.std_dataset_score is not None else np.nan
-                for row in model.candidates
+                for row in scoped_candidates
             ],
             dtype=np.float64,
         ),
         "dataset_ids": np.asarray(model.datasets, dtype=object),
         "metric_names": np.asarray(model.metric_names, dtype=object),
         "parameter_names": np.asarray(model.parameter_names, dtype=object),
-        "score_matrix": model.score_matrix,
-        "runtime_matrix": model.runtime_matrix,
-        "metric_tensor": model.metric_tensor,
-        "parameter_numeric_matrix": model.parameter_numeric_matrix,
-        "parameter_text_matrix": np.asarray(model.parameter_text_matrix, dtype=object),
+        "score_matrix": scoped_score_matrix,
+        "runtime_matrix": scoped_runtime_matrix,
+        "metric_tensor": scoped_metric_tensor,
+        "parameter_numeric_matrix": scoped_parameter_numeric_matrix,
+        "parameter_text_matrix": np.asarray(scoped_parameter_text_matrix, dtype=object),
         "stage_names": np.asarray(stage_names, dtype=object),
         "stage_planned_runs": np.asarray(
             [model.stages[name].num_runs_planned for name in stage_names],
@@ -5266,11 +5611,11 @@ def export_sweep_visualization_bundle(model: SweepVisualizationModel, output_dir
             dtype=object,
         ),
         "candidate_table_json": np.asarray(
-            [_compact_json(_candidate_row_to_export_dict(row)) for row in model.candidates],
+            [_compact_json(_candidate_row_to_export_dict(row)) for row in scoped_candidates],
             dtype=object,
         ),
         "run_metric_records_json": np.asarray(
-            [_compact_json(_run_metric_record_to_export_dict(record)) for record in model.run_metric_records],
+            [_compact_json(_run_metric_record_to_export_dict(record)) for record in scoped_run_records],
             dtype=object,
         ),
         "parameter_sensitivity_json": np.asarray(
@@ -5386,9 +5731,9 @@ def _format_effects_text(
     parameter_filters: Dict[str, str],
 ) -> str:
     base_rows = (
-        _candidate_rows_to_effect_rows(model.candidates)
+        _candidate_rows_to_effect_rows(candidate_rows_for_generation_scope(model, model.default_generation_scope))
         if dataset_scope == "aggregate"
-        else _run_records_to_effect_rows(model.run_metric_records)
+        else _run_records_to_effect_rows(run_records_for_generation_scope(model, model.default_generation_scope))
     )
     filtered = _filter_effect_rows(
         base_rows,
@@ -6128,12 +6473,12 @@ class SweepVisualizationApp:
             values = sorted(
                 {
                     _stringify_param(row_item.params.get(parameter_name))
-                    for row_item in model.candidates
+                    for row_item in candidate_rows_for_generation_scope(model, model.default_generation_scope)
                     if parameter_name in row_item.params
                 }
                 | {
                     _stringify_param(record.params.get(parameter_name))
-                    for record in model.run_metric_records
+                    for record in run_records_for_generation_scope(model, model.default_generation_scope)
                     if parameter_name in record.params
                 }
             )
@@ -6449,7 +6794,7 @@ def _sweep_visualization_app_init(
     self.model = None
     self._canvases = {}
     self._preview_image_ref = None
-    self._rectification_bundle_cache: Dict[Tuple[str, str, str, str], RectificationDisplayBundle] = {}
+    self._rectification_bundle_cache: Dict[Tuple[str, str, str, str, str], RectificationDisplayBundle] = {}
     self._comparison_slot_a_key: Optional[RectificationResultKey] = None
     self._comparison_slot_b_key: Optional[RectificationResultKey] = None
     self._comparison_slots_cleared = False
@@ -6487,6 +6832,7 @@ def _sweep_visualization_app_init(
     self.leaderboard_strategy_var = tk.StringVar(value="All")
     self.leaderboard_family_var = tk.StringVar(value="All")
     self.leaderboard_alpha_var = tk.StringVar(value="All")
+    self.generation_scope_var = tk.StringVar(value=GENERATION_SCOPE_ALL)
     self.comparison_stage_var = tk.StringVar(value="")
     self.comparison_dataset_var = tk.StringVar(value="")
     self.comparison_component_var = tk.StringVar(value="gradient")
@@ -6518,6 +6864,16 @@ def _sweep_visualization_build_ui(self: SweepVisualizationApp) -> None:
     self.ttk.Button(top, text="Reload", command=self._on_reload).pack(side="left", padx=3)
     self.ttk.Button(top, text="Export...", command=self._on_export_dialog).pack(side="left", padx=3)
     self.ttk.Button(top, text="Open Folder", command=self._on_open_folder).pack(side="left", padx=3)
+    self.ttk.Label(top, text="Generation").pack(side="left", padx=(10, 3))
+    self.generation_scope_combo = self.ttk.Combobox(
+        top,
+        textvariable=self.generation_scope_var,
+        state="readonly",
+        width=16,
+        values=[GENERATION_SCOPE_ALL],
+    )
+    self.generation_scope_combo.pack(side="left", padx=3)
+    self.generation_scope_combo.bind("<<ComboboxSelected>>", lambda _evt: self._on_generation_scope_changed())
     self.ttk.Label(top, textvariable=self.status_var).pack(side="right", padx=8)
 
     self.notebook = self.ttk.Notebook(self.root)
@@ -6914,7 +7270,7 @@ def _sweep_visualization_leaderboard_candidate_rows(
     family_filter = self.leaderboard_family_var.get() or "All"
     alpha_filter = self.leaderboard_alpha_var.get() or "All"
     rows: List[CandidateVisualizationRow] = []
-    for row in self.model.candidates:
+    for row in candidate_rows_for_generation_scope(self.model, self.model.default_generation_scope):
         if stage_name != "All" and row.stage != stage_name:
             continue
         if strategy_filter != "All" and row.strategy != strategy_filter:
@@ -6932,6 +7288,9 @@ def _sweep_visualization_leaderboard_candidate_label(
     row: CandidateVisualizationRow,
 ) -> str:
     stage_name = self.leaderboard_stage_var.get() or (self.model.primary_stage_name if self.model else "")
+    if self.model is not None and self.model.default_generation_scope == GENERATION_SCOPE_ALL:
+        prefix = row.generation_id or "unknown"
+        return f"{prefix}:{row.stage}:{row.candidate_id}" if stage_name == "All" else f"{prefix}:{row.candidate_id}"
     return f"{row.stage}:{row.candidate_id}" if stage_name == "All" else row.candidate_id
 
 
@@ -7034,6 +7393,7 @@ def _sweep_visualization_format_leaderboard_detail_text(
         lines = [
             f"candidate: {row.candidate_id}",
             f"stage: {row.stage}",
+            f"generation: {row.generation_id or 'n/a'}",
             f"strategy: {row.strategy}",
             f"rank: {row.rank}",
             f"dataset scope: {dataset_scope}",
@@ -7087,19 +7447,25 @@ def _sweep_visualization_seed_diagnostics_from_row(
 ) -> None:
     if self.model is None:
         return
+    scoped_records = run_records_for_generation_scope(self.model, self.model.default_generation_scope)
     candidate_values = _sorted_unique(
-        record.candidate_id for record in self.model.run_metric_records if record.stage == row.stage
+        _diagnostic_candidate_key(record)
+        for record in scoped_records
+        if record.stage == row.stage
     )
+    selected_candidate_key = f"{row.generation_id}:{row.stage}:{row.candidate_id}" if row.generation_id else f"{row.stage}:{row.candidate_id}"
     dataset_values = _sorted_unique(
         record.dataset_id
-        for record in self.model.run_metric_records
-        if record.stage == row.stage and record.candidate_id == row.candidate_id
+        for record in scoped_records
+        if record.stage == row.stage
+        and record.candidate_id == row.candidate_id
+        and (row.generation_id is None or record.generation_id == row.generation_id)
     )
-    self.diagnostic_stage_combo["values"] = _sorted_unique(record.stage for record in self.model.run_metric_records)
+    self.diagnostic_stage_combo["values"] = _sorted_unique(record.stage for record in scoped_records)
     self.diagnostic_stage_var.set(row.stage)
     self.diagnostic_candidate_combo["values"] = candidate_values
     self.diagnostic_candidate_var.set(
-        row.candidate_id if row.candidate_id in candidate_values else (candidate_values[0] if candidate_values else "")
+        selected_candidate_key if selected_candidate_key in candidate_values else (candidate_values[0] if candidate_values else "")
     )
     self.diagnostic_dataset_combo["values"] = dataset_values
     preferred_dataset = dataset_hint if dataset_hint in dataset_values else None
@@ -7255,6 +7621,7 @@ def _sweep_visualization_selection_for_row(
         stage=row.stage,
         candidate_id=row.candidate_id,
         dataset_id=self._comparison_dataset(),
+        generation_id=row.generation_id,
         component_name=self.comparison_component_var.get() or _default_component_name(self.model) if self.model else None,
     )
 
@@ -7265,12 +7632,13 @@ def _sweep_visualization_row_for_key(
 ) -> Optional[CandidateVisualizationRow]:
     if self.model is None or key is None:
         return None
-    stage_name, candidate_id, _dataset_id = key
+    stage_name, candidate_id, _dataset_id, generation_id = _unpack_rectification_key(key)
     return next(
         (
             row
-            for row in self.model.candidates
+            for row in candidate_rows_for_generation_scope(self.model, self.model.default_generation_scope)
             if row.stage == stage_name and row.candidate_id == candidate_id
+            and (generation_id is None or row.generation_id == generation_id)
         ),
         None,
     )
@@ -7282,8 +7650,9 @@ def _sweep_visualization_key_label(
 ) -> str:
     if key is None:
         return "not set"
-    stage_name, candidate_id, dataset_id = key
-    return f"{candidate_id} / {dataset_id} / {stage_name}"
+    stage_name, candidate_id, dataset_id, generation_id = _unpack_rectification_key(key)
+    generation_text = f" / {generation_id}" if generation_id else ""
+    return f"{candidate_id} / {dataset_id} / {stage_name}{generation_text}"
 
 
 def _sweep_visualization_bundle_for_key(
@@ -7292,9 +7661,9 @@ def _sweep_visualization_bundle_for_key(
 ) -> Optional[RectificationDisplayBundle]:
     if self.model is None or key is None:
         return None
-    stage_name, candidate_id, dataset_id = key
+    stage_name, candidate_id, dataset_id, generation_id = _unpack_rectification_key(key)
     component_name = self.comparison_component_var.get() or _default_component_name(self.model)
-    cache_key = (stage_name, candidate_id, dataset_id, component_name)
+    cache_key = (stage_name, candidate_id, dataset_id, generation_id or "", component_name)
     cached = self._rectification_bundle_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -7304,6 +7673,7 @@ def _sweep_visualization_bundle_for_key(
             stage=stage_name,
             candidate_id=candidate_id,
             dataset_id=dataset_id,
+            generation_id=generation_id,
             component_name=component_name,
         ),
     )
@@ -7363,11 +7733,11 @@ def _sweep_visualization_clear_comparison_slots(self: SweepVisualizationApp) -> 
 def _sweep_visualization_update_comparison_dataset_keys(self: SweepVisualizationApp) -> None:
     dataset_id = self._comparison_dataset()
     if self._comparison_slot_a_key is not None:
-        stage_name, candidate_id, _old_dataset = self._comparison_slot_a_key
-        self._comparison_slot_a_key = (stage_name, candidate_id, dataset_id)
+        stage_name, candidate_id, _old_dataset, generation_id = _unpack_rectification_key(self._comparison_slot_a_key)
+        self._comparison_slot_a_key = (stage_name, candidate_id, dataset_id, generation_id)
     if self._comparison_slot_b_key is not None:
-        stage_name, candidate_id, _old_dataset = self._comparison_slot_b_key
-        self._comparison_slot_b_key = (stage_name, candidate_id, dataset_id)
+        stage_name, candidate_id, _old_dataset, generation_id = _unpack_rectification_key(self._comparison_slot_b_key)
+        self._comparison_slot_b_key = (stage_name, candidate_id, dataset_id, generation_id)
 
 
 def _sweep_visualization_ensure_default_comparison_slots(self: SweepVisualizationApp) -> None:
@@ -7523,15 +7893,27 @@ def _sweep_visualization_open_preview(self: SweepVisualizationApp) -> None:
     if self.model is None:
         return
     stage_name = self.preview_stage_var.get()
-    candidate_id = self.preview_candidate_var.get()
+    candidate_key = self.preview_candidate_var.get()
     dataset_id = self.preview_dataset_var.get()
-    if not stage_name or not candidate_id or not dataset_id:
+    if not stage_name or not candidate_key or not dataset_id:
         self.messagebox.showwarning("Preview", "Select a stage, candidate, and dataset first.")
         return
+    row = next(
+        (
+            item
+            for item in _rows_for_stage(self.model, stage_name)
+            if _preview_candidate_key(item) == candidate_key or item.candidate_id == candidate_key
+        ),
+        None,
+    )
+    if row is None:
+        self.messagebox.showwarning("Preview", "No preview image found for the selected row.")
+        return
     selection = RectificationViewSelection(
-        stage=stage_name,
-        candidate_id=candidate_id,
+        stage=row.stage,
+        candidate_id=row.candidate_id,
         dataset_id=dataset_id,
+        generation_id=row.generation_id,
         component_name=self.comparison_component_var.get() or _default_component_name(self.model),
     )
     bundle = load_rectification_display_bundle(self.model, selection)
@@ -7540,7 +7922,7 @@ def _sweep_visualization_open_preview(self: SweepVisualizationApp) -> None:
         return
     self._open_rectification_viewer(
         bundle,
-        title=f"{candidate_id} / {dataset_id}",
+        title=f"{self._leaderboard_candidate_label(row)} / {dataset_id}",
     )
 
 
@@ -7555,6 +7937,7 @@ def _sweep_visualization_open_selected_diagnostic_preview(self: SweepVisualizati
             stage=record.stage,
             candidate_id=record.candidate_id,
             dataset_id=record.dataset_id,
+            generation_id=record.generation_id,
             component_name=self.diagnostic_component_var.get() or _default_component_name(self.model),
         ),
     )
@@ -7594,6 +7977,120 @@ def _sweep_visualization_open_selected_metric_record(self: SweepVisualizationApp
         self.messagebox.showerror("metric_record", err or "Failed to open metric_record.json.")
 
 
+def _preview_candidate_key(row: CandidateVisualizationRow) -> str:
+    return row.row_id
+
+
+def _diagnostic_candidate_key(record: RunMetricRecord) -> str:
+    generation_prefix = f"{record.generation_id}:" if record.generation_id else ""
+    return f"{generation_prefix}{record.stage}:{record.candidate_id}"
+
+
+def _diagnostic_record_matches_candidate_key(record: RunMetricRecord, key: str) -> bool:
+    return key in {
+        record.candidate_id,
+        f"{record.stage}:{record.candidate_id}",
+        _diagnostic_candidate_key(record),
+    }
+
+
+def _sweep_visualization_on_generation_scope_changed(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        return
+    requested = self.generation_scope_var.get() or GENERATION_SCOPE_ALL
+    self.model.default_generation_scope = _normalize_generation_scope(self.model, requested)
+    self.generation_scope_var.set(self.model.default_generation_scope)
+    self._rectification_bundle_cache.clear()
+    self._comparison_slot_a_key = None
+    self._comparison_slot_b_key = None
+    self._comparison_slots_cleared = False
+    self._populate_from_model(self.model)
+
+
+def _sweep_visualization_refresh_preview_candidates(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        self.preview_candidate_combo["values"] = []
+        self.preview_candidate_var.set("")
+        return
+    stage_name = self.preview_stage_var.get()
+    rows = [row for row in _rows_for_stage(self.model, stage_name) if row.preview_paths]
+    candidate_values = [_preview_candidate_key(row) for row in rows]
+    self.preview_candidate_combo["values"] = candidate_values
+    self.preview_candidate_var.set(candidate_values[0] if candidate_values else "")
+    self._refresh_preview_datasets()
+
+
+def _sweep_visualization_refresh_preview_datasets(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        self.preview_dataset_combo["values"] = []
+        self.preview_dataset_var.set("")
+        return
+    stage_name = self.preview_stage_var.get()
+    candidate_key = self.preview_candidate_var.get()
+    row = next(
+        (
+            item
+            for item in _rows_for_stage(self.model, stage_name)
+            if _preview_candidate_key(item) == candidate_key or item.candidate_id == candidate_key
+        ),
+        None,
+    )
+    dataset_values = sorted(row.preview_paths.keys()) if row is not None else []
+    self.preview_dataset_combo["values"] = dataset_values
+    self.preview_dataset_var.set(dataset_values[0] if dataset_values else "")
+
+
+def _sweep_visualization_selected_diagnostic_record(self: SweepVisualizationApp) -> Optional[RunMetricRecord]:
+    if self.model is None:
+        return None
+    stage_name = self.diagnostic_stage_var.get()
+    candidate_key = self.diagnostic_candidate_var.get()
+    dataset_id = self.diagnostic_dataset_var.get()
+    return next(
+        (
+            record
+            for record in run_records_for_generation_scope(self.model, self.model.default_generation_scope)
+            if record.stage == stage_name
+            and _diagnostic_record_matches_candidate_key(record, candidate_key)
+            and record.dataset_id == dataset_id
+        ),
+        None,
+    )
+
+
+def _sweep_visualization_refresh_diagnostic_candidates(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        self.diagnostic_candidate_combo["values"] = []
+        self.diagnostic_candidate_var.set("")
+        return
+    stage_name = self.diagnostic_stage_var.get()
+    candidate_values = _sorted_unique(
+        _diagnostic_candidate_key(record)
+        for record in run_records_for_generation_scope(self.model, self.model.default_generation_scope)
+        if record.stage == stage_name
+    )
+    self.diagnostic_candidate_combo["values"] = candidate_values
+    self.diagnostic_candidate_var.set(candidate_values[0] if candidate_values else "")
+    self._refresh_diagnostic_datasets()
+
+
+def _sweep_visualization_refresh_diagnostic_datasets(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        self.diagnostic_dataset_combo["values"] = []
+        self.diagnostic_dataset_var.set("")
+        return
+    stage_name = self.diagnostic_stage_var.get()
+    candidate_key = self.diagnostic_candidate_var.get()
+    dataset_values = _sorted_unique(
+        record.dataset_id
+        for record in run_records_for_generation_scope(self.model, self.model.default_generation_scope)
+        if record.stage == stage_name and _diagnostic_record_matches_candidate_key(record, candidate_key)
+    )
+    self.diagnostic_dataset_combo["values"] = dataset_values
+    self.diagnostic_dataset_var.set(dataset_values[0] if dataset_values else "")
+    self.refresh_metric_diagnostics()
+
+
 def _sweep_visualization_populate_from_model(
     self: SweepVisualizationApp,
     model: SweepVisualizationModel,
@@ -7606,6 +8103,13 @@ def _sweep_visualization_populate_from_model(
     self._set_text_widget(self.progression_text, "\n".join(_progression_summary_lines(model)))
     self._set_text_widget(self.significance_text, _format_significance_text(model))
     self._set_text_widget(self.metric_text, _format_metric_summary_text(model))
+    generation_values = generation_scope_options(model)
+    self.generation_scope_combo["values"] = generation_values
+    if model.default_generation_scope not in generation_values:
+        model.default_generation_scope = generation_values[0] if generation_values else GENERATION_SCOPE_ALL
+    self.generation_scope_var.set(model.default_generation_scope)
+    scoped_candidates = candidate_rows_for_generation_scope(model, model.default_generation_scope)
+    scoped_records = run_records_for_generation_scope(model, model.default_generation_scope)
 
     stage_values = ["All", *model.stage_order]
     self.coverage_stage_combo["values"] = stage_values
@@ -7628,14 +8132,14 @@ def _sweep_visualization_populate_from_model(
     self.coverage_strategy_combo["values"] = ["All", *model.strategies]
     self.coverage_strategy_var.set("All")
     families = _sorted_unique(
-        [row.family for row in model.candidates if row.family]
-        + [record.family for record in model.run_metric_records if record.family]
+        [row.family for row in scoped_candidates if row.family]
+        + [record.family for record in scoped_records if record.family]
     )
     alpha_values = _sorted_unique(
-        [_alpha_filter_value(row.alpha) for row in model.candidates if row.alpha is not None]
+        [_alpha_filter_value(row.alpha) for row in scoped_candidates if row.alpha is not None]
         + [
             _alpha_filter_value(record.alpha)
-            for record in model.run_metric_records
+            for record in scoped_records
             if record.alpha is not None
         ]
     )
@@ -7691,7 +8195,7 @@ def _sweep_visualization_populate_from_model(
     self.comparison_component_combo["values"] = diagnostic_components
     self.comparison_component_var.set(_default_component_name(model))
 
-    diagnostic_stage_values = _sorted_unique(record.stage for record in model.run_metric_records)
+    diagnostic_stage_values = _sorted_unique(record.stage for record in scoped_records)
     self.diagnostic_stage_combo["values"] = diagnostic_stage_values
     self.diagnostic_stage_var.set(
         model.primary_stage_name if model.primary_stage_name in diagnostic_stage_values else (diagnostic_stage_values[0] if diagnostic_stage_values else "")
@@ -7714,6 +8218,7 @@ def _sweep_visualization_populate_from_model(
 
 SweepVisualizationApp.__init__ = _sweep_visualization_app_init
 SweepVisualizationApp._build_ui = _sweep_visualization_build_ui
+SweepVisualizationApp._on_generation_scope_changed = _sweep_visualization_on_generation_scope_changed
 SweepVisualizationApp._build_leaderboard_tab = _sweep_visualization_build_leaderboard_tab
 SweepVisualizationApp._build_sensitivity_tab = _sweep_visualization_build_sensitivity_tab
 SweepVisualizationApp._build_extensions_tab = _sweep_visualization_build_extensions_tab
@@ -7750,7 +8255,12 @@ SweepVisualizationApp._comparison_rows = _sweep_visualization_comparison_rows
 SweepVisualizationApp.refresh_comparison = _sweep_visualization_refresh_comparison
 SweepVisualizationApp.refresh_metric_diagnostics = _sweep_visualization_refresh_metric_diagnostics
 SweepVisualizationApp._open_rectification_viewer = _sweep_visualization_open_rectification_viewer
+SweepVisualizationApp._refresh_preview_candidates = _sweep_visualization_refresh_preview_candidates
+SweepVisualizationApp._refresh_preview_datasets = _sweep_visualization_refresh_preview_datasets
 SweepVisualizationApp._open_preview = _sweep_visualization_open_preview
+SweepVisualizationApp._selected_diagnostic_record = _sweep_visualization_selected_diagnostic_record
+SweepVisualizationApp._refresh_diagnostic_candidates = _sweep_visualization_refresh_diagnostic_candidates
+SweepVisualizationApp._refresh_diagnostic_datasets = _sweep_visualization_refresh_diagnostic_datasets
 SweepVisualizationApp._open_selected_diagnostic_preview = _sweep_visualization_open_selected_diagnostic_preview
 SweepVisualizationApp._open_selected_diagnostic_folder = _sweep_visualization_open_selected_diagnostic_folder
 SweepVisualizationApp._open_selected_metric_record = _sweep_visualization_open_selected_metric_record

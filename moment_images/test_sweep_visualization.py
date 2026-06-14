@@ -13,6 +13,7 @@ from PIL import Image
 from moment_images.sweep_visualization import (
     RectificationViewSelection,
     SweepVisualizationApp,
+    candidate_rows_for_generation_scope,
     create_candidate_robustness_figure,
     create_comparison_figure,
     create_effects_figure,
@@ -21,8 +22,10 @@ from moment_images.sweep_visualization import (
     export_sweep_visualization_bundle,
     compute_parameter_sensitivity,
     generate_next_extension_suggestions,
+    generation_scope_options,
     load_rectification_display_bundle,
     load_sweep_visualization_model,
+    run_records_for_generation_scope,
     main,
 )
 
@@ -958,6 +961,108 @@ def test_extension_suggestions_use_previous_generation_and_boundary_evidence(tmp
     assert max_row.best_value == "12"
     assert any(suggestion.rule_id == "boundary_winner" for suggestion in suggestions)
     assert any(suggestion.rule_id == "extension_delta" for suggestion in suggestions)
+
+
+def test_generation_scope_helpers_load_all_generations_with_qualified_rows(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+    run_state = _run_state_payload(output_dir, ["d1", "d2"], stage_mode="single_stage")
+    run_state["active_generation_id"] = "gen_new"
+    run_state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run", "created_at": "2026-04-01T00:00:00+00:00"},
+        {"generation_id": "gen_mid", "action": "extend", "created_at": "2026-04-02T00:00:00+00:00"},
+        {"generation_id": "gen_new", "action": "extend", "created_at": "2026-04-03T00:00:00+00:00"},
+    ]
+    _write_json(output_dir / "run_state.json", run_state)
+
+    active_rankings = []
+    for idx, score in enumerate([0.91, 0.82]):
+        row = _ranking(
+            f"s1c{idx:04d}",
+            score=score,
+            rank=idx + 1,
+            datasets=["d1", "d2"],
+            stage="stage1",
+        )
+        row["generation_id"] = "gen_new"
+        active_rankings.append(row)
+    _write_json(output_dir / "stage1_summary.json", _stage_summary("stage1", active_rankings))
+
+    for generation_id, score in [("gen_old", 0.51), ("gen_mid", 0.73)]:
+        row = _ranking(
+            "s1c0000",
+            score=score,
+            rank=1,
+            datasets=["d1", "d2"],
+            stage="stage1",
+        )
+        row["generation_id"] = generation_id
+        _write_json(
+            output_dir / "generations" / generation_id / "products" / "stage1_summary.json",
+            _stage_summary("stage1", [row]),
+        )
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert generation_scope_options(model) == ["All", "Active", "gen_old", "gen_mid", "gen_new"]
+    active_rows = candidate_rows_for_generation_scope(model, "Active")
+    all_rows = candidate_rows_for_generation_scope(model, "All")
+    assert [row.generation_id for row in active_rows] == ["gen_new", "gen_new"]
+    assert sorted(row.generation_id for row in all_rows) == ["gen_mid", "gen_new", "gen_new", "gen_old"]
+    assert [row.rank for row in all_rows] == [1, 2, 3, 4]
+    assert [row.score for row in all_rows] == [0.91, 0.82, 0.73, 0.51]
+    assert len({row.row_id for row in all_rows}) == 4
+    assert len([row for row in all_rows if row.candidate_id == "s1c0000"]) == 3
+    assert candidate_rows_for_generation_scope(model, None) == all_rows
+
+
+def test_generation_scope_helpers_include_historical_run_records(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+    run_state = _run_state_payload(output_dir, ["d1", "d2"], stage_mode="single_stage")
+    run_state["active_generation_id"] = "gen_new"
+    run_state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run"},
+        {"generation_id": "gen_new", "action": "extend"},
+    ]
+    _write_json(output_dir / "run_state.json", run_state)
+
+    active_summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    active_summary[0]["generation_id"] = "gen_new"
+    _write_json(output_dir / "summary.json", active_summary)
+
+    old_record = dict(active_summary[0])
+    old_record["run"] = "stage1_s1c0000_d1"
+    old_record["generation_id"] = "gen_old"
+    _write_json(
+        output_dir / "generations" / "gen_old" / "products" / "summary.json",
+        [old_record],
+    )
+    old_ranking = _ranking(
+        "s1c0000",
+        score=0.44,
+        rank=1,
+        datasets=["d1", "d2"],
+        stage="stage1",
+    )
+    old_ranking["generation_id"] = "gen_old"
+    _write_json(
+        output_dir / "generations" / "gen_old" / "products" / "stage1_summary.json",
+        _stage_summary("stage1", [old_ranking]),
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+
+    all_records = run_records_for_generation_scope(model, "All")
+    assert [record.generation_id for record in all_records] == ["gen_old", "gen_new"]
+    assert len({record.row_id for record in all_records}) == 2
+    assert run_records_for_generation_scope(model, "Active")[0].generation_id == "gen_new"
 
 
 def test_create_comparison_and_robustness_figures_render(tmp_path):
