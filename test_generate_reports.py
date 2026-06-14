@@ -23,6 +23,7 @@ def _write_run(
     metric_value: float,
     formulation_id: str,
     alpha: float,
+    generation_id: str | None = None,
 ) -> None:
     run_dir = base_dir / "runs" / stage_name / candidate_id / dataset_id
     config = {
@@ -47,8 +48,83 @@ def _write_run(
         "inter_view_consistency_metrics": {"mean_view_std": 0.2},
         "runtime_seconds": 0.1,
     }
+    if generation_id is not None:
+        metric_record["generation_id"] = generation_id
     _write_json(run_dir / "config.json", config)
     _write_json(run_dir / "metric_record.json", metric_record)
+
+
+def _run_dir(base_dir: Path, stage_name: str, candidate_id: str, dataset_id: str) -> Path:
+    return base_dir / "runs" / stage_name / candidate_id / dataset_id
+
+
+def _write_run_state(
+    output_dir: Path,
+    *,
+    active_generation_id: str,
+    runs: dict[str, dict[str, object]],
+) -> None:
+    _write_json(
+        output_dir / "run_state.json",
+        {
+            "schema_version": 2,
+            "active_generation_id": active_generation_id,
+            "spec_generations": [
+                {"generation_id": "gen_old", "action": "run"},
+                {"generation_id": active_generation_id, "action": "extend"},
+            ],
+            "runs": runs,
+        },
+    )
+
+
+def _run_state_entry(
+    *,
+    stage_name: str,
+    candidate_id: str,
+    dataset_id: str,
+    run_dir: Path,
+    generation_id: str | None,
+    active: bool = True,
+    status: str = "ok",
+) -> dict[str, object]:
+    run_uid = f"{stage_name}_{candidate_id}_{dataset_id}"
+    return {
+        "run_uid": run_uid,
+        "stage": stage_name,
+        "candidate_id": candidate_id,
+        "dataset_id": dataset_id,
+        "status": status,
+        "active": active,
+        "generation_id": generation_id,
+        "run_dir": str(run_dir),
+        "candidate_signature": f"candidate-{candidate_id}",
+        "dataset_signature": f"dataset-{dataset_id}",
+        "run_signature": f"signature-{run_uid}",
+        "artifact_paths": {"metric_record": str(run_dir / "metric_record.json")},
+    }
+
+
+def _write_spec(spec_path: Path) -> None:
+    _write_json(
+        spec_path,
+        {
+            "datasets": [{"id": "d1", "views_path": "unused.npy"}],
+            "strategies": ["pixel"],
+            "stages": {
+                "mode": "single_stage",
+                "total_budget_per_dataset": 1,
+                "stage1_fraction": 1.0,
+                "top_k": 1,
+            },
+            "scoring": {
+                "metric_weights": {"laplacian_variance": 1.0},
+                "robustness_lambda": 0.0,
+                "missing_dataset_penalty": 0.0,
+            },
+            "analyze": True,
+        },
+    )
 
 
 def test_main_rebuilds_nested_metric_phase_reports(tmp_path, monkeypatch):
@@ -120,3 +196,196 @@ def test_main_rebuilds_nested_metric_phase_reports(tmp_path, monkeypatch):
     assert alpha_report["num_runs_considered"] == 1
     assert alpha_report["ranked_runs"][0]["run"] == "metric_phase_m1c0000_d1"
     assert alpha_report["ranked_runs"][0]["formulation_id"] == "exp_grad"
+
+
+def test_rebuild_summaries_preserves_active_generation_id(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    active_run_dir = _run_dir(output_dir, "stage1", "c_active", "d1")
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=active_run_dir,
+                generation_id="gen_new",
+            )
+        },
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_reports.py",
+            str(output_dir),
+            "--spec",
+            str(spec_path),
+            "--rebuild-summaries",
+        ],
+    )
+
+    generate_reports.main()
+
+    stage_summary = json.loads((output_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    summary_records = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert stage_summary["generation_id"] == "gen_new"
+    assert {row["generation_id"] for row in stage_summary["rankings"]} == {"gen_new"}
+    assert {record["generation_id"] for record in summary_records} == {"gen_new"}
+
+
+def test_rebuild_summaries_uses_active_run_state_not_stale_run_folders(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_old",
+        dataset_id="d1",
+        run_name="stage1_c_old_d1",
+        metric_value=99.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_old",
+    )
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_old_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_old",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_old", "d1"),
+                generation_id="gen_old",
+                active=False,
+            ),
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_active", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_reports.py",
+            str(output_dir),
+            "--spec",
+            str(spec_path),
+            "--rebuild-summaries",
+        ],
+    )
+
+    generate_reports.main()
+
+    leaderboard = json.loads((output_dir / "leaderboard.json").read_text(encoding="utf-8"))
+    summary_records = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert [row["candidate_id"] for row in leaderboard] == ["c_active"]
+    assert [record["run"] for record in summary_records] == ["stage1_c_active_d1"]
+
+
+def test_rebuild_summaries_snapshots_metric_phase_generation_products(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    metric_dir = output_dir / "metric_experiments"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        metric_dir,
+        stage_name="metric_phase",
+        candidate_id="m1c0000",
+        dataset_id="d1",
+        run_name="metric_phase_m1c0000_d1",
+        metric_value=9.0,
+        formulation_id="exp_grad",
+        alpha=0.25,
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_active", "d1"),
+                generation_id="gen_new",
+            ),
+            "metric_phase_m1c0000_d1": _run_state_entry(
+                stage_name="metric_phase",
+                candidate_id="m1c0000",
+                dataset_id="d1",
+                run_dir=_run_dir(metric_dir, "metric_phase", "m1c0000", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_reports.py",
+            str(output_dir),
+            "--spec",
+            str(spec_path),
+            "--rebuild-summaries",
+        ],
+    )
+
+    generate_reports.main()
+
+    metric_summary = json.loads((metric_dir / "metric_phase_summary.json").read_text(encoding="utf-8"))
+    product_summary_path = (
+        output_dir
+        / "generations"
+        / "gen_new"
+        / "products"
+        / "metric_experiments"
+        / "metric_phase_summary.json"
+    )
+    product_summary = json.loads(product_summary_path.read_text(encoding="utf-8"))
+    assert metric_summary["generation_id"] == "gen_new"
+    assert {row["generation_id"] for row in metric_summary["rankings"]} == {"gen_new"}
+    assert product_summary["generation_id"] == "gen_new"
