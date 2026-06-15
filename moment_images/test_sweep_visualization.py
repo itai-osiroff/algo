@@ -13,6 +13,7 @@ from PIL import Image
 from moment_images.sweep_visualization import (
     RectificationViewSelection,
     SweepVisualizationApp,
+    _comparison_artifacts_for_candidate,
     candidate_rows_for_generation_scope,
     create_candidate_robustness_figure,
     create_comparison_figure,
@@ -1065,6 +1066,218 @@ def test_generation_scope_helpers_include_historical_run_records(tmp_path):
     assert run_records_for_generation_scope(model, "Active")[0].generation_id == "gen_new"
 
 
+def test_historical_generation_bundle_loads_archived_product_preview(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+    run_state = _run_state_payload(output_dir, ["d1", "d2"], stage_mode="single_stage")
+    run_state["active_generation_id"] = "gen_new"
+    run_state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run"},
+        {"generation_id": "gen_new", "action": "extend"},
+    ]
+    _write_json(output_dir / "run_state.json", run_state)
+    old_ranking = _ranking("s1c_old0000", score=0.44, rank=1, datasets=["d1"], stage="stage1")
+    old_ranking["generation_id"] = "gen_old"
+    _write_json(
+        output_dir / "generations" / "gen_old" / "products" / "stage1_summary.json",
+        _stage_summary("stage1", [old_ranking]),
+    )
+    _write_preview(
+        output_dir
+        / "generations"
+        / "gen_old"
+        / "products"
+        / "runs"
+        / "stage1"
+        / "s1c_old0000"
+        / "d1"
+        / "avg_rectified.png"
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+    model.default_generation_scope = "All"
+    bundle = load_rectification_display_bundle(
+        model,
+        RectificationViewSelection(
+            stage="stage1",
+            candidate_id="s1c_old0000",
+            dataset_id="d1",
+            generation_id="gen_old",
+        ),
+    )
+
+    assert bundle.preview is not None
+    assert bundle.preview_path is not None
+    assert "generations" in bundle.preview_path
+
+
+def test_historical_generation_bundle_falls_back_to_matching_root_run_artifacts(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+        include_workspace=True,
+    )
+    run_state = _run_state_payload(output_dir, ["d1", "d2"], stage_mode="single_stage")
+    run_state["active_generation_id"] = "gen_new"
+    run_state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run"},
+        {"generation_id": "gen_new", "action": "extend"},
+    ]
+    _write_json(output_dir / "run_state.json", run_state)
+    old_summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    old_summary[0]["generation_id"] = "gen_old"
+    _write_json(output_dir / "generations" / "gen_old" / "products" / "summary.json", old_summary)
+    old_ranking = _ranking("s1c0000", score=0.44, rank=1, datasets=["d1"], stage="stage1")
+    old_ranking["generation_id"] = "gen_old"
+    _write_json(
+        output_dir / "generations" / "gen_old" / "products" / "stage1_summary.json",
+        _stage_summary("stage1", [old_ranking]),
+    )
+    root_metric_record = output_dir / "runs" / "stage1" / "s1c0000" / "d1" / "metric_record.json"
+    _write_metric_record(
+        root_metric_record,
+        run="stage1_s1c0000_d1",
+        family="intensity",
+        alpha=1.0,
+        formulation_id="intensity_default",
+        metric_base=10.0,
+    )
+    metric_payload = json.loads(root_metric_record.read_text(encoding="utf-8"))
+    metric_payload["generation_id"] = "gen_old"
+    _write_json(root_metric_record, metric_payload)
+
+    model = load_sweep_visualization_model(output_dir)
+    model.default_generation_scope = "All"
+    bundle = load_rectification_display_bundle(
+        model,
+        RectificationViewSelection(
+            stage="stage1",
+            candidate_id="s1c0000",
+            dataset_id="d1",
+            generation_id="gen_old",
+            component_name="gradient",
+        ),
+    )
+
+    assert bundle.preview is not None
+    assert bundle.blended_score is not None
+    assert bundle.preview_path == str(output_dir / "runs" / "stage1" / "s1c0000" / "d1" / "avg_rectified.png")
+    assert bundle.workspace_path == str(output_dir / "runs" / "stage1" / "s1c0000" / "d1" / "workspace.npz")
+
+
+def test_historical_generation_root_fallback_rejects_mismatched_generation_id(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+    run_state = _run_state_payload(output_dir, ["d1", "d2"], stage_mode="single_stage")
+    run_state["active_generation_id"] = "gen_new"
+    run_state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run"},
+        {"generation_id": "gen_new", "action": "extend"},
+    ]
+    _write_json(output_dir / "run_state.json", run_state)
+    old_summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    old_summary[0]["generation_id"] = "gen_old"
+    _write_json(output_dir / "generations" / "gen_old" / "products" / "summary.json", old_summary)
+    old_ranking = _ranking("s1c0000", score=0.44, rank=1, datasets=["d1"], stage="stage1")
+    old_ranking["generation_id"] = "gen_old"
+    _write_json(
+        output_dir / "generations" / "gen_old" / "products" / "stage1_summary.json",
+        _stage_summary("stage1", [old_ranking]),
+    )
+    root_metric_record = output_dir / "runs" / "stage1" / "s1c0000" / "d1" / "metric_record.json"
+    _write_metric_record(
+        root_metric_record,
+        run="stage1_s1c0000_d1",
+        family="intensity",
+        alpha=1.0,
+        formulation_id="intensity_default",
+        metric_base=10.0,
+    )
+    metric_payload = json.loads(root_metric_record.read_text(encoding="utf-8"))
+    metric_payload["generation_id"] = "gen_new"
+    _write_json(root_metric_record, metric_payload)
+
+    model = load_sweep_visualization_model(output_dir)
+    model.default_generation_scope = "All"
+    bundle = load_rectification_display_bundle(
+        model,
+        RectificationViewSelection(
+            stage="stage1",
+            candidate_id="s1c0000",
+            dataset_id="d1",
+            generation_id="gen_old",
+        ),
+    )
+
+    assert bundle.preview is None
+    assert bundle.preview_path is None
+    assert any("Preview image unavailable" in warning for warning in bundle.warnings)
+
+
+def test_comparison_artifacts_use_generation_aware_run_record(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+        include_workspace=True,
+    )
+    run_state = _run_state_payload(output_dir, ["d1", "d2"], stage_mode="single_stage")
+    run_state["active_generation_id"] = "gen_new"
+    run_state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run"},
+        {"generation_id": "gen_new", "action": "extend"},
+    ]
+    _write_json(output_dir / "run_state.json", run_state)
+    active_summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    active_summary[0]["generation_id"] = "gen_new"
+    _write_json(output_dir / "summary.json", active_summary)
+    old_summary = [dict(active_summary[0], generation_id="gen_old")]
+    _write_json(output_dir / "generations" / "gen_old" / "products" / "summary.json", old_summary)
+    old_ranking = _ranking("s1c0000", score=0.44, rank=1, datasets=["d1"], stage="stage1")
+    old_ranking["generation_id"] = "gen_old"
+    _write_json(
+        output_dir / "generations" / "gen_old" / "products" / "stage1_summary.json",
+        _stage_summary("stage1", [old_ranking]),
+    )
+    root_metric_record = output_dir / "runs" / "stage1" / "s1c0000" / "d1" / "metric_record.json"
+    _write_metric_record(
+        root_metric_record,
+        run="stage1_s1c0000_d1",
+        family="intensity",
+        alpha=1.0,
+        formulation_id="intensity_default",
+        metric_base=10.0,
+    )
+    metric_payload = json.loads(root_metric_record.read_text(encoding="utf-8"))
+    metric_payload["generation_id"] = "gen_old"
+    _write_json(root_metric_record, metric_payload)
+
+    model = load_sweep_visualization_model(output_dir)
+    model.default_generation_scope = "All"
+    row = next(
+        row
+        for row in candidate_rows_for_generation_scope(model, "All")
+        if row.candidate_id == "s1c0000" and row.generation_id == "gen_old"
+    )
+    artifact = _comparison_artifacts_for_candidate(
+        model,
+        row,
+        dataset_id="d1",
+        component_name="gradient",
+    )
+
+    assert artifact["preview"] is not None
+    assert artifact["component"] is not None
+    assert artifact["record"].generation_id == "gen_old"
+
+
 def test_create_comparison_and_robustness_figures_render(tmp_path):
     output_dir = _create_modern_fixture(
         tmp_path,
@@ -1279,6 +1492,60 @@ def test_gui_preview_actions_use_zoomable_viewer(tmp_path):
     assert len(captures) == 2
     assert captures[0][0].selection.candidate_id == "s1c0000"
     assert captures[1][0].selection.dataset_id == "d1"
+    root.destroy()
+
+
+def test_gui_preview_tab_opens_generation_qualified_candidate(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+    run_state = _run_state_payload(output_dir, ["d1", "d2"], stage_mode="single_stage")
+    run_state["active_generation_id"] = "gen_new"
+    run_state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run"},
+        {"generation_id": "gen_new", "action": "extend"},
+    ]
+    _write_json(output_dir / "run_state.json", run_state)
+    old_ranking = _ranking("s1c_old0000", score=0.44, rank=1, datasets=["d1"], stage="stage1")
+    old_ranking["generation_id"] = "gen_old"
+    _write_json(
+        output_dir / "generations" / "gen_old" / "products" / "stage1_summary.json",
+        _stage_summary("stage1", [old_ranking]),
+    )
+    _write_preview(
+        output_dir
+        / "generations"
+        / "gen_old"
+        / "products"
+        / "runs"
+        / "stage1"
+        / "s1c_old0000"
+        / "d1"
+        / "avg_rectified.png"
+    )
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root, initial_path=output_dir)
+    app.messagebox.showwarning = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+    captures = []
+    app._open_rectification_viewer = lambda bundle, *, title: captures.append((bundle, title))
+    root.update()
+
+    app.generation_scope_var.set("All")
+    app._on_generation_scope_changed()
+    app.preview_stage_var.set("stage1")
+    app._refresh_preview_candidates()
+    old_key = "gen_old:stage1:s1c_old0000"
+    assert old_key in app.preview_candidate_combo["values"]
+    app.preview_candidate_var.set(old_key)
+    app._refresh_preview_datasets()
+    app.preview_dataset_var.set("d1")
+    app._open_preview()
+
+    assert len(captures) == 1
+    assert captures[0][0].selection.generation_id == "gen_old"
+    assert captures[0][0].selection.candidate_id == "s1c_old0000"
     root.destroy()
 
 

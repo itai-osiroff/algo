@@ -4244,6 +4244,18 @@ def _copy_product_if_exists(source: Path, destination: Path) -> None:
     shutil.copy2(source_to_copy, destination)
 
 
+def _snapshot_run_display_artifacts(source_runs_dir: Path, destination_runs_dir: Path) -> None:
+    if not source_runs_dir.exists():
+        return
+    for source_run_dir in sorted(source_runs_dir.glob("*/*/*")):
+        if not source_run_dir.is_dir():
+            continue
+        relative_run_dir = source_run_dir.relative_to(source_runs_dir)
+        destination_run_dir = destination_runs_dir / relative_run_dir
+        for filename in ("avg_rectified.png", "workspace.npz", "metric_record.json"):
+            _copy_product_if_exists(source_run_dir / filename, destination_run_dir / filename)
+
+
 def _snapshot_generation_products(output_dir: Path, generation_id: str) -> Path:
     products_dir = _generation_dir(output_dir, generation_id) / "products"
     for filename in (
@@ -4258,6 +4270,7 @@ def _snapshot_generation_products(output_dir: Path, generation_id: str) -> Path:
         "experiment_manifest.json",
     ):
         _copy_product_if_exists(output_dir / filename, products_dir / filename)
+    _snapshot_run_display_artifacts(output_dir / "runs", products_dir / "runs")
 
     metric_dir = output_dir / "metric_experiments"
     if metric_dir.exists():
@@ -4277,6 +4290,7 @@ def _snapshot_generation_products(output_dir: Path, generation_id: str) -> Path:
             "alpha_report_displacement_vs_alpha.png",
         ):
             _copy_product_if_exists(metric_dir / filename, metric_products_dir / filename)
+        _snapshot_run_display_artifacts(metric_dir / "runs", metric_products_dir / "runs")
     return products_dir
 
 

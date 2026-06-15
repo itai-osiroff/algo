@@ -1954,6 +1954,11 @@ def test_run_sweep_extend_existing_creates_generation_products_and_reuses_runs(m
     assert (products_dir / "stage2_summary.json").exists()
     assert (products_dir / "leaderboard.json").exists()
     assert (products_dir / "experiment_manifest.json").exists()
+    copied_run_dirs = sorted(products_dir.glob("runs/*/*/*"))
+    assert copied_run_dirs
+    assert any((run_dir / "avg_rectified.png").exists() for run_dir in copied_run_dirs)
+    assert any((run_dir / "workspace.npz").exists() for run_dir in copied_run_dirs)
+    assert any((run_dir / "metric_record.json").exists() for run_dir in copied_run_dirs)
 
 
 def test_run_sweep_merge_from_copies_missing_and_skips_duplicates(monkeypatch, tmp_path):

@@ -4472,6 +4472,76 @@ def _rectification_preview_path(
     return None if record is None else record.preview_path
 
 
+def _root_artifact_generation_matches(
+    metric_record_path: Path,
+    generation_id: Optional[str],
+) -> bool:
+    if generation_id is None:
+        return True
+    if not _candidate_path_exists(metric_record_path):
+        return False
+    try:
+        payload, _used_path, _warnings = read_json_first_valid(
+            metric_record_path,
+            validator=lambda obj: isinstance(obj, dict),
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return _coerce_optional_str(cast(Dict[str, object], payload).get("generation_id")) == generation_id
+
+
+def _root_run_artifact_paths_for_selection(
+    model: SweepVisualizationModel,
+    *,
+    stage_name: str,
+    candidate_id: str,
+    dataset_id: str,
+    generation_id: Optional[str],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    base_dir = (
+        model.metric_phase_dir
+        if stage_name == "metric_phase" and model.metric_phase_dir is not None
+        else model.experiment_root
+    )
+    run_dir = base_dir / "runs" / stage_name / candidate_id / dataset_id
+    metric_record_path = run_dir / "metric_record.json"
+    if not _root_artifact_generation_matches(metric_record_path, generation_id):
+        return None, None, None
+    preview_path = run_dir / "avg_rectified.png"
+    workspace_path = run_dir / "workspace.npz"
+    return (
+        str(preview_path) if preview_path.exists() else None,
+        str(workspace_path) if _candidate_path_exists(workspace_path) else None,
+        str(metric_record_path) if _candidate_path_exists(metric_record_path) else None,
+    )
+
+
+def _rectification_artifact_paths(
+    model: SweepVisualizationModel,
+    selection: RectificationViewSelection,
+    row: Optional[CandidateVisualizationRow],
+    record: Optional[RunMetricRecord],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    preview_path = _rectification_preview_path(row, record, selection.dataset_id)
+    workspace_path = None if record is None else record.workspace_path
+    metric_record_path = None if record is None else record.metric_record_path
+    if preview_path is not None and workspace_path is not None:
+        return preview_path, workspace_path, metric_record_path
+
+    root_preview, root_workspace, root_metric = _root_run_artifact_paths_for_selection(
+        model,
+        stage_name=selection.stage,
+        candidate_id=selection.candidate_id,
+        dataset_id=selection.dataset_id,
+        generation_id=selection.generation_id,
+    )
+    return (
+        preview_path or root_preview,
+        workspace_path or root_workspace,
+        metric_record_path or root_metric,
+    )
+
+
 def load_rectification_display_bundle(
     model: SweepVisualizationModel,
     selection: RectificationViewSelection,
@@ -4480,9 +4550,13 @@ def load_rectification_display_bundle(
 
     row = _rectification_candidate_row(model, selection)
     record = _rectification_record(model, selection)
-    preview_path = _rectification_preview_path(row, record, selection.dataset_id)
+    preview_path, workspace_path, _metric_record_path = _rectification_artifact_paths(
+        model,
+        selection,
+        row,
+        record,
+    )
     preview, warnings = _load_preview_array_with_warnings(preview_path)
-    workspace_path = None if record is None else record.workspace_path
     payload: Dict[str, np.ndarray] = {}
     if workspace_path:
         payload, workspace_warnings = _load_workspace_diagnostics(Path(workspace_path))
@@ -4546,16 +4620,26 @@ def _comparison_artifacts_for_candidate(
         stage_name=row.stage,
         candidate_id=row.candidate_id,
         dataset_id=dataset_id,
+        generation_id=row.generation_id,
     )
-    preview_path = row.preview_paths.get(dataset_id) or row.preview_paths.get("aggregate")
-    if preview_path is None and record is not None:
-        preview_path = record.preview_path
+    preview_path, workspace_path, _metric_record_path = _rectification_artifact_paths(
+        model,
+        RectificationViewSelection(
+            stage=row.stage,
+            candidate_id=row.candidate_id,
+            dataset_id=dataset_id,
+            generation_id=row.generation_id,
+            component_name=component_name,
+        ),
+        row,
+        record,
+    )
     preview = _load_preview_array(preview_path)
 
     payload: Dict[str, np.ndarray] = {}
     read_warnings: List[str] = []
-    if record is not None and record.workspace_path is not None:
-        payload, read_warnings = _load_workspace_diagnostics(Path(record.workspace_path))
+    if workspace_path is not None:
+        payload, read_warnings = _load_workspace_diagnostics(Path(workspace_path))
 
     blended = _collapse_image_like(cast(Optional[np.ndarray], payload.get("pixel_blended_scores")))
     component = _collapse_image_like(
