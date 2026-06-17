@@ -3,6 +3,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import generate_reports
@@ -125,6 +127,28 @@ def _write_spec(spec_path: Path) -> None:
             "analyze": True,
         },
     )
+
+
+def _set_rebuild_argv(monkeypatch, output_dir: Path, spec_path: Path) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_reports.py",
+            str(output_dir),
+            "--spec",
+            str(spec_path),
+            "--rebuild-summaries",
+        ],
+    )
+
+
+def _read_failure_report(output_dir: Path) -> dict[str, object]:
+    report_path = output_dir / "rebuild_failure_report.json"
+    assert report_path.exists()
+    markdown_path = output_dir / "rebuild_failure_report.md"
+    assert markdown_path.exists()
+    return json.loads(report_path.read_text(encoding="utf-8"))
 
 
 def test_main_rebuilds_nested_metric_phase_reports(tmp_path, monkeypatch):
@@ -442,3 +466,241 @@ def test_rebuild_summaries_resolves_relocated_run_state_paths(tmp_path, monkeypa
     stage_summary = json.loads((relocated_dir / "stage1_summary.json").read_text(encoding="utf-8"))
     assert [row["candidate_id"] for row in leaderboard] == ["c_active"]
     assert stage_summary["generation_id"] == "gen_new"
+
+
+def test_rebuild_summaries_uses_run_state_backup_when_primary_is_corrupt(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_old",
+        dataset_id="d1",
+        run_name="stage1_c_old_d1",
+        metric_value=99.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_old",
+    )
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    state_payload = {
+        "schema_version": 2,
+        "active_generation_id": "gen_new",
+        "spec_generations": [{"generation_id": "gen_new", "action": "extend"}],
+        "runs": {
+            "stage1_c_old_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_old",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_old", "d1"),
+                generation_id="gen_old",
+                active=False,
+            ),
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_active", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    }
+    _write_json(output_dir / "run_state.json.bak", state_payload)
+    (output_dir / "run_state.json").write_text("{broken", encoding="utf-8")
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    leaderboard = json.loads((output_dir / "leaderboard.json").read_text(encoding="utf-8"))
+    assert [row["candidate_id"] for row in leaderboard] == ["c_active"]
+
+
+def test_rebuild_summaries_aborts_with_failure_report_when_run_state_unreadable(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    _write_json(output_dir / "summary.json", [{"run": "previous"}])
+    previous_summary = (output_dir / "summary.json").read_text(encoding="utf-8")
+    (output_dir / "run_state.json").write_text("{broken", encoding="utf-8")
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    with pytest.raises(Exception, match="run_state"):
+        generate_reports.main()
+
+    report = _read_failure_report(output_dir)
+    report_text = json.dumps(report)
+    assert report["status"] == "failed"
+    assert report["error_type"] == "RebuildDataError"
+    assert "run_state.json" in report_text
+    assert (output_dir / "summary.json").read_text(encoding="utf-8") == previous_summary
+
+
+def test_rebuild_summaries_aborts_when_state_omits_existing_raw_run(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_extra",
+        dataset_id="d1",
+        run_name="stage1_c_extra_d1",
+        metric_value=7.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    _write_json(output_dir / "stage1_summary.json", {"stage": "stage1", "num_runs": 1})
+    previous_stage_summary = (output_dir / "stage1_summary.json").read_text(encoding="utf-8")
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_active", "d1"),
+                generation_id="gen_new",
+            )
+        },
+    )
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    with pytest.raises(Exception, match="not represented in run_state"):
+        generate_reports.main()
+
+    report = _read_failure_report(output_dir)
+    report_text = json.dumps(report)
+    assert "c_extra" in report_text
+    assert "filesystem_extra_runs" in report_text
+    assert (output_dir / "stage1_summary.json").read_text(encoding="utf-8") == previous_stage_summary
+
+
+def test_rebuild_summaries_falls_back_to_metric_record_config(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    run_dir = _run_dir(output_dir, "stage1", "c_active", "d1")
+    (run_dir / "config.json").unlink()
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=run_dir,
+                generation_id="gen_new",
+            )
+        },
+    )
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    stage_summary = json.loads((output_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    assert stage_summary["runs"][0]["config"]["dataset_id"] == "d1"
+    assert any("config.json" in warning for warning in stage_summary["execution"]["warnings"])
+
+
+def test_rebuild_summaries_aborts_with_report_for_unknown_dataset(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d_missing",
+        run_name="stage1_c_active_d_missing",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    with pytest.raises(Exception, match="Unknown dataset"):
+        generate_reports.main()
+
+    report = _read_failure_report(output_dir)
+    report_text = json.dumps(report)
+    assert "d_missing" in report_text
+    assert "stage1_c_active_d_missing" in report_text
+
+
+def test_rebuild_summaries_snapshots_reports_after_generation(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_active", "d1"),
+                generation_id="gen_new",
+            )
+        },
+    )
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    products_dir = output_dir / "generations" / "gen_new" / "products"
+    assert (products_dir / "analysis.json").exists()
+    assert (products_dir / "alpha_report.json").exists()
