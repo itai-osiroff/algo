@@ -14,6 +14,7 @@ from moment_images.sweep_visualization import (
     RectificationViewSelection,
     SweepVisualizationApp,
     _comparison_artifacts_for_candidate,
+    _format_comparison_text,
     candidate_rows_for_generation_scope,
     create_candidate_robustness_figure,
     create_comparison_figure,
@@ -1302,6 +1303,23 @@ def test_create_comparison_and_robustness_figures_render(tmp_path):
     assert robustness.axes[0].get_ylabel() == "candidate"
 
 
+def test_format_comparison_text_reports_mixed_stages(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+    )
+    model = load_sweep_visualization_model(output_dir)
+    stage2_row = next(row for row in model.candidates if row.stage == "stage2")
+    metric_row = next(row for row in model.candidates if row.stage == "metric_phase")
+
+    text = _format_comparison_text(model, [stage2_row, metric_row], dataset_id="d1")
+
+    assert "stages: stage2, metric_phase" in text
+    assert "stage=stage2" in text
+    assert "stage=metric_phase" in text
+
+
 def test_export_bundle_without_workspace_still_writes_report(tmp_path):
     output_dir = _create_modern_fixture(
         tmp_path,
@@ -1459,6 +1477,69 @@ def test_gui_comparison_slots_channel_lock_and_sync(tmp_path):
     app.comparison_inspector_a.apply_axes_limits((1.0, 4.0), (4.0, 1.0))
     app._on_comparison_limits_changed(app.comparison_inspector_a)
     assert app.comparison_inspector_b.get_axes_limits() == ((0.0, 5.0), (5.0, 0.0))
+    root.destroy()
+
+
+def test_gui_comparison_stage_pair_controls_seed_cross_stage_slots(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_workspace=True,
+    )
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root, initial_path=output_dir)
+    app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+    root.update()
+
+    app.comparison_stage_a_var.set("stage2")
+    app._on_comparison_stage_changed("A")
+    app.comparison_stage_b_var.set("metric_phase")
+    app._on_comparison_stage_changed("B")
+    root.update()
+
+    assert app._comparison_slot_a_key is not None
+    assert app._comparison_slot_b_key is not None
+    assert app._comparison_slot_a_key[0] == "stage2"
+    assert app._comparison_slot_b_key[0] == "metric_phase"
+    assert app.comparison_inspector_a.has_image()
+    assert app.comparison_inspector_b.has_image()
+    comparison_text = app.comparison_text.get("1.0", "end").strip()
+    assert "stages: stage2, metric_phase" in comparison_text
+    root.destroy()
+
+
+def test_gui_use_two_selected_preserves_cross_stage_comparison(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_workspace=True,
+    )
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root, initial_path=output_dir)
+    app.messagebox.showerror = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args))
+    root.update()
+
+    app.leaderboard_stage_var.set("All")
+    app.refresh_leaderboard()
+    selected_ids = [
+        row_id
+        for row_id, row in app._leaderboard_row_lookup.items()
+        if row.stage in {"stage2", "metric_phase"}
+    ][:2]
+    assert len(selected_ids) == 2
+    app.leaderboard_tree.selection_set(selected_ids)
+    app._assign_comparison_slots_from_selection()
+    root.update()
+
+    assert app._comparison_slot_a_key is not None
+    assert app._comparison_slot_b_key is not None
+    assert {app._comparison_slot_a_key[0], app._comparison_slot_b_key[0]} == {"stage2", "metric_phase"}
+    app.refresh_comparison()
+    assert app._comparison_slot_a_key is not None
+    assert app._comparison_slot_b_key is not None
+    assert {app._comparison_slot_a_key[0], app._comparison_slot_b_key[0]} == {"stage2", "metric_phase"}
     root.destroy()
 
 

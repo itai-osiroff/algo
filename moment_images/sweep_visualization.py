@@ -4718,6 +4718,34 @@ def _top_candidates_for_stage(
     return rows[: max(1, min(limit, len(rows)))] if rows else []
 
 
+def _comparison_rows_need_stage_labels(rows: Sequence[CandidateVisualizationRow]) -> bool:
+    if len({row.stage for row in rows}) > 1:
+        return True
+    candidate_counts = Counter(row.candidate_id for row in rows)
+    return any(count > 1 for count in candidate_counts.values())
+
+
+def _comparison_row_label(
+    row: CandidateVisualizationRow,
+    rows: Sequence[CandidateVisualizationRow],
+) -> str:
+    if _comparison_rows_need_stage_labels(rows):
+        return f"{row.stage}:{row.candidate_id}"
+    return row.candidate_id
+
+
+def _comparison_stage_header(
+    model: SweepVisualizationModel,
+    rows: Sequence[CandidateVisualizationRow],
+) -> str:
+    stages = list(dict.fromkeys(row.stage for row in rows))
+    if not stages:
+        return f"stage: {model.primary_stage_name}"
+    if len(stages) == 1:
+        return f"stage: {stages[0]}"
+    return f"stages: {', '.join(stages)}"
+
+
 def _varying_parameter_lines(rows: Sequence[CandidateVisualizationRow]) -> List[str]:
     varying_names = [
         name
@@ -4746,7 +4774,7 @@ def _format_comparison_text(
         return "No candidates available for comparison."
 
     lines = [
-        f"stage: {rows[0].stage if rows else model.primary_stage_name}",
+        _comparison_stage_header(model, rows),
         f"dataset: {dataset_id}",
         f"candidates compared: {len(rows)}",
         "",
@@ -4763,7 +4791,8 @@ def _format_comparison_text(
             " | ".join(
                 [
                     f"rank {row.rank}",
-                    row.candidate_id,
+                    _comparison_row_label(row, rows),
+                    f"stage={row.stage}",
                     f"strategy={row.strategy}",
                     f"dataset_score={_format_float(dataset_score)}",
                     f"mean_score={_format_float(row.mean_dataset_score)}",
@@ -4807,7 +4836,7 @@ def create_preview_comparison_figure(
             ax,
             preview,
             title=(
-                f"{row.candidate_id}\n"
+                f"{_comparison_row_label(row, rows)}\n"
                 f"rank {row.rank} | score "
                 f"{_format_float(_candidate_score_for_dataset(row, dataset_id, model.primary_metric))}"
             ),
@@ -4870,7 +4899,7 @@ def create_comparison_figure(
             axis = axes[row_idx, col_idx]
             rendered_title = title
             if row_idx == 0:
-                rendered_title = f"{row.candidate_id} (rank {row.rank})\n{title}"
+                rendered_title = f"{_comparison_row_label(row, rows)} (rank {row.rank})\n{title}"
             _draw_image_panel(
                 fig,
                 axis,
@@ -4920,7 +4949,7 @@ def create_candidate_robustness_figure(
     ax.set_xticks(range(len(datasets)))
     ax.set_xticklabels(datasets, rotation=25, ha="right")
     ax.set_yticks(range(len(rows)))
-    ax.set_yticklabels([row.candidate_id for row in rows])
+    ax.set_yticklabels([_comparison_row_label(row, rows) for row in rows])
     ax.set_title("Selected candidates across datasets")
     ax.set_xlabel("dataset")
     ax.set_ylabel("candidate")
@@ -6917,7 +6946,9 @@ def _sweep_visualization_app_init(
     self.leaderboard_family_var = tk.StringVar(value="All")
     self.leaderboard_alpha_var = tk.StringVar(value="All")
     self.generation_scope_var = tk.StringVar(value=GENERATION_SCOPE_ALL)
-    self.comparison_stage_var = tk.StringVar(value="")
+    self.comparison_stage_a_var = tk.StringVar(value="")
+    self.comparison_stage_b_var = tk.StringVar(value="")
+    self.comparison_stage_var = self.comparison_stage_a_var
     self.comparison_dataset_var = tk.StringVar(value="")
     self.comparison_component_var = tk.StringVar(value="gradient")
     self.comparison_sync_var = tk.BooleanVar(value=True)
@@ -7219,15 +7250,25 @@ def _sweep_visualization_build_comparison_tab(self: SweepVisualizationApp) -> No
     self.ttk.Button(controls, text="Use 2 Selected", command=self._assign_comparison_slots_from_selection).pack(side="left", padx=3)
     self.ttk.Button(controls, text="Swap", command=self._swap_comparison_slots).pack(side="left", padx=3)
     self.ttk.Button(controls, text="Clear", command=self._clear_comparison_slots).pack(side="left", padx=3)
-    self.ttk.Label(controls, text="Stage").pack(side="left")
-    self.comparison_stage_combo = self.ttk.Combobox(
+    self.ttk.Label(controls, text="A Stage").pack(side="left")
+    self.comparison_stage_a_combo = self.ttk.Combobox(
         controls,
-        textvariable=self.comparison_stage_var,
+        textvariable=self.comparison_stage_a_var,
         state="readonly",
         width=14,
     )
-    self.comparison_stage_combo.pack(side="left", padx=4)
-    self.comparison_stage_combo.bind("<<ComboboxSelected>>", lambda _evt: self.refresh_comparison())
+    self.comparison_stage_a_combo.pack(side="left", padx=4)
+    self.comparison_stage_a_combo.bind("<<ComboboxSelected>>", lambda _evt: self._on_comparison_stage_changed("A"))
+    self.comparison_stage_combo = self.comparison_stage_a_combo
+    self.ttk.Label(controls, text="B Stage").pack(side="left", padx=(8, 0))
+    self.comparison_stage_b_combo = self.ttk.Combobox(
+        controls,
+        textvariable=self.comparison_stage_b_var,
+        state="readonly",
+        width=14,
+    )
+    self.comparison_stage_b_combo.pack(side="left", padx=4)
+    self.comparison_stage_b_combo.bind("<<ComboboxSelected>>", lambda _evt: self._on_comparison_stage_changed("B"))
     self.ttk.Label(controls, text="Dataset").pack(side="left", padx=(8, 0))
     self.comparison_dataset_combo = self.ttk.Combobox(
         controls,
@@ -7565,10 +7606,11 @@ def _sweep_visualization_on_leaderboard_selection_changed(
         self._format_leaderboard_detail_text(selected_rows),
     )
     if selected_rows and self.model is not None:
-        self.comparison_stage_var.set(selected_rows[0].stage)
         if self._comparison_slot_a_key is None and self._comparison_slot_b_key is None and not self._comparison_slots_cleared:
+            self._set_comparison_stage_for_slot("A", selected_rows[0].stage)
             self._comparison_slot_a_key = self._selection_for_row(selected_rows[0]).key
             if len(selected_rows) > 1:
+                self._set_comparison_stage_for_slot("B", selected_rows[1].stage)
                 self._comparison_slot_b_key = self._selection_for_row(selected_rows[1]).key
         self._seed_diagnostics_from_row(
             selected_rows[0],
@@ -7697,6 +7739,114 @@ def _sweep_visualization_comparison_dataset(self: SweepVisualizationApp) -> str:
     return self.comparison_dataset_var.get() or _default_comparison_dataset(self.model)
 
 
+def _comparison_key_identity(key: RectificationResultKey) -> Tuple[str, str, Optional[str]]:
+    stage_name, candidate_id, _dataset_id, generation_id = _unpack_rectification_key(key)
+    return stage_name, candidate_id, generation_id
+
+
+def _sweep_visualization_comparison_stage_for_slot(
+    self: SweepVisualizationApp,
+    slot_name: str,
+) -> str:
+    if self.model is None:
+        return ""
+    var = self.comparison_stage_a_var if slot_name == "A" else self.comparison_stage_b_var
+    stage_name = var.get() or self.model.primary_stage_name
+    if stage_name not in self.model.stage_order:
+        stage_name = self.model.primary_stage_name
+        var.set(stage_name)
+    return stage_name
+
+
+def _sweep_visualization_set_comparison_stage_for_slot(
+    self: SweepVisualizationApp,
+    slot_name: str,
+    stage_name: str,
+) -> None:
+    var = self.comparison_stage_a_var if slot_name == "A" else self.comparison_stage_b_var
+    var.set(stage_name)
+
+
+def _sweep_visualization_default_comparison_key_for_stage(
+    self: SweepVisualizationApp,
+    stage_name: str,
+    *,
+    exclude_key: Optional[RectificationResultKey] = None,
+) -> Optional[RectificationResultKey]:
+    if self.model is None:
+        return None
+    rows = _rows_for_stage(self.model, stage_name)
+    if not rows:
+        return None
+    fallback = rows[0]
+    exclude_identity = _comparison_key_identity(exclude_key) if exclude_key is not None else None
+    for row in rows:
+        row_identity = (row.stage, row.candidate_id, row.generation_id)
+        if exclude_identity is not None and row_identity == exclude_identity:
+            continue
+        return self._selection_for_row(row).key
+    return self._selection_for_row(fallback).key
+
+
+def _sweep_visualization_comparison_slot_needs_seed(
+    self: SweepVisualizationApp,
+    key: Optional[RectificationResultKey],
+    stage_name: str,
+) -> bool:
+    if key is None:
+        return True
+    key_stage, _candidate_id, _dataset_id, _generation_id = _unpack_rectification_key(key)
+    if key_stage != stage_name:
+        return True
+    return self._row_for_comparison_key(key) is None
+
+
+def _sweep_visualization_sync_comparison_slots_to_stage_controls(
+    self: SweepVisualizationApp,
+    *,
+    force_slot: Optional[str] = None,
+) -> None:
+    if self.model is None or self._comparison_slots_cleared:
+        return
+    stage_a = self._comparison_stage_for_slot("A")
+    stage_b = self._comparison_stage_for_slot("B")
+
+    key_a = self._comparison_slot_a_key
+    key_b = self._comparison_slot_b_key
+    if force_slot in {None, "A"} and (
+        force_slot == "A" or self._comparison_slot_needs_seed(key_a, stage_a)
+    ):
+        exclude = key_b if stage_a == stage_b else None
+        key_a = self._default_comparison_key_for_stage(stage_a, exclude_key=exclude)
+        self._comparison_slot_a_key = key_a
+
+    if force_slot in {None, "B"} and (
+        force_slot == "B" or self._comparison_slot_needs_seed(key_b, stage_b)
+    ):
+        exclude = key_a if stage_a == stage_b else None
+        key_b = self._default_comparison_key_for_stage(stage_b, exclude_key=exclude)
+        self._comparison_slot_b_key = key_b
+
+    if (
+        stage_a == stage_b
+        and key_a is not None
+        and key_b is not None
+        and _comparison_key_identity(key_a) == _comparison_key_identity(key_b)
+    ):
+        replacement = self._default_comparison_key_for_stage(stage_b, exclude_key=key_a)
+        if replacement is not None:
+            self._comparison_slot_b_key = replacement
+
+
+def _sweep_visualization_on_comparison_stage_changed(
+    self: SweepVisualizationApp,
+    slot_name: str,
+) -> None:
+    self._comparison_slots_cleared = False
+    self._sync_comparison_slots_to_stage_controls(force_slot=slot_name)
+    self.refresh_comparison()
+
+
 def _sweep_visualization_selection_for_row(
     self: SweepVisualizationApp,
     row: CandidateVisualizationRow,
@@ -7780,6 +7930,7 @@ def _sweep_visualization_set_comparison_slot(
         return
     row = selected[0] if slot_name == "A" or len(selected) == 1 else selected[1]
     key = self._selection_for_row(row).key
+    self._set_comparison_stage_for_slot(slot_name, row.stage)
     if slot_name == "A":
         self._comparison_slot_a_key = key
     else:
@@ -7793,6 +7944,8 @@ def _sweep_visualization_assign_comparison_slots_from_selection(self: SweepVisua
     if len(selected) < 2:
         self.messagebox.showwarning("Comparison", "Select two leaderboard rows to compare.")
         return
+    self._set_comparison_stage_for_slot("A", selected[0].stage)
+    self._set_comparison_stage_for_slot("B", selected[1].stage)
     self._comparison_slot_a_key = self._selection_for_row(selected[0]).key
     self._comparison_slot_b_key = self._selection_for_row(selected[1]).key
     self._comparison_slots_cleared = False
@@ -7804,6 +7957,9 @@ def _sweep_visualization_swap_comparison_slots(self: SweepVisualizationApp) -> N
         self._comparison_slot_b_key,
         self._comparison_slot_a_key,
     )
+    stage_a = self.comparison_stage_a_var.get()
+    self.comparison_stage_a_var.set(self.comparison_stage_b_var.get())
+    self.comparison_stage_b_var.set(stage_a)
     self.refresh_comparison()
 
 
@@ -7825,18 +7981,9 @@ def _sweep_visualization_update_comparison_dataset_keys(self: SweepVisualization
 
 
 def _sweep_visualization_ensure_default_comparison_slots(self: SweepVisualizationApp) -> None:
-    if (
-        self.model is None
-        or self._comparison_slots_cleared
-        or self._comparison_slot_a_key is not None
-        or self._comparison_slot_b_key is not None
-    ):
+    if self.model is None or self._comparison_slots_cleared:
         return
-    rows = self._comparison_rows()
-    if rows:
-        self._comparison_slot_a_key = self._selection_for_row(rows[0]).key
-    if len(rows) > 1:
-        self._comparison_slot_b_key = self._selection_for_row(rows[1]).key
+    self._sync_comparison_slots_to_stage_controls()
 
 
 def _sweep_visualization_on_comparison_channel_changed(
@@ -7888,8 +8035,7 @@ def _sweep_visualization_comparison_rows(
     ]
     if keyed_rows:
         return keyed_rows
-    stage_name = self.comparison_stage_var.get() or self.model.primary_stage_name
-    selected = [row for row in self._selected_leaderboard_rows() if row.stage == stage_name]
+    selected = self._selected_leaderboard_rows()
     unique_rows: List[CandidateVisualizationRow] = []
     seen = set()
     for row in selected:
@@ -7899,17 +8045,26 @@ def _sweep_visualization_comparison_rows(
         unique_rows.append(row)
     if unique_rows:
         return unique_rows[:2]
-    return _top_candidates_for_stage(self.model, stage_name, limit=2)
+    stage_a = self._comparison_stage_for_slot("A")
+    stage_b = self._comparison_stage_for_slot("B")
+    key_a = self._default_comparison_key_for_stage(stage_a)
+    key_b = self._default_comparison_key_for_stage(
+        stage_b,
+        exclude_key=key_a if stage_a == stage_b else None,
+    )
+    return [
+        row
+        for row in (
+            self._row_for_comparison_key(key_a),
+            self._row_for_comparison_key(key_b),
+        )
+        if row is not None
+    ]
 
 
 def _sweep_visualization_refresh_comparison(self: SweepVisualizationApp) -> None:
     if self.model is None:
         return
-    current_stage = self.comparison_stage_var.get() or self.model.primary_stage_name
-    if self._comparison_slot_a_key is not None and self._comparison_slot_a_key[0] != current_stage:
-        self._comparison_slot_a_key = None
-    if self._comparison_slot_b_key is not None and self._comparison_slot_b_key[0] != current_stage:
-        self._comparison_slot_b_key = None
     self._update_comparison_dataset_keys()
     self._ensure_default_comparison_slots()
     dataset_id = self._comparison_dataset()
@@ -8271,7 +8426,10 @@ def _sweep_visualization_populate_from_model(
 
     dataset_values = _real_datasets(model)
     self.comparison_stage_combo["values"] = model.stage_order
-    self.comparison_stage_var.set(model.primary_stage_name)
+    self.comparison_stage_a_combo["values"] = model.stage_order
+    self.comparison_stage_b_combo["values"] = model.stage_order
+    self.comparison_stage_a_var.set(model.primary_stage_name)
+    self.comparison_stage_b_var.set(model.primary_stage_name)
     self.comparison_dataset_combo["values"] = dataset_values
     self.comparison_dataset_var.set(_default_comparison_dataset(model))
     diagnostic_components = cast(List[str], model.diagnostic_availability.get("components", []))
@@ -8322,6 +8480,12 @@ SweepVisualizationApp._sensitivity_filters = _sweep_visualization_sensitivity_fi
 SweepVisualizationApp.refresh_sensitivity = _sweep_visualization_refresh_sensitivity
 SweepVisualizationApp.refresh_extension_suggestions = _sweep_visualization_refresh_extension_suggestions
 SweepVisualizationApp._comparison_dataset = _sweep_visualization_comparison_dataset
+SweepVisualizationApp._comparison_stage_for_slot = _sweep_visualization_comparison_stage_for_slot
+SweepVisualizationApp._set_comparison_stage_for_slot = _sweep_visualization_set_comparison_stage_for_slot
+SweepVisualizationApp._default_comparison_key_for_stage = _sweep_visualization_default_comparison_key_for_stage
+SweepVisualizationApp._comparison_slot_needs_seed = _sweep_visualization_comparison_slot_needs_seed
+SweepVisualizationApp._sync_comparison_slots_to_stage_controls = _sweep_visualization_sync_comparison_slots_to_stage_controls
+SweepVisualizationApp._on_comparison_stage_changed = _sweep_visualization_on_comparison_stage_changed
 SweepVisualizationApp._selection_for_row = _sweep_visualization_selection_for_row
 SweepVisualizationApp._row_for_comparison_key = _sweep_visualization_row_for_key
 SweepVisualizationApp._comparison_key_label = _sweep_visualization_key_label
