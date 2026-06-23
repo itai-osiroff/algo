@@ -115,6 +115,32 @@ def test_state_to_spec_roundtrip_with_metric_experiments(tmp_path):
     assert roundtrip.metric_experiment_rows[1].family == "blurred_composite_corr"
 
 
+def test_new_metric_experiment_gui_state_defaults_to_independent_intensity(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.metric_experiments_enabled = True
+    state.metric_experiment_rows = [SpecGuiMetricExperimentRowState()]
+
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    experimental = payload["experimental_metric_sweep"]
+    assert experimental["candidate_source"] == "independent_search"
+    assert experimental["search_stages"]["total_budget_per_dataset"] == int(
+        state.metric_experiments_shortlist_top_k
+    )
+    assert experimental["formulations"] == [
+        {
+            "id": "intensity_default",
+            "family": "intensity",
+            "alphas": [1.0],
+        }
+    ]
+    assert roundtrip.metric_experiments_candidate_source == "independent_search"
+    assert roundtrip.metric_experiment_rows[0].formulation_id == "intensity_default"
+    assert roundtrip.metric_experiment_rows[0].family == "intensity"
+    assert roundtrip.metric_experiment_rows[0].alphas == "1.0"
+
+
 def test_state_to_spec_roundtrip_with_scoring_profile(tmp_path):
     state = _build_valid_state(tmp_path)
     config_path = tmp_path / "metrics_config.json"

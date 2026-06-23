@@ -299,6 +299,35 @@ def _skip_run_state_entry(discovery: StageDiscovery, entry: Dict[str, object], r
     discovery.skipped_entries.append(skipped)
 
 
+def _normalize_metric_record_identity_from_entry(
+    *,
+    metric_record: Dict[str, object],
+    entry: Dict[str, object],
+    stage_name: str,
+    run_uid: str,
+    candidate_id: str,
+    dataset_id: str,
+    strategy: str,
+    config: Dict[str, object],
+) -> Dict[str, object]:
+    normalized = dict(metric_record)
+    normalized.update(
+        {
+            "run": run_uid,
+            "run_uid": run_uid,
+            "stage": stage_name,
+            "candidate_id": candidate_id,
+            "dataset_id": dataset_id,
+            "strategy": strategy,
+            "config": dict(config),
+        }
+    )
+    for key in ("candidate_signature", "dataset_signature", "run_signature", "artifact_paths"):
+        if key in entry:
+            normalized[key] = entry[key]
+    return normalized
+
+
 def _run_result_from_entry(
     *,
     output_dir: Path,
@@ -361,16 +390,30 @@ def _run_result_from_entry(
     for key in ("candidate_signature", "dataset_signature", "run_signature", "artifact_paths"):
         if key in entry and key not in metric_record:
             metric_record[key] = entry[key]
+    strategy = (
+        _coerce_nonempty_str(entry.get("strategy"))
+        or _coerce_nonempty_str(config.get("subpixel_mode"))
+        or _coerce_nonempty_str(config.get("strategy"))
+        or "unknown"
+    )
+    metric_record = _normalize_metric_record_identity_from_entry(
+        metric_record=metric_record,
+        entry=entry,
+        stage_name=stage_name,
+        run_uid=run_uid,
+        candidate_id=candidate_id,
+        dataset_id=dataset_id,
+        strategy=strategy,
+        config=config,
+    )
 
     return {
-        "run": _coerce_nonempty_str(metric_record.get("run")) or run_uid,
+        "run": run_uid,
         "status": "ok",
         "stage": stage_name,
         "candidate_id": candidate_id,
         "dataset_id": dataset_id,
-        "strategy": _coerce_nonempty_str(entry.get("strategy"))
-        or _coerce_nonempty_str(config.get("subpixel_mode"))
-        or "unknown",
+        "strategy": strategy,
         "run_uid": run_uid,
         "run_dir": str(run_dir),
         "config": config,

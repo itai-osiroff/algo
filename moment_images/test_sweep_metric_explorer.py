@@ -299,6 +299,86 @@ def test_load_sweep_metric_explorer_model_recomputes_metrics_and_profiles(tmp_pa
     assert good_d1.metrics["hoyer_avg"] > bad_d2.metrics["hoyer_avg"]
 
 
+def test_metric_explorer_model_keeps_reused_metric_stage_records_public(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    metric_dir = output_dir / "metric_experiments"
+    stale_run_name = "metric_stage1_m_metric_d1"
+    state = json.loads((output_dir / "run_state.json").read_text(encoding="utf-8"))
+    state["stages"]["metric_phase"] = {"planned_runs": 1, "completed_runs": 1}
+    state["runs"]["metric_phase_m_metric_d1"] = {
+        "run_uid": "metric_phase_m_metric_d1",
+        "stage": "metric_phase",
+        "candidate_id": "m_metric",
+        "dataset_id": "d1",
+        "status": "skipped_valid",
+        "run_dir": str(metric_dir / "runs" / "metric_phase" / "m_metric" / "d1"),
+    }
+    _write_json(output_dir / "run_state.json", state)
+    metric_ranking = {
+        "candidate_id": "m_metric",
+        "strategy": "combined",
+        "config": {
+            "strategy": "combined",
+            "displacement_metric_family": "intensity",
+            "displacement_alpha": 1.0,
+            "metric_formulation_id": "intensity_default",
+            "max_displacement": 5,
+            "gauss_sigma": 3.0,
+        },
+        "params": {
+            "max_displacement": 5,
+            "gauss_sigma": 3.0,
+            "pixel_threshold": 0.05,
+        },
+        "score": 0.99,
+        "mean_dataset_score": 0.99,
+        "std_dataset_score": 0.0,
+        "missing_datasets": [],
+        "dataset_scores": {"d1": 0.99},
+        "runtime_seconds": {"d1": 1.0},
+        "dataset_metrics": {"d1": {"laplacian_variance": 99.0}},
+        "rank": 1,
+    }
+    _write_json(
+        metric_dir / "metric_phase_summary.json",
+        {
+            "stage": "metric_phase",
+            "num_runs": 1,
+            "num_successful": 1,
+            "num_failed": 0,
+            "rankings": [metric_ranking],
+            "failed_runs": [],
+            "runs": [],
+            "execution": {"selected_workers": 1, "requested_workers": 1},
+        },
+    )
+    metric_record = {
+        "run": stale_run_name,
+        "config": metric_ranking["config"],
+        "global_and_local_metrics": {
+            "laplacian_variance": 99.0,
+            "sum_squared_gradient": 10.0,
+            "total_variation": 5.0,
+        },
+    }
+    _write_json(metric_dir / "summary.json", [metric_record])
+    run_dir = metric_dir / "runs" / "metric_phase" / "m_metric" / "d1"
+    _write_json(run_dir / "metric_record.json", metric_record)
+    _write_preview(run_dir / "avg_rectified.png", np.full((16, 16), 127, dtype=np.uint8))
+
+    model = load_sweep_metric_explorer_model(output_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+
+    assert any(
+        record.stage == "metric_phase" and record.candidate_id == "m_metric"
+        for record in model.base_model.run_metric_records
+    )
+    assert not any(record.stage == "metric_stage1" for record in model.base_model.run_metric_records)
+    assert not any(
+        record.candidate_id == "stage1_m_metric"
+        for record in model.base_model.run_metric_records
+    )
+
+
 def test_metric_explorer_scores_all_generation_occurrences_by_default(tmp_path):
     output_dir = _make_modern_fixture(tmp_path)
     state = json.loads((output_dir / "run_state.json").read_text(encoding="utf-8"))

@@ -53,6 +53,8 @@ from moment_images.rectification_strategy import (
     BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
     BLURRED_GRADIENT_CORR_METRIC_FAMILY,
     BLURRED_LAPLACIAN_CORR_METRIC_FAMILY,
+    DEFAULT_DISPLACEMENT_ALPHA,
+    DEFAULT_DISPLACEMENT_METRIC_FAMILY,
     normalize_displacement_metric_family,
 )
 from moment_images.reliable_io import (
@@ -87,6 +89,15 @@ THREAD_LIMIT_ENV_VARS = (
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
 )
+
+METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST = "baseline_shortlist"
+METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH = "independent_search"
+METRIC_CANDIDATE_SOURCES = {
+    METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST,
+    METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH,
+}
+METRIC_SEARCH_STAGE1_NAME = "metric_stage1"
+METRIC_PHASE_STAGE_NAME = "metric_phase"
 
 
 class LiveMetricsPlotter:
@@ -336,6 +347,27 @@ class SweepStageSpec:
             )
 
 
+def _stage_spec_from_dict(payload: Optional[Dict[str, object]]) -> SweepStageSpec:
+    raw = payload or {}
+    return SweepStageSpec(
+        mode=cast(
+            Literal["two_stage", "single_stage"],
+            str(raw.get("mode", "two_stage")),
+        ),
+        total_budget_per_dataset=int(raw.get("total_budget_per_dataset", 320)),
+        stage1_fraction=float(raw.get("stage1_fraction", 0.6)),
+        top_k=int(raw.get("top_k", 8)),
+        max_workers=(
+            None
+            if raw.get("max_workers") is None
+            else int(cast(object, raw.get("max_workers")))
+        ),
+        refinement=SweepStageRefinementSpec.from_dict(
+            cast(Optional[Dict[str, object]], raw.get("refinement"))
+        ),
+    )
+
+
 @dataclass
 class SweepScoringSpec:
     """Controls composite metric scoring and robustness aggregation."""
@@ -373,6 +405,13 @@ class MetricFormulationSpec:
             if not np.isfinite(alpha) or alpha < 0.0 or alpha > 1.0:
                 raise ValueError("metric_formulations alpha values must be finite and in [0, 1].")
         self.alphas = normalized_alphas
+
+        if self.family == DEFAULT_DISPLACEMENT_METRIC_FAMILY:
+            if self.component_weights is not None:
+                raise ValueError("Intensity metric formulations do not accept component_weights.")
+            if self.alphas != [DEFAULT_DISPLACEMENT_ALPHA]:
+                raise ValueError("Intensity metric formulations require alpha=1.0.")
+            return
 
         if self.component_weights is None:
             return
@@ -460,6 +499,22 @@ def _clone_metric_formulation(spec: MetricFormulationSpec) -> MetricFormulationS
     )
 
 
+def _clone_stage_spec(spec: Optional[SweepStageSpec]) -> Optional[SweepStageSpec]:
+    if spec is None:
+        return None
+    return SweepStageSpec(
+        mode=spec.mode,
+        total_budget_per_dataset=int(spec.total_budget_per_dataset),
+        stage1_fraction=float(spec.stage1_fraction),
+        top_k=int(spec.top_k),
+        max_workers=spec.max_workers,
+        refinement=SweepStageRefinementSpec(
+            method=spec.refinement.method,
+            extrapolation=spec.refinement.extrapolation,
+        ),
+    )
+
+
 def _parse_metric_formulations_payload(
     formulations_raw: Optional[List[Dict[str, object]]],
     *,
@@ -489,6 +544,40 @@ class ExperimentalMetricSweepSpec:
     enabled: bool = False
     shortlist_top_k: int = 8
     formulations: List[MetricFormulationSpec] = field(default_factory=list)
+    candidate_source: Literal["baseline_shortlist", "independent_search"] = (
+        METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST
+    )
+    search_stages: Optional[SweepStageSpec] = None
+
+    def __post_init__(self) -> None:
+        self.shortlist_top_k = int(self.shortlist_top_k)
+        if self.shortlist_top_k < 1:
+            raise ValueError("experimental_metric_sweep.shortlist_top_k must be >= 1.")
+
+        source = str(self.candidate_source).strip().lower()
+        if source not in METRIC_CANDIDATE_SOURCES:
+            raise ValueError(
+                "experimental_metric_sweep.candidate_source must be either "
+                "'baseline_shortlist' or 'independent_search'."
+            )
+        self.candidate_source = cast(
+            Literal["baseline_shortlist", "independent_search"], source
+        )
+
+        if self.search_stages is not None and not isinstance(
+            self.search_stages, SweepStageSpec
+        ):
+            self.search_stages = _stage_spec_from_dict(
+                cast(Dict[str, object], self.search_stages)
+            )
+        if self.candidate_source == METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH:
+            if self.search_stages is None:
+                self.search_stages = SweepStageSpec(
+                    total_budget_per_dataset=self.shortlist_top_k,
+                    top_k=self.shortlist_top_k,
+                )
+        else:
+            self.search_stages = None
 
     @classmethod
     def from_dict(
@@ -511,10 +600,27 @@ class ExperimentalMetricSweepSpec:
             raise ValueError(
                 "experimental_metric_sweep.formulations cannot be empty when enabled."
             )
+        candidate_source = str(
+            payload.get(
+                "candidate_source", METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST
+            )
+        )
+        search_stages_raw = payload.get("search_stages")
+        if search_stages_raw is not None and not isinstance(search_stages_raw, dict):
+            raise ValueError("experimental_metric_sweep.search_stages must be an object.")
+        search_stages = (
+            _stage_spec_from_dict(cast(Dict[str, object], search_stages_raw))
+            if search_stages_raw is not None
+            else None
+        )
         return cls(
             enabled=enabled,
             shortlist_top_k=shortlist_top_k,
             formulations=formulations,
+            candidate_source=cast(
+                Literal["baseline_shortlist", "independent_search"], candidate_source
+            ),
+            search_stages=search_stages,
         )
 
 
@@ -557,6 +663,8 @@ class SweepExperimentSpec:
                 enabled=True,
                 shortlist_top_k=experimental.shortlist_top_k,
                 formulations=legacy_formulations,
+                candidate_source=experimental.candidate_source,
+                search_stages=_clone_stage_spec(experimental.search_stages),
             )
 
         if int(experimental.shortlist_top_k) < 1:
@@ -587,6 +695,8 @@ class SweepExperimentSpec:
             enabled=bool(experimental.enabled),
             shortlist_top_k=int(experimental.shortlist_top_k),
             formulations=cloned_formulations,
+            candidate_source=experimental.candidate_source,
+            search_stages=_clone_stage_spec(experimental.search_stages),
         )
         self.metric_formulations = [
             _clone_metric_formulation(item)
@@ -2279,6 +2389,7 @@ def _normalize_fingerprint_payload_for_resume_compat(
                         dataset_entry[key] = f"<{key}>"
                 normalized_datasets.append(dataset_entry)
             spec_snapshot["datasets"] = normalized_datasets
+        spec_snapshot = _normalize_metric_sweep_fingerprint_defaults(spec_snapshot)
         normalized["spec"] = spec_snapshot
 
     datasets_payload = normalized.get("datasets")
@@ -2296,6 +2407,29 @@ def _normalize_fingerprint_payload_for_resume_compat(
         normalized["datasets"] = normalized_dataset_payload
 
     return normalized
+
+
+def _normalize_metric_sweep_fingerprint_defaults(
+    spec_snapshot: Dict[str, object],
+) -> Dict[str, object]:
+    normalized_spec = dict(spec_snapshot)
+    experimental_raw = normalized_spec.get("experimental_metric_sweep")
+    if not isinstance(experimental_raw, dict):
+        return normalized_spec
+
+    experimental = dict(experimental_raw)
+    source = str(
+        experimental.get("candidate_source", METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST)
+    ).strip().lower()
+    if source in METRIC_CANDIDATE_SOURCES:
+        experimental["candidate_source"] = source
+        if source == METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST:
+            experimental["search_stages"] = None
+    elif "candidate_source" not in experimental:
+        experimental["candidate_source"] = METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST
+        experimental["search_stages"] = None
+    normalized_spec["experimental_metric_sweep"] = experimental
+    return normalized_spec
 
 
 def _fingerprint_payloads_resume_compatible(
@@ -2696,26 +2830,85 @@ def _validate_run_artifacts(run_dir: Path) -> Dict[str, object]:
     return diagnostics
 
 
-def _load_cached_stage_result(task: Dict[str, object], run_dir: Path) -> Dict[str, object]:
+def _metric_formulation_payload_for_task(task: Dict[str, object]) -> Dict[str, object]:
+    family, alpha, component_weights, formulation_id = _metric_formulation_from_params(
+        dict(cast(Dict[str, object], task["params"]))
+    )
+    return {
+        "id": formulation_id,
+        "family": family,
+        "alpha": float(alpha),
+        "component_weights": (
+            None if component_weights is None else dict(component_weights)
+        ),
+    }
+
+
+def _normalize_cached_metric_record_identity(
+    task: Dict[str, object],
+    metric_record: Dict[str, object],
+    artifact_paths: Dict[str, str],
+) -> Dict[str, object]:
+    normalized = dict(metric_record)
+    normalized.update(
+        {
+            "run": str(task["run_uid"]),
+            "run_uid": str(task["run_uid"]),
+            "stage": str(task["stage"]),
+            "candidate_id": str(task["candidate_id"]),
+            "dataset_id": str(task["dataset_id"]),
+            "strategy": str(task["strategy"]),
+            "config": dict(cast(Dict[str, object], task["config"])),
+            "metric_formulation": _metric_formulation_payload_for_task(task),
+            "candidate_signature": task.get("candidate_signature"),
+            "dataset_signature": task.get("dataset_signature"),
+            "run_signature": task.get("run_signature"),
+            "generation_id": task.get("generation_id"),
+            "artifact_paths": artifact_paths,
+        }
+    )
+    return normalized
+
+
+def _load_cached_stage_result(
+    task: Dict[str, object],
+    run_dir: Path,
+    *,
+    persist_identity: bool = True,
+) -> Dict[str, object]:
     config_payload, _, _ = read_json_first_valid(
         run_dir / "config.json",
         validator=lambda obj: isinstance(obj, dict),
     )
-    metric_record, _, _ = read_json_first_valid(
+    metric_record_payload, _, _ = read_json_first_valid(
         run_dir / "metric_record.json",
         validator=lambda obj: isinstance(obj, dict),
     )
     artifact_paths = _artifact_paths_payload(run_dir)
-    metric_record = dict(cast(Dict[str, object], metric_record))
-    for key in (
-        "candidate_signature",
-        "dataset_signature",
-        "run_signature",
-        "generation_id",
-        "artifact_paths",
-    ):
-        if key in task and key not in metric_record:
-            metric_record[key] = task[key]
+    config_payload = dict(cast(Dict[str, object], config_payload))
+    task_config = dict(cast(Dict[str, object], task["config"]))
+    metric_record = _normalize_cached_metric_record_identity(
+        task,
+        dict(cast(Dict[str, object], metric_record_payload)),
+        artifact_paths,
+    )
+    if persist_identity:
+        if config_payload != task_config:
+            write_json_atomic(
+                run_dir / "config.json",
+                task_config,
+                indent=2,
+                sort_keys=False,
+                create_backup=True,
+            )
+        if metric_record != metric_record_payload:
+            write_json_atomic(
+                run_dir / "metric_record.json",
+                metric_record,
+                indent=2,
+                sort_keys=False,
+                create_backup=True,
+            )
     return {
         "status": "ok",
         "stage": str(task["stage"]),
@@ -2725,7 +2918,7 @@ def _load_cached_stage_result(task: Dict[str, object], run_dir: Path) -> Dict[st
         "run_uid": str(task["run_uid"]),
         "run_dir": str(run_dir),
         "runtime_seconds": float(0.0),
-        "config": config_payload,
+        "config": task_config,
         "params": task["params"],
         "metric_record": metric_record,
         "candidate_signature": task.get("candidate_signature"),
@@ -3359,7 +3552,7 @@ def _source_experiment_root(source_root: Path) -> Path:
 
 def _source_base_for_stage(source_root: Path, stage_name: str) -> Path:
     root = _source_experiment_root(source_root)
-    if stage_name == "metric_phase":
+    if stage_name in {METRIC_PHASE_STAGE_NAME, METRIC_SEARCH_STAGE1_NAME}:
         return root / "metric_experiments"
     return root
 
@@ -3558,6 +3751,47 @@ def _adopt_existing_signature_artifacts(
         _copy_run_artifacts_dir(source_run_dir, destination_run_dir)
 
 
+def _adopt_existing_candidate_dataset_artifacts(
+    *,
+    tasks: Sequence[Dict[str, object]],
+    state_runs: Dict[str, Dict[str, object]],
+) -> None:
+    """Copy valid artifacts with the same config and dataset across stages."""
+
+    entries_by_identity: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for entry in state_runs.values():
+        if not isinstance(entry, dict):
+            continue
+        candidate_signature = str(entry.get("candidate_signature", ""))
+        dataset_signature = str(entry.get("dataset_signature", ""))
+        if not candidate_signature or not dataset_signature:
+            continue
+        key = (candidate_signature, dataset_signature)
+        if key not in entries_by_identity:
+            entries_by_identity[key] = cast(Dict[str, object], entry)
+
+    for task in tasks:
+        destination_run_dir = Path(cast(str, task["run_dir"]))
+        if destination_run_dir.exists():
+            continue
+        key = (
+            str(task.get("candidate_signature", "")),
+            str(task.get("dataset_signature", "")),
+        )
+        source_entry = entries_by_identity.get(key)
+        if source_entry is None:
+            continue
+        source_run_dir_raw = source_entry.get("run_dir")
+        if not source_run_dir_raw:
+            continue
+        source_run_dir = Path(str(source_run_dir_raw))
+        if source_run_dir == destination_run_dir:
+            continue
+        if not bool(_validate_run_artifacts(source_run_dir).get("valid", False)):
+            continue
+        _copy_run_artifacts_dir(source_run_dir, destination_run_dir)
+
+
 def _evaluate_stage(
     stage_name: str,
     candidates: Sequence[SweepCandidate],
@@ -3647,6 +3881,7 @@ def _evaluate_stage(
     )
     if state_runs and not dry_run:
         _adopt_existing_signature_artifacts(tasks=tasks, state_runs=state_runs)
+        _adopt_existing_candidate_dataset_artifacts(tasks=tasks, state_runs=state_runs)
     _merge_artifacts_for_tasks(
         tasks=tasks,
         stage_name=stage_name,
@@ -3704,7 +3939,11 @@ def _evaluate_stage(
 
         if bool(artifact_validation.get("valid", False)):
             try:
-                cached_result = _load_cached_stage_result(task, run_dir)
+                cached_result = _load_cached_stage_result(
+                    task,
+                    run_dir,
+                    persist_identity=not dry_run,
+                )
             except Exception:
                 task["_recompute_after_invalid"] = previous_status in {"ok", "recomputed", "skipped_valid"}
                 tasks_to_execute.append(task)
@@ -4178,6 +4417,307 @@ def _collect_metric_experiment_candidates(
     return _dedupe_candidates(metric_candidates)
 
 
+def _metric_formulation_variants(
+    formulations: Sequence[MetricFormulationSpec],
+) -> List[MetricFormulationSpec]:
+    variants: List[MetricFormulationSpec] = []
+    for formulation in formulations:
+        for alpha in formulation.alphas:
+            variants.append(
+                MetricFormulationSpec(
+                    formulation_id=formulation.formulation_id,
+                    family=formulation.family,
+                    alphas=[float(alpha)],
+                    component_weights=(
+                        None
+                        if formulation.component_weights is None
+                        else dict(formulation.component_weights)
+                    ),
+                )
+            )
+    return variants
+
+
+def _metric_variant_payload_from_values(
+    formulation_id: str,
+    family: str,
+    alpha: float,
+    component_weights: Optional[Dict[str, float]],
+) -> Dict[str, object]:
+    payload: Dict[str, object] = {
+        "id": str(formulation_id),
+        "family": normalize_displacement_metric_family(family),
+        "alpha": float(alpha),
+    }
+    if component_weights is not None:
+        payload["component_weights"] = dict(component_weights)
+    return payload
+
+
+def _metric_variant_key_from_values(
+    formulation_id: str,
+    family: str,
+    alpha: float,
+    component_weights: Optional[Dict[str, float]],
+) -> str:
+    return json.dumps(
+        _metric_variant_payload_from_values(
+            formulation_id,
+            family,
+            alpha,
+            component_weights,
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _metric_variant_key_from_formulation(formulation: MetricFormulationSpec) -> str:
+    return _metric_variant_key_from_values(
+        formulation.formulation_id,
+        formulation.family,
+        float(formulation.alphas[0]),
+        formulation.component_weights,
+    )
+
+
+def _metric_variant_key_from_params(params: Mapping[str, object]) -> str:
+    family, alpha, component_weights, formulation_id = _metric_formulation_from_params(
+        dict(params)
+    )
+    return _metric_variant_key_from_values(
+        formulation_id,
+        family,
+        alpha,
+        component_weights,
+    )
+
+
+def _metric_variant_payload_from_key(key: str) -> Dict[str, object]:
+    payload = json.loads(key)
+    return cast(Dict[str, object], payload)
+
+
+def _metric_search_stages(experimental_spec: ExperimentalMetricSweepSpec) -> SweepStageSpec:
+    return _clone_stage_spec(experimental_spec.search_stages) or SweepStageSpec(
+        total_budget_per_dataset=experimental_spec.shortlist_top_k,
+        top_k=experimental_spec.shortlist_top_k,
+    )
+
+
+def _independent_metric_stage_budgets(stage_spec: SweepStageSpec) -> Tuple[int, int]:
+    total = max(1, int(stage_spec.total_budget_per_dataset))
+    if stage_spec.mode == "single_stage":
+        return total, 0
+    return _stage_budgets(stage_spec)
+
+
+def _eligible_metric_search_strategies(spec: SweepExperimentSpec) -> List[str]:
+    return [strategy for strategy in spec.strategies if strategy in {"pixel", "combined"}]
+
+
+def _base_metric_search_candidates(
+    spec: SweepExperimentSpec,
+    *,
+    budget: int,
+) -> List[SweepCandidate]:
+    candidates: List[SweepCandidate] = []
+    for strategy in _eligible_metric_search_strategies(spec):
+        candidates.extend(generate_coarse_candidates(spec.search_spaces[strategy], budget=None))
+    candidates = _dedupe_candidates(candidates)
+    candidates.sort(key=lambda item: json.dumps(item.params, sort_keys=True))
+    return _limit_candidates(candidates, budget)
+
+
+def _collect_independent_metric_stage_candidates(
+    spec: SweepExperimentSpec,
+    experimental_spec: ExperimentalMetricSweepSpec,
+    *,
+    budget_per_variant: int,
+) -> List[SweepCandidate]:
+    candidates: List[SweepCandidate] = []
+    for variant in _metric_formulation_variants(experimental_spec.formulations):
+        base_candidates = _base_metric_search_candidates(
+            spec,
+            budget=budget_per_variant,
+        )
+        candidates.extend(
+            _expand_candidates_with_metric_formulations(base_candidates, [variant])
+        )
+    return _dedupe_candidates(candidates)
+
+
+def _collect_independent_metric_refined_candidates(
+    *,
+    metric_stage1_rankings: Sequence[Dict[str, object]],
+    metric_stage1_lookup: Dict[str, SweepCandidate],
+    search_spaces: Dict[str, SweepSearchSpace],
+    stage_spec: SweepStageSpec,
+    budget_per_variant: int,
+) -> List[SweepCandidate]:
+    grouped_rankings: Dict[str, List[Dict[str, object]]] = {}
+    for row in metric_stage1_rankings:
+        params = cast(Dict[str, object], row.get("params", {}))
+        grouped_rankings.setdefault(_metric_variant_key_from_params(params), []).append(
+            row
+        )
+
+    refined_candidates: List[SweepCandidate] = []
+    for rows in grouped_rankings.values():
+        refined = generate_refined_candidates(
+            ranked_candidates=rows,
+            candidate_lookup=metric_stage1_lookup,
+            search_spaces=search_spaces,
+            top_k=stage_spec.top_k,
+            budget=budget_per_variant,
+            refinement=stage_spec.refinement,
+        )
+        if not refined and rows:
+            best_id = str(rows[0].get("candidate_id", ""))
+            best = metric_stage1_lookup.get(best_id)
+            if best is not None:
+                refined = [best]
+        refined_candidates.extend(refined)
+
+    return _dedupe_candidates(refined_candidates)
+
+
+def _metric_candidate_count_payload(
+    candidates: Sequence[SweepCandidate],
+    *,
+    dataset_count: int,
+) -> List[Dict[str, object]]:
+    counts: Dict[str, int] = {}
+    for candidate in candidates:
+        key = _metric_variant_key_from_params(candidate.params)
+        counts[key] = counts.get(key, 0) + 1
+
+    rows: List[Dict[str, object]] = []
+    for key in sorted(counts):
+        payload = _metric_variant_payload_from_key(key)
+        payload["num_candidates"] = int(counts[key])
+        payload["num_runs"] = int(counts[key] * dataset_count)
+        rows.append(payload)
+    return rows
+
+
+def _metric_experiment_plan_payload(
+    *,
+    experimental_spec: ExperimentalMetricSweepSpec,
+    candidates: Sequence[SweepCandidate],
+    dataset_count: int,
+    status: str,
+    output_dir: Optional[Path] = None,
+    stage1_candidates: Sequence[SweepCandidate] = (),
+    stage1_execution: Optional[Dict[str, object]] = None,
+    final_execution: Optional[Dict[str, object]] = None,
+    num_ranked: int = 0,
+    num_results: Optional[int] = None,
+) -> Dict[str, object]:
+    search_stages = _metric_search_stages(experimental_spec)
+    planned_final_runs = len(candidates) * dataset_count
+    result_count = planned_final_runs if num_results is None else int(num_results)
+    payload: Dict[str, object] = {
+        "enabled": True,
+        "candidate_source": experimental_spec.candidate_source,
+        "output_dir": None if output_dir is None else str(output_dir.resolve()),
+        "status": status,
+        "shortlist_top_k": int(experimental_spec.shortlist_top_k),
+        "search_stages": asdict(search_stages)
+        if experimental_spec.candidate_source == METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH
+        else None,
+        "num_formulations": len(experimental_spec.formulations),
+        "num_variants": len(_metric_formulation_variants(experimental_spec.formulations)),
+        "num_candidates": len(candidates),
+        "num_planned_runs": int(planned_final_runs),
+        "num_runs": int(result_count),
+        "num_ranked": int(num_ranked),
+        "per_formulation": _metric_candidate_count_payload(
+            candidates,
+            dataset_count=dataset_count,
+        ),
+    }
+    if stage1_candidates:
+        payload["internal_stage1"] = {
+            "stage": METRIC_SEARCH_STAGE1_NAME,
+            "num_candidates": len(stage1_candidates),
+            "num_planned_runs": len(stage1_candidates) * dataset_count,
+            "per_formulation": _metric_candidate_count_payload(
+                stage1_candidates,
+                dataset_count=dataset_count,
+            ),
+            "execution": dict(stage1_execution or {}),
+        }
+    if final_execution is not None:
+        payload["execution"] = dict(final_execution)
+    return payload
+
+
+def _metric_experiment_dry_run_payload(
+    *,
+    spec: SweepExperimentSpec,
+    prepared_datasets: Sequence[PreparedDataset],
+) -> Dict[str, object]:
+    experimental_spec = (
+        spec.experimental_metric_sweep
+        if spec.experimental_metric_sweep is not None
+        else ExperimentalMetricSweepSpec(
+            enabled=False,
+            shortlist_top_k=spec.stages.top_k,
+            formulations=[],
+        )
+    )
+    if not experimental_spec.enabled:
+        return {
+            "enabled": False,
+            "candidate_source": experimental_spec.candidate_source,
+            "output_dir": None,
+            "status": "disabled",
+        }
+    if experimental_spec.candidate_source == METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST:
+        return {
+            "enabled": True,
+            "candidate_source": experimental_spec.candidate_source,
+            "output_dir": None,
+            "status": "requires_completed_baseline_rankings",
+            "shortlist_top_k": int(experimental_spec.shortlist_top_k),
+            "num_formulations": len(experimental_spec.formulations),
+            "num_variants": len(_metric_formulation_variants(experimental_spec.formulations)),
+        }
+
+    search_stages = _metric_search_stages(experimental_spec)
+    stage1_budget, stage2_budget = _independent_metric_stage_budgets(search_stages)
+    stage1_candidates = _collect_independent_metric_stage_candidates(
+        spec,
+        experimental_spec,
+        budget_per_variant=stage1_budget,
+    )
+    if search_stages.mode == "single_stage":
+        final_candidates = stage1_candidates
+    else:
+        # Candidate identities for refinement depend on metric-stage-1 rankings.
+        final_candidates = []
+        for variant in _metric_formulation_variants(experimental_spec.formulations):
+            base_candidates = _base_metric_search_candidates(
+                spec,
+                budget=stage2_budget,
+            )
+            final_candidates.extend(
+                _expand_candidates_with_metric_formulations(base_candidates, [variant])
+            )
+        final_candidates = _dedupe_candidates(final_candidates)
+
+    return _metric_experiment_plan_payload(
+        experimental_spec=experimental_spec,
+        candidates=final_candidates,
+        dataset_count=len(prepared_datasets),
+        status="planned",
+        stage1_candidates=stage1_candidates
+        if search_stages.mode != "single_stage"
+        else (),
+    )
+
+
 def _write_phase_summary_artifacts(
     *,
     output_dir: Path,
@@ -4234,6 +4774,131 @@ def _write_phase_summary_artifacts(
             primary_metric=reporting.primary_metric,
             tolerate_partial_outputs=reporting.tolerate_partial_outputs,
         )
+
+
+def _run_independent_metric_search_phase(
+    *,
+    spec: SweepExperimentSpec,
+    experimental_metric_spec: ExperimentalMetricSweepSpec,
+    prepared_datasets: Sequence[PreparedDataset],
+    dataset_ids: Sequence[str],
+    metric_output_dir: Path,
+    requested_workers: int,
+    run_state: Dict[str, object],
+    run_state_path: Path,
+    generation_id: Optional[str],
+    merge_sources: Sequence[Path],
+    merge_log: Dict[str, object],
+) -> Dict[str, object]:
+    search_stages = _metric_search_stages(experimental_metric_spec)
+    stage1_budget, stage2_budget = _independent_metric_stage_budgets(search_stages)
+    metric_stage1_candidates: List[SweepCandidate] = []
+    metric_stage1_execution: Optional[Dict[str, object]] = None
+
+    if search_stages.mode == "single_stage":
+        metric_candidates = _assign_candidate_ids(
+            _collect_independent_metric_stage_candidates(
+                spec,
+                experimental_metric_spec,
+                budget_per_variant=stage1_budget,
+            ),
+            "m1c",
+        )
+    else:
+        metric_stage1_candidates = _assign_candidate_ids(
+            _collect_independent_metric_stage_candidates(
+                spec,
+                experimental_metric_spec,
+                budget_per_variant=stage1_budget,
+            ),
+            "m1s1c",
+        )
+        metric_stage1_lookup = {
+            candidate.candidate_id: candidate for candidate in metric_stage1_candidates
+        }
+        metric_stage1_eval = _evaluate_stage(
+            stage_name=METRIC_SEARCH_STAGE1_NAME,
+            candidates=metric_stage1_candidates,
+            datasets=prepared_datasets,
+            output_dir=metric_output_dir,
+            save_figures_flag=spec.save_figures,
+            requested_workers=requested_workers,
+            scoring=spec.scoring,
+            run_state=run_state,
+            run_state_path=run_state_path,
+            generation_id=generation_id,
+            merge_sources=merge_sources,
+            merge_log=merge_log,
+            dry_run=False,
+        )
+        metric_stage1_execution = metric_stage1_eval.execution
+        metric_stage1_rankings = score_and_rank_runs(
+            metric_stage1_eval.stage_results,
+            spec.scoring,
+            dataset_ids=dataset_ids,
+        )
+        _write_stage_outputs(
+            METRIC_SEARCH_STAGE1_NAME,
+            metric_stage1_eval.stage_results,
+            metric_stage1_rankings,
+            metric_output_dir,
+            execution=metric_stage1_eval.execution,
+            generation_id=generation_id,
+        )
+        metric_candidates = _assign_candidate_ids(
+            _collect_independent_metric_refined_candidates(
+                metric_stage1_rankings=metric_stage1_rankings,
+                metric_stage1_lookup=metric_stage1_lookup,
+                search_spaces=spec.search_spaces,
+                stage_spec=search_stages,
+                budget_per_variant=stage2_budget,
+            ),
+            "m1c",
+        )
+
+    metric_eval = _evaluate_stage(
+        stage_name=METRIC_PHASE_STAGE_NAME,
+        candidates=metric_candidates,
+        datasets=prepared_datasets,
+        output_dir=metric_output_dir,
+        save_figures_flag=spec.save_figures,
+        requested_workers=requested_workers,
+        scoring=spec.scoring,
+        run_state=run_state,
+        run_state_path=run_state_path,
+        generation_id=generation_id,
+        merge_sources=merge_sources,
+        merge_log=merge_log,
+        dry_run=False,
+    )
+    metric_results = metric_eval.stage_results
+    metric_rankings = score_and_rank_runs(
+        metric_results,
+        spec.scoring,
+        dataset_ids=dataset_ids,
+    )
+    _write_phase_summary_artifacts(
+        output_dir=metric_output_dir,
+        stage_name=METRIC_PHASE_STAGE_NAME,
+        stage_results=metric_results,
+        rankings=metric_rankings,
+        execution=metric_eval.execution,
+        reporting=spec.reporting,
+        analyze=spec.analyze,
+        generation_id=generation_id,
+    )
+    return _metric_experiment_plan_payload(
+        experimental_spec=experimental_metric_spec,
+        candidates=metric_candidates,
+        dataset_count=len(prepared_datasets),
+        status="completed",
+        output_dir=metric_output_dir,
+        stage1_candidates=metric_stage1_candidates,
+        stage1_execution=metric_stage1_execution,
+        final_execution=metric_eval.execution,
+        num_ranked=len(metric_rankings),
+        num_results=len(metric_results),
+    )
 
 
 def _copy_product_if_exists(source: Path, destination: Path) -> None:
@@ -4471,6 +5136,10 @@ def run_sweep_experiment(
                     else {}
                 ),
             },
+            "metric_experiments": _metric_experiment_dry_run_payload(
+                spec=spec,
+                prepared_datasets=prepared_datasets,
+            ),
             "merge_log": merge_log,
         }
         write_json_atomic(
@@ -4535,54 +5204,72 @@ def run_sweep_experiment(
     if experimental_metric_spec.enabled:
         metric_output_dir = resolved_output_dir / "metric_experiments"
         metric_output_dir.mkdir(parents=True, exist_ok=True)
-        baseline_candidate_lookup = dict(coarse_lookup)
-        baseline_candidate_lookup.update(refined_lookup)
-        metric_candidates = _collect_metric_experiment_candidates(
-            final_rankings=final_rankings,
-            baseline_candidate_lookup=baseline_candidate_lookup,
-            experimental_spec=experimental_metric_spec,
-        )
-        metric_candidates = _assign_candidate_ids(metric_candidates, "m1c")
+        if (
+            experimental_metric_spec.candidate_source
+            == METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH
+        ):
+            metric_phase_manifest = _run_independent_metric_search_phase(
+                spec=spec,
+                experimental_metric_spec=experimental_metric_spec,
+                prepared_datasets=prepared_datasets,
+                dataset_ids=dataset_ids,
+                metric_output_dir=metric_output_dir,
+                requested_workers=requested_workers,
+                run_state=run_state,
+                run_state_path=run_state_path,
+                generation_id=generation_id,
+                merge_sources=merge_sources,
+                merge_log=merge_log,
+            )
+        else:
+            baseline_candidate_lookup = dict(coarse_lookup)
+            baseline_candidate_lookup.update(refined_lookup)
+            metric_candidates = _collect_metric_experiment_candidates(
+                final_rankings=final_rankings,
+                baseline_candidate_lookup=baseline_candidate_lookup,
+                experimental_spec=experimental_metric_spec,
+            )
+            metric_candidates = _assign_candidate_ids(metric_candidates, "m1c")
 
-        metric_eval = _evaluate_stage(
-            stage_name="metric_phase",
-            candidates=metric_candidates,
-            datasets=prepared_datasets,
-            output_dir=metric_output_dir,
-            save_figures_flag=spec.save_figures,
-            requested_workers=requested_workers,
-            scoring=spec.scoring,
-            run_state=run_state,
-            run_state_path=run_state_path,
-            generation_id=generation_id,
-            merge_sources=merge_sources,
-            merge_log=merge_log,
-            dry_run=False,
-        )
-        metric_results = metric_eval.stage_results
-        metric_rankings = score_and_rank_runs(
-            metric_results, spec.scoring, dataset_ids=dataset_ids
-        )
-        _write_phase_summary_artifacts(
-            output_dir=metric_output_dir,
-            stage_name="metric_phase",
-            stage_results=metric_results,
-            rankings=metric_rankings,
-            execution=metric_eval.execution,
-            reporting=spec.reporting,
-            analyze=spec.analyze,
-            generation_id=generation_id,
-        )
-        metric_phase_manifest = {
-            "enabled": True,
-            "output_dir": str(metric_output_dir.resolve()),
-            "status": "completed",
-            "shortlist_top_k": int(experimental_metric_spec.shortlist_top_k),
-            "num_formulations": len(experimental_metric_spec.formulations),
-            "num_candidates": len(metric_candidates),
-            "num_runs": len(metric_results),
-            "num_ranked": len(metric_rankings),
-        }
+            metric_eval = _evaluate_stage(
+                stage_name=METRIC_PHASE_STAGE_NAME,
+                candidates=metric_candidates,
+                datasets=prepared_datasets,
+                output_dir=metric_output_dir,
+                save_figures_flag=spec.save_figures,
+                requested_workers=requested_workers,
+                scoring=spec.scoring,
+                run_state=run_state,
+                run_state_path=run_state_path,
+                generation_id=generation_id,
+                merge_sources=merge_sources,
+                merge_log=merge_log,
+                dry_run=False,
+            )
+            metric_results = metric_eval.stage_results
+            metric_rankings = score_and_rank_runs(
+                metric_results, spec.scoring, dataset_ids=dataset_ids
+            )
+            _write_phase_summary_artifacts(
+                output_dir=metric_output_dir,
+                stage_name=METRIC_PHASE_STAGE_NAME,
+                stage_results=metric_results,
+                rankings=metric_rankings,
+                execution=metric_eval.execution,
+                reporting=spec.reporting,
+                analyze=spec.analyze,
+                generation_id=generation_id,
+            )
+            metric_phase_manifest = _metric_experiment_plan_payload(
+                experimental_spec=experimental_metric_spec,
+                candidates=metric_candidates,
+                dataset_count=len(prepared_datasets),
+                status="completed",
+                output_dir=metric_output_dir,
+                final_execution=metric_eval.execution,
+                num_ranked=len(metric_rankings),
+                num_results=len(metric_results),
+            )
 
     write_json_atomic(
         resolved_output_dir / "experiment_manifest.json",
@@ -5196,9 +5883,9 @@ class SpecGuiDatasetState:
 
 @dataclass
 class SpecGuiMetricExperimentRowState:
-    formulation_id: str = "exp_grad_alpha"
-    family: str = BLURRED_GRADIENT_CORR_METRIC_FAMILY
-    alphas: str = "0.0,0.5,1.0"
+    formulation_id: str = "intensity_default"
+    family: str = DEFAULT_DISPLACEMENT_METRIC_FAMILY
+    alphas: str = "1.0"
     gradient_weight: str = "0.5"
     laplacian_weight: str = "0.5"
 
@@ -5268,6 +5955,7 @@ class SpecGuiState:
     robustness_lambda: str = "0.5"
     missing_dataset_penalty: str = "1.0"
     metric_experiments_enabled: bool = False
+    metric_experiments_candidate_source: str = METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH
     metric_experiments_shortlist_top_k: str = "8"
     metric_experiment_rows: List[SpecGuiMetricExperimentRowState] = field(
         default_factory=lambda: [SpecGuiMetricExperimentRowState()]
@@ -5403,6 +6091,12 @@ def _state_metric_row_to_spec(
         "family": family,
         "alphas": alphas,
     }
+    if family == DEFAULT_DISPLACEMENT_METRIC_FAMILY:
+        if alphas != [DEFAULT_DISPLACEMENT_ALPHA]:
+            raise ValueError(
+                f"metric experiment row {row_index} intensity family requires alpha=1.0."
+            )
+        return formulation_payload
     if family == BLURRED_COMPOSITE_CORR_METRIC_FAMILY:
         gradient_weight = float(row.gradient_weight.strip())
         laplacian_weight = float(row.laplacian_weight.strip())
@@ -5429,7 +6123,7 @@ def _metric_formulation_payload_to_state_row(
     payload: Dict[str, object], default_idx: int
 ) -> SpecGuiMetricExperimentRowState:
     family = normalize_displacement_metric_family(
-        payload.get("family", BLURRED_GRADIENT_CORR_METRIC_FAMILY),
+        payload.get("family", DEFAULT_DISPLACEMENT_METRIC_FAMILY),
         allow_unknown=True,
     )
     component_weights = cast(Optional[Dict[str, object]], payload.get("component_weights"))
@@ -5441,7 +6135,7 @@ def _metric_formulation_payload_to_state_row(
     return SpecGuiMetricExperimentRowState(
         formulation_id=str(payload.get("id") or payload.get("formulation_id") or f"formulation_{default_idx:02d}"),
         family=family,
-        alphas=_list_to_csv(cast(List[object], payload.get("alphas", []))) or "0.5",
+        alphas=_list_to_csv(cast(List[object], payload.get("alphas", []))) or "1.0",
         gradient_weight=gradient_weight,
         laplacian_weight=laplacian_weight,
     )
@@ -5644,14 +6338,39 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             raise ValueError(
                 "At least one metric experiment formulation row is required when enabled."
             )
-        payload["experimental_metric_sweep"] = {
+        metric_candidate_source = (
+            state.metric_experiments_candidate_source.strip().lower()
+            or METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH
+        )
+        if metric_candidate_source not in METRIC_CANDIDATE_SOURCES:
+            raise ValueError(
+                "Metric experiment source must be baseline_shortlist or independent_search."
+            )
+        metric_budget = int(state.metric_experiments_shortlist_top_k.strip())
+        experimental_payload: Dict[str, object] = {
             "enabled": True,
-            "shortlist_top_k": int(state.metric_experiments_shortlist_top_k.strip()),
+            "candidate_source": metric_candidate_source,
+            "shortlist_top_k": metric_budget,
             "formulations": [
                 _state_metric_row_to_spec(row, idx + 1)
                 for idx, row in enumerate(state.metric_experiment_rows)
             ],
         }
+        if metric_candidate_source == METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH:
+            experimental_payload["search_stages"] = {
+                "mode": "two_stage",
+                "total_budget_per_dataset": metric_budget,
+                "stage1_fraction": stage1_fraction_value,
+                "top_k": int(state.top_k.strip()),
+                "max_workers": (
+                    int(state.max_workers.strip()) if state.max_workers.strip() else None
+                ),
+                "refinement": {
+                    "method": refinement_method,
+                    "extrapolation": refinement_extrapolation,
+                },
+            }
+        payload["experimental_metric_sweep"] = experimental_payload
     relocation_rules = _state_relocation_rules(state)
     if relocation_rules or state.adopt_relocated:
         payload["relocation"] = {
@@ -5807,9 +6526,21 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
     formulations_payload: List[Dict[str, object]] = []
     if experimental_payload is not None:
         state.metric_experiments_enabled = bool(experimental_payload.get("enabled", False))
+        state.metric_experiments_candidate_source = str(
+            experimental_payload.get(
+                "candidate_source", METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST
+            )
+        )
         shortlist_top_k = experimental_payload.get("shortlist_top_k")
         if shortlist_top_k is None:
-            shortlist_top_k = stages.get("top_k", state.metric_experiments_shortlist_top_k)
+            search_stages = experimental_payload.get("search_stages")
+            if isinstance(search_stages, dict):
+                shortlist_top_k = search_stages.get(
+                    "total_budget_per_dataset",
+                    state.metric_experiments_shortlist_top_k,
+                )
+            else:
+                shortlist_top_k = stages.get("top_k", state.metric_experiments_shortlist_top_k)
         state.metric_experiments_shortlist_top_k = str(shortlist_top_k)
         raw_formulations = cast(
             List[object], experimental_payload.get("formulations", [])
@@ -5823,9 +6554,11 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
             cast(Dict[str, object], item) for item in raw_formulations if isinstance(item, dict)
         ]
         state.metric_experiments_enabled = bool(formulations_payload)
+        state.metric_experiments_candidate_source = METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST
         state.metric_experiments_shortlist_top_k = str(stages.get("top_k", state.top_k))
     else:
         state.metric_experiments_enabled = False
+        state.metric_experiments_candidate_source = METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH
         state.metric_experiments_shortlist_top_k = str(stages.get("top_k", state.top_k))
 
     if formulations_payload:
@@ -6078,6 +6811,14 @@ def validate_state(state: SpecGuiState) -> List[str]:
             issues.append(
                 "Experimental metrics require at least one pixel/combined strategy."
             )
+        metric_candidate_source = (
+            state.metric_experiments_candidate_source.strip().lower()
+            or METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH
+        )
+        if metric_candidate_source not in METRIC_CANDIDATE_SOURCES:
+            issues.append(
+                "Metric experiment source must be baseline_shortlist or independent_search."
+            )
         try:
             if int(state.metric_experiments_shortlist_top_k.strip()) < 1:
                 issues.append(
@@ -6118,6 +6859,13 @@ def validate_state(state: SpecGuiState) -> List[str]:
                     )
             except ValueError as exc:
                 issues.append(str(exc))
+                continue
+
+            if family == DEFAULT_DISPLACEMENT_METRIC_FAMILY:
+                if alphas != [DEFAULT_DISPLACEMENT_ALPHA]:
+                    issues.append(
+                        f"Metric experiment row {idx}: intensity family requires alpha=1.0."
+                    )
                 continue
 
             if family == BLURRED_COMPOSITE_CORR_METRIC_FAMILY:
@@ -6584,7 +7332,25 @@ class SpecGuiApp:
         )
         metric_enabled_chk.pack(side="left", padx=4)
         self._register_editable(metric_enabled_chk)
-        self.ttk.Label(metric_exp_controls, text="Shortlist top-k").pack(
+        self.ttk.Label(metric_exp_controls, text="Source").pack(
+            side="left", padx=(12, 2)
+        )
+        self.metric_candidate_source_var = self.tk.StringVar(
+            value=METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH
+        )
+        self.metric_candidate_source_combo = self.ttk.Combobox(
+            metric_exp_controls,
+            textvariable=self.metric_candidate_source_var,
+            values=[
+                METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH,
+                METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST,
+            ],
+            width=18,
+            state="readonly",
+        )
+        self.metric_candidate_source_combo.pack(side="left", padx=2)
+        self._register_editable(self.metric_candidate_source_combo)
+        self.ttk.Label(metric_exp_controls, text="Budget/top-k").pack(
             side="left", padx=(12, 2)
         )
         self.metric_shortlist_entry = self.ttk.Entry(metric_exp_controls, width=8)
@@ -6633,11 +7399,13 @@ class SpecGuiApp:
         if enabled:
             self.metric_exp_headers.pack(fill="x", padx=4, pady=(2, 0))
             self.metric_experiment_rows_frame.pack(fill="x", padx=4, pady=2)
+            self.metric_candidate_source_combo.configure(state="readonly")
             self.metric_shortlist_entry.configure(state="normal")
             self.metric_add_row_btn.configure(state="normal")
         else:
             self.metric_exp_headers.pack_forget()
             self.metric_experiment_rows_frame.pack_forget()
+            self.metric_candidate_source_combo.configure(state="disabled")
             self.metric_shortlist_entry.configure(state="disabled")
             self.metric_add_row_btn.configure(state="disabled")
 
@@ -6864,6 +7632,7 @@ class SpecGuiApp:
             row_frame,
             family_var,
             family_var.get(),
+            DEFAULT_DISPLACEMENT_METRIC_FAMILY,
             BLURRED_GRADIENT_CORR_METRIC_FAMILY,
             BLURRED_LAPLACIAN_CORR_METRIC_FAMILY,
             BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
@@ -7066,6 +7835,7 @@ class SpecGuiApp:
             robustness_lambda=self.robustness_entry.get().strip(),
             missing_dataset_penalty=self.missing_penalty_entry.get().strip(),
             metric_experiments_enabled=bool(self.metric_experiments_enabled_var.get()),
+            metric_experiments_candidate_source=self.metric_candidate_source_var.get().strip(),
             metric_experiments_shortlist_top_k=self.metric_shortlist_entry.get().strip(),
             metric_experiment_rows=metric_rows,
             datasets=datasets,
@@ -7095,6 +7865,11 @@ class SpecGuiApp:
         self.analyze_var.set(state.analyze)
         self.save_figures_var.set(state.save_figures)
         self.metric_experiments_enabled_var.set(state.metric_experiments_enabled)
+        self.metric_candidate_source_var.set(
+            state.metric_experiments_candidate_source
+            if state.metric_experiments_candidate_source in METRIC_CANDIDATE_SOURCES
+            else METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH
+        )
         self.metric_shortlist_entry.delete(0, self.tk.END)
         self.metric_shortlist_entry.insert(0, state.metric_experiments_shortlist_top_k)
 

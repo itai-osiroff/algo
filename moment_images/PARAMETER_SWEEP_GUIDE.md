@@ -124,12 +124,24 @@ comparison-only and cannot rank new runs.
 
 ## Optional Metric Experiments
 
-`experimental_metric_sweep` runs after baseline ranking. It expands shortlisted
-baseline candidates across local displacement metric formulations and alpha
-values.
+`experimental_metric_sweep` runs metric-family comparisons under
+`metric_experiments/`. It supports two candidate sources:
+
+- `candidate_source: "independent_search"` runs a separate metric search for
+  each formulation/alpha lane. `search_stages.total_budget_per_dataset` is the
+  per-lane budget, so adding formulations or alpha values increases the total
+  run count. This is the GUI default and is the right mode when a metric family
+  might prefer different rectification parameters than the vanilla intensity
+  baseline.
+- `candidate_source: "baseline_shortlist"` preserves the legacy behavior. It
+  takes the final baseline leaderboard, keeps `shortlist_top_k` pixel/combined
+  candidates, strips metric axes, and reruns those candidates across the
+  requested formulations. Existing specs without `candidate_source` use this
+  mode for compatibility.
 
 Supported formulation families:
 
+- `intensity` (`alphas` must be `[1.0]`; this is the vanilla comparator)
 - `blurred_gradient_corr`
 - `blurred_laplacian_corr`
 - `blurred_composite_corr`

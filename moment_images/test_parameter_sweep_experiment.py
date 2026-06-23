@@ -1211,6 +1211,34 @@ def test_metric_formulations_expand_candidates_with_alpha_dimension():
     assert alphas == {0.0, 0.5, 1.0}
 
 
+def test_metric_formulation_accepts_intensity_baseline_only():
+    formulation = MetricFormulationSpec(
+        formulation_id="intensity_default",
+        family="intensity",
+        alphas=[1.0],
+    )
+
+    assert formulation.family == "intensity"
+    assert formulation.alphas == [1.0]
+
+
+def test_metric_formulation_rejects_intensity_alpha_or_weights():
+    with pytest.raises(ValueError, match="alpha=1.0"):
+        MetricFormulationSpec(
+            formulation_id="bad_intensity_alpha",
+            family="intensity",
+            alphas=[0.5],
+        )
+
+    with pytest.raises(ValueError, match="component_weights"):
+        MetricFormulationSpec(
+            formulation_id="bad_intensity_weights",
+            family="intensity",
+            alphas=[1.0],
+            component_weights={"gradient": 1.0},
+        )
+
+
 def test_combined_search_space_propagates_reference_mode_into_candidates():
     candidates = generate_coarse_candidates(
         SweepSearchSpace(
@@ -1261,9 +1289,53 @@ def test_spec_from_dict_maps_legacy_metric_formulations_to_experimental_lane():
 
     assert spec.experimental_metric_sweep is not None
     assert spec.experimental_metric_sweep.enabled is True
+    assert spec.experimental_metric_sweep.candidate_source == "baseline_shortlist"
     assert len(spec.experimental_metric_sweep.formulations) == 1
     assert spec.experimental_metric_sweep.formulations[0].formulation_id == "legacy_grad"
     assert spec.experimental_metric_sweep.formulations[0].family == "blurred_gradient_corr"
+
+
+def test_spec_from_dict_supports_independent_metric_search_stages(tmp_path):
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4))
+    payload = {
+        "datasets": [{"id": "d1", "views": str(views_path)}],
+        "strategies": ["pixel"],
+        "search_spaces": {
+            "pixel": {
+                "similarity_window_sizes": [1, 3],
+                "max_displacements": [0],
+                "gauss_sigmas": [1.0],
+                "disp_gauss_sigmas": [0.0],
+                "pixel_thresholds": [0.05],
+                "sub_pix_factors": [1],
+                "pixel_sigma_pyramid": [False],
+                "zero_fill_roll": [True],
+            }
+        },
+        "experimental_metric_sweep": {
+            "enabled": True,
+            "candidate_source": "independent_search",
+            "shortlist_top_k": 1,
+            "search_stages": {
+                "mode": "single_stage",
+                "total_budget_per_dataset": 2,
+                "top_k": 1,
+                "max_workers": 1,
+            },
+            "formulations": [
+                {"id": "intensity_default", "family": "intensity", "alphas": [1.0]},
+            ],
+        },
+    }
+
+    spec = SweepExperimentSpec.from_dict(payload)
+
+    assert spec.experimental_metric_sweep is not None
+    assert spec.experimental_metric_sweep.candidate_source == "independent_search"
+    assert spec.experimental_metric_sweep.search_stages is not None
+    assert spec.experimental_metric_sweep.search_stages.mode == "single_stage"
+    assert spec.experimental_metric_sweep.search_stages.total_budget_per_dataset == 2
 
 
 def test_spec_from_dict_supports_single_stage_mode_and_defaults_to_two_stage():
@@ -1554,6 +1626,55 @@ def test_run_sweep_blocks_mismatched_fingerprint(tmp_path):
 
     with pytest.raises(ValueError, match="fingerprint"):
         run_sweep_experiment(changed_spec, output_dir=out_dir)
+
+
+def test_resume_fingerprint_accepts_legacy_metric_shortlist_defaults():
+    old_payload = {
+        "schema_version": 2,
+        "output_dir": "C:/old/sweep",
+        "spec": {
+            "output_dir": "C:/old/sweep",
+            "datasets": [],
+            "stages": {"mode": "two_stage", "top_k": 1},
+            "experimental_metric_sweep": {
+                "enabled": True,
+                "shortlist_top_k": 1,
+                "formulations": [
+                    {
+                        "id": "legacy_grad",
+                        "family": "blurred_gradient_corr",
+                        "alphas": [0.5],
+                    }
+                ],
+            },
+        },
+        "datasets": [],
+    }
+    new_payload = json.loads(json.dumps(old_payload))
+    new_payload["output_dir"] = "C:/new/sweep"
+    new_payload["spec"]["output_dir"] = "C:/new/sweep"
+    new_payload["spec"]["experimental_metric_sweep"]["candidate_source"] = "baseline_shortlist"
+    new_payload["spec"]["experimental_metric_sweep"]["search_stages"] = None
+
+    assert parameter_sweep._fingerprint_payloads_resume_compatible(
+        old_payload,
+        new_payload,
+    )
+
+    independent_payload = json.loads(json.dumps(new_payload))
+    independent_payload["spec"]["experimental_metric_sweep"][
+        "candidate_source"
+    ] = "independent_search"
+    independent_payload["spec"]["experimental_metric_sweep"]["search_stages"] = {
+        "mode": "single_stage",
+        "total_budget_per_dataset": 1,
+        "top_k": 1,
+    }
+
+    assert not parameter_sweep._fingerprint_payloads_resume_compatible(
+        old_payload,
+        independent_payload,
+    )
 
 
 def test_run_sweep_resume_adopts_relocated_run_state(tmp_path):
@@ -2100,6 +2221,279 @@ def test_run_sweep_experiment_with_metric_phase_outputs(tmp_path):
     assert {
         payload["displacement_metric_family"] for payload in config_payloads
     } == {"blurred_gradient_corr", "blurred_laplacian_corr"}
+
+
+def test_independent_metric_search_uses_per_formulation_search_space(monkeypatch, tmp_path):
+    _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1, 3],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            mode="single_stage",
+            total_budget_per_dataset=1,
+            top_k=1,
+            max_workers=1,
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            candidate_source="independent_search",
+            search_stages=SweepStageSpec(
+                mode="single_stage",
+                total_budget_per_dataset=2,
+                top_k=1,
+                max_workers=1,
+            ),
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="intensity_default",
+                    family="intensity",
+                    alphas=[1.0],
+                ),
+                MetricFormulationSpec(
+                    formulation_id="exp_grad",
+                    family="ncc_gradient",
+                    alphas=[0.5],
+                ),
+            ],
+        ),
+        output_dir=str(tmp_path / "independent_metric_search"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    out_dir = run_sweep_experiment(spec)
+    config_payloads = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((out_dir / "metric_experiments").glob("runs/metric_phase/*/*/config.json"))
+    ]
+
+    windows_by_family: dict[str, set[int]] = {}
+    for payload in config_payloads:
+        windows_by_family.setdefault(payload["displacement_metric_family"], set()).add(
+            int(payload["similarity_window_size"])
+        )
+
+    assert windows_by_family == {
+        "intensity": {1, 3},
+        "blurred_gradient_corr": {1, 3},
+    }
+    metric_summary = json.loads(
+        (out_dir / "metric_experiments" / "metric_phase_summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metric_summary["stage"] == "metric_phase"
+    manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["metric_experiments"]["candidate_source"] == "independent_search"
+    assert manifest["metric_experiments"]["num_candidates"] == 4
+    assert {
+        item["family"] for item in manifest["metric_experiments"]["per_formulation"]
+    } == {"intensity", "blurred_gradient_corr"}
+
+
+def test_independent_metric_search_reuses_identical_baseline_artifacts(monkeypatch, tmp_path):
+    calls = _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            mode="single_stage",
+            total_budget_per_dataset=1,
+            top_k=1,
+            max_workers=1,
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            candidate_source="independent_search",
+            search_stages=SweepStageSpec(
+                mode="single_stage",
+                total_budget_per_dataset=1,
+                top_k=1,
+                max_workers=1,
+            ),
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="intensity_default",
+                    family="intensity",
+                    alphas=[1.0],
+                )
+            ],
+        ),
+        output_dir=str(tmp_path / "cross_stage_reuse"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    out_dir = run_sweep_experiment(spec)
+
+    assert [call for call in calls if call.startswith("metric_phase_")] == []
+    metric_summary = json.loads(
+        (out_dir / "metric_experiments" / "metric_phase_summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metric_summary["execution"]["skipped_valid_count"] == 1
+
+
+def test_independent_metric_search_rewrites_reused_internal_stage_identity(monkeypatch, tmp_path):
+    calls = _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            mode="single_stage",
+            total_budget_per_dataset=1,
+            top_k=1,
+            max_workers=1,
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            candidate_source="independent_search",
+            search_stages=SweepStageSpec(
+                total_budget_per_dataset=2,
+                stage1_fraction=0.5,
+                top_k=1,
+                max_workers=1,
+            ),
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="intensity_default",
+                    family="intensity",
+                    alphas=[1.0],
+                )
+            ],
+        ),
+        output_dir=str(tmp_path / "internal_stage_reuse"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    out_dir = run_sweep_experiment(spec)
+    metric_dir = out_dir / "metric_experiments"
+
+    assert [call for call in calls if call.startswith("metric_phase_")] == []
+    metric_summary = json.loads(
+        (metric_dir / "metric_phase_summary.json").read_text(encoding="utf-8")
+    )
+    summary_records = json.loads((metric_dir / "summary.json").read_text(encoding="utf-8"))
+    raw_records = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in metric_dir.glob("runs/metric_phase/*/*/metric_record.json")
+    ]
+
+    summary_run_names = [
+        row["metric_record"]["run"]
+        for row in metric_summary["runs"]
+        if row.get("status") == "ok"
+    ]
+    public_run_names = (
+        summary_run_names
+        + [record["run"] for record in summary_records]
+        + [record["run"] for record in raw_records]
+    )
+    assert public_run_names
+    assert all(run_name.startswith("metric_phase_") for run_name in public_run_names)
+    assert not any(run_name.startswith("metric_stage1_") for run_name in public_run_names)
+
+
+def test_dry_run_reports_independent_metric_search_plan(monkeypatch, tmp_path):
+    _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1, 3],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            mode="single_stage",
+            total_budget_per_dataset=1,
+            top_k=1,
+            max_workers=1,
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            candidate_source="independent_search",
+            search_stages=SweepStageSpec(
+                mode="single_stage",
+                total_budget_per_dataset=2,
+                top_k=1,
+                max_workers=1,
+            ),
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="intensity_default",
+                    family="intensity",
+                    alphas=[1.0],
+                ),
+                MetricFormulationSpec(
+                    formulation_id="exp_grad",
+                    family="ncc_gradient",
+                    alphas=[0.5],
+                ),
+            ],
+        ),
+        output_dir=str(tmp_path / "dry_metric_plan"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    out_dir = run_sweep_experiment(spec, dry_run=True)
+    dry_run_path = next((out_dir / "generations").glob("*/dry_run.json"))
+    dry_run_payload = json.loads(dry_run_path.read_text(encoding="utf-8"))
+
+    assert dry_run_payload["metric_experiments"]["candidate_source"] == "independent_search"
+    assert dry_run_payload["metric_experiments"]["num_candidates"] == 4
+    assert dry_run_payload["metric_experiments"]["num_runs"] == 4
+    assert not (out_dir / "metric_experiments" / "runs").exists()
 
 
 def test_run_sweep_resume_recomputes_corrupt_metric_phase_artifact(tmp_path):

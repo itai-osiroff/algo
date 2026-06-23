@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from moment_images import report_generation
 from moment_images.sweep_visualization import (
     RectificationViewSelection,
     SweepVisualizationApp,
@@ -614,6 +615,90 @@ def test_load_sweep_visualization_model_supports_metric_phase_outputs(tmp_path):
     assert {"blurred_gradient_corr", "blurred_laplacian_corr"}.issubset(families)
     assert model.diagnostic_availability["score_maps"] is True
     assert "gradient" in model.diagnostic_availability["components"]
+
+
+def test_load_sweep_visualization_model_normalizes_stale_internal_metric_run_names(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+    )
+    metric_dir = output_dir / "metric_experiments"
+    stale_run_name = "metric_stage1_m1c0000_d1"
+    summary_path = metric_dir / "summary.json"
+    summary_records = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary_records[0]["run"] = stale_run_name
+    _write_json(summary_path, summary_records)
+    _write_metric_record(
+        metric_dir / "runs" / "metric_phase" / "m1c0000" / "d1" / "metric_record.json",
+        run=stale_run_name,
+        family="ncc_gradient",
+        alpha=0.2,
+        formulation_id="grad_0p2",
+        metric_base=20.0,
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+
+    metric_records = [record for record in model.run_metric_records if record.stage == "metric_phase"]
+    assert any(
+        record.candidate_id == "m1c0000" and record.dataset_id == "d1"
+        for record in metric_records
+    )
+    assert not any(record.stage == "metric_stage1" for record in model.run_metric_records)
+    assert not any(record.candidate_id == "stage1_m1c0000" for record in model.run_metric_records)
+
+
+def test_report_rebuild_normalizes_stale_internal_metric_record_identity(tmp_path):
+    metric_dir = tmp_path / "metric_experiments"
+    run_dir = metric_dir / "runs" / "metric_phase" / "m1c0000" / "d1"
+    _write_metric_record(
+        run_dir / "metric_record.json",
+        run="metric_stage1_m1c0000_d1",
+        family="intensity",
+        alpha=1.0,
+        formulation_id="intensity_default",
+        metric_base=20.0,
+    )
+    _write_json(
+        run_dir / "config.json",
+        {
+            "strategy": "combined",
+            "displacement_metric_family": "intensity",
+            "displacement_alpha": 1.0,
+            "metric_formulation_id": "intensity_default",
+        },
+    )
+    entry = {
+        "run_uid": "metric_phase_m1c0000_d1",
+        "stage": "metric_phase",
+        "candidate_id": "m1c0000",
+        "dataset_id": "d1",
+        "status": "skipped_valid",
+        "run_dir": str(run_dir),
+        "generation_id": "gen1",
+    }
+    discovery = report_generation.StageDiscovery(
+        stage_name="metric_phase",
+        output_dir=metric_dir,
+        source="run_state",
+    )
+
+    result = report_generation._run_result_from_entry(
+        output_dir=metric_dir,
+        stage_name="metric_phase",
+        entry=entry,
+        active_generation_id="gen1",
+        run_state={"runs": {"metric_phase_m1c0000_d1": entry}},
+        discovery=discovery,
+    )
+
+    assert result is not None
+    assert result["run"] == "metric_phase_m1c0000_d1"
+    assert result["metric_record"]["run"] == "metric_phase_m1c0000_d1"
+    assert result["metric_record"]["stage"] == "metric_phase"
+    assert result["metric_record"]["candidate_id"] == "m1c0000"
+    assert result["metric_record"]["dataset_id"] == "d1"
 
 
 def test_load_sweep_visualization_model_supports_direct_metric_phase_directory(tmp_path):

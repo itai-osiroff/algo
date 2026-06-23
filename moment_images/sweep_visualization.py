@@ -1008,6 +1008,9 @@ def _infer_run_identity(
     if stage_match is not None:
         stage_name = stage_match.group(1)
         remainder = stage_match.group(2)
+    elif stage_hint == "metric_phase" and run_name.startswith("metric_stage1_"):
+        stage_name = "metric_phase"
+        remainder = run_name[len("metric_stage1_") :]
     elif stage_name == "metric_phase" and remainder.startswith("metric_"):
         remainder = remainder[len("metric_") :]
 
