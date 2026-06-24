@@ -27,8 +27,7 @@ from moment_images.reliable_io import (
     write_csv_atomic,
     write_json_atomic,
 )
-from moment_images.sweep_analysis import compute_image_metrics
-from moment_images.metric_profiles import validate_profile_for_sweep
+from moment_images.metric_profiles import compute_extended_image_metrics, validate_profile_for_sweep
 from moment_images.sweep_visualization import (
     CandidateVisualizationRow,
     SweepVisualizationModel,
@@ -38,7 +37,7 @@ from moment_images.sweep_visualization import (
 )
 
 
-REGISTRY_VERSION = "2026-05-24-v1"
+REGISTRY_VERSION = "2026-06-24-tamura-v1"
 DEFAULT_GUIDE_SIGMA = 1.0
 DEFAULT_SEARCH_WEIGHT_STEP = 0.1
 DEFAULT_TOP_K = 5
@@ -725,6 +724,19 @@ def build_metric_registry() -> Dict[str, MetricDescriptor]:
             representation=representation,
             description="Raw focus metric recomputed from the workspace artifact.",
         )
+    tamura_metrics = {
+        "tamura_gradient_avg": ("Tamura Gradient (Avg)", "avg_gradient"),
+        "tamura_guide": ("Tamura Coefficient (Guide)", "guide_log"),
+    }
+    for name, (label, representation) in tamura_metrics.items():
+        registry[name] = MetricDescriptor(
+            name=name,
+            label=label,
+            direction="max",
+            category="tamura",
+            representation=representation,
+            description="Tamura coefficient focus metric recomputed from the workspace artifact.",
+        )
     return registry
 
 
@@ -741,7 +753,7 @@ def _metric_names_by_categories(
 
 
 def _workspace_metric_names(metric_registry: Mapping[str, MetricDescriptor]) -> List[str]:
-    return _metric_names_by_categories(metric_registry, ("old", "new"))
+    return _metric_names_by_categories(metric_registry, ("old", "new", "tamura"))
 
 
 def _new_metric_names(metric_registry: Mapping[str, MetricDescriptor]) -> List[str]:
@@ -826,6 +838,20 @@ def _default_profiles(
             label="New DCT + Sparsity",
             metric_weights=dict(new_weights),
             description="Equal-weight blend of the new DCT, sparsity, and Vollath metrics.",
+            built_in=True,
+        ),
+        RankingProfileSpec(
+            name="tamura_tog",
+            label="Tamura ToG",
+            metric_weights={"tamura_gradient_avg": 1.0},
+            description="Tamura coefficient of the average-image gradient magnitude.",
+            built_in=True,
+        ),
+        RankingProfileSpec(
+            name="tamura_focus_pair",
+            label="Tamura Focus Pair",
+            metric_weights={"tamura_gradient_avg": 0.5, "tamura_guide": 0.5},
+            description="Equal-weight Tamura blend of average-image gradient and LoG-guide sparsity.",
             built_in=True,
         ),
         RankingProfileSpec(
@@ -1160,26 +1186,7 @@ def compute_metrics_from_workspace(
     if avg_image_raw is None:
         return {}, warnings
 
-    avg_image = _prepare_avg_image_channel(avg_image_raw)
-    guide_log = _prepare_guide_log_channel(avg_image_raw)
-    ndct_avg = _normalized_dct_channel(avg_image)
-    ndct_guide = _normalized_dct_channel(guide_log)
-
-    metrics = compute_image_metrics(np.asarray(avg_image_raw, dtype=np.float64))
-    metrics.update(
-        {
-            "ndct_shannon_avg": _normalized_shannon_entropy(ndct_avg),
-            "ndct_shannon_guide": _normalized_shannon_entropy(ndct_guide),
-            "ndct_bayes_avg": _bayes_dct_entropy(avg_image),
-            "ndct_bayes_guide": _bayes_dct_entropy(guide_log),
-            "gini_avg": _gini_index(avg_image),
-            "gini_guide": _gini_index(guide_log),
-            "hoyer_avg": _hoyer_index(avg_image),
-            "hoyer_guide": _hoyer_index(guide_log),
-            "vollath_f4_avg": _vollath_f4(avg_image),
-            "vollath_f4_guide": _vollath_f4(guide_log),
-        }
-    )
+    metrics = compute_extended_image_metrics(np.asarray(avg_image_raw, dtype=np.float64))
     global_avg = cast(Optional[np.ndarray], payload.get("average_rectified_global_image"))
     if isinstance(global_avg, np.ndarray):
         global_norm = _prepare_avg_image_channel(np.asarray(global_avg, dtype=np.float64))

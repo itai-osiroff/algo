@@ -501,6 +501,30 @@ def test_score_and_rank_runs_accepts_new_explorer_metric():
     assert rankings[0]["candidate_id"] == "high"
 
 
+def test_score_and_rank_runs_accepts_tamura_profile_metric():
+    def record(candidate_id: str, metric_value: float) -> dict:
+        payload = {
+            "status": "ok",
+            "candidate_id": candidate_id,
+            "dataset_id": "d1",
+            "strategy": "pixel",
+            "config": {},
+            "params": {},
+            "runtime_seconds": 1.0,
+            "metric_record": _metric_record(0.0),
+        }
+        payload["metric_record"]["global_and_local_metrics"]["tamura_gradient_avg"] = metric_value
+        return payload
+
+    rankings = score_and_rank_runs(
+        [record("low", 0.25), record("high", 2.5)],
+        SweepScoringSpec(metric_weights={"tamura_gradient_avg": 1.0}),
+        dataset_ids=["d1"],
+    )
+
+    assert rankings[0]["candidate_id"] == "high"
+
+
 def test_experiment_spec_resolves_scoring_profile(tmp_path):
     config_path = tmp_path / "metrics_config.json"
     config_path.write_text(
@@ -1008,6 +1032,49 @@ def test_run_sweep_backfills_missing_scoring_metrics_for_reused_artifacts(monkey
         assert "gini_avg" in payload["global_and_local_metrics"]
         assert payload["metric_backfilled"] is True
         assert "gini_avg" in payload["metric_backfilled_names"]
+
+
+def test_run_sweep_backfills_missing_tamura_metric_for_reused_artifacts(monkeypatch, tmp_path):
+    calls = _install_structured_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    base_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={"pixel": _pixel_space(similarity_window_sizes=[1, 3], max_displacements=[0], sub_pix_factors=[1], pixel_sigma_pyramid=[False])},
+        strategies=["pixel"],
+        stages=SweepStageSpec(mode="single_stage", total_budget_per_dataset=2, top_k=1, max_workers=1),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "tamura_backfill_reuse"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(base_spec)
+    _remove_metric_from_run_records(out_dir, "tamura_gradient_avg")
+
+    calls.clear()
+    updated_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces=base_spec.search_spaces,
+        strategies=["pixel"],
+        stages=base_spec.stages,
+        scoring=SweepScoringSpec(metric_weights={"tamura_gradient_avg": 1.0}),
+        output_dir=str(out_dir),
+        save_figures=False,
+        analyze=False,
+    )
+    run_sweep_experiment(updated_spec, output_dir=out_dir, extend_existing=True)
+
+    assert calls == []
+    summary = json.loads((out_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    assert summary["execution"]["metric_backfilled_count"] == 2
+    assert summary["execution"]["metric_backfill_failed_count"] == 0
+    for path in sorted(out_dir.glob("runs/stage1/*/d1/metric_record.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert "tamura_gradient_avg" in payload["global_and_local_metrics"]
+        assert payload["metric_backfilled"] is True
+        assert "tamura_gradient_avg" in payload["metric_backfilled_names"]
 
 
 def test_run_sweep_dry_run_reports_metric_backfill_without_writing(monkeypatch, tmp_path):
