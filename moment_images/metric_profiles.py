@@ -144,6 +144,29 @@ def prepare_guide_log_channel(avg_image: np.ndarray, sigma: float = DEFAULT_GUID
     return np.abs(np.asarray(lap, dtype=np.float64))
 
 
+def gradient_magnitude_channel(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float64)
+    if arr.ndim != 2 or arr.size == 0:
+        return np.zeros_like(arr, dtype=np.float64)
+    dy = np.zeros_like(arr, dtype=np.float64)
+    dx = np.zeros_like(arr, dtype=np.float64)
+    dy[1:, :] = arr[1:, :] - arr[:-1, :]
+    dx[:, 1:] = arr[:, 1:] - arr[:, :-1]
+    return np.sqrt(np.square(dx) + np.square(dy))
+
+
+def tamura_coefficient(values: np.ndarray) -> float:
+    arr = np.asarray(values, dtype=np.float64).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 0.0
+    arr = np.abs(arr)
+    mean = float(np.mean(arr))
+    if mean <= 1e-12:
+        return 0.0
+    return float(np.std(arr) / mean)
+
+
 def normalized_dct_channel(image: np.ndarray) -> np.ndarray:
     arr = np.asarray(image, dtype=np.float32)
     dct = np.abs(cv.dct(arr))
@@ -251,6 +274,7 @@ def compute_extended_image_metrics(image: np.ndarray) -> Dict[str, float]:
     avg_raw = np.asarray(image, dtype=np.float64)
     avg_image = prepare_avg_image_channel(avg_raw)
     guide_log = prepare_guide_log_channel(avg_raw)
+    gradient_mag = gradient_magnitude_channel(avg_image)
     ndct_avg = normalized_dct_channel(avg_image)
     ndct_guide = normalized_dct_channel(guide_log)
     metrics = compute_base_image_metrics(avg_raw)
@@ -266,6 +290,8 @@ def compute_extended_image_metrics(image: np.ndarray) -> Dict[str, float]:
             "hoyer_guide": hoyer_index(guide_log),
             "vollath_f4_avg": vollath_f4(avg_image),
             "vollath_f4_guide": vollath_f4(guide_log),
+            "tamura_gradient_avg": tamura_coefficient(gradient_mag),
+            "tamura_guide": tamura_coefficient(guide_log),
         }
     )
     return {name: float(value) for name, value in metrics.items() if math.isfinite(float(value))}
@@ -335,6 +361,19 @@ def build_metric_registry(*, include_saved: bool = True) -> Dict[str, MetricDesc
             category="new",
             representation=representation,
             description="Raw focus metric recomputed from the workspace artifact.",
+        )
+    tamura_metrics = {
+        "tamura_gradient_avg": ("Tamura Gradient (Avg)", "avg_gradient"),
+        "tamura_guide": ("Tamura Coefficient (Guide)", "guide_log"),
+    }
+    for name, (label, representation) in tamura_metrics.items():
+        registry[name] = MetricDescriptor(
+            name=name,
+            label=label,
+            direction="max",
+            category="tamura",
+            representation=representation,
+            description="Tamura coefficient focus metric recomputed from the workspace artifact.",
         )
     return registry
 
@@ -476,6 +515,20 @@ def default_profiles(
             label="New DCT + Sparsity",
             metric_weights=dict(new_weights),
             description="Equal-weight blend of the new DCT, sparsity, and Vollath metrics.",
+            built_in=True,
+        ),
+        RankingProfileSpec(
+            name="tamura_tog",
+            label="Tamura ToG",
+            metric_weights={"tamura_gradient_avg": 1.0},
+            description="Tamura coefficient of the average-image gradient magnitude.",
+            built_in=True,
+        ),
+        RankingProfileSpec(
+            name="tamura_focus_pair",
+            label="Tamura Focus Pair",
+            metric_weights={"tamura_gradient_avg": 0.5, "tamura_guide": 0.5},
+            description="Equal-weight Tamura blend of average-image gradient and LoG-guide sparsity.",
             built_in=True,
         ),
         RankingProfileSpec(
@@ -691,6 +744,8 @@ def save_metric_config(
 _preview_from_array = preview_from_array
 _prepare_avg_image_channel = prepare_avg_image_channel
 _prepare_guide_log_channel = prepare_guide_log_channel
+_gradient_magnitude_channel = gradient_magnitude_channel
+_tamura_coefficient = tamura_coefficient
 _normalized_dct_channel = normalized_dct_channel
 _normalized_shannon_entropy = normalized_shannon_entropy
 _bayes_dct_entropy = bayes_dct_entropy

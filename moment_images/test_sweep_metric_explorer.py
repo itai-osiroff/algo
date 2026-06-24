@@ -282,13 +282,20 @@ def test_load_sweep_metric_explorer_model_recomputes_metrics_and_profiles(tmp_pa
 
     assert model.base_model.primary_stage_name == "stage1"
     assert len(model.raw_records) == 4
-    assert {"ndct_shannon_avg", "gini_avg", "hoyer_avg", "vollath_f4_avg"}.issubset(
-        model.metric_registry.keys()
-    )
+    assert {
+        "ndct_shannon_avg",
+        "gini_avg",
+        "hoyer_avg",
+        "vollath_f4_avg",
+        "tamura_gradient_avg",
+        "tamura_guide",
+    }.issubset(model.metric_registry.keys())
     saved = model.profile_results[("stage1", "saved_original")]
     new_only = model.profile_results[("stage1", "new_dct_sparse")]
+    tamura_only = model.profile_results[("stage1", "tamura_tog")]
     assert saved[0].candidate_id == "c_bad"
     assert new_only[0].candidate_id == "c_good"
+    assert tamura_only[0].candidate_id == "c_good"
     good_d1 = next(
         record for record in model.raw_records if record.candidate_id == "c_good" and record.dataset_id == "d1"
     )
@@ -297,6 +304,7 @@ def test_load_sweep_metric_explorer_model_recomputes_metrics_and_profiles(tmp_pa
     )
     assert good_d1.metrics["vollath_f4_avg"] > bad_d2.metrics["vollath_f4_avg"]
     assert good_d1.metrics["hoyer_avg"] > bad_d2.metrics["hoyer_avg"]
+    assert good_d1.metrics["tamura_gradient_avg"] > bad_d2.metrics["tamura_gradient_avg"]
 
 
 def test_metric_explorer_model_keeps_reused_metric_stage_records_public(tmp_path):
