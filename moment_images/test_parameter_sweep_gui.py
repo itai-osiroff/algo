@@ -508,6 +508,94 @@ def test_gui_run_lifecycle_extension_dry_run_passes_flags(monkeypatch, tmp_path)
     root.destroy()
 
 
+def test_gui_update_planned_runs_uses_preview_builder(monkeypatch, tmp_path):
+    from moment_images import parameter_sweep as ps
+
+    root = _make_root_or_skip()
+    app = ps.SpecGuiApp(root)
+
+    app.dataset_rows[0]["source_path_var"].set(str(tmp_path / "views.npy"))
+    app.output_dir_entry.delete(0, app.tk.END)
+    app.output_dir_entry.insert(0, str(tmp_path / "out"))
+    app.dry_run_var.set(False)
+
+    calls = []
+
+    def _preview(spec, **kwargs):
+        calls.append((spec, kwargs))
+        return {
+            "stages": {
+                "stage1": {
+                    "planned_run_count": 2,
+                    "pending_run_count": 2,
+                    "skipped_valid_count": 0,
+                    "exact": True,
+                }
+            },
+            "metric_experiments": {
+                "enabled": True,
+                "candidate_source": "baseline_shortlist",
+                "status": "estimated_requires_baseline_rankings",
+                "num_planned_runs": 3,
+                "pending_run_count": 3,
+                "skipped_valid_count": 0,
+                "exact": False,
+                "estimate_reason": "baseline_rankings_unavailable",
+            },
+            "totals": {
+                "planned_run_count": 5,
+                "pending_run_count": 5,
+                "skipped_valid_count": 0,
+                "exact": False,
+            },
+        }
+
+    monkeypatch.setattr(ps, "build_sweep_run_preview", _preview)
+    monkeypatch.setattr(
+        ps,
+        "run_sweep_experiment",
+        lambda *args, **kwargs: pytest.fail("planned run update must not start a sweep"),
+    )
+
+    app._on_update_planned_runs()
+    deadline = time.time() + 5.0
+    while app._is_previewing and time.time() < deadline:
+        root.update()
+        time.sleep(0.05)
+
+    assert len(calls) == 1
+    assert calls[0][1]["extend_existing"] is False
+    assert calls[0][1]["allow_dataset_generation"] is False
+    assert "Pending: 5" in app.planned_runs_var.get()
+    assert "Metric: estimated 3 pending" in app.planned_runs_detail_var.get()
+    root.destroy()
+
+
+def test_gui_update_planned_runs_reports_validation_errors(monkeypatch, tmp_path):
+    from moment_images import parameter_sweep as ps
+
+    root = _make_root_or_skip()
+    app = ps.SpecGuiApp(root)
+
+    app.output_dir_entry.delete(0, app.tk.END)
+    app.output_dir_entry.insert(0, str(tmp_path / "out"))
+    app.dataset_rows[0]["source_path_var"].set("")
+    errors = []
+    app.messagebox.showerror = lambda *args, **kwargs: errors.append(args)  # type: ignore[assignment]
+    monkeypatch.setattr(
+        ps,
+        "build_sweep_run_preview",
+        lambda *args, **kwargs: pytest.fail("invalid state must not call preview builder"),
+    )
+
+    app._on_update_planned_runs()
+
+    assert errors
+    assert app._is_previewing is False
+    assert "Plan unavailable" in app.planned_runs_var.get()
+    root.destroy()
+
+
 def test_gui_run_lifecycle_passes_relocation_options(monkeypatch, tmp_path):
     from moment_images import parameter_sweep as ps
 

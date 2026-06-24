@@ -2055,15 +2055,9 @@ def _prepare_dataset(
     dataset: SweepDatasetSpec,
     output_dir: Path,
     dataset_identities: Optional[Mapping[str, Mapping[str, object]]] = None,
+    *,
+    allow_dataset_generation: bool = True,
 ) -> PreparedDataset:
-    dataset_dir = output_dir / "datasets" / dataset.dataset_id
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    expected_identity = (
-        dataset_identities.get(dataset.dataset_id)
-        if dataset_identities is not None
-        else None
-    )
-
     data_sources = [
         dataset.views_path is not None,
         dataset.source_image is not None,
@@ -2107,6 +2101,37 @@ def _prepare_dataset(
             views_file_mtime_ns=int(stat.st_mtime_ns),
         )
 
+    dataset_dir = output_dir / "datasets" / dataset.dataset_id
+    expected_identity = (
+        dataset_identities.get(dataset.dataset_id)
+        if dataset_identities is not None
+        else None
+    )
+    if not allow_dataset_generation:
+        if dataset.source_image is not None:
+            cached = _cached_prepared_dataset(
+                dataset=dataset,
+                cache_path=dataset_dir / "generated_views.npy",
+                expected_identity=expected_identity,
+                hdr_enabled=False,
+            )
+            if cached is not None:
+                return cached
+        if dataset.source_image_dir is not None:
+            cached = _cached_prepared_dataset(
+                dataset=dataset,
+                cache_path=dataset_dir / "generated_exposure_views.npy",
+                expected_identity=expected_identity,
+                hdr_enabled=True if dataset.hdr_enabled is None else bool(dataset.hdr_enabled),
+            )
+            if cached is not None:
+                return cached
+        raise ValueError(
+            f"Dataset '{dataset.dataset_id}' requires view generation; "
+            "planned-run preview cannot generate dataset caches."
+        )
+
+    dataset_dir.mkdir(parents=True, exist_ok=True)
     if dataset.source_image is not None:
         source_image_path = Path(dataset.source_image)
         if not source_image_path.exists():
@@ -2231,6 +2256,8 @@ def _prepare_datasets(
     spec: SweepExperimentSpec,
     output_dir: Path,
     dataset_identities: Optional[Mapping[str, Mapping[str, object]]] = None,
+    *,
+    allow_dataset_generation: bool = True,
 ) -> List[PreparedDataset]:
     seen: set[str] = set()
     prepared: List[PreparedDataset] = []
@@ -2243,6 +2270,7 @@ def _prepare_datasets(
                 dataset,
                 output_dir=output_dir,
                 dataset_identities=dataset_identities,
+                allow_dataset_generation=allow_dataset_generation,
             )
         )
     prepared.sort(key=lambda item: item.dataset_id)
@@ -4718,6 +4746,493 @@ def _metric_experiment_dry_run_payload(
     )
 
 
+def _stage_preview_payload(execution: Mapping[str, object]) -> Dict[str, object]:
+    planned_uids = execution.get("planned_run_uids")
+    planned_count = (
+        len(cast(Sequence[object], planned_uids))
+        if isinstance(planned_uids, list)
+        else int(execution.get("completed_runs", 0) or 0)
+        + int(execution.get("pending_run_count", 0) or 0)
+    )
+    return {
+        **dict(execution),
+        "planned_run_count": int(planned_count),
+        "pending_run_count": int(execution.get("pending_run_count", 0) or 0),
+        "skipped_valid_count": int(execution.get("skipped_valid_count", 0) or 0),
+        "exact": True,
+    }
+
+
+def _metric_pending_count(payload: Mapping[str, object]) -> int:
+    pending = int(payload.get("pending_run_count", payload.get("num_runs", 0)) or 0)
+    internal = payload.get("internal_stage1")
+    if isinstance(internal, dict):
+        execution = internal.get("execution")
+        if isinstance(execution, dict):
+            pending += int(execution.get("pending_run_count", 0) or 0)
+    return pending
+
+
+def _metric_skipped_valid_count(payload: Mapping[str, object]) -> int:
+    skipped = int(payload.get("skipped_valid_count", 0) or 0)
+    internal = payload.get("internal_stage1")
+    if isinstance(internal, dict):
+        execution = internal.get("execution")
+        if isinstance(execution, dict):
+            skipped += int(execution.get("skipped_valid_count", 0) or 0)
+    return skipped
+
+
+def _metric_planned_count(payload: Mapping[str, object]) -> int:
+    planned = int(payload.get("num_planned_runs", 0) or 0)
+    internal = payload.get("internal_stage1")
+    if isinstance(internal, dict):
+        planned += int(internal.get("num_planned_runs", 0) or 0)
+    return planned
+
+
+def _disabled_metric_preview_payload(
+    experimental_spec: ExperimentalMetricSweepSpec,
+) -> Dict[str, object]:
+    return {
+        "enabled": False,
+        "candidate_source": experimental_spec.candidate_source,
+        "output_dir": None,
+        "status": "disabled",
+        "num_planned_runs": 0,
+        "pending_run_count": 0,
+        "skipped_valid_count": 0,
+        "exact": True,
+    }
+
+
+def _estimate_baseline_shortlist_metric_preview(
+    *,
+    experimental_spec: ExperimentalMetricSweepSpec,
+    baseline_candidate_lookup: Mapping[str, SweepCandidate],
+    dataset_count: int,
+) -> Dict[str, object]:
+    eligible_candidates = [
+        candidate
+        for candidate in baseline_candidate_lookup.values()
+        if candidate.strategy in {"pixel", "combined"}
+    ]
+    eligible_bases = _dedupe_candidates(
+        [_candidate_without_metric_axes(candidate) for candidate in eligible_candidates]
+    )
+    shortlist_count = min(int(experimental_spec.shortlist_top_k), len(eligible_bases))
+    estimated_candidates = _expand_candidates_with_metric_formulations(
+        eligible_bases[:shortlist_count],
+        experimental_spec.formulations,
+    )
+    estimated_candidates = _dedupe_candidates(estimated_candidates)
+    planned_runs = len(estimated_candidates) * int(dataset_count)
+    payload = _metric_experiment_plan_payload(
+        experimental_spec=experimental_spec,
+        candidates=estimated_candidates,
+        dataset_count=dataset_count,
+        status="estimated_requires_baseline_rankings",
+    )
+    payload.update(
+        {
+            "pending_run_count": int(planned_runs),
+            "skipped_valid_count": 0,
+            "exact": False,
+            "estimate_reason": "baseline_rankings_unavailable",
+        }
+    )
+    return payload
+
+
+def _preview_independent_metric_search(
+    *,
+    spec: SweepExperimentSpec,
+    experimental_spec: ExperimentalMetricSweepSpec,
+    prepared_datasets: Sequence[PreparedDataset],
+    metric_output_dir: Path,
+    requested_workers: int,
+    run_state: Dict[str, object],
+    run_state_path: Optional[Path],
+    generation_id: Optional[str],
+    merge_sources: Sequence[Path],
+    merge_log: Dict[str, object],
+) -> Dict[str, object]:
+    search_stages = _metric_search_stages(experimental_spec)
+    stage1_budget, stage2_budget = _independent_metric_stage_budgets(search_stages)
+    metric_stage1_candidates: List[SweepCandidate] = []
+    metric_stage1_execution: Optional[Dict[str, object]] = None
+
+    if search_stages.mode == "single_stage":
+        metric_candidates = _assign_candidate_ids(
+            _collect_independent_metric_stage_candidates(
+                spec,
+                experimental_spec,
+                budget_per_variant=stage1_budget,
+            ),
+            "m1c",
+        )
+    else:
+        metric_stage1_candidates = _assign_candidate_ids(
+            _collect_independent_metric_stage_candidates(
+                spec,
+                experimental_spec,
+                budget_per_variant=stage1_budget,
+            ),
+            "m1s1c",
+        )
+        metric_stage1_eval = _evaluate_stage(
+            stage_name=METRIC_SEARCH_STAGE1_NAME,
+            candidates=metric_stage1_candidates,
+            datasets=prepared_datasets,
+            output_dir=metric_output_dir,
+            save_figures_flag=spec.save_figures,
+            requested_workers=requested_workers,
+            scoring=spec.scoring,
+            run_state=run_state,
+            run_state_path=run_state_path,
+            generation_id=generation_id,
+            merge_sources=merge_sources,
+            merge_log=merge_log,
+            dry_run=True,
+        )
+        metric_stage1_execution = metric_stage1_eval.execution
+        metric_candidates = _assign_candidate_ids(
+            _dedupe_candidates(
+                _expand_candidates_with_metric_formulations(
+                    _base_metric_search_candidates(spec, budget=stage2_budget),
+                    _metric_formulation_variants(experimental_spec.formulations),
+                )
+            ),
+            "m1c",
+        )
+
+    metric_eval = _evaluate_stage(
+        stage_name=METRIC_PHASE_STAGE_NAME,
+        candidates=metric_candidates,
+        datasets=prepared_datasets,
+        output_dir=metric_output_dir,
+        save_figures_flag=spec.save_figures,
+        requested_workers=requested_workers,
+        scoring=spec.scoring,
+        run_state=run_state,
+        run_state_path=run_state_path,
+        generation_id=generation_id,
+        merge_sources=merge_sources,
+        merge_log=merge_log,
+        dry_run=True,
+    )
+    payload = _metric_experiment_plan_payload(
+        experimental_spec=experimental_spec,
+        candidates=metric_candidates,
+        dataset_count=len(prepared_datasets),
+        status="planned",
+        output_dir=metric_output_dir,
+        stage1_candidates=metric_stage1_candidates,
+        stage1_execution=metric_stage1_execution,
+        final_execution=metric_eval.execution,
+    )
+    payload.update(
+        {
+            "pending_run_count": int(metric_eval.execution.get("pending_run_count", 0) or 0),
+            "skipped_valid_count": int(metric_eval.execution.get("skipped_valid_count", 0) or 0),
+            "exact": True,
+        }
+    )
+    return payload
+
+
+def _preview_baseline_shortlist_metric_phase(
+    *,
+    spec: SweepExperimentSpec,
+    experimental_spec: ExperimentalMetricSweepSpec,
+    prepared_datasets: Sequence[PreparedDataset],
+    final_rankings: Sequence[Dict[str, object]],
+    baseline_candidate_lookup: Mapping[str, SweepCandidate],
+    metric_output_dir: Path,
+    requested_workers: int,
+    run_state: Dict[str, object],
+    run_state_path: Optional[Path],
+    generation_id: Optional[str],
+    merge_sources: Sequence[Path],
+    merge_log: Dict[str, object],
+) -> Dict[str, object]:
+    if not final_rankings:
+        return _estimate_baseline_shortlist_metric_preview(
+            experimental_spec=experimental_spec,
+            baseline_candidate_lookup=baseline_candidate_lookup,
+            dataset_count=len(prepared_datasets),
+        )
+
+    metric_candidates = _collect_metric_experiment_candidates(
+        final_rankings=final_rankings,
+        baseline_candidate_lookup=dict(baseline_candidate_lookup),
+        experimental_spec=experimental_spec,
+    )
+    metric_candidates = _assign_candidate_ids(metric_candidates, "m1c")
+    metric_eval = _evaluate_stage(
+        stage_name=METRIC_PHASE_STAGE_NAME,
+        candidates=metric_candidates,
+        datasets=prepared_datasets,
+        output_dir=metric_output_dir,
+        save_figures_flag=spec.save_figures,
+        requested_workers=requested_workers,
+        scoring=spec.scoring,
+        run_state=run_state,
+        run_state_path=run_state_path,
+        generation_id=generation_id,
+        merge_sources=merge_sources,
+        merge_log=merge_log,
+        dry_run=True,
+    )
+    payload = _metric_experiment_plan_payload(
+        experimental_spec=experimental_spec,
+        candidates=metric_candidates,
+        dataset_count=len(prepared_datasets),
+        status="planned",
+        output_dir=metric_output_dir,
+        final_execution=metric_eval.execution,
+    )
+    payload.update(
+        {
+            "pending_run_count": int(metric_eval.execution.get("pending_run_count", 0) or 0),
+            "skipped_valid_count": int(metric_eval.execution.get("skipped_valid_count", 0) or 0),
+            "exact": True,
+        }
+    )
+    return payload
+
+
+def build_sweep_run_preview(
+    spec: SweepExperimentSpec,
+    output_dir: Optional[Path] = None,
+    *,
+    extend_existing: bool = False,
+    merge_from: Optional[Sequence[Path]] = None,
+    adopt_relocated: bool = False,
+    relocation_rules: Sequence[PathRelocationRule] = (),
+    relocation_report: Optional[Mapping[str, object]] = None,
+    allow_dataset_generation: bool = False,
+) -> Dict[str, object]:
+    """Build a non-rectifying run-count preview for baseline and metric stages."""
+
+    resolved_output_dir = (
+        output_dir
+        if output_dir is not None
+        else (
+            Path(spec.output_dir)
+            if spec.output_dir
+            else Path("sweep_runs") / "preview"
+        )
+    )
+    dataset_identities = _read_dataset_identity_payloads(resolved_output_dir)
+    prepared_datasets = _prepare_datasets(
+        spec,
+        resolved_output_dir,
+        dataset_identities=dataset_identities,
+        allow_dataset_generation=allow_dataset_generation,
+    )
+    dataset_ids = [dataset.dataset_id for dataset in prepared_datasets]
+    fingerprint_payload = _build_experiment_fingerprint_payload(
+        spec=spec,
+        prepared_datasets=prepared_datasets,
+        output_dir=resolved_output_dir,
+    )
+    merge_sources = [Path(path) for path in (merge_from or [])]
+    run_state, run_state_path, generation_id = _load_or_initialize_run_state(
+        output_dir=resolved_output_dir,
+        fingerprint_payload=fingerprint_payload,
+        allow_extend=extend_existing,
+        allow_merge=bool(merge_sources),
+        adopt_relocated=bool(adopt_relocated),
+        relocation_rules=relocation_rules,
+        relocation_report=relocation_report,
+        merge_sources=merge_sources,
+        dry_run=True,
+    )
+    merge_log: Dict[str, object] = {
+        "generation_id": generation_id,
+        "created_at": _utc_now_iso(),
+        "canonical_output_dir": str(resolved_output_dir.resolve()),
+        "merge_sources": [str(path.resolve()) for path in merge_sources],
+        "sources": [],
+        "copied": [],
+        "would_copy": [],
+        "skipped_duplicates": [],
+        "rejected": [],
+        "conflicts": [],
+    }
+
+    stage_mode = spec.stages.mode
+    stage1_budget, stage2_budget = _stage_budgets(spec.stages)
+    baseline_budget = (
+        stage1_budget
+        if stage_mode == "two_stage"
+        else max(1, int(spec.stages.total_budget_per_dataset))
+    )
+    coarse_candidates_base: List[SweepCandidate] = []
+    for strategy in spec.strategies:
+        search_space = spec.search_spaces[strategy]
+        coarse_candidates_base.extend(generate_coarse_candidates(search_space, budget=None))
+    coarse_candidates = _assign_candidate_ids(
+        _limit_candidates(_dedupe_candidates(coarse_candidates_base), baseline_budget),
+        "s1c",
+    )
+    coarse_lookup = {candidate.candidate_id: candidate for candidate in coarse_candidates}
+    requested_workers = _default_max_workers(spec.stages.max_workers)
+
+    stage1_eval = _evaluate_stage(
+        stage_name="stage1",
+        candidates=coarse_candidates,
+        datasets=prepared_datasets,
+        output_dir=resolved_output_dir,
+        save_figures_flag=spec.save_figures,
+        requested_workers=requested_workers,
+        scoring=spec.scoring,
+        run_state=run_state,
+        run_state_path=run_state_path,
+        generation_id=generation_id,
+        merge_sources=merge_sources,
+        merge_log=merge_log,
+        dry_run=True,
+    )
+    stage1_rankings = score_and_rank_runs(
+        stage1_eval.stage_results,
+        spec.scoring,
+        dataset_ids=dataset_ids,
+    )
+    stages_payload: Dict[str, object] = {
+        "stage1": _stage_preview_payload(stage1_eval.execution)
+    }
+
+    refined_lookup: Dict[str, SweepCandidate] = {}
+    stage2_rankings: List[Dict[str, object]] = []
+    if stage_mode == "two_stage":
+        refined_candidates = generate_refined_candidates(
+            ranked_candidates=stage1_rankings,
+            candidate_lookup=coarse_lookup,
+            search_spaces=spec.search_spaces,
+            top_k=spec.stages.top_k,
+            budget=stage2_budget,
+            refinement=spec.stages.refinement,
+        )
+        if not refined_candidates and stage1_rankings:
+            best_id = str(stage1_rankings[0]["candidate_id"])
+            refined_candidates = [coarse_lookup[best_id]]
+        refined_candidates = _assign_candidate_ids(_dedupe_candidates(refined_candidates), "s2c")
+        refined_lookup = {candidate.candidate_id: candidate for candidate in refined_candidates}
+        stage2_eval = _evaluate_stage(
+            stage_name="stage2",
+            candidates=refined_candidates,
+            datasets=prepared_datasets,
+            output_dir=resolved_output_dir,
+            save_figures_flag=spec.save_figures,
+            requested_workers=requested_workers,
+            scoring=spec.scoring,
+            run_state=run_state,
+            run_state_path=run_state_path,
+            generation_id=generation_id,
+            merge_sources=merge_sources,
+            merge_log=merge_log,
+            dry_run=True,
+        )
+        stage2_rankings = score_and_rank_runs(
+            stage2_eval.stage_results,
+            spec.scoring,
+            dataset_ids=dataset_ids,
+        )
+        stages_payload["stage2"] = _stage_preview_payload(stage2_eval.execution)
+
+    final_rankings = stage2_rankings if stage2_rankings else stage1_rankings
+    experimental_spec = (
+        spec.experimental_metric_sweep
+        if spec.experimental_metric_sweep is not None
+        else ExperimentalMetricSweepSpec(
+            enabled=False,
+            shortlist_top_k=spec.stages.top_k,
+            formulations=[],
+        )
+    )
+    if not experimental_spec.enabled:
+        metric_payload = _disabled_metric_preview_payload(experimental_spec)
+    else:
+        metric_output_dir = resolved_output_dir / "metric_experiments"
+        if experimental_spec.candidate_source == METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH:
+            metric_payload = _preview_independent_metric_search(
+                spec=spec,
+                experimental_spec=experimental_spec,
+                prepared_datasets=prepared_datasets,
+                metric_output_dir=metric_output_dir,
+                requested_workers=requested_workers,
+                run_state=run_state,
+                run_state_path=run_state_path,
+                generation_id=generation_id,
+                merge_sources=merge_sources,
+                merge_log=merge_log,
+            )
+        else:
+            baseline_candidate_lookup = dict(coarse_lookup)
+            baseline_candidate_lookup.update(refined_lookup)
+            metric_payload = _preview_baseline_shortlist_metric_phase(
+                spec=spec,
+                experimental_spec=experimental_spec,
+                prepared_datasets=prepared_datasets,
+                final_rankings=final_rankings,
+                baseline_candidate_lookup=baseline_candidate_lookup,
+                metric_output_dir=metric_output_dir,
+                requested_workers=requested_workers,
+                run_state=run_state,
+                run_state_path=run_state_path,
+                generation_id=generation_id,
+                merge_sources=merge_sources,
+                merge_log=merge_log,
+            )
+
+    stage_planned = sum(
+        int(cast(Mapping[str, object], payload).get("planned_run_count", 0) or 0)
+        for payload in stages_payload.values()
+        if isinstance(payload, dict)
+    )
+    stage_pending = sum(
+        int(cast(Mapping[str, object], payload).get("pending_run_count", 0) or 0)
+        for payload in stages_payload.values()
+        if isinstance(payload, dict)
+    )
+    stage_skipped = sum(
+        int(cast(Mapping[str, object], payload).get("skipped_valid_count", 0) or 0)
+        for payload in stages_payload.values()
+        if isinstance(payload, dict)
+    )
+    totals = {
+        "planned_run_count": int(stage_planned + _metric_planned_count(metric_payload)),
+        "pending_run_count": int(stage_pending + _metric_pending_count(metric_payload)),
+        "skipped_valid_count": int(stage_skipped + _metric_skipped_valid_count(metric_payload)),
+        "exact": bool(
+            all(
+                bool(cast(Mapping[str, object], payload).get("exact", False))
+                for payload in stages_payload.values()
+                if isinstance(payload, dict)
+            )
+            and bool(metric_payload.get("exact", False))
+        ),
+    }
+    return {
+        "generation_id": generation_id,
+        "generated_at": _utc_now_iso(),
+        "canonical_output_dir": str(resolved_output_dir.resolve()),
+        "extend_existing": bool(extend_existing),
+        "merge_sources": [str(path.resolve()) for path in merge_sources],
+        "relocation": relocation_report
+        or {
+            "rules": _relocation_rules_to_payload(relocation_rules),
+            "applied": [],
+        },
+        "stages": stages_payload,
+        "metric_experiments": metric_payload,
+        "totals": totals,
+        "merge_log": merge_log,
+    }
+
+
 def _write_phase_summary_artifacts(
     *,
     output_dir: Path,
@@ -5117,6 +5632,75 @@ def run_sweep_experiment(
             )
 
     if dry_run:
+        experimental_metric_spec = (
+            spec.experimental_metric_sweep
+            if spec.experimental_metric_sweep is not None
+            else ExperimentalMetricSweepSpec(
+                enabled=False,
+                shortlist_top_k=spec.stages.top_k,
+                formulations=[],
+            )
+        )
+        if not experimental_metric_spec.enabled:
+            metric_dry_run_payload = _disabled_metric_preview_payload(experimental_metric_spec)
+        else:
+            metric_output_dir = resolved_output_dir / "metric_experiments"
+            if (
+                experimental_metric_spec.candidate_source
+                == METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH
+            ):
+                metric_dry_run_payload = _preview_independent_metric_search(
+                    spec=spec,
+                    experimental_spec=experimental_metric_spec,
+                    prepared_datasets=prepared_datasets,
+                    metric_output_dir=metric_output_dir,
+                    requested_workers=requested_workers,
+                    run_state=run_state,
+                    run_state_path=run_state_path,
+                    generation_id=generation_id,
+                    merge_sources=merge_sources,
+                    merge_log=merge_log,
+                )
+            else:
+                baseline_candidate_lookup = dict(coarse_lookup)
+                baseline_candidate_lookup.update(refined_lookup)
+                metric_dry_run_payload = _preview_baseline_shortlist_metric_phase(
+                    spec=spec,
+                    experimental_spec=experimental_metric_spec,
+                    prepared_datasets=prepared_datasets,
+                    final_rankings=stage2_rankings if stage2_rankings else stage1_rankings,
+                    baseline_candidate_lookup=baseline_candidate_lookup,
+                    metric_output_dir=metric_output_dir,
+                    requested_workers=requested_workers,
+                    run_state=run_state,
+                    run_state_path=run_state_path,
+                    generation_id=generation_id,
+                    merge_sources=merge_sources,
+                    merge_log=merge_log,
+                )
+        stages_payload: Dict[str, object] = {
+            "stage1": _stage_preview_payload(stage1_eval.execution),
+            **(
+                {"stage2": _stage_preview_payload(stage2_eval.execution)}
+                if stage_mode == "two_stage" and "stage2_eval" in locals()
+                else {}
+            ),
+        }
+        stage_planned = sum(
+            int(cast(Mapping[str, object], payload).get("planned_run_count", 0) or 0)
+            for payload in stages_payload.values()
+            if isinstance(payload, dict)
+        )
+        stage_pending = sum(
+            int(cast(Mapping[str, object], payload).get("pending_run_count", 0) or 0)
+            for payload in stages_payload.values()
+            if isinstance(payload, dict)
+        )
+        stage_skipped = sum(
+            int(cast(Mapping[str, object], payload).get("skipped_valid_count", 0) or 0)
+            for payload in stages_payload.values()
+            if isinstance(payload, dict)
+        )
         dry_run_payload = {
             "generation_id": generation_id,
             "generated_at": _utc_now_iso(),
@@ -5128,18 +5712,21 @@ def run_sweep_experiment(
                 "rules": _relocation_rules_to_payload(relocation_rules),
                 "applied": [],
             },
-            "stages": {
-                "stage1": stage1_eval.execution,
-                **(
-                    {"stage2": stage2_eval.execution}
-                    if stage_mode == "two_stage" and "stage2_eval" in locals()
-                    else {}
+            "stages": stages_payload,
+            "metric_experiments": metric_dry_run_payload,
+            "totals": {
+                "planned_run_count": int(stage_planned + _metric_planned_count(metric_dry_run_payload)),
+                "pending_run_count": int(stage_pending + _metric_pending_count(metric_dry_run_payload)),
+                "skipped_valid_count": int(stage_skipped + _metric_skipped_valid_count(metric_dry_run_payload)),
+                "exact": bool(
+                    all(
+                        bool(cast(Mapping[str, object], payload).get("exact", False))
+                        for payload in stages_payload.values()
+                        if isinstance(payload, dict)
+                    )
+                    and bool(metric_dry_run_payload.get("exact", False))
                 ),
             },
-            "metric_experiments": _metric_experiment_dry_run_payload(
-                spec=spec,
-                prepared_datasets=prepared_datasets,
-            ),
             "merge_log": merge_log,
         }
         write_json_atomic(
@@ -6940,7 +7527,11 @@ class SpecGuiApp:
         self.log_queue: "queue.Queue[Dict[str, object]]" = queue.Queue()
         self.run_thread: Optional[threading.Thread] = None
         self._is_running = False
+        self.preview_thread: Optional[threading.Thread] = None
+        self._is_previewing = False
         self.status_var = tk.StringVar(value="Idle")
+        self.planned_runs_var = tk.StringVar(value="Planned runs: not updated")
+        self.planned_runs_detail_var = tk.StringVar(value="")
         self.show_advanced_var = tk.BooleanVar(value=False)
         self.run_mode_var = tk.StringVar(value="normal")
         self.dry_run_var = tk.BooleanVar(value=False)
@@ -7092,8 +7683,28 @@ class SpecGuiApp:
         dry_run_check.pack(side="left", padx=12)
         self._register_editable(dry_run_check)
 
+        plan_frame = self.ttk.Frame(basic_frame)
+        plan_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+        self.update_planned_runs_btn = self.ttk.Button(
+            plan_frame,
+            text="Update planned runs",
+            command=self._on_update_planned_runs,
+        )
+        self.update_planned_runs_btn.pack(side="left", padx=(0, 8))
+        self._register_editable(self.update_planned_runs_btn)
+        plan_text_frame = self.ttk.Frame(plan_frame)
+        plan_text_frame.pack(side="left", fill="x", expand=True)
+        self.ttk.Label(
+            plan_text_frame,
+            textvariable=self.planned_runs_var,
+        ).pack(anchor="w")
+        self.ttk.Label(
+            plan_text_frame,
+            textvariable=self.planned_runs_detail_var,
+        ).pack(anchor="w")
+
         relocation_frame = self.ttk.LabelFrame(basic_frame, text="Relocation")
-        relocation_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+        relocation_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
         relocation_btns = self.ttk.Frame(relocation_frame)
         relocation_btns.pack(fill="x", padx=4, pady=3)
         add_reloc_btn = self.ttk.Button(
@@ -7128,7 +7739,7 @@ class SpecGuiApp:
         self.relocation_rows_frame.pack(fill="x", padx=4, pady=3)
 
         strat_frame = self.ttk.Frame(basic_frame)
-        strat_frame.grid(row=3, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        strat_frame.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=2)
         self.ttk.Label(strat_frame, text="Strategies:").pack(side="left")
         self.strategy_pixel_var = self.tk.BooleanVar(value=True)
         self.strategy_combined_var = self.tk.BooleanVar(value=True)
@@ -7143,7 +7754,7 @@ class SpecGuiApp:
             self._register_editable(chk)
 
         stage_frame = self.ttk.Frame(basic_frame)
-        stage_frame.grid(row=4, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        stage_frame.grid(row=5, column=0, columnspan=3, sticky="w", padx=4, pady=2)
         self.ttk.Label(stage_frame, text="Execution mode").grid(row=0, column=0, sticky="w")
         self.stage_mode_var = self.tk.StringVar(value="two_stage")
         self.stage_mode_combo = self.ttk.Combobox(
@@ -7200,7 +7811,7 @@ class SpecGuiApp:
         self._register_editable(self.refinement_extrapolation_combo)
 
         toggles_frame = self.ttk.Frame(basic_frame)
-        toggles_frame.grid(row=5, column=0, columnspan=3, sticky="w", padx=4, pady=2)
+        toggles_frame.grid(row=6, column=0, columnspan=3, sticky="w", padx=4, pady=2)
         self.analyze_var = self.tk.BooleanVar(value=True)
         self.save_figures_var = self.tk.BooleanVar(value=False)
         analyze_chk = self.ttk.Checkbutton(toggles_frame, text="Analyze", variable=self.analyze_var)
@@ -8035,6 +8646,99 @@ class SpecGuiApp:
         _save_spec_payload(Path(selected), payload)
         self._append_log(f"Saved spec: {selected}")
 
+    def _format_planned_runs_summary(self, preview: Mapping[str, object]) -> Tuple[str, str]:
+        totals = cast(Mapping[str, object], preview.get("totals", {}))
+        stages = cast(Mapping[str, object], preview.get("stages", {}))
+        metric = cast(Mapping[str, object], preview.get("metric_experiments", {}))
+
+        total_planned = int(totals.get("planned_run_count", 0) or 0)
+        total_pending = int(totals.get("pending_run_count", 0) or 0)
+        total_reused = int(totals.get("skipped_valid_count", 0) or 0)
+        exact_label = "exact" if bool(totals.get("exact", False)) else "includes estimates"
+        summary = (
+            f"Planned: {total_planned} | Pending: {total_pending} | "
+            f"Reusable: {total_reused} ({exact_label})"
+        )
+
+        stage_parts: List[str] = []
+        for stage_name in ("stage1", "stage2"):
+            stage = stages.get(stage_name)
+            if not isinstance(stage, dict):
+                continue
+            stage_parts.append(
+                f"{stage_name}: {int(stage.get('pending_run_count', 0) or 0)} pending"
+            )
+        metric_detail = "Metric: disabled"
+        if bool(metric.get("enabled", False)):
+            metric_pending = _metric_pending_count(metric)
+            metric_reused = _metric_skipped_valid_count(metric)
+            metric_prefix = "exact" if bool(metric.get("exact", False)) else "estimated"
+            metric_detail = (
+                f"Metric: {metric_prefix} {metric_pending} pending, "
+                f"{metric_reused} reusable"
+            )
+        detail = " | ".join(stage_parts + [metric_detail])
+        return summary, detail
+
+    def _preview_worker(self, payload: Dict[str, object], run_mode: str) -> None:
+        try:
+            relocation_rules, adopt_relocated = _relocation_options_from_spec_payload(payload)
+            relocated_payload, relocation_report = _apply_relocation_to_spec_payload(
+                payload,
+                relocation_rules,
+            )
+            spec = SweepExperimentSpec.from_dict(relocated_payload)
+            kwargs: Dict[str, object] = {
+                "extend_existing": run_mode == "extend",
+                "relocation_rules": relocation_rules,
+                "relocation_report": relocation_report,
+                "allow_dataset_generation": False,
+            }
+            if adopt_relocated:
+                kwargs["adopt_relocated"] = True
+            preview = build_sweep_run_preview(spec, **kwargs)
+            self.log_queue.put({"type": "preview_done", "preview": preview})
+        except Exception as exc:  # noqa: BLE001
+            self.log_queue.put(
+                {
+                    "type": "preview_error",
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+
+    def _on_update_planned_runs(self) -> None:
+        if self._is_previewing:
+            return
+        state = self._get_state()
+        issues = validate_state(state)
+        if issues:
+            self.planned_runs_var.set("Plan unavailable")
+            self.planned_runs_detail_var.set(issues[0])
+            self.messagebox.showerror("Update Planned Runs", "\n".join(issues[:12]))
+            return
+        try:
+            payload = state_to_spec_dict(state)
+            relocation_rules, _ = _relocation_options_from_spec_payload(payload)
+            relocated_payload, _ = _apply_relocation_to_spec_payload(payload, relocation_rules)
+            SweepExperimentSpec.from_dict(relocated_payload)
+        except Exception as exc:  # noqa: BLE001
+            self.planned_runs_var.set("Plan unavailable")
+            self.planned_runs_detail_var.set(str(exc))
+            self.messagebox.showerror("Update Planned Runs", str(exc))
+            return
+
+        self._is_previewing = True
+        self.update_planned_runs_btn.configure(state="disabled")
+        self.planned_runs_var.set("Updating planned runs...")
+        self.planned_runs_detail_var.set("")
+        self.preview_thread = threading.Thread(
+            target=self._preview_worker,
+            args=(payload, state.run_mode.strip().lower() or "normal"),
+            daemon=True,
+        )
+        self.preview_thread.start()
+
     def _run_worker(self, payload: Dict[str, object], run_mode: str, dry_run: bool) -> None:
         self.log_queue.put({"type": "log", "message": "Preparing experiment spec..."})
         try:
@@ -8180,6 +8884,24 @@ class SpecGuiApp:
                     str(event.get("message", "Unknown error")),
                     str(event.get("traceback", "")),
                 )
+            elif event_type == "preview_done":
+                self._is_previewing = False
+                if not self._is_running:
+                    self.update_planned_runs_btn.configure(state="normal")
+                preview = cast(Mapping[str, object], event.get("preview", {}))
+                summary, detail = self._format_planned_runs_summary(preview)
+                self.planned_runs_var.set(summary)
+                self.planned_runs_detail_var.set(detail)
+                self._append_log(f"Planned run preview updated. {summary}")
+            elif event_type == "preview_error":
+                self._is_previewing = False
+                if not self._is_running:
+                    self.update_planned_runs_btn.configure(state="normal")
+                message = str(event.get("message", "Unknown error"))
+                self.planned_runs_var.set("Plan unavailable")
+                self.planned_runs_detail_var.set(message)
+                self._append_log("Planned run preview failed.")
+                self._append_log(message)
         self.root.after(150, self._poll_logs)
 
     def _latest_dry_run_path(self, output_dir: Path) -> Optional[Path]:

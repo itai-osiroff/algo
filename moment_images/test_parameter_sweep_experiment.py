@@ -2563,6 +2563,131 @@ def test_dry_run_reports_independent_metric_search_plan(monkeypatch, tmp_path):
     assert not (out_dir / "metric_experiments" / "runs").exists()
 
 
+def test_dry_run_estimates_baseline_shortlist_metric_plan_without_rankings(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: pytest.fail("dry run must not execute tasks"),
+    )
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1, 3],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            mode="single_stage",
+            total_budget_per_dataset=2,
+            top_k=1,
+            max_workers=1,
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            candidate_source="baseline_shortlist",
+            shortlist_top_k=2,
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="intensity_default",
+                    family="intensity",
+                    alphas=[1.0],
+                ),
+                MetricFormulationSpec(
+                    formulation_id="exp_grad",
+                    family="ncc_gradient",
+                    alphas=[0.5, 1.0],
+                ),
+            ],
+        ),
+        output_dir=str(tmp_path / "dry_metric_estimate"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    out_dir = run_sweep_experiment(spec, dry_run=True)
+    dry_run_path = next((out_dir / "generations").glob("*/dry_run.json"))
+    dry_run_payload = json.loads(dry_run_path.read_text(encoding="utf-8"))
+    metric_plan = dry_run_payload["metric_experiments"]
+
+    assert metric_plan["candidate_source"] == "baseline_shortlist"
+    assert metric_plan["status"] == "estimated_requires_baseline_rankings"
+    assert metric_plan["exact"] is False
+    assert metric_plan["num_planned_runs"] == 6
+    assert metric_plan["pending_run_count"] == 6
+    assert metric_plan["estimate_reason"] == "baseline_rankings_unavailable"
+    assert dry_run_payload["totals"]["pending_run_count"] == (
+        dry_run_payload["stages"]["stage1"]["pending_run_count"] + 6
+    )
+    assert not (out_dir / "metric_experiments" / "runs").exists()
+
+
+def test_preview_reports_exact_baseline_shortlist_metric_reuse(monkeypatch, tmp_path):
+    calls = _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            mode="single_stage",
+            total_budget_per_dataset=1,
+            top_k=1,
+            max_workers=1,
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            candidate_source="baseline_shortlist",
+            shortlist_top_k=1,
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="intensity_default",
+                    family="intensity",
+                    alphas=[1.0],
+                )
+            ],
+        ),
+        output_dir=str(tmp_path / "exact_metric_preview"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    out_dir = run_sweep_experiment(spec)
+    assert calls
+    calls.clear()
+
+    preview = parameter_sweep.build_sweep_run_preview(spec, output_dir=out_dir)
+    metric_plan = preview["metric_experiments"]
+
+    assert metric_plan["candidate_source"] == "baseline_shortlist"
+    assert metric_plan["status"] == "planned"
+    assert metric_plan["exact"] is True
+    assert metric_plan["num_planned_runs"] == 1
+    assert metric_plan["pending_run_count"] == 0
+    assert metric_plan["skipped_valid_count"] == 1
+    assert preview["totals"]["pending_run_count"] == 0
+    assert calls == []
+
+
 def test_run_sweep_resume_recomputes_corrupt_metric_phase_artifact(tmp_path):
     views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
     views_path = tmp_path / "views.npy"
