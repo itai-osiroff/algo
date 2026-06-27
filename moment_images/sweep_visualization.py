@@ -70,6 +70,9 @@ RECTIFICATION_VIEW_CMAPS = {
     "component_score": "viridis",
     "global_final_delta": "coolwarm",
 }
+EFFECT_SEARCH_AGGREGATE_SOURCE = "Aggregate candidates"
+EFFECT_SEARCH_DATASET_SOURCE = "Dataset runs"
+EFFECT_SEARCH_SOURCE_OPTIONS = (EFFECT_SEARCH_AGGREGATE_SOURCE, EFFECT_SEARCH_DATASET_SOURCE)
 
 
 @dataclass
@@ -2656,10 +2659,13 @@ def _rows_for_stage(model: SweepVisualizationModel, stage_name: Optional[str]) -
 
 @dataclass
 class EffectRow:
+    row_id: str
     source_kind: str
     stage: str
     candidate_id: str
     dataset_id: Optional[str]
+    run_name: Optional[str]
+    generation_id: Optional[str]
     strategy: str
     family: Optional[str]
     alpha: Optional[float]
@@ -2670,6 +2676,9 @@ class EffectRow:
     metric_means: Dict[str, float]
     displacement_field_metrics: Dict[str, float]
     inter_view_consistency_metrics: Dict[str, float]
+    preview_path: Optional[str]
+    workspace_path: Optional[str]
+    metric_record_path: Optional[str]
 
 
 def _alpha_filter_value(alpha: Optional[float]) -> str:
@@ -2719,10 +2728,13 @@ def _effect_row_value_for_option(row: EffectRow, option: str) -> Optional[float]
 def _candidate_rows_to_effect_rows(rows: Sequence[CandidateVisualizationRow]) -> List[EffectRow]:
     return [
         EffectRow(
+            row_id=row.row_id,
             source_kind="candidate",
             stage=row.stage,
             candidate_id=row.candidate_id,
             dataset_id=None,
+            run_name=None,
+            generation_id=row.generation_id,
             strategy=row.strategy,
             family=row.family,
             alpha=row.alpha,
@@ -2733,6 +2745,9 @@ def _candidate_rows_to_effect_rows(rows: Sequence[CandidateVisualizationRow]) ->
             metric_means=row.metric_means,
             displacement_field_metrics=row.displacement_field_metrics,
             inter_view_consistency_metrics=row.inter_view_consistency_metrics,
+            preview_path=next((row.preview_paths[key] for key in sorted(row.preview_paths)), None),
+            workspace_path=None,
+            metric_record_path=None,
         )
         for row in rows
     ]
@@ -2741,10 +2756,13 @@ def _candidate_rows_to_effect_rows(rows: Sequence[CandidateVisualizationRow]) ->
 def _run_records_to_effect_rows(records: Sequence[RunMetricRecord]) -> List[EffectRow]:
     return [
         EffectRow(
+            row_id=record.row_id,
             source_kind="run",
             stage=record.stage,
             candidate_id=record.candidate_id,
             dataset_id=record.dataset_id,
+            run_name=record.run_name,
+            generation_id=record.generation_id,
             strategy=record.strategy,
             family=record.family,
             alpha=record.alpha,
@@ -2755,6 +2773,9 @@ def _run_records_to_effect_rows(records: Sequence[RunMetricRecord]) -> List[Effe
             metric_means=record.metric_means,
             displacement_field_metrics=record.displacement_field_metrics,
             inter_view_consistency_metrics=record.inter_view_consistency_metrics,
+            preview_path=record.preview_path,
+            workspace_path=record.workspace_path,
+            metric_record_path=record.metric_record_path,
         )
         for record in records
     ]
@@ -2797,6 +2818,95 @@ def _filter_effect_rows(
         if matches:
             filtered.append(row)
     return filtered
+
+
+def _effect_search_source_rows(model: SweepVisualizationModel, source_mode: str) -> List[EffectRow]:
+    if source_mode == EFFECT_SEARCH_DATASET_SOURCE:
+        return _run_records_to_effect_rows(
+            run_records_for_generation_scope(model, model.default_generation_scope)
+        )
+    return _candidate_rows_to_effect_rows(
+        candidate_rows_for_generation_scope(model, model.default_generation_scope)
+    )
+
+
+def _effect_search_row_matches(row: EffectRow, parameter_filters: Dict[str, str]) -> bool:
+    for parameter_name, filter_value in parameter_filters.items():
+        if not filter_value or filter_value == "All":
+            continue
+        if parameter_name not in row.params:
+            return False
+        if _stringify_param(row.params.get(parameter_name)) != filter_value:
+            return False
+    return True
+
+
+def _effect_search_sort_key(row: EffectRow) -> Tuple[str, str, str, str, str, str]:
+    return (
+        row.generation_id or "",
+        row.stage,
+        row.candidate_id,
+        row.dataset_id or "",
+        row.run_name or "",
+        row.row_id,
+    )
+
+
+def _effect_search_rows(
+    model: SweepVisualizationModel,
+    source_mode: str,
+    parameter_filters: Dict[str, str],
+) -> List[EffectRow]:
+    return sorted(
+        [
+            row
+            for row in _effect_search_source_rows(model, source_mode)
+            if _effect_search_row_matches(row, parameter_filters)
+        ],
+        key=_effect_search_sort_key,
+    )
+
+
+def _effect_row_identity_dict(row: EffectRow) -> Dict[str, object]:
+    return {
+        "row_id": row.row_id,
+        "source_kind": row.source_kind,
+        "generation_id": row.generation_id,
+        "stage": row.stage,
+        "candidate_id": row.candidate_id,
+        "dataset_id": row.dataset_id,
+        "run_name": row.run_name,
+        "score": row.score,
+        "mean_dataset_score": row.mean_dataset_score,
+        "mean_runtime_seconds": row.mean_runtime_seconds,
+        "preview_path": row.preview_path,
+        "workspace_path": row.workspace_path,
+        "metric_record_path": row.metric_record_path,
+    }
+
+
+def _format_effect_search_detail(row: Optional[EffectRow]) -> str:
+    if row is None:
+        return "No effect search result selected."
+    lines = [
+        f"row_id: {row.row_id}",
+        f"generation: {row.generation_id or 'n/a'}",
+        f"source: {row.source_kind}",
+        f"stage: {row.stage}",
+        f"candidate: {row.candidate_id}",
+        f"dataset: {row.dataset_id or 'aggregate'}",
+        f"run: {row.run_name or 'n/a'}",
+        f"score: {_format_float(row.score)}",
+        f"mean dataset score: {_format_float(row.mean_dataset_score)}",
+        f"runtime: {_format_float(row.mean_runtime_seconds, precision=3)}s",
+        f"preview: {row.preview_path or 'n/a'}",
+        f"workspace: {row.workspace_path or 'n/a'}",
+        f"metric_record: {row.metric_record_path or 'n/a'}",
+        "",
+        "params:",
+        json.dumps(row.params, indent=2, sort_keys=True),
+    ]
+    return "\n".join(lines)
 
 
 def _stage_parameter_rankings(
@@ -6451,6 +6561,84 @@ class SweepVisualizationApp:
         self.coverage_filter_frame = self.ttk.Frame(self.coverage_tab)
         self.coverage_filter_frame.pack(fill="x", padx=6, pady=4)
 
+        self.effect_search_frame = self.ttk.LabelFrame(self.coverage_tab, text="Find Exact Params")
+        self.effect_search_frame.pack(fill="x", padx=6, pady=4)
+        search_controls = self.ttk.Frame(self.effect_search_frame)
+        search_controls.pack(fill="x", padx=4, pady=(4, 2))
+        self.ttk.Label(search_controls, text="Source").pack(side="left")
+        self.effect_search_source_combo = self.ttk.Combobox(
+            search_controls,
+            textvariable=self.effect_search_source_var,
+            state="readonly",
+            width=22,
+            values=EFFECT_SEARCH_SOURCE_OPTIONS,
+        )
+        self.effect_search_source_combo.pack(side="left", padx=4)
+        self.effect_search_source_combo.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_effect_search_results())
+        self.ttk.Button(search_controls, text="Refresh", command=self._refresh_effect_search_results).pack(side="left", padx=(8, 4))
+        self.ttk.Button(search_controls, text="Copy Identity", command=self._copy_effect_search_identity).pack(side="left", padx=4)
+        self.ttk.Button(search_controls, text="Copy Params", command=self._copy_effect_search_params).pack(side="left", padx=4)
+        self.ttk.Button(search_controls, text="Open Run Folder", command=self._open_effect_search_folder).pack(side="left", padx=4)
+        self.ttk.Button(search_controls, text="Open metric_record", command=self._open_effect_search_metric_record).pack(side="left", padx=4)
+        self.ttk.Button(search_controls, text="Open Preview", command=self._open_effect_search_preview).pack(side="left", padx=4)
+
+        self.effect_search_filter_frame = self.ttk.Frame(self.effect_search_frame)
+        self.effect_search_filter_frame.pack(fill="x", padx=4, pady=2)
+
+        search_results = self.ttk.Frame(self.effect_search_frame)
+        search_results.pack(fill="x", padx=4, pady=4)
+        columns = (
+            "source",
+            "generation",
+            "stage",
+            "candidate",
+            "dataset",
+            "run",
+            "score",
+            "row_id",
+        )
+        self.effect_search_tree = self.ttk.Treeview(
+            search_results,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            height=6,
+        )
+        headings = {
+            "source": "Source",
+            "generation": "Generation",
+            "stage": "Stage",
+            "candidate": "Candidate",
+            "dataset": "Dataset",
+            "run": "Run",
+            "score": "Score",
+            "row_id": "Row ID",
+        }
+        widths = {
+            "source": 90,
+            "generation": 110,
+            "stage": 100,
+            "candidate": 120,
+            "dataset": 100,
+            "run": 150,
+            "score": 90,
+            "row_id": 220,
+        }
+        for column in columns:
+            self.effect_search_tree.heading(
+                column,
+                text=headings[column],
+                command=lambda col=column: self._on_effect_search_sort(col),
+            )
+            self.effect_search_tree.column(column, width=widths[column], anchor="w")
+        search_scroll = self.ttk.Scrollbar(search_results, orient="vertical", command=self.effect_search_tree.yview)
+        self.effect_search_tree.configure(yscrollcommand=search_scroll.set)
+        self.effect_search_tree.pack(side="left", fill="x", expand=True)
+        search_scroll.pack(side="right", fill="y")
+        self.effect_search_tree.bind("<<TreeviewSelect>>", lambda _evt: self._on_effect_search_selection_changed())
+        self.effect_search_detail_text = self.tk.Text(self.effect_search_frame, height=8, wrap="word")
+        self.effect_search_detail_text.pack(fill="x", padx=4, pady=(0, 4))
+
         self.coverage_text = self.tk.Text(self.coverage_tab, height=12, wrap="word")
         self.coverage_text.pack(fill="x", padx=6, pady=4)
         self.coverage_plot_frame = self.ttk.Frame(self.coverage_tab)
@@ -6919,6 +7107,12 @@ def _sweep_visualization_app_init(
     self._metric_tab_visible = False
     self._effect_filter_vars = {}
     self._effect_filter_combos = {}
+    self.effect_search_source_var = tk.StringVar(value=EFFECT_SEARCH_AGGREGATE_SOURCE)
+    self.effect_search_filter_vars: Dict[str, Any] = {}
+    self.effect_search_filter_combos: Dict[str, Any] = {}
+    self._effect_search_row_lookup: Dict[str, EffectRow] = {}
+    self._effect_search_sort_column = "row_id"
+    self._effect_search_sort_reverse = False
     self._leaderboard_row_lookup: Dict[str, CandidateVisualizationRow] = {}
     self._leaderboard_sort_column = "rank"
     self._leaderboard_sort_reverse = False
@@ -7637,6 +7831,229 @@ def _sweep_visualization_refresh_leaderboard(self: SweepVisualizationApp) -> Non
     elif rows:
         self.leaderboard_tree.selection_set(rows[0].row_id)
     self._on_leaderboard_selection_changed()
+
+
+def _effect_search_item_id(row: EffectRow) -> str:
+    return f"{row.source_kind}:{row.row_id}"
+
+
+def _effect_search_column_value(row: EffectRow, column: str) -> str:
+    if column == "source":
+        return row.source_kind
+    if column == "generation":
+        return row.generation_id or ""
+    if column == "stage":
+        return row.stage
+    if column == "candidate":
+        return row.candidate_id
+    if column == "dataset":
+        return row.dataset_id or "aggregate"
+    if column == "run":
+        return row.run_name or ""
+    if column == "score":
+        return _format_float(row.score)
+    if column == "row_id":
+        return row.row_id
+    return ""
+
+
+def _sweep_visualization_rebuild_effect_search_controls(
+    self: SweepVisualizationApp,
+    model: SweepVisualizationModel,
+) -> None:
+    for widget in self.effect_search_filter_frame.winfo_children():
+        widget.destroy()
+    self.effect_search_filter_vars = {}
+    self.effect_search_filter_combos = {}
+    scoped_candidates = candidate_rows_for_generation_scope(model, model.default_generation_scope)
+    scoped_records = run_records_for_generation_scope(model, model.default_generation_scope)
+    for idx, parameter_name in enumerate(model.parameter_names):
+        row_idx = idx // 4
+        col_idx = (idx % 4) * 2
+        values = sorted(
+            {
+                _stringify_param(row.params.get(parameter_name))
+                for row in scoped_candidates
+                if parameter_name in row.params
+            }
+            | {
+                _stringify_param(record.params.get(parameter_name))
+                for record in scoped_records
+                if parameter_name in record.params
+            }
+        )
+        var = self.tk.StringVar(value="All")
+        label = self.ttk.Label(self.effect_search_filter_frame, text=parameter_name)
+        label.grid(row=row_idx, column=col_idx, sticky="w", padx=3, pady=2)
+        combo = self.ttk.Combobox(
+            self.effect_search_filter_frame,
+            textvariable=var,
+            state="readonly",
+            width=16,
+            values=["All", *values],
+        )
+        combo.grid(row=row_idx, column=col_idx + 1, sticky="we", padx=3, pady=2)
+        combo.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_effect_search_results())
+        self.effect_search_filter_vars[parameter_name] = var
+        self.effect_search_filter_combos[parameter_name] = combo
+
+
+def _sweep_visualization_effect_search_filters(self: SweepVisualizationApp) -> Dict[str, str]:
+    return {
+        parameter_name: var.get() or "All"
+        for parameter_name, var in self.effect_search_filter_vars.items()
+    }
+
+
+def _sweep_visualization_sorted_effect_search_rows(
+    self: SweepVisualizationApp,
+    rows: Sequence[EffectRow],
+) -> List[EffectRow]:
+    column = self._effect_search_sort_column
+    if column == "score":
+        finite_rows: List[Tuple[float, EffectRow]] = []
+        missing_rows: List[EffectRow] = []
+        for row in rows:
+            if row.score is None or not math.isfinite(row.score):
+                missing_rows.append(row)
+            else:
+                finite_rows.append((float(row.score), row))
+        finite_rows.sort(
+            key=lambda item: (item[0], _effect_search_sort_key(item[1])),
+            reverse=self._effect_search_sort_reverse,
+        )
+        return [row for _value, row in finite_rows] + missing_rows
+    return sorted(
+        rows,
+        key=lambda row: (_effect_search_column_value(row, column), _effect_search_sort_key(row)),
+        reverse=self._effect_search_sort_reverse,
+    )
+
+
+def _sweep_visualization_effect_search_row_values(row: EffectRow) -> Tuple[str, ...]:
+    return (
+        _effect_search_column_value(row, "source"),
+        _effect_search_column_value(row, "generation"),
+        _effect_search_column_value(row, "stage"),
+        _effect_search_column_value(row, "candidate"),
+        _effect_search_column_value(row, "dataset"),
+        _effect_search_column_value(row, "run"),
+        _effect_search_column_value(row, "score"),
+        _effect_search_column_value(row, "row_id"),
+    )
+
+
+def _sweep_visualization_refresh_effect_search_results(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        return
+    selected_ids = list(self.effect_search_tree.selection())
+    source_mode = self.effect_search_source_var.get() or EFFECT_SEARCH_AGGREGATE_SOURCE
+    rows = self._sorted_effect_search_rows(
+        _effect_search_rows(
+            self.model,
+            source_mode,
+            self._effect_search_filters(),
+        )
+    )
+    self._effect_search_row_lookup = {_effect_search_item_id(row): row for row in rows}
+    self.effect_search_tree.delete(*self.effect_search_tree.get_children())
+    for row in rows:
+        item_id = _effect_search_item_id(row)
+        self.effect_search_tree.insert(
+            "",
+            "end",
+            iid=item_id,
+            values=_sweep_visualization_effect_search_row_values(row),
+        )
+    reselection = [item_id for item_id in selected_ids if item_id in self._effect_search_row_lookup]
+    if reselection:
+        self.effect_search_tree.selection_set(reselection[0])
+    self._on_effect_search_selection_changed()
+
+
+def _sweep_visualization_selected_effect_search_row(self: SweepVisualizationApp) -> Optional[EffectRow]:
+    selected = self.effect_search_tree.selection()
+    if not selected:
+        return None
+    return self._effect_search_row_lookup.get(selected[0])
+
+
+def _sweep_visualization_on_effect_search_selection_changed(self: SweepVisualizationApp) -> None:
+    self._set_text_widget(
+        self.effect_search_detail_text,
+        _format_effect_search_detail(self._selected_effect_search_row()),
+    )
+
+
+def _sweep_visualization_on_effect_search_sort(self: SweepVisualizationApp, column: str) -> None:
+    if self._effect_search_sort_column == column:
+        self._effect_search_sort_reverse = not self._effect_search_sort_reverse
+    else:
+        self._effect_search_sort_column = column
+        self._effect_search_sort_reverse = column == "score"
+    self._refresh_effect_search_results()
+
+
+def _sweep_visualization_copy_to_clipboard(self: SweepVisualizationApp, text: str) -> None:
+    self.root.clipboard_clear()
+    self.root.clipboard_append(text)
+    self.status_var.set("Copied to clipboard")
+
+
+def _sweep_visualization_copy_effect_search_identity(self: SweepVisualizationApp) -> None:
+    row = self._selected_effect_search_row()
+    if row is None:
+        self.messagebox.showwarning("Effect Search", "Select an effect search row first.")
+        return
+    self._copy_to_clipboard(json.dumps(_effect_row_identity_dict(row), indent=2, sort_keys=True))
+
+
+def _sweep_visualization_copy_effect_search_params(self: SweepVisualizationApp) -> None:
+    row = self._selected_effect_search_row()
+    if row is None:
+        self.messagebox.showwarning("Effect Search", "Select an effect search row first.")
+        return
+    self._copy_to_clipboard(json.dumps(row.params, indent=2, sort_keys=True))
+
+
+def _effect_search_artifact_parent(row: EffectRow) -> Optional[Path]:
+    for path_text in (row.metric_record_path, row.workspace_path, row.preview_path):
+        if path_text:
+            return Path(path_text).parent
+    return None
+
+
+def _sweep_visualization_open_effect_search_folder(self: SweepVisualizationApp) -> None:
+    row = self._selected_effect_search_row()
+    candidate_path = None if row is None else _effect_search_artifact_parent(row)
+    if candidate_path is None:
+        self.messagebox.showwarning("Run Folder", "No run folder could be resolved for the selected effect row.")
+        return
+    ok, err = _open_with_system(candidate_path)
+    if not ok:
+        self.messagebox.showerror("Run Folder", err or "Failed to open run folder.")
+
+
+def _sweep_visualization_open_effect_search_metric_record(self: SweepVisualizationApp) -> None:
+    row = self._selected_effect_search_row()
+    metric_record_path = None if row is None else row.metric_record_path
+    if not metric_record_path:
+        self.messagebox.showwarning("metric_record", "No metric_record.json available for the selected effect row.")
+        return
+    ok, err = _open_with_system(Path(metric_record_path))
+    if not ok:
+        self.messagebox.showerror("metric_record", err or "Failed to open metric_record.json.")
+
+
+def _sweep_visualization_open_effect_search_preview(self: SweepVisualizationApp) -> None:
+    row = self._selected_effect_search_row()
+    preview_path = None if row is None else row.preview_path
+    if not preview_path:
+        self.messagebox.showwarning("Preview", "No preview image available for the selected effect row.")
+        return
+    ok, err = _open_with_system(Path(preview_path))
+    if not ok:
+        self.messagebox.showerror("Preview", err or "Failed to open preview.")
 
 
 def _sweep_visualization_sensitivity_filters(self: SweepVisualizationApp) -> Dict[str, object]:
@@ -8391,6 +8808,10 @@ def _sweep_visualization_populate_from_model(
     self.coverage_alpha_var.set("All")
     self.coverage_mode_var.set("1D Trend")
     self._rebuild_effect_filter_controls(model)
+    self.effect_search_source_combo["values"] = EFFECT_SEARCH_SOURCE_OPTIONS
+    if self.effect_search_source_var.get() not in EFFECT_SEARCH_SOURCE_OPTIONS:
+        self.effect_search_source_var.set(EFFECT_SEARCH_AGGREGATE_SOURCE)
+    self._rebuild_effect_search_controls(model)
 
     self.sensitivity_stage_combo["values"] = stage_values
     self.sensitivity_stage_var.set(model.primary_stage_name)
@@ -8451,6 +8872,7 @@ def _sweep_visualization_populate_from_model(
 
     self._update_metric_tab_visibility(bool(model.alpha_family_summary))
     self.refresh_effects()
+    self._refresh_effect_search_results()
     self.refresh_sensitivity()
     self.refresh_leaderboard()
     self._draw_figure("overview", self.overview_plot_frame, create_overview_figure(model))
@@ -8479,6 +8901,19 @@ SweepVisualizationApp._on_leaderboard_sort = _sweep_visualization_on_leaderboard
 SweepVisualizationApp._seed_diagnostics_from_row = _sweep_visualization_seed_diagnostics_from_row
 SweepVisualizationApp._on_leaderboard_selection_changed = _sweep_visualization_on_leaderboard_selection_changed
 SweepVisualizationApp.refresh_leaderboard = _sweep_visualization_refresh_leaderboard
+SweepVisualizationApp._rebuild_effect_search_controls = _sweep_visualization_rebuild_effect_search_controls
+SweepVisualizationApp._effect_search_filters = _sweep_visualization_effect_search_filters
+SweepVisualizationApp._sorted_effect_search_rows = _sweep_visualization_sorted_effect_search_rows
+SweepVisualizationApp._refresh_effect_search_results = _sweep_visualization_refresh_effect_search_results
+SweepVisualizationApp._selected_effect_search_row = _sweep_visualization_selected_effect_search_row
+SweepVisualizationApp._on_effect_search_selection_changed = _sweep_visualization_on_effect_search_selection_changed
+SweepVisualizationApp._on_effect_search_sort = _sweep_visualization_on_effect_search_sort
+SweepVisualizationApp._copy_to_clipboard = _sweep_visualization_copy_to_clipboard
+SweepVisualizationApp._copy_effect_search_identity = _sweep_visualization_copy_effect_search_identity
+SweepVisualizationApp._copy_effect_search_params = _sweep_visualization_copy_effect_search_params
+SweepVisualizationApp._open_effect_search_folder = _sweep_visualization_open_effect_search_folder
+SweepVisualizationApp._open_effect_search_metric_record = _sweep_visualization_open_effect_search_metric_record
+SweepVisualizationApp._open_effect_search_preview = _sweep_visualization_open_effect_search_preview
 SweepVisualizationApp._sensitivity_filters = _sweep_visualization_sensitivity_filters
 SweepVisualizationApp.refresh_sensitivity = _sweep_visualization_refresh_sensitivity
 SweepVisualizationApp.refresh_extension_suggestions = _sweep_visualization_refresh_extension_suggestions

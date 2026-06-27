@@ -15,7 +15,10 @@ from moment_images.sweep_visualization import (
     RectificationViewSelection,
     SweepVisualizationApp,
     _comparison_artifacts_for_candidate,
+    _effect_row_identity_dict,
+    _effect_search_rows,
     _format_comparison_text,
+    _format_effect_search_detail,
     candidate_rows_for_generation_scope,
     create_candidate_robustness_figure,
     create_comparison_figure,
@@ -924,6 +927,99 @@ def test_create_effects_figure_supports_aggregate_and_dataset_specific_grouping(
     assert any(text.get_text() == "2" for text in heatmap.axes[0].texts)
 
 
+def test_effect_search_rows_find_exact_aggregate_params_with_identity(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+    run_state = _run_state_payload(output_dir, ["d1", "d2"], stage_mode="single_stage")
+    run_state["active_generation_id"] = "gen_new"
+    run_state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run"},
+        {"generation_id": "gen_new", "action": "extend"},
+    ]
+    _write_json(output_dir / "run_state.json", run_state)
+
+    active_ranking = _ranking(
+        "s1c0000",
+        score=0.91,
+        rank=1,
+        datasets=["d1", "d2"],
+        stage="stage1",
+        params={"max_displacement": 6},
+    )
+    active_ranking["generation_id"] = "gen_new"
+    old_ranking = _ranking(
+        "s1c0000",
+        score=0.51,
+        rank=1,
+        datasets=["d1", "d2"],
+        stage="stage1",
+        params={"max_displacement": 11},
+    )
+    old_ranking["generation_id"] = "gen_old"
+    _write_json(output_dir / "stage1_summary.json", _stage_summary("stage1", [active_ranking]))
+    _write_json(
+        output_dir / "generations" / "gen_old" / "products" / "stage1_summary.json",
+        _stage_summary("stage1", [old_ranking]),
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+    model.default_generation_scope = "All"
+
+    all_rows = _effect_search_rows(model, "Aggregate candidates", {})
+    exact_rows = _effect_search_rows(model, "Aggregate candidates", {"max_displacement": "11"})
+
+    assert len(all_rows) == 2
+    assert [row.generation_id for row in exact_rows] == ["gen_old"]
+    assert exact_rows[0].row_id == "gen_old:stage1:s1c0000"
+    assert exact_rows[0].candidate_id == "s1c0000"
+
+    identity = _effect_row_identity_dict(exact_rows[0])
+    assert identity["row_id"] == "gen_old:stage1:s1c0000"
+    assert identity["generation_id"] == "gen_old"
+    assert identity["candidate_id"] == "s1c0000"
+
+
+def test_effect_search_rows_find_dataset_runs_with_artifacts(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_metric_phase=True,
+        include_workspace=True,
+    )
+    _write_metric_record(
+        output_dir / "metric_experiments" / "runs" / "metric_phase" / "m1c0000" / "d1" / "metric_record.json",
+        run="metric_m1c0000_d1",
+        family="ncc_gradient",
+        alpha=0.2,
+        formulation_id="grad_0p2",
+        metric_base=20.0,
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+
+    rows = _effect_search_rows(
+        model,
+        "Dataset runs",
+        {"displacement_metric_family": "blurred_gradient_corr", "displacement_alpha": "0.2"},
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.source_kind == "run"
+    assert row.dataset_id == "d1"
+    assert row.run_name == "metric_m1c0000_d1"
+    assert row.preview_path and row.preview_path.endswith("avg_rectified.png")
+    assert row.workspace_path and row.workspace_path.endswith("workspace.npz")
+    assert row.metric_record_path and row.metric_record_path.endswith("metric_record.json")
+
+    detail = _format_effect_search_detail(row)
+    assert "run: metric_m1c0000_d1" in detail
+    assert "metric_record:" in detail
+
+
 def test_compute_parameter_sensitivity_ranks_aggregate_and_dataset_effects(tmp_path):
     output_dir = _create_modern_fixture(tmp_path, include_stage2_summary=True)
     datasets = ["d1", "d2"]
@@ -1712,6 +1808,35 @@ def test_gui_preview_tab_opens_generation_qualified_candidate(tmp_path):
     assert len(captures) == 1
     assert captures[0][0].selection.generation_id == "gen_old"
     assert captures[0][0].selection.candidate_id == "s1c_old0000"
+    root.destroy()
+
+
+def test_gui_effect_search_filters_and_shows_identity_detail(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root, initial_path=output_dir)
+    root.update()
+
+    app.effect_search_source_var.set("Aggregate candidates")
+    app.effect_search_filter_vars["max_displacement"].set("6")
+    app._refresh_effect_search_results()
+    root.update()
+
+    children = app.effect_search_tree.get_children()
+    assert len(children) == 1
+    app.effect_search_tree.selection_set(children[0])
+    app._on_effect_search_selection_changed()
+    detail_text = app.effect_search_detail_text.get("1.0", "end").strip()
+
+    assert "row_id: stage1:s1c0000" in detail_text
+    assert "generation:" in detail_text
+    assert "stage: stage1" in detail_text
+    assert "candidate: s1c0000" in detail_text
+    assert "params:" in detail_text
     root.destroy()
 
 
