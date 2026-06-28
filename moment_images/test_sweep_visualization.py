@@ -1580,6 +1580,8 @@ def test_gui_loads_model_and_toggles_metric_tab(tmp_path):
     assert "Leaderboard" in tab_names
     assert "Comparison" in tab_names
     assert "Effects" in tab_names
+    assert "Parameter Locator" in tab_names
+    assert tab_names.index("Parameter Locator") == tab_names.index("Effects") + 1
     assert "Sensitivity" in tab_names
     assert "Next Extensions" in tab_names
     assert "Metric Diagnostics" in tab_names
@@ -1837,6 +1839,51 @@ def test_gui_effect_search_filters_and_shows_identity_detail(tmp_path):
     assert "stage: stage1" in detail_text
     assert "candidate: s1c0000" in detail_text
     assert "params:" in detail_text
+    root.destroy()
+
+
+def test_gui_parameter_locator_lives_outside_effects_tab(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root, initial_path=output_dir)
+    root.update()
+
+    assert app.effect_search_frame.master is app.locator_tab
+    assert app.effect_search_frame not in app.coverage_tab.winfo_children()
+    assert app.effect_search_tree.master.master is app.effect_search_frame
+    root.destroy()
+
+
+def test_gui_effect_filters_can_seed_parameter_locator(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        stage_mode="single_stage",
+    )
+    root = _make_root_or_skip()
+    app = SweepVisualizationApp(root, initial_path=output_dir)
+    root.update()
+
+    app.effect_search_source_var.set("Aggregate candidates")
+    app.effect_search_filter_vars["max_displacement"].set("9")
+    app.effect_search_filter_vars["gauss_sigma"].set("999")
+    app._refresh_effect_search_results()
+    assert len(app.effect_search_tree.get_children()) == 0
+
+    app._effect_filter_vars["max_displacement"].set("6")
+    app._send_effects_filters_to_locator()
+    root.update()
+
+    assert app.effect_search_filter_vars["max_displacement"].get() == "6"
+    assert app.effect_search_filter_vars["gauss_sigma"].get() == "All"
+    assert app.notebook.select() == str(app.locator_tab)
+    children = app.effect_search_tree.get_children()
+    assert len(children) == 1
+    assert "stage1:s1c0000" in children[0]
     root.destroy()
 
 
