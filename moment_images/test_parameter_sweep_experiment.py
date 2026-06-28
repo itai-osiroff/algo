@@ -2688,6 +2688,78 @@ def test_preview_reports_exact_baseline_shortlist_metric_reuse(monkeypatch, tmp_
     assert calls == []
 
 
+def test_count_only_preview_does_not_require_generated_source_image_views(tmp_path):
+    spec = SweepExperimentSpec(
+        datasets=[
+            SweepDatasetSpec(
+                dataset_id="d1",
+                source_image=str(tmp_path / "source.png"),
+                center_x=10,
+                center_y=10,
+                view_radius=4,
+            ),
+            SweepDatasetSpec(
+                dataset_id="d2",
+                source_image=str(tmp_path / "other.png"),
+                center_x=12,
+                center_y=12,
+                view_radius=4,
+            ),
+        ],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1, 3],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            mode="single_stage",
+            total_budget_per_dataset=2,
+            top_k=1,
+            max_workers=1,
+        ),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            candidate_source="independent_search",
+            search_stages=SweepStageSpec(
+                mode="single_stage",
+                total_budget_per_dataset=1,
+                top_k=1,
+                max_workers=1,
+            ),
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="intensity_default",
+                    family="intensity",
+                    alphas=[1.0],
+                )
+            ],
+        ),
+        output_dir=str(tmp_path / "source_count_only"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    preview = parameter_sweep.build_sweep_run_preview(
+        spec,
+        reuse_existing_artifacts=False,
+    )
+
+    assert preview["stages"]["stage1"]["planned_run_count"] == 4
+    assert preview["stages"]["stage1"]["pending_run_count"] == 4
+    assert preview["stages"]["stage1"]["exact"] is False
+    assert preview["metric_experiments"]["candidate_source"] == "independent_search"
+    assert preview["metric_experiments"]["num_planned_runs"] == 2
+    assert preview["metric_experiments"]["pending_run_count"] == 2
+    assert preview["metric_experiments"]["exact"] is False
+    assert preview["totals"]["planned_run_count"] == 6
+    assert preview["totals"]["pending_run_count"] == 6
+    assert not (tmp_path / "source_count_only" / "datasets").exists()
+
+
 def test_run_sweep_resume_recomputes_corrupt_metric_phase_artifact(tmp_path):
     views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
     views_path = tmp_path / "views.npy"

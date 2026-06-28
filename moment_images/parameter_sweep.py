@@ -5002,6 +5002,179 @@ def _preview_baseline_shortlist_metric_phase(
     return payload
 
 
+def _count_only_stage_payload(planned_runs: int, *, status: str = "count_only") -> Dict[str, object]:
+    return {
+        "planned_run_count": int(planned_runs),
+        "pending_run_count": int(planned_runs),
+        "skipped_valid_count": 0,
+        "exact": False,
+        "status": status,
+        "estimate_reason": "dataset_metadata_not_required",
+    }
+
+
+def _count_only_independent_metric_payload(
+    *,
+    spec: SweepExperimentSpec,
+    experimental_spec: ExperimentalMetricSweepSpec,
+    dataset_count: int,
+) -> Dict[str, object]:
+    search_stages = _metric_search_stages(experimental_spec)
+    stage1_budget, stage2_budget = _independent_metric_stage_budgets(search_stages)
+    stage1_candidates: List[SweepCandidate] = []
+    if search_stages.mode == "single_stage":
+        metric_candidates = _collect_independent_metric_stage_candidates(
+            spec,
+            experimental_spec,
+            budget_per_variant=stage1_budget,
+        )
+    else:
+        stage1_candidates = _collect_independent_metric_stage_candidates(
+            spec,
+            experimental_spec,
+            budget_per_variant=stage1_budget,
+        )
+        metric_candidates = []
+        for variant in _metric_formulation_variants(experimental_spec.formulations):
+            base_candidates = _base_metric_search_candidates(spec, budget=stage2_budget)
+            metric_candidates.extend(
+                _expand_candidates_with_metric_formulations(base_candidates, [variant])
+            )
+        metric_candidates = _dedupe_candidates(metric_candidates)
+
+    payload = _metric_experiment_plan_payload(
+        experimental_spec=experimental_spec,
+        candidates=metric_candidates,
+        dataset_count=dataset_count,
+        status="count_only",
+        stage1_candidates=stage1_candidates,
+    )
+    payload.update(
+        {
+            "pending_run_count": int(payload.get("num_planned_runs", 0) or 0),
+            "skipped_valid_count": 0,
+            "exact": False,
+            "estimate_reason": "dataset_metadata_not_required",
+        }
+    )
+    internal = payload.get("internal_stage1")
+    if isinstance(internal, dict):
+        internal["execution"] = _count_only_stage_payload(
+            int(internal.get("num_planned_runs", 0) or 0)
+        )
+    return payload
+
+
+def _build_count_only_sweep_run_preview(
+    *,
+    spec: SweepExperimentSpec,
+    resolved_output_dir: Path,
+    extend_existing: bool,
+    merge_sources: Sequence[Path],
+    relocation_rules: Sequence[PathRelocationRule],
+    relocation_report: Optional[Mapping[str, object]],
+) -> Dict[str, object]:
+    dataset_count = len(spec.datasets)
+    stage_mode = spec.stages.mode
+    stage1_budget, stage2_budget = _stage_budgets(spec.stages)
+    baseline_budget = (
+        stage1_budget
+        if stage_mode == "two_stage"
+        else max(1, int(spec.stages.total_budget_per_dataset))
+    )
+    coarse_candidates_base: List[SweepCandidate] = []
+    for strategy in spec.strategies:
+        search_space = spec.search_spaces[strategy]
+        coarse_candidates_base.extend(generate_coarse_candidates(search_space, budget=None))
+    coarse_candidates = _assign_candidate_ids(
+        _limit_candidates(_dedupe_candidates(coarse_candidates_base), baseline_budget),
+        "s1c",
+    )
+    stages_payload: Dict[str, object] = {
+        "stage1": _count_only_stage_payload(len(coarse_candidates) * dataset_count)
+    }
+    refined_lookup: Dict[str, SweepCandidate] = {}
+    if stage_mode == "two_stage":
+        stages_payload["stage2"] = _count_only_stage_payload(
+            max(1, int(stage2_budget)) * dataset_count,
+            status="estimated_requires_stage1_rankings",
+        )
+
+    experimental_spec = (
+        spec.experimental_metric_sweep
+        if spec.experimental_metric_sweep is not None
+        else ExperimentalMetricSweepSpec(
+            enabled=False,
+            shortlist_top_k=spec.stages.top_k,
+            formulations=[],
+        )
+    )
+    if not experimental_spec.enabled:
+        metric_payload = _disabled_metric_preview_payload(experimental_spec)
+    elif experimental_spec.candidate_source == METRIC_CANDIDATE_SOURCE_INDEPENDENT_SEARCH:
+        metric_payload = _count_only_independent_metric_payload(
+            spec=spec,
+            experimental_spec=experimental_spec,
+            dataset_count=dataset_count,
+        )
+    else:
+        baseline_candidate_lookup = {candidate.candidate_id: candidate for candidate in coarse_candidates}
+        baseline_candidate_lookup.update(refined_lookup)
+        metric_payload = _estimate_baseline_shortlist_metric_preview(
+            experimental_spec=experimental_spec,
+            baseline_candidate_lookup=baseline_candidate_lookup,
+            dataset_count=dataset_count,
+        )
+
+    stage_planned = sum(
+        int(cast(Mapping[str, object], payload).get("planned_run_count", 0) or 0)
+        for payload in stages_payload.values()
+        if isinstance(payload, dict)
+    )
+    stage_pending = sum(
+        int(cast(Mapping[str, object], payload).get("pending_run_count", 0) or 0)
+        for payload in stages_payload.values()
+        if isinstance(payload, dict)
+    )
+    stage_skipped = sum(
+        int(cast(Mapping[str, object], payload).get("skipped_valid_count", 0) or 0)
+        for payload in stages_payload.values()
+        if isinstance(payload, dict)
+    )
+    return {
+        "generation_id": "preview_count_only",
+        "generated_at": _utc_now_iso(),
+        "canonical_output_dir": str(resolved_output_dir.resolve()),
+        "extend_existing": bool(extend_existing),
+        "merge_sources": [str(path.resolve()) for path in merge_sources],
+        "relocation": relocation_report
+        or {
+            "rules": _relocation_rules_to_payload(relocation_rules),
+            "applied": [],
+        },
+        "stages": stages_payload,
+        "metric_experiments": metric_payload,
+        "totals": {
+            "planned_run_count": int(stage_planned + _metric_planned_count(metric_payload)),
+            "pending_run_count": int(stage_pending + _metric_pending_count(metric_payload)),
+            "skipped_valid_count": int(stage_skipped + _metric_skipped_valid_count(metric_payload)),
+            "exact": False,
+        },
+        "merge_log": {
+            "generation_id": "preview_count_only",
+            "created_at": _utc_now_iso(),
+            "canonical_output_dir": str(resolved_output_dir.resolve()),
+            "merge_sources": [str(path.resolve()) for path in merge_sources],
+            "sources": [],
+            "copied": [],
+            "would_copy": [],
+            "skipped_duplicates": [],
+            "rejected": [],
+            "conflicts": [],
+        },
+    }
+
+
 def build_sweep_run_preview(
     spec: SweepExperimentSpec,
     output_dir: Optional[Path] = None,
@@ -5012,6 +5185,7 @@ def build_sweep_run_preview(
     relocation_rules: Sequence[PathRelocationRule] = (),
     relocation_report: Optional[Mapping[str, object]] = None,
     allow_dataset_generation: bool = False,
+    reuse_existing_artifacts: bool = True,
 ) -> Dict[str, object]:
     """Build a non-rectifying run-count preview for baseline and metric stages."""
 
@@ -5024,6 +5198,16 @@ def build_sweep_run_preview(
             else Path("sweep_runs") / "preview"
         )
     )
+    merge_sources = [Path(path) for path in (merge_from or [])]
+    if not reuse_existing_artifacts:
+        return _build_count_only_sweep_run_preview(
+            spec=spec,
+            resolved_output_dir=resolved_output_dir,
+            extend_existing=extend_existing,
+            merge_sources=merge_sources,
+            relocation_rules=relocation_rules,
+            relocation_report=relocation_report,
+        )
     dataset_identities = _read_dataset_identity_payloads(resolved_output_dir)
     prepared_datasets = _prepare_datasets(
         spec,
@@ -5037,7 +5221,6 @@ def build_sweep_run_preview(
         prepared_datasets=prepared_datasets,
         output_dir=resolved_output_dir,
     )
-    merge_sources = [Path(path) for path in (merge_from or [])]
     run_state, run_state_path, generation_id = _load_or_initialize_run_state(
         output_dir=resolved_output_dir,
         fingerprint_payload=fingerprint_payload,
@@ -8693,6 +8876,7 @@ class SpecGuiApp:
                 "relocation_rules": relocation_rules,
                 "relocation_report": relocation_report,
                 "allow_dataset_generation": False,
+                "reuse_existing_artifacts": False,
             }
             if adopt_relocated:
                 kwargs["adopt_relocated"] = True

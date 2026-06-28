@@ -566,6 +566,7 @@ def test_gui_update_planned_runs_uses_preview_builder(monkeypatch, tmp_path):
     assert len(calls) == 1
     assert calls[0][1]["extend_existing"] is False
     assert calls[0][1]["allow_dataset_generation"] is False
+    assert calls[0][1]["reuse_existing_artifacts"] is False
     assert "Pending: 5" in app.planned_runs_var.get()
     assert "Metric: estimated 3 pending" in app.planned_runs_detail_var.get()
     root.destroy()
