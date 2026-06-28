@@ -6414,6 +6414,7 @@ class SweepVisualizationApp:
 
         self.overview_tab = self.ttk.Frame(self.notebook)
         self.coverage_tab = self.ttk.Frame(self.notebook)
+        self.locator_tab = self.ttk.Frame(self.notebook)
         self.progression_tab = self.ttk.Frame(self.notebook)
         self.significance_tab = self.ttk.Frame(self.notebook)
         self.metric_tab = self.ttk.Frame(self.notebook)
@@ -6421,12 +6422,14 @@ class SweepVisualizationApp:
 
         self.notebook.add(self.overview_tab, text="Overview")
         self.notebook.add(self.coverage_tab, text="Effects")
+        self.notebook.add(self.locator_tab, text="Parameter Locator")
         self.notebook.add(self.progression_tab, text="Progression")
         self.notebook.add(self.significance_tab, text="Significance")
         self.notebook.add(self.diagnostics_tab, text="Metric Diagnostics")
 
         self._build_overview_tab()
         self._build_coverage_tab()
+        self._build_locator_tab()
         self._build_progression_tab()
         self._build_significance_tab()
         self._build_metric_tab()
@@ -6561,8 +6564,22 @@ class SweepVisualizationApp:
         self.coverage_filter_frame = self.ttk.Frame(self.coverage_tab)
         self.coverage_filter_frame.pack(fill="x", padx=6, pady=4)
 
-        self.effect_search_frame = self.ttk.LabelFrame(self.coverage_tab, text="Find Exact Params")
-        self.effect_search_frame.pack(fill="x", padx=6, pady=4)
+        handoff = self.ttk.Frame(self.coverage_tab)
+        handoff.pack(fill="x", padx=6, pady=(0, 4))
+        self.ttk.Button(
+            handoff,
+            text="Use Filters in Locator",
+            command=self._send_effects_filters_to_locator,
+        ).pack(side="left")
+
+        self.coverage_text = self.tk.Text(self.coverage_tab, height=12, wrap="word")
+        self.coverage_text.pack(fill="x", padx=6, pady=4)
+        self.coverage_plot_frame = self.ttk.Frame(self.coverage_tab)
+        self.coverage_plot_frame.pack(fill="both", expand=True, padx=6, pady=6)
+
+    def _build_locator_tab(self) -> None:
+        self.effect_search_frame = self.ttk.LabelFrame(self.locator_tab, text="Exact Parameter Set Locator")
+        self.effect_search_frame.pack(fill="x", padx=6, pady=6)
         search_controls = self.ttk.Frame(self.effect_search_frame)
         search_controls.pack(fill="x", padx=4, pady=(4, 2))
         self.ttk.Label(search_controls, text="Source").pack(side="left")
@@ -6638,11 +6655,6 @@ class SweepVisualizationApp:
         self.effect_search_tree.bind("<<TreeviewSelect>>", lambda _evt: self._on_effect_search_selection_changed())
         self.effect_search_detail_text = self.tk.Text(self.effect_search_frame, height=8, wrap="word")
         self.effect_search_detail_text.pack(fill="x", padx=4, pady=(0, 4))
-
-        self.coverage_text = self.tk.Text(self.coverage_tab, height=12, wrap="word")
-        self.coverage_text.pack(fill="x", padx=6, pady=4)
-        self.coverage_plot_frame = self.ttk.Frame(self.coverage_tab)
-        self.coverage_plot_frame.pack(fill="both", expand=True, padx=6, pady=6)
 
     def _build_progression_tab(self) -> None:
         self.progression_text = self.tk.Text(self.progression_tab, height=12, wrap="word")
@@ -7195,6 +7207,7 @@ def _sweep_visualization_build_ui(self: SweepVisualizationApp) -> None:
     self.leaderboard_tab = self.ttk.Frame(self.notebook)
     self.comparison_tab = self.ttk.Frame(self.notebook)
     self.coverage_tab = self.ttk.Frame(self.notebook)
+    self.locator_tab = self.ttk.Frame(self.notebook)
     self.sensitivity_tab = self.ttk.Frame(self.notebook)
     self.extensions_tab = self.ttk.Frame(self.notebook)
     self.progression_tab = self.ttk.Frame(self.notebook)
@@ -7206,6 +7219,7 @@ def _sweep_visualization_build_ui(self: SweepVisualizationApp) -> None:
     self.notebook.add(self.leaderboard_tab, text="Leaderboard")
     self.notebook.add(self.comparison_tab, text="Comparison")
     self.notebook.add(self.coverage_tab, text="Effects")
+    self.notebook.add(self.locator_tab, text="Parameter Locator")
     self.notebook.add(self.sensitivity_tab, text="Sensitivity")
     self.notebook.add(self.extensions_tab, text="Next Extensions")
     self.notebook.add(self.progression_tab, text="Progression")
@@ -7216,6 +7230,7 @@ def _sweep_visualization_build_ui(self: SweepVisualizationApp) -> None:
     self._build_leaderboard_tab()
     self._build_comparison_tab()
     self._build_coverage_tab()
+    self._build_locator_tab()
     self._build_sensitivity_tab()
     self._build_extensions_tab()
     self._build_progression_tab()
@@ -7896,6 +7911,26 @@ def _sweep_visualization_rebuild_effect_search_controls(
         combo.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_effect_search_results())
         self.effect_search_filter_vars[parameter_name] = var
         self.effect_search_filter_combos[parameter_name] = combo
+
+
+def _sweep_visualization_send_effects_filters_to_locator(self: SweepVisualizationApp) -> None:
+    if self.model is None:
+        self.messagebox.showwarning("Parameter Locator", "Load a sweep first.")
+        return
+    active_filters = {
+        parameter_name: value
+        for parameter_name, var in self._effect_filter_vars.items()
+        for value in [var.get() or "All"]
+        if value != "All"
+    }
+    for parameter_name, var in self.effect_search_filter_vars.items():
+        var.set(active_filters.get(parameter_name, "All"))
+    self.notebook.select(self.locator_tab)
+    self._refresh_effect_search_results()
+    count = len(active_filters)
+    self.status_var.set(
+        f"Sent {count} active Effects filter{'s' if count != 1 else ''} to Parameter Locator"
+    )
 
 
 def _sweep_visualization_effect_search_filters(self: SweepVisualizationApp) -> Dict[str, str]:
@@ -8902,6 +8937,7 @@ SweepVisualizationApp._seed_diagnostics_from_row = _sweep_visualization_seed_dia
 SweepVisualizationApp._on_leaderboard_selection_changed = _sweep_visualization_on_leaderboard_selection_changed
 SweepVisualizationApp.refresh_leaderboard = _sweep_visualization_refresh_leaderboard
 SweepVisualizationApp._rebuild_effect_search_controls = _sweep_visualization_rebuild_effect_search_controls
+SweepVisualizationApp._send_effects_filters_to_locator = _sweep_visualization_send_effects_filters_to_locator
 SweepVisualizationApp._effect_search_filters = _sweep_visualization_effect_search_filters
 SweepVisualizationApp._sorted_effect_search_rows = _sweep_visualization_sorted_effect_search_rows
 SweepVisualizationApp._refresh_effect_search_results = _sweep_visualization_refresh_effect_search_results
