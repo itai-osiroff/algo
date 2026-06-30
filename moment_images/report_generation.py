@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple, cast
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 from moment_images.parameter_sweep import (
     SweepExperimentSpec,
@@ -80,6 +82,16 @@ def parse_args() -> argparse.Namespace:
         "--rebuild-summaries",
         action="store_true",
         help="Rebuild stage1/stage2/final summary+leaderboard artifacts from run folders.",
+    )
+    parser.add_argument(
+        "--repair-run-state",
+        nargs="?",
+        const="preview",
+        choices=("preview", "apply"),
+        help=(
+            "Preview or apply run_state.json repairs for raw run folders missing from state. "
+            "Requires --rebuild-summaries and --spec. Omit the value to preview."
+        ),
     )
     parser.add_argument(
         "--primary-metric",
@@ -156,6 +168,28 @@ def _coerce_nonempty_str(value: object) -> Optional[str]:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _canonical_json(payload: object) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _hash_payload(payload: object) -> str:
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _candidate_signature_from_config_payload(config_payload: Mapping[str, object]) -> str:
+    return _hash_payload(dict(config_payload))
+
+
+def _run_signature(stage_name: str, candidate_signature: str, dataset_signature: str) -> str:
+    return _hash_payload(
+        {
+            "stage": stage_name,
+            "candidate_signature": candidate_signature,
+            "dataset_signature": dataset_signature,
+        }
+    )
 
 
 def _run_state_path_for_scope(output_dir: Path) -> Tuple[Optional[Path], Path]:
@@ -469,6 +503,331 @@ def _filesystem_run_refs(
             }
         )
     return refs
+
+
+def _filesystem_run_dir_refs(
+    output_dir: Path,
+    stage_name: str,
+    known_dataset_ids: Sequence[str],
+) -> List[Dict[str, object]]:
+    refs: List[Dict[str, object]] = []
+    stage_root = output_dir / "runs" / stage_name
+    if not stage_root.exists():
+        return refs
+    for run_dir in sorted(path for path in stage_root.glob("*/*") if path.is_dir()):
+        metric_record_path = run_dir / "metric_record.json"
+        candidate_id, dataset_id = _infer_run_ids_from_path(metric_record_path, {}, known_dataset_ids)
+        refs.append(
+            {
+                "stage": stage_name,
+                "candidate_id": candidate_id,
+                "dataset_id": dataset_id,
+                "run_dir": str(run_dir),
+                "metric_record": str(metric_record_path),
+            }
+        )
+    return refs
+
+
+def _artifact_validation_for_recovered_run(run_dir: Path) -> Dict[str, object]:
+    required_paths = {
+        "config": run_dir / "config.json",
+        "metric_record": run_dir / "metric_record.json",
+        "rectified_views": run_dir / "rectified_views.npy",
+        "workspace": run_dir / "workspace.npz",
+        "avg_rectified": run_dir / "avg_rectified.png",
+    }
+    missing = [
+        f"{key}:{path.name}"
+        for key, path in required_paths.items()
+        if not path.exists() and not Path(f"{path}.bak").exists()
+    ]
+    return {
+        "run_dir": str(run_dir),
+        "valid": not missing,
+        "missing": missing,
+        "corrupt": [],
+    }
+
+
+def _repair_rejection(ref: Dict[str, object], reason: str, **details: object) -> Dict[str, object]:
+    rejected = {
+        "stage": ref.get("stage"),
+        "candidate_id": ref.get("candidate_id"),
+        "dataset_id": ref.get("dataset_id"),
+        "run_dir": ref.get("run_dir"),
+        "metric_record": ref.get("metric_record"),
+        "reason": reason,
+    }
+    rejected.update(details)
+    return rejected
+
+
+def _repair_entry_summary(entry: Dict[str, object], *, generation_inferred: bool) -> Dict[str, object]:
+    return {
+        "run_uid": entry.get("run_uid"),
+        "stage": entry.get("stage"),
+        "candidate_id": entry.get("candidate_id"),
+        "dataset_id": entry.get("dataset_id"),
+        "generation_id": entry.get("generation_id"),
+        "generation_inferred": generation_inferred,
+        "run_dir": entry.get("run_dir"),
+        "candidate_signature": entry.get("candidate_signature"),
+        "dataset_signature": entry.get("dataset_signature"),
+        "run_signature": entry.get("run_signature"),
+        "artifact_paths": entry.get("artifact_paths"),
+        "entry": entry,
+    }
+
+
+def _build_repair_entry_from_ref(
+    ref: Dict[str, object],
+    *,
+    active_generation_id: Optional[str],
+    known_dataset_ids: Sequence[str],
+    warnings: List[str],
+) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]]]:
+    stage_name = str(ref["stage"])
+    run_dir = Path(str(ref["run_dir"]))
+    metric_record_path = run_dir / "metric_record.json"
+    if not metric_record_path.exists() and not Path(f"{metric_record_path}.bak").exists():
+        return None, _repair_rejection(ref, "metric_record_missing")
+
+    try:
+        metric_record, _ = _read_json_dict(
+            metric_record_path,
+            label=f"metric_record artifact {metric_record_path}",
+            warnings=warnings,
+        )
+    except RebuildDataError as exc:
+        return None, _repair_rejection(ref, "metric_record_unreadable", error=str(exc))
+
+    config = _load_config_for_run(run_dir=run_dir, metric_record=metric_record, warnings=warnings)
+    if not config:
+        return None, _repair_rejection(ref, "config_unusable")
+
+    candidate_id, dataset_id = _infer_run_ids_from_path(metric_record_path, config, known_dataset_ids)
+    ref = dict(ref)
+    ref["candidate_id"] = candidate_id
+    ref["dataset_id"] = dataset_id
+    if dataset_id not in set(known_dataset_ids):
+        return None, _repair_rejection(ref, "unknown_dataset")
+
+    metric_generation_id = _coerce_nonempty_str(metric_record.get("generation_id"))
+    if (
+        active_generation_id is not None
+        and metric_generation_id is not None
+        and metric_generation_id != active_generation_id
+    ):
+        return None, _repair_rejection(
+            ref,
+            "generation_mismatch",
+            generation_id=metric_generation_id,
+            active_generation_id=active_generation_id,
+        )
+
+    generation_id = metric_generation_id or active_generation_id
+    if generation_id is None:
+        return None, _repair_rejection(ref, "generation_missing")
+
+    run_uid = f"{stage_name}_{candidate_id}_{dataset_id}"
+    candidate_signature = _coerce_nonempty_str(metric_record.get("candidate_signature"))
+    if candidate_signature is None:
+        candidate_signature = _candidate_signature_from_config_payload(config)
+    dataset_signature = _coerce_nonempty_str(metric_record.get("dataset_signature"))
+    if dataset_signature is None:
+        dataset_signature = _hash_payload({"dataset_id": dataset_id})
+    run_signature = _coerce_nonempty_str(metric_record.get("run_signature"))
+    if run_signature is None:
+        run_signature = _run_signature(stage_name, candidate_signature, dataset_signature)
+    artifact_paths = metric_record.get("artifact_paths")
+    if not isinstance(artifact_paths, dict):
+        artifact_paths = _artifact_paths_payload(run_dir)
+
+    entry: Dict[str, object] = {
+        "run_uid": run_uid,
+        "stage": stage_name,
+        "candidate_id": candidate_id,
+        "dataset_id": dataset_id,
+        "status": "ok",
+        "active": True,
+        "generation_id": generation_id,
+        "run_dir": str(run_dir),
+        "candidate_signature": candidate_signature,
+        "dataset_signature": dataset_signature,
+        "run_signature": run_signature,
+        "artifact_paths": dict(cast(Dict[str, object], artifact_paths)),
+        "attempts": [],
+        "artifact_validation": _artifact_validation_for_recovered_run(run_dir),
+    }
+    return _repair_entry_summary(entry, generation_inferred=metric_generation_id is None), None
+
+
+def _repair_scope_specs(output_dir: Path) -> List[Tuple[Path, str]]:
+    if _is_metric_phase_dir(output_dir):
+        return [(output_dir, "metric_phase")]
+    specs = [(output_dir, "stage1"), (output_dir, "stage2")]
+    metric_output_dir = output_dir / "metric_experiments"
+    if _has_report_inputs(metric_output_dir):
+        specs.append((metric_output_dir, "metric_phase"))
+    return specs
+
+
+def _collect_run_state_repairs(
+    output_dir: Path,
+    dataset_ids: Sequence[str],
+) -> Tuple[RunStateScope, Dict[str, object]]:
+    run_state_scope = _load_run_state_for_scope(output_dir)
+    run_state = run_state_scope.run_state
+    active_generation = _active_generation_id(run_state)
+    warnings = list(run_state_scope.warnings)
+    adoptable_entries: List[Dict[str, object]] = []
+    rejected_entries: List[Dict[str, object]] = []
+    scope_reports: List[Dict[str, object]] = []
+
+    if not isinstance(run_state, dict):
+        warnings.append("No run_state.json was found; repair is not needed because rebuild will use filesystem discovery.")
+    else:
+        for stage_output_dir, stage_name in _repair_scope_specs(output_dir):
+            represented_keys = _run_state_keys_for_stage(run_state, stage_name)
+            refs = _filesystem_run_dir_refs(stage_output_dir, stage_name, dataset_ids)
+            scope_reports.append(
+                {
+                    "stage": stage_name,
+                    "output_dir": str(stage_output_dir),
+                    "num_run_dirs": len(refs),
+                }
+            )
+            for ref in refs:
+                path_key = (str(ref["candidate_id"]), str(ref["dataset_id"]))
+                if path_key in represented_keys:
+                    continue
+                entry_summary, rejection = _build_repair_entry_from_ref(
+                    ref,
+                    active_generation_id=active_generation,
+                    known_dataset_ids=dataset_ids,
+                    warnings=warnings,
+                )
+                if rejection is not None:
+                    rejected_entries.append(rejection)
+                    continue
+                if entry_summary is None:
+                    continue
+                key = (str(entry_summary["candidate_id"]), str(entry_summary["dataset_id"]))
+                if key in represented_keys:
+                    continue
+                adoptable_entries.append(entry_summary)
+
+    report = {
+        "status": "preview",
+        "mode": "preview",
+        "generated_at": _utc_now_iso(),
+        "output_dir": str(output_dir),
+        "state_path": None if run_state_scope.state_path is None else str(run_state_scope.state_path),
+        "state_source": None if run_state_scope.state_source is None else str(run_state_scope.state_source),
+        "active_generation_id": active_generation,
+        "counts": {
+            "adoptable": len(adoptable_entries),
+            "rejected": len(rejected_entries),
+            "applied": 0,
+            "scopes": len(scope_reports),
+        },
+        "adoptable_entries": adoptable_entries,
+        "rejected_entries": rejected_entries,
+        "warnings": warnings,
+        "scopes": scope_reports,
+    }
+    return run_state_scope, report
+
+
+def _format_run_state_repair_report_markdown(report: Dict[str, object]) -> str:
+    lines = [
+        "# Run State Repair Report",
+        "",
+        f"- Status: {report.get('status')}",
+        f"- Mode: {report.get('mode')}",
+        f"- Generated at: {report.get('generated_at')}",
+        f"- Output directory: {report.get('output_dir')}",
+        f"- State path: {report.get('state_path')}",
+        f"- Active generation: {report.get('active_generation_id')}",
+        "",
+        "## Counts",
+        "",
+    ]
+    counts = report.get("counts", {})
+    if isinstance(counts, dict):
+        for key, value in counts.items():
+            lines.append(f"- {key}: {value}")
+
+    adoptable = cast(List[object], report.get("adoptable_entries", []))
+    if adoptable:
+        lines.extend(["", "## Adoptable Entries", ""])
+        for item in adoptable:
+            if isinstance(item, dict):
+                lines.append(
+                    f"- {item.get('run_uid')} ({item.get('stage')}, {item.get('candidate_id')}, "
+                    f"{item.get('dataset_id')}, generation={item.get('generation_id')})"
+                )
+
+    rejected = cast(List[object], report.get("rejected_entries", []))
+    if rejected:
+        lines.extend(["", "## Rejected Entries", ""])
+        for item in rejected:
+            if isinstance(item, dict):
+                lines.append(
+                    f"- {item.get('stage')} {item.get('candidate_id')}/{item.get('dataset_id')}: "
+                    f"{item.get('reason')} ({item.get('run_dir')})"
+                )
+
+    warnings = cast(List[object], report.get("warnings", []))
+    if warnings:
+        lines.extend(["", "## Warnings", ""])
+        for warning in warnings:
+            lines.append(f"- {warning}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _write_run_state_repair_report(output_dir: Path, report: Dict[str, object]) -> Tuple[Path, Path]:
+    json_path = output_dir / "run_state_repair_report.json"
+    markdown_path = output_dir / "run_state_repair_report.md"
+    write_json_atomic(json_path, report, indent=2, sort_keys=False, create_backup=True)
+    write_text_atomic(markdown_path, _format_run_state_repair_report_markdown(report), create_backup=True)
+    return json_path, markdown_path
+
+
+def _repair_run_state_for_rebuild(output_dir: Path, spec: SweepExperimentSpec, mode: str) -> Dict[str, object]:
+    dataset_ids = [dataset.dataset_id for dataset in spec.datasets]
+    run_state_scope, report = _collect_run_state_repairs(output_dir, dataset_ids)
+    report["mode"] = mode
+    report["status"] = "preview" if mode == "preview" else "applied"
+    if mode == "apply":
+        run_state = run_state_scope.run_state
+        if not isinstance(run_state, dict) or run_state_scope.state_path is None:
+            raise RebuildDataError(
+                "Cannot apply run_state repair because no usable run_state.json was found.",
+                diagnostics=report,
+            )
+        runs = run_state.get("runs", {})
+        if not isinstance(runs, dict):
+            raise RebuildDataError(
+                "Cannot apply run_state repair because run_state.json has no usable 'runs' object.",
+                diagnostics=report,
+            )
+        applied = 0
+        for item in cast(List[Dict[str, object]], report["adoptable_entries"]):
+            entry = item.get("entry")
+            if not isinstance(entry, dict):
+                continue
+            run_uid = _coerce_nonempty_str(entry.get("run_uid"))
+            if run_uid is None:
+                continue
+            cast(Dict[str, object], runs)[run_uid] = entry
+            applied += 1
+        cast(Dict[str, object], report["counts"])["applied"] = applied
+        write_json_atomic(run_state_scope.state_path, run_state, indent=2, sort_keys=False, create_backup=True)
+    _write_run_state_repair_report(output_dir, report)
+    return report
 
 
 def _run_state_keys_for_stage(run_state: Dict[str, object], stage_name: str) -> set[Tuple[str, str]]:
@@ -956,6 +1315,9 @@ def main() -> None:
     rebuild_context: Optional[Dict[str, object]] = None
     snapshot_requests: List[Tuple[Path, Optional[str]]] = []
 
+    if args.repair_run_state and not args.rebuild_summaries:
+        raise ValueError("--repair-run-state requires --rebuild-summaries.")
+
     if args.rebuild_summaries:
         rebuild_context = {
             "output_dir": str(output_dir),
@@ -974,6 +1336,17 @@ def main() -> None:
                 raise ValueError("--rebuild-summaries requires --spec so rankings can be recomputed.")
             cast(Dict[str, object], rebuild_context)["phase"] = "load_spec"
             spec = SweepExperimentSpec.from_dict(_load_json(Path(args.spec)))
+            if args.repair_run_state:
+                cast(Dict[str, object], rebuild_context)["phase"] = "repair_run_state"
+                repair_report = _repair_run_state_for_rebuild(output_dir, spec, str(args.repair_run_state))
+                counts = cast(Dict[str, object], repair_report["counts"])
+                print(
+                    "Run-state repair "
+                    f"{repair_report['status']}: adoptable={counts['adoptable']}, "
+                    f"rejected={counts['rejected']}, applied={counts['applied']}"
+                )
+                if args.repair_run_state == "preview":
+                    return
             if _is_metric_phase_dir(output_dir):
                 cast(Dict[str, object], rebuild_context)["phase"] = "rebuild_metric_phase"
                 metric_count, active_generation, experiment_root = _rebuild_metric_phase_summaries(

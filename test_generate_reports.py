@@ -143,10 +143,32 @@ def _set_rebuild_argv(monkeypatch, output_dir: Path, spec_path: Path) -> None:
     )
 
 
+def _set_repair_argv(monkeypatch, output_dir: Path, spec_path: Path, mode: str | None = None) -> None:
+    argv = [
+        "generate_reports.py",
+        str(output_dir),
+        "--spec",
+        str(spec_path),
+        "--rebuild-summaries",
+        "--repair-run-state",
+    ]
+    if mode is not None:
+        argv.append(mode)
+    monkeypatch.setattr(sys, "argv", argv)
+
+
 def _read_failure_report(output_dir: Path) -> dict[str, object]:
     report_path = output_dir / "rebuild_failure_report.json"
     assert report_path.exists()
     markdown_path = output_dir / "rebuild_failure_report.md"
+    assert markdown_path.exists()
+    return json.loads(report_path.read_text(encoding="utf-8"))
+
+
+def _read_repair_report(output_dir: Path) -> dict[str, object]:
+    report_path = output_dir / "run_state_repair_report.json"
+    assert report_path.exists()
+    markdown_path = output_dir / "run_state_repair_report.md"
     assert markdown_path.exists()
     return json.loads(report_path.read_text(encoding="utf-8"))
 
@@ -604,6 +626,308 @@ def test_rebuild_summaries_aborts_when_state_omits_existing_raw_run(tmp_path, mo
     assert "c_extra" in report_text
     assert "filesystem_extra_runs" in report_text
     assert (output_dir / "stage1_summary.json").read_text(encoding="utf-8") == previous_stage_summary
+
+
+def test_repair_run_state_preview_reports_adoptable_stage2_run_without_writing_state(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="stage2",
+        candidate_id="c_missing",
+        dataset_id="d1",
+        run_name="stage2_c_missing_d1",
+        metric_value=9.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_active", "d1"),
+                generation_id="gen_new",
+            )
+        },
+    )
+    original_state = (output_dir / "run_state.json").read_text(encoding="utf-8")
+    _set_repair_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    report = _read_repair_report(output_dir)
+    assert report["mode"] == "preview"
+    assert report["status"] == "preview"
+    assert report["counts"]["adoptable"] == 1
+    assert report["counts"]["rejected"] == 0
+    adopted = report["adoptable_entries"][0]
+    assert adopted["run_uid"] == "stage2_c_missing_d1"
+    assert adopted["generation_id"] == "gen_new"
+    assert adopted["generation_inferred"] is True
+    assert (output_dir / "run_state.json").read_text(encoding="utf-8") == original_state
+    assert not (output_dir / "stage2_summary.json").exists()
+
+
+def test_repair_run_state_apply_adopts_stage2_run_and_rebuilds(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="stage2",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage2_c_active_d1",
+        metric_value=7.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="stage2",
+        candidate_id="c_missing",
+        dataset_id="d1",
+        run_name="stage2_c_missing_d1",
+        metric_value=9.0,
+        formulation_id="baseline",
+        alpha=1.0,
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_active", "d1"),
+                generation_id="gen_new",
+            ),
+            "stage2_c_active_d1": _run_state_entry(
+                stage_name="stage2",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage2", "c_active", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    )
+    _set_repair_argv(monkeypatch, output_dir, spec_path, "apply")
+
+    generate_reports.main()
+
+    report = _read_repair_report(output_dir)
+    assert report["mode"] == "apply"
+    assert report["status"] == "applied"
+    state = json.loads((output_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert "stage1_c_active_d1" in state["runs"]
+    assert "stage2_c_active_d1" in state["runs"]
+    adopted_entry = state["runs"]["stage2_c_missing_d1"]
+    assert adopted_entry["status"] == "ok"
+    assert adopted_entry["active"] is True
+    assert adopted_entry["generation_id"] == "gen_new"
+    assert adopted_entry["artifact_paths"]["metric_record"].endswith("metric_record.json")
+    assert (output_dir / "run_state.json.bak").exists()
+    stage2_summary = json.loads((output_dir / "stage2_summary.json").read_text(encoding="utf-8"))
+    assert {row["run"] for row in stage2_summary["runs"]} == {
+        "stage2_c_active_d1",
+        "stage2_c_missing_d1",
+    }
+
+
+def test_repair_run_state_preview_rejects_unknown_dataset(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="stage2",
+        candidate_id="c_bad",
+        dataset_id="d_missing",
+        run_name="stage2_c_bad_d_missing",
+        metric_value=9.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_active", "d1"),
+                generation_id="gen_new",
+            )
+        },
+    )
+    _set_repair_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    report = _read_repair_report(output_dir)
+    assert report["counts"]["adoptable"] == 0
+    assert report["counts"]["rejected"] == 1
+    assert report["rejected_entries"][0]["reason"] == "unknown_dataset"
+    state = json.loads((output_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert "stage2_c_bad_d_missing" not in state["runs"]
+
+
+def test_repair_run_state_preview_rejects_generation_mismatch(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="stage2",
+        candidate_id="c_old",
+        dataset_id="d1",
+        run_name="stage2_c_old_d1",
+        metric_value=9.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_old",
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_active", "d1"),
+                generation_id="gen_new",
+            )
+        },
+    )
+    _set_repair_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    report = _read_repair_report(output_dir)
+    assert report["counts"]["adoptable"] == 0
+    assert report["rejected_entries"][0]["reason"] == "generation_mismatch"
+    assert report["rejected_entries"][0]["generation_id"] == "gen_old"
+
+
+def test_repair_run_state_preview_rejects_corrupt_or_missing_metric_record(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_active",
+        dataset_id="d1",
+        run_name="stage1_c_active_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="stage2",
+        candidate_id="c_corrupt",
+        dataset_id="d1",
+        run_name="stage2_c_corrupt_d1",
+        metric_value=9.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    (_run_dir(output_dir, "stage2", "c_corrupt", "d1") / "metric_record.json").write_text(
+        "{broken",
+        encoding="utf-8",
+    )
+    missing_dir = _run_dir(output_dir, "stage2", "c_missing", "d1")
+    missing_dir.mkdir(parents=True)
+    _write_json(
+        missing_dir / "config.json",
+        {
+            "dataset_id": "d1",
+            "subpixel_mode": "pixel",
+            "displacement_metric_family": "ncc_gradient",
+            "displacement_alpha": 1.0,
+            "metric_formulation_id": "baseline",
+        },
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_active_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_active",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_active", "d1"),
+                generation_id="gen_new",
+            )
+        },
+    )
+    _set_repair_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    report = _read_repair_report(output_dir)
+    assert report["counts"]["adoptable"] == 0
+    assert {entry["reason"] for entry in report["rejected_entries"]} == {
+        "metric_record_unreadable",
+        "metric_record_missing",
+    }
 
 
 def test_rebuild_summaries_falls_back_to_metric_record_config(tmp_path, monkeypatch):
