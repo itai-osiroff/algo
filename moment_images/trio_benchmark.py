@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import math
 import re
 from dataclasses import dataclass, field
@@ -23,6 +24,8 @@ from PIL import Image
 from moment_images.reliable_io import write_csv_atomic, write_json_atomic, write_text_atomic
 from moment_images.validate_rectification import load_rectified_reference
 from moment_images.sweep_visualization import (
+    GENERATION_SCOPE_ACTIVE,
+    GENERATION_SCOPE_ALL,
     candidate_rows_for_generation_scope,
     load_sweep_visualization_model,
     run_records_for_generation_scope,
@@ -44,7 +47,7 @@ class BenchmarkConfig:
     thorcam_image: Path
     output_dir: Path
     stage: Optional[str] = None
-    generation_scope: str = "all"
+    generation_scope: str = GENERATION_SCOPE_ALL
     anchor_row_id: str = "auto"
     scale_values: Optional[Sequence[float]] = None
     top_k: int = DEFAULT_TOP_K
@@ -81,7 +84,7 @@ class ValidationMetricResult:
 @dataclass
 class CandidateImageRecord:
     row: Any
-    record: Any
+    record: Optional[Any]
     image: np.ndarray
     workspace_path: Optional[str]
     preview_path: Optional[str]
@@ -385,7 +388,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     thorcam = _load_grayscale_image(cfg.thorcam_image)
     model = load_sweep_visualization_model(cfg.sweep_dir)
     stage = cfg.stage or str(model.primary_stage_name)
-    candidate_images = _collect_candidate_images(model, cfg, stage)
+    candidate_images, skipped_candidate_warnings = _collect_candidate_images(model, cfg, stage)
     if not candidate_images:
         raise ValueError(
             f"No LF candidates with loadable images found for stage={stage!r}, "
@@ -480,6 +483,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         thor_row,
         rows,
         model_warnings=_unique_strings(getattr(model, "warnings", [])),
+        skipped_candidate_warnings=skipped_candidate_warnings,
     )
     _write_results_csv(cfg.output_dir / "trio_benchmark_results.csv", rows)
     write_json_atomic(
@@ -498,6 +502,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
 def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
     scale_values = list(config.scale_values) if config.scale_values is not None else parse_scale_search(DEFAULT_SCALE_SEARCH)
+    generation_scope = _normalize_generation_scope_arg(config.generation_scope)
     return BenchmarkConfig(
         sweep_dir=Path(config.sweep_dir),
         dataset_id=str(config.dataset_id),
@@ -505,7 +510,7 @@ def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
         thorcam_image=Path(config.thorcam_image),
         output_dir=Path(config.output_dir),
         stage=config.stage,
-        generation_scope=config.generation_scope,
+        generation_scope=generation_scope,
         anchor_row_id=config.anchor_row_id,
         scale_values=scale_values,
         top_k=int(config.top_k),
@@ -514,7 +519,20 @@ def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
     )
 
 
-def _collect_candidate_images(model: Any, config: BenchmarkConfig, stage: str) -> List[CandidateImageRecord]:
+def _normalize_generation_scope_arg(scope: str) -> str:
+    text = str(scope).strip()
+    if text.lower() == GENERATION_SCOPE_ALL.lower():
+        return GENERATION_SCOPE_ALL
+    if text.lower() == GENERATION_SCOPE_ACTIVE.lower():
+        return GENERATION_SCOPE_ACTIVE
+    return text
+
+
+def _collect_candidate_images(
+    model: Any,
+    config: BenchmarkConfig,
+    stage: str,
+) -> Tuple[List[CandidateImageRecord], List[str]]:
     rows = [
         row
         for row in candidate_rows_for_generation_scope(model, config.generation_scope)
@@ -535,6 +553,7 @@ def _collect_candidate_images(model: Any, config: BenchmarkConfig, stage: str) -
         for record in records
     }
     result: List[CandidateImageRecord] = []
+    skipped_warnings: List[str] = []
     for row in rows:
         key = (
             str(getattr(row, "stage", "")),
@@ -542,11 +561,18 @@ def _collect_candidate_images(model: Any, config: BenchmarkConfig, stage: str) -
             _optional_str(getattr(row, "generation_id", None)),
         )
         record = record_by_key.get(key)
-        if record is None:
-            continue
         try:
-            image, workspace_path, preview_path, warnings = _load_candidate_image(record)
-        except Exception:
+            image, workspace_path, preview_path, warnings = _load_candidate_image(
+                row,
+                record,
+                dataset_id=config.dataset_id,
+            )
+        except Exception as exc:
+            skipped_warnings.append(
+                "skipped candidate "
+                f"{str(getattr(row, 'stage', stage))}:{str(getattr(row, 'candidate_id', 'unknown'))} "
+                f"dataset={config.dataset_id}: {type(exc).__name__}: {exc}"
+            )
             continue
         result.append(
             CandidateImageRecord(
@@ -558,12 +584,25 @@ def _collect_candidate_images(model: Any, config: BenchmarkConfig, stage: str) -
                 warnings=warnings,
             )
         )
-    return result
+    return result, skipped_warnings
 
 
-def _load_candidate_image(record: Any) -> Tuple[np.ndarray, Optional[str], Optional[str], List[str]]:
-    workspace_path = _optional_str(getattr(record, "workspace_path", None))
-    preview_path = _optional_str(getattr(record, "preview_path", None))
+def _load_candidate_image(
+    row: Any,
+    record: Optional[Any],
+    *,
+    dataset_id: str,
+) -> Tuple[np.ndarray, Optional[str], Optional[str], List[str]]:
+    workspace_path = _optional_str(getattr(record, "workspace_path", None)) if record is not None else None
+    preview_path = _optional_str(getattr(record, "preview_path", None)) if record is not None else None
+    if not preview_path:
+        preview_paths = getattr(row, "preview_paths", {})
+        if isinstance(preview_paths, Mapping):
+            preview_path = _optional_str(preview_paths.get(dataset_id) or preview_paths.get("aggregate"))
+    if not workspace_path and preview_path:
+        adjacent_workspace = Path(preview_path).with_name("workspace.npz")
+        if adjacent_workspace.exists():
+            workspace_path = str(adjacent_workspace)
     warnings: List[str] = []
     if workspace_path:
         try:
@@ -618,6 +657,8 @@ def _write_results_csv(path: Path, rows: Sequence[BenchmarkResultRow]) -> None:
         "residual_translation_x",
         "residual_translation_y",
         "residual_applied",
+        "params_json",
+        "config_json",
         "workspace_path",
         "preview_path",
         "warnings",
@@ -646,6 +687,8 @@ def _row_to_csv(row: BenchmarkResultRow) -> Dict[str, Any]:
         "residual_translation_x": _csv_float(reg.residual_translation_x),
         "residual_translation_y": _csv_float(reg.residual_translation_y),
         "residual_applied": str(bool(reg.residual_applied)).lower(),
+        "params_json": json.dumps(row.params, sort_keys=True, separators=(",", ":")),
+        "config_json": json.dumps(row.config, sort_keys=True, separators=(",", ":")),
         "workspace_path": row.workspace_path or "",
         "preview_path": row.preview_path or "",
         "warnings": "; ".join(row.warnings),
@@ -672,6 +715,7 @@ def _build_summary(
     rows: Sequence[BenchmarkResultRow],
     *,
     model_warnings: Sequence[str],
+    skipped_candidate_warnings: Sequence[str],
 ) -> Dict[str, Any]:
     deltas: Dict[str, Optional[float]] = {}
     if best is not None:
@@ -681,6 +725,7 @@ def _build_summary(
                 deltas[name] = float(value) - float(thor_value)
     warnings = _unique_strings(
         list(model_warnings)
+        + list(skipped_candidate_warnings)
         + [warning for row in rows for warning in row.warnings]
         + (["nonrigid diagnostic requested; primary score remains similarity-only"] if config.enable_nonrigid_diagnostic else [])
     )
@@ -1237,7 +1282,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--thorcam-image", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--stage", default=None)
-    parser.add_argument("--generation-scope", default="all")
+    parser.add_argument("--generation-scope", default=GENERATION_SCOPE_ALL)
     parser.add_argument("--anchor-row-id", default="auto")
     parser.add_argument("--scale-search", default=DEFAULT_SCALE_SEARCH)
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)

@@ -28,6 +28,7 @@ For Point Grey / FLIR camera preview and acquisition, see
 | Summary/alpha report regeneration | `../generate_reports.py` | [Sweep Reporting Guide](SWEEP_REPORTING_GUIDE.md) |
 | Rectification validation against external cameras | `validate_rectification.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
 | Batch validation image preprocessing | `batch_process_validation_images.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
+| Trio benchmark against validation/ThorCam | `trio_benchmark.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
 | Teledyne mean-variance system gain | `main_thor_gain.py` | [Gain Calibration Guide](GAIN_CALIBRATION_GUIDE.md) |
 | Pairwise image linear gain regression | `pairwise_linear_gain.py` | [Gain Calibration Guide](GAIN_CALIBRATION_GUIDE.md) |
 | Workspace unpacking | `unpack_workspace.py` | [Rectification Guide](RECTIFICATION_GUIDE.md) |
@@ -74,6 +75,13 @@ Run validation against Validation Camera and Thorcam images:
 
 ```bash
 python -m moment_images.validate_rectification
+```
+
+Rank completed LF sweep candidates against processed Validation Camera and
+ThorCam images:
+
+```bash
+python -m moment_images.trio_benchmark --sweep-dir path/to/sweep_output --dataset-id scene_id --validation-image path/to/validation_processed.tif --thorcam-image path/to/thorcam_processed.tif --output-dir path/to/trio_report
 ```
 
 Compute Teledyne mean-variance gain:

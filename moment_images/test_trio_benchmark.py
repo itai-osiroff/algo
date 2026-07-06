@@ -7,6 +7,7 @@ import cv2 as cv
 import numpy as np
 from PIL import Image
 
+from moment_images.test_sweep_visualization import _create_modern_fixture
 from moment_images.trio_benchmark import (
     PROFILE_NAME,
     BenchmarkConfig,
@@ -230,8 +231,13 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
 
     with (output_dir / "trio_benchmark_results.csv").open(newline="", encoding="utf-8") as fp:
         csv_rows = list(csv.DictReader(fp))
+    assert "params_json" in csv_rows[0]
+    assert "config_json" in csv_rows[0]
     assert [row["source_kind"] for row in csv_rows].count("lf_candidate") == 2
     assert [row["source_kind"] for row in csv_rows].count("thorcam_baseline") == 1
+    first_lf_row = next(row for row in csv_rows if row["candidate_id"] == "candidate_a")
+    assert json.loads(first_lf_row["params_json"]) == {"alpha": 1.0}
+    assert json.loads(first_lf_row["config_json"]) == {"strategy": "combined"}
     fallback_row = next(row for row in csv_rows if row["candidate_id"] == "candidate_b")
     assert "preview_fallback" in fallback_row["warnings"]
 
@@ -240,3 +246,94 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
     assert summary["config"]["profile_name"] == PROFILE_NAME
     assert "best_lf_minus_thorcam" in summary
     assert result.rows[0].source_kind == "lf_candidate"
+
+
+def test_run_benchmark_default_generation_scope_matches_sweep_visualization(tmp_path):
+    sweep_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        include_workspace=True,
+        stage_mode="single_stage",
+    )
+    validation = _synthetic_beads((16, 16))
+    validation_path = tmp_path / "validation_scope.tif"
+    thorcam_path = tmp_path / "thorcam_scope.tif"
+    _write_image(validation_path, validation)
+    _write_image(thorcam_path, validation)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="d1",
+            validation_image=validation_path,
+            thorcam_image=thorcam_path,
+            output_dir=tmp_path / "scope_out",
+            stage="stage1",
+            scale_values=[1.0],
+            top_k=1,
+        )
+    )
+
+    assert result.best_lf_row_id == "stage1:s1c0000"
+
+
+def test_run_benchmark_uses_candidate_preview_when_run_record_missing(tmp_path):
+    sweep_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_workspace=False,
+        stage_mode="two_stage",
+    )
+    validation = np.full((16, 16), 127, dtype=np.float32)
+    validation[4:12, 4:12] = 255
+    validation_path = tmp_path / "validation_preview.tif"
+    thorcam_path = tmp_path / "thorcam_preview.tif"
+    _write_image(validation_path, validation)
+    _write_image(thorcam_path, validation)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="d1",
+            validation_image=validation_path,
+            thorcam_image=thorcam_path,
+            output_dir=tmp_path / "preview_out",
+            stage="stage2",
+            scale_values=[1.0],
+            top_k=1,
+        )
+    )
+
+    assert result.best_lf_row_id == "stage2:s2c0000"
+    assert "preview_fallback" in result.rows[0].warnings
+
+
+def test_run_benchmark_reports_skipped_candidate_artifacts(tmp_path):
+    sweep_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        include_workspace=False,
+        stage_mode="single_stage",
+    )
+    validation = np.full((16, 16), 127, dtype=np.float32)
+    validation[4:12, 4:12] = 255
+    validation_path = tmp_path / "validation_skipped.tif"
+    thorcam_path = tmp_path / "thorcam_skipped.tif"
+    _write_image(validation_path, validation)
+    _write_image(thorcam_path, validation)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="d1",
+            validation_image=validation_path,
+            thorcam_image=thorcam_path,
+            output_dir=tmp_path / "skipped_out",
+            stage="stage1",
+            scale_values=[1.0],
+            top_k=1,
+        )
+    )
+
+    assert result.best_lf_row_id == "stage1:s1c0000"
+    assert any("skipped candidate stage1:s1c0001" in warning for warning in result.summary["warnings"])

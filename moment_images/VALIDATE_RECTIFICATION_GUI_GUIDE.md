@@ -293,3 +293,21 @@ flux-sum preservation.
 Current limitation: this helper does not expose a normal argparse command line
 or `--help` reference. Run it from a desktop session and configure it through
 the GUI.
+
+## Headless Trio Benchmark
+
+`moment_images/trio_benchmark.py` ranks completed LF sweep candidates against a
+processed Validation Camera image and scores a ThorCam image as a baseline
+comparator. The sweep algorithm stays blind to those reference images; this
+tool only post-processes completed sweep artifacts.
+
+```bash
+python -m moment_images.trio_benchmark --sweep-dir path/to/sweep_output --dataset-id scene_id --validation-image path/to/validation_processed.tif --thorcam-image path/to/thorcam_processed.tif --output-dir path/to/trio_report
+```
+
+The benchmark writes `trio_benchmark_results.csv`,
+`trio_benchmark_summary.json`, `trio_benchmark_report.html`, and a `figures/`
+folder. Results use the stable `validation_hybrid_v1` metric profile and
+preserve sweep row identity (`row_id`, `stage`, `candidate_id`, `dataset_id`,
+and `generation_id`) so later utilities can join the records back to sweep
+artifacts.
