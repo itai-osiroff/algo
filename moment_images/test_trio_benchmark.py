@@ -1,0 +1,242 @@
+import csv
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import cv2 as cv
+import numpy as np
+from PIL import Image
+
+from moment_images.trio_benchmark import (
+    PROFILE_NAME,
+    BenchmarkConfig,
+    apply_anchor_registration,
+    compute_validation_metrics,
+    estimate_similarity_registration,
+    parse_scale_search,
+    run_benchmark,
+)
+
+
+def _synthetic_beads(shape: tuple[int, int] = (160, 160)) -> np.ndarray:
+    image = np.zeros(shape, dtype=np.float32)
+    for x, y, radius, value in [
+        (35, 38, 4, 1.0),
+        (92, 34, 3, 0.9),
+        (121, 88, 5, 0.85),
+        (54, 118, 4, 0.75),
+        (104, 125, 3, 0.65),
+    ]:
+        cv.circle(image, (x, y), radius, value, -1)
+    return cv.GaussianBlur(image, (0, 0), 0.8)
+
+
+def _write_image(path: Path, image: np.ndarray) -> None:
+    arr = np.asarray(image, dtype=np.float32)
+    low = float(np.nanmin(arr))
+    high = float(np.nanmax(arr))
+    if high <= low:
+        scaled = np.zeros_like(arr, dtype=np.uint8)
+    else:
+        scaled = np.clip((arr - low) / (high - low), 0.0, 1.0)
+        scaled = np.asarray(np.round(scaled * 255.0), dtype=np.uint8)
+    Image.fromarray(scaled).save(path)
+
+
+def test_parse_scale_search_returns_inclusive_grid():
+    values = parse_scale_search("0.90:1.10:5")
+
+    np.testing.assert_allclose(values, [0.90, 0.95, 1.00, 1.05, 1.10])
+
+
+def test_similarity_registration_recovers_no_shear_transform():
+    reference = _synthetic_beads()
+    center = (reference.shape[1] / 2.0, reference.shape[0] / 2.0)
+    ref_to_moving = cv.getRotationMatrix2D(center, -4.0, 0.94)
+    ref_to_moving[:, 2] += np.array([7.0, -5.0], dtype=np.float32)
+    moving = cv.warpAffine(reference, ref_to_moving, reference.shape[::-1], flags=cv.INTER_LINEAR)
+
+    result = estimate_similarity_registration(
+        reference,
+        moving,
+        scale_values=parse_scale_search("0.95:1.15:9"),
+    )
+
+    assert result.status == "aligned"
+    assert abs(result.scale - (1.0 / 0.94)) <= 0.08
+    assert abs(abs(result.rotation_deg) - 4.0) <= 2.0
+    assert result.aligned_image.shape == reference.shape
+    assert float(np.mean(np.abs(result.aligned_image - reference))) < 0.08
+    linear = result.forward_matrix[:, :2]
+    assert abs(float(np.dot(linear[:, 0], linear[:, 1]))) < 1e-3
+    np.testing.assert_allclose(
+        np.linalg.norm(linear[:, 0]),
+        np.linalg.norm(linear[:, 1]),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+def test_residual_translation_above_cap_is_not_applied():
+    reference = _synthetic_beads()
+    anchor = estimate_similarity_registration(reference, reference, scale_values=[1.0])
+    shifted = cv.warpAffine(
+        reference,
+        np.array([[1.0, 0.0, 11.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        reference.shape[::-1],
+        flags=cv.INTER_LINEAR,
+    )
+
+    result = apply_anchor_registration(
+        reference,
+        shifted,
+        anchor,
+        residual_translation_max_px=3.0,
+    )
+
+    assert result.residual_applied is False
+    assert result.residual_translation_norm > 3.0
+    assert any("Residual translation" in warning for warning in result.warnings)
+
+
+def test_validation_metrics_penalize_blur_and_center_errors():
+    validation = _synthetic_beads()
+    sharp = validation.copy()
+    blurred = cv.GaussianBlur(validation, (0, 0), 4.0)
+    shifted = cv.warpAffine(
+        validation,
+        np.array([[1.0, 0.0, 5.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        validation.shape[::-1],
+        flags=cv.INTER_LINEAR,
+    )
+
+    sharp_metrics = compute_validation_metrics(validation, sharp)
+    blurred_metrics = compute_validation_metrics(validation, blurred)
+    shifted_metrics = compute_validation_metrics(validation, shifted)
+
+    assert sharp_metrics.metrics[PROFILE_NAME] > blurred_metrics.metrics[PROFILE_NAME]
+    assert sharp_metrics.metrics["validation_sharpness"] > blurred_metrics.metrics["validation_sharpness"]
+    assert sharp_metrics.metrics["validation_bead"] > shifted_metrics.metrics["validation_bead"]
+
+
+def test_low_confidence_bead_detection_renormalizes_to_image_metrics():
+    validation = np.zeros((80, 80), dtype=np.float32)
+    candidate = np.zeros_like(validation)
+
+    metrics = compute_validation_metrics(validation, candidate)
+
+    assert metrics.metrics["validation_bead"] is None
+    assert metrics.metrics["validation_sharpness"] is None
+    assert metrics.metrics[PROFILE_NAME] == metrics.metrics["validation_signal_structure_score"]
+    assert any("low-confidence bead detection" in warning for warning in metrics.warnings)
+
+
+def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monkeypatch):
+    validation = _synthetic_beads((96, 96))
+    sharp = validation.copy()
+    blurred = cv.GaussianBlur(validation, (0, 0), 3.0)
+    thorcam = cv.GaussianBlur(validation, (0, 0), 4.0)
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_path = tmp_path / "validation.tif"
+    thorcam_path = tmp_path / "thorcam.tif"
+    _write_image(validation_path, validation)
+    _write_image(thorcam_path, thorcam)
+
+    run1 = sweep_dir / "run1"
+    run1.mkdir()
+    workspace1 = run1 / "workspace.npz"
+    np.savez_compressed(workspace1, average_rectified_image=sharp)
+
+    run2 = sweep_dir / "run2"
+    run2.mkdir()
+    preview2 = run2 / "avg_rectified.png"
+    _write_image(preview2, blurred)
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    rows = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            generation_id="gen1",
+            rank=1,
+            strategy="combined",
+            params={"alpha": 1.0},
+            config={"strategy": "combined"},
+            score=10.0,
+        ),
+        SimpleNamespace(
+            row_id="stage2:candidate_b",
+            stage="stage2",
+            candidate_id="candidate_b",
+            generation_id="gen1",
+            rank=2,
+            strategy="combined",
+            params={"alpha": 0.5},
+            config={"strategy": "combined"},
+            score=8.0,
+        ),
+    ]
+    records = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            dataset_id="scene_a",
+            generation_id="gen1",
+            workspace_path=str(workspace1),
+            preview_path=None,
+            metric_record_path=None,
+        ),
+        SimpleNamespace(
+            row_id="stage2:candidate_b",
+            stage="stage2",
+            candidate_id="candidate_b",
+            dataset_id="scene_a",
+            generation_id="gen1",
+            workspace_path=None,
+            preview_path=str(preview2),
+            metric_record_path=None,
+        ),
+    ]
+
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_a",
+            validation_image=validation_path,
+            thorcam_image=thorcam_path,
+            output_dir=output_dir,
+            scale_values=[1.0],
+            residual_translation_max_px=2.0,
+            top_k=2,
+            enable_nonrigid_diagnostic=True,
+        )
+    )
+
+    assert result.best_lf_row_id == "stage2:candidate_a"
+    assert (output_dir / "trio_benchmark_results.csv").exists()
+    assert (output_dir / "trio_benchmark_summary.json").exists()
+    assert (output_dir / "trio_benchmark_report.html").exists()
+    assert (output_dir / "figures" / "rank_001_stage2_candidate_a_overlay.png").exists()
+    assert (output_dir / "figures" / "rank_001_stage2_candidate_a_affine_diagnostic_overlay.png").exists()
+
+    with (output_dir / "trio_benchmark_results.csv").open(newline="", encoding="utf-8") as fp:
+        csv_rows = list(csv.DictReader(fp))
+    assert [row["source_kind"] for row in csv_rows].count("lf_candidate") == 2
+    assert [row["source_kind"] for row in csv_rows].count("thorcam_baseline") == 1
+    fallback_row = next(row for row in csv_rows if row["candidate_id"] == "candidate_b")
+    assert "preview_fallback" in fallback_row["warnings"]
+
+    summary = json.loads((output_dir / "trio_benchmark_summary.json").read_text(encoding="utf-8"))
+    assert summary["best_candidate"]["row_id"] == "stage2:candidate_a"
+    assert summary["config"]["profile_name"] == PROFILE_NAME
+    assert "best_lf_minus_thorcam" in summary
+    assert result.rows[0].source_kind == "lf_candidate"
