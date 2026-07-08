@@ -16,10 +16,14 @@ from moment_images.trio_benchmark import (
     DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE,
     DEFAULT_REGISTRATION_PROFILE,
     DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX,
+    DEFAULT_REGISTRATION_ROTATION_SEARCH,
+    DEFAULT_REGISTRATION_TOP_HYPOTHESES,
+    DEFAULT_REGISTRATION_DIAGNOSTICS_TOP_N,
     DEFAULT_SCALE_SEARCH,
     DEFAULT_TOP_K,
     PROFILE_NAME,
     BenchmarkConfig,
+    parse_rotation_search,
     parse_scale_search,
     run_benchmark,
 )
@@ -105,7 +109,8 @@ def _scene_to_benchmark_config(
         stage=_optional_str(merged.get("stage")),
         generation_scope=str(merged.get("generation_scope", GENERATION_SCOPE_ALL)),
         anchor_row_id=str(merged.get("anchor_row_id", "auto")),
-        scale_values=parse_scale_search(str(merged.get("scale_search", DEFAULT_SCALE_SEARCH))),
+        scale_values=None if "scale_search" not in merged else parse_scale_search(str(merged.get("scale_search", DEFAULT_SCALE_SEARCH))),
+        rotation_values=parse_rotation_search(str(merged.get("registration_rotation_search", DEFAULT_REGISTRATION_ROTATION_SEARCH))),
         top_k=int(merged.get("top_k", DEFAULT_TOP_K)),
         residual_translation_max_px=float(
             merged.get("residual_translation_max_px", DEFAULT_RESIDUAL_TRANSLATION_MAX_PX)
@@ -119,6 +124,12 @@ def _scene_to_benchmark_config(
         ),
         registration_min_structure_score=float(
             merged.get("registration_min_structure_score", DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE)
+        ),
+        registration_top_hypotheses=int(
+            merged.get("registration_top_hypotheses", DEFAULT_REGISTRATION_TOP_HYPOTHESES)
+        ),
+        registration_diagnostics_top_n=int(
+            merged.get("registration_diagnostics_top_n", DEFAULT_REGISTRATION_DIAGNOSTICS_TOP_N)
         ),
         enable_nonrigid_diagnostic=bool(merged.get("enable_nonrigid_diagnostic", False)),
     )
@@ -151,6 +162,9 @@ def _successful_scene_summary(
         "registration_profile": config.registration_profile,
         "registration_confidence": _mapping(best.get("registration", {})).get("registration_confidence"),
         "registration_suspect": _mapping(best.get("registration", {})).get("registration_suspect"),
+        "registration_constraint_level": _mapping(best.get("registration", {})).get("registration_constraint_level"),
+        "registration_underconstrained": _mapping(best.get("registration", {})).get("registration_underconstrained"),
+        "registration_initializer": _mapping(best.get("registration", {})).get("registration_initializer"),
         "warnings": list(benchmark_summary.get("warnings", [])),
         "error": None,
     }
@@ -173,6 +187,9 @@ def _failed_scene_summary(scene_id: str, scene: Mapping[str, Any], scene_dir: Pa
         "registration_profile": None,
         "registration_confidence": None,
         "registration_suspect": None,
+        "registration_constraint_level": None,
+        "registration_underconstrained": None,
+        "registration_initializer": None,
         "warnings": [],
         "error": f"{type(exc).__name__}: {exc}",
     }
@@ -194,6 +211,9 @@ def _write_batch_csv(path: Path, scene_summaries: Sequence[Mapping[str, Any]]) -
         "registration_profile",
         "registration_confidence",
         "registration_suspect",
+        "registration_constraint_level",
+        "registration_underconstrained",
+        "registration_initializer",
         "warnings",
         "error",
     ]
@@ -225,6 +245,7 @@ def _render_batch_html(summary: Mapping[str, Any]) -> str:
             f"<td>{_html_float(scene_map.get('best_lf_minus_thorcam_validation_hybrid_v1'))}</td>"
             f"<td>{_html_float(scene_map.get('registration_confidence'))}</td>"
             f"<td>{html.escape(str(scene_map.get('registration_suspect') or ''))}</td>"
+            f"<td>{html.escape(str(scene_map.get('registration_constraint_level') or ''))}</td>"
             f"<td>{report_link}</td>"
             f"<td>{html.escape(str(scene_map.get('error') or ''))}</td>"
             "</tr>"
@@ -240,7 +261,7 @@ def _render_batch_html(summary: Mapping[str, Any]) -> str:
         f"successful: {int(summary.get('num_successful', 0))}; "
         f"failed: {int(summary.get('num_failed', 0))}</p>"
         "<table><thead><tr><th>Scene</th><th>Status</th><th>Best LF Row</th>"
-        "<th>Best LF Score</th><th>ThorCam Score</th><th>Delta</th><th>Reg Conf</th><th>Reg Suspect</th>"
+        "<th>Best LF Score</th><th>ThorCam Score</th><th>Delta</th><th>Reg Conf</th><th>Reg Suspect</th><th>Constraint</th>"
         "<th>Report</th><th>Error</th>"
         "</tr></thead><tbody>"
         + "\n".join(rows)

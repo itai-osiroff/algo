@@ -1,4 +1,5 @@
 import json
+import csv
 
 import numpy as np
 
@@ -51,8 +52,17 @@ def test_run_batch_from_manifest_writes_scene_outputs_and_aggregate_summary(tmp_
     assert summary["scenes"][0]["scene_id"] == "scene_one"
     assert summary["scenes"][0]["status"] == "ok"
     assert summary["scenes"][0]["best_lf_row_id"] == "stage1:s1c0000"
+    assert "registration_confidence" in summary["scenes"][0]
+    assert "registration_constraint_level" in summary["scenes"][0]
+    assert "registration_underconstrained" in summary["scenes"][0]
+    assert "registration_initializer" in summary["scenes"][0]
     assert (scene_dir / "trio_benchmark_results.csv").exists()
     assert (scene_dir / "trio_benchmark_summary.json").exists()
     assert (output_dir / "trio_batch_summary.json").exists()
     assert (output_dir / "trio_batch_results.csv").exists()
     assert (output_dir / "trio_batch_report.html").exists()
+    with (output_dir / "trio_batch_results.csv").open(newline="", encoding="utf-8") as fp:
+        rows = list(csv.DictReader(fp))
+    assert "registration_constraint_level" in rows[0]
+    assert "registration_underconstrained" in rows[0]
+    assert "registration_initializer" in rows[0]

@@ -32,6 +32,28 @@ def _synthetic_beads(shape: tuple[int, int] = (160, 160)) -> np.ndarray:
     return cv.GaussianBlur(image, (0, 0), 0.8)
 
 
+def _single_synthetic_bead(shape: tuple[int, int] = (120, 120)) -> np.ndarray:
+    image = np.zeros(shape, dtype=np.float32)
+    cv.circle(image, (72, 51), 4, 1.0, -1)
+    return cv.GaussianBlur(image, (0, 0), 0.9)
+
+
+def _warp_reference_to_moving(
+    reference: np.ndarray,
+    moving_shape: tuple[int, int],
+    moving_to_reference: np.ndarray,
+) -> np.ndarray:
+    reference_to_moving = cv.invertAffineTransform(np.asarray(moving_to_reference, dtype=np.float32))
+    return cv.warpAffine(
+        reference,
+        reference_to_moving,
+        moving_shape[::-1],
+        flags=cv.INTER_LINEAR,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+
+
 def _write_image(path: Path, image: np.ndarray) -> None:
     arr = np.asarray(image, dtype=np.float32)
     low = float(np.nanmin(arr))
@@ -76,6 +98,73 @@ def test_similarity_registration_recovers_no_shear_transform():
         rtol=1e-3,
         atol=1e-3,
     )
+
+
+def test_geometric_registration_recovers_multibead_different_fov_transform():
+    reference = _synthetic_beads((190, 190))
+    moving_shape = (150, 150)
+    center = (moving_shape[1] / 2.0, moving_shape[0] / 2.0)
+    moving_to_reference = cv.getRotationMatrix2D(center, 11.0, 1.28).astype(np.float32)
+    moving_to_reference[:, 2] += np.array([24.0, -9.0], dtype=np.float32)
+    moving = _warp_reference_to_moving(reference, moving_shape, moving_to_reference)
+    moving = np.asarray(0.35 + 1.8 * moving, dtype=np.float32)
+
+    result = estimate_similarity_registration(
+        reference,
+        moving,
+        scale_values=parse_scale_search("0.50:2.00:31"),
+        registration_profile="bead_geometric_v2",
+    )
+
+    assert result.status == "aligned"
+    assert result.registration_profile == "bead_geometric_v2"
+    assert result.registration_constraint_level == "full"
+    assert result.registration_underconstrained is False
+    assert result.registration_initializer == "bead_pair"
+    assert result.matched_bead_count >= 3
+    assert abs(result.scale - 1.28) <= 0.12
+    assert abs(abs(result.rotation_deg) - 11.0) <= 3.0
+    assert float(np.mean(np.abs(_robust_unit_for_test(result.aligned_image) - _robust_unit_for_test(reference)))) < 0.25
+    linear = result.forward_matrix[:, :2]
+    assert abs(float(np.dot(linear[:, 0], linear[:, 1]))) < 1e-3
+    np.testing.assert_allclose(
+        np.linalg.norm(linear[:, 0]),
+        np.linalg.norm(linear[:, 1]),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+def test_geometric_registration_reports_single_bead_underconstrained_without_match_count_failure():
+    reference = _single_synthetic_bead()
+    moving_shape = (96, 96)
+    center = (moving_shape[1] / 2.0, moving_shape[0] / 2.0)
+    moving_to_reference = cv.getRotationMatrix2D(center, -17.0, 1.45).astype(np.float32)
+    moving_to_reference[:, 2] += np.array([18.0, 7.0], dtype=np.float32)
+    moving = _warp_reference_to_moving(reference, moving_shape, moving_to_reference)
+
+    result = estimate_similarity_registration(
+        reference,
+        moving,
+        scale_values=parse_scale_search("0.50:2.00:31"),
+        registration_profile="bead_geometric_v2",
+    )
+
+    assert result.status == "aligned"
+    assert result.registration_constraint_level == "single_bead"
+    assert result.registration_underconstrained is True
+    assert result.registration_initializer == "single_bead_grid"
+    assert result.matched_bead_count >= 1
+    assert not any("matched_bead_count<3" in reason for reason in result.registration_suspect_reasons)
+
+
+def _robust_unit_for_test(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float32)
+    low = float(np.percentile(arr, 1.0))
+    high = float(np.percentile(arr, 99.5))
+    if high <= low:
+        return np.zeros_like(arr)
+    return np.clip((arr - low) / (high - low), 0.0, 1.0)
 
 
 def test_residual_translation_above_cap_is_not_applied():
@@ -244,6 +333,10 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
     assert "common_fov_fraction" in csv_rows[0]
     assert "anchor_selection_reason" in csv_rows[0]
     assert "residual_translation_norm" in csv_rows[0]
+    assert "registration_constraint_level" in csv_rows[0]
+    assert "registration_underconstrained" in csv_rows[0]
+    assert "registration_initializer" in csv_rows[0]
+    assert "registration_refined_score" in csv_rows[0]
     assert [row["source_kind"] for row in csv_rows].count("lf_candidate") == 2
     assert [row["source_kind"] for row in csv_rows].count("thorcam_baseline") == 1
     first_lf_row = next(row for row in csv_rows if row["candidate_id"] == "candidate_a")
@@ -255,9 +348,11 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
     summary = json.loads((output_dir / "trio_benchmark_summary.json").read_text(encoding="utf-8"))
     assert summary["best_candidate"]["row_id"] == "stage2:candidate_a"
     assert summary["config"]["profile_name"] == PROFILE_NAME
-    assert summary["config"]["registration_profile"] == "bead_similarity_v1"
+    assert summary["config"]["registration_profile"] == "bead_geometric_v2"
     assert "registration_confidence" in summary["best_candidate"]["registration"]
     assert "matched_bead_count" in summary["best_candidate"]["registration"]
+    assert "registration_constraint_level" in summary["best_candidate"]["registration"]
+    assert "registration_initializer" in summary["best_candidate"]["registration"]
     assert "best_lf_minus_thorcam" in summary
     assert result.rows[0].source_kind == "lf_candidate"
 
@@ -350,8 +445,86 @@ def test_run_benchmark_auto_anchor_selects_registration_confident_candidate_by_d
     )
 
     assert result.summary["anchor"]["candidate_id"] == "candidate_good"
-    assert result.summary["anchor"]["registration"]["registration_profile"] == "bead_similarity_v1"
+    assert result.summary["anchor"]["registration"]["registration_profile"] == "bead_geometric_v2"
     assert result.summary["anchor"]["registration"]["anchor_selection_reason"] == "best_registration_confidence"
+
+
+def test_run_benchmark_uses_profile_specific_default_scale_search(tmp_path, monkeypatch):
+    validation = _synthetic_beads((96, 96))
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_path = tmp_path / "validation.tif"
+    thorcam_path = tmp_path / "thorcam.tif"
+    _write_image(validation_path, validation)
+    _write_image(thorcam_path, validation)
+
+    run1 = sweep_dir / "run1"
+    run1.mkdir()
+    workspace1 = run1 / "workspace.npz"
+    np.savez_compressed(workspace1, average_rectified_image=validation)
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    rows = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            generation_id="gen1",
+            rank=1,
+            strategy="combined",
+            params={},
+            config={},
+            score=10.0,
+        )
+    ]
+    records = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            dataset_id="scene_a",
+            generation_id="gen1",
+            workspace_path=str(workspace1),
+            preview_path=None,
+            metric_record_path=None,
+        )
+    ]
+
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+
+    default_result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_a",
+            validation_image=validation_path,
+            thorcam_image=thorcam_path,
+            output_dir=output_dir / "default",
+            scale_values=None,
+        )
+    )
+    legacy_result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_a",
+            validation_image=validation_path,
+            thorcam_image=thorcam_path,
+            output_dir=output_dir / "legacy",
+            scale_values=None,
+            registration_profile="centered_ecc_legacy",
+        )
+    )
+
+    assert default_result.summary["config"]["registration_profile"] == "bead_geometric_v2"
+    assert default_result.summary["config"]["scale_values"][0] == 0.5
+    assert default_result.summary["config"]["scale_values"][-1] == 2.0
+    assert len(default_result.summary["config"]["scale_values"]) == 31
+    assert legacy_result.summary["config"]["registration_profile"] == "centered_ecc_legacy"
+    assert legacy_result.summary["config"]["scale_values"][0] == 0.9
+    assert legacy_result.summary["config"]["scale_values"][-1] == 1.1
+    assert len(legacy_result.summary["config"]["scale_values"]) == 11
 
 
 def test_run_benchmark_reads_references_from_validation_workspace(tmp_path, monkeypatch):
