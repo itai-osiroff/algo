@@ -92,6 +92,12 @@ images:
 python -m moment_images.trio_benchmark --sweep-dir path/to/sweep_output --dataset-id scene_id --validation-workspace path/to/validation_workspace.npz --output-dir path/to/trio_report
 ```
 
+By default, trio registration uses `bead_similarity_v1`: a similarity-only
+bead/structure registration profile that auto-selects the LF anchor by
+registration confidence, then reports suspect registration fields in the CSV,
+JSON, and HTML outputs. Use `--registration-profile centered_ecc_legacy` to
+run the older centered ECC registration path for comparison.
+
 Run a manifest of trio scenes:
 
 ```bash

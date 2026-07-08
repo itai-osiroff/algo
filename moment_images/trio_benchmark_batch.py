@@ -12,6 +12,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from moment_images.reliable_io import write_csv_atomic, write_json_atomic, write_text_atomic
 from moment_images.trio_benchmark import (
     DEFAULT_RESIDUAL_TRANSLATION_MAX_PX,
+    DEFAULT_REGISTRATION_MIN_MATCHED_BEADS,
+    DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE,
+    DEFAULT_REGISTRATION_PROFILE,
+    DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX,
     DEFAULT_SCALE_SEARCH,
     DEFAULT_TOP_K,
     PROFILE_NAME,
@@ -106,6 +110,16 @@ def _scene_to_benchmark_config(
         residual_translation_max_px=float(
             merged.get("residual_translation_max_px", DEFAULT_RESIDUAL_TRANSLATION_MAX_PX)
         ),
+        registration_profile=str(merged.get("registration_profile", DEFAULT_REGISTRATION_PROFILE)),
+        registration_suspect_residual_px=float(
+            merged.get("registration_suspect_residual_px", DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX)
+        ),
+        registration_min_matched_beads=int(
+            merged.get("registration_min_matched_beads", DEFAULT_REGISTRATION_MIN_MATCHED_BEADS)
+        ),
+        registration_min_structure_score=float(
+            merged.get("registration_min_structure_score", DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE)
+        ),
         enable_nonrigid_diagnostic=bool(merged.get("enable_nonrigid_diagnostic", False)),
     )
 
@@ -134,6 +148,9 @@ def _successful_scene_summary(
         "best_validation_hybrid_v1": best_metrics.get(PROFILE_NAME),
         "thorcam_validation_hybrid_v1": thor_metrics.get(PROFILE_NAME),
         "best_lf_minus_thorcam_validation_hybrid_v1": deltas.get(PROFILE_NAME),
+        "registration_profile": config.registration_profile,
+        "registration_confidence": _mapping(best.get("registration", {})).get("registration_confidence"),
+        "registration_suspect": _mapping(best.get("registration", {})).get("registration_suspect"),
         "warnings": list(benchmark_summary.get("warnings", [])),
         "error": None,
     }
@@ -153,6 +170,9 @@ def _failed_scene_summary(scene_id: str, scene: Mapping[str, Any], scene_dir: Pa
         "best_validation_hybrid_v1": None,
         "thorcam_validation_hybrid_v1": None,
         "best_lf_minus_thorcam_validation_hybrid_v1": None,
+        "registration_profile": None,
+        "registration_confidence": None,
+        "registration_suspect": None,
         "warnings": [],
         "error": f"{type(exc).__name__}: {exc}",
     }
@@ -171,6 +191,9 @@ def _write_batch_csv(path: Path, scene_summaries: Sequence[Mapping[str, Any]]) -
         "best_validation_hybrid_v1",
         "thorcam_validation_hybrid_v1",
         "best_lf_minus_thorcam_validation_hybrid_v1",
+        "registration_profile",
+        "registration_confidence",
+        "registration_suspect",
         "warnings",
         "error",
     ]
@@ -200,6 +223,8 @@ def _render_batch_html(summary: Mapping[str, Any]) -> str:
             f"<td>{_html_float(scene_map.get('best_validation_hybrid_v1'))}</td>"
             f"<td>{_html_float(scene_map.get('thorcam_validation_hybrid_v1'))}</td>"
             f"<td>{_html_float(scene_map.get('best_lf_minus_thorcam_validation_hybrid_v1'))}</td>"
+            f"<td>{_html_float(scene_map.get('registration_confidence'))}</td>"
+            f"<td>{html.escape(str(scene_map.get('registration_suspect') or ''))}</td>"
             f"<td>{report_link}</td>"
             f"<td>{html.escape(str(scene_map.get('error') or ''))}</td>"
             "</tr>"
@@ -215,7 +240,8 @@ def _render_batch_html(summary: Mapping[str, Any]) -> str:
         f"successful: {int(summary.get('num_successful', 0))}; "
         f"failed: {int(summary.get('num_failed', 0))}</p>"
         "<table><thead><tr><th>Scene</th><th>Status</th><th>Best LF Row</th>"
-        "<th>Best LF Score</th><th>ThorCam Score</th><th>Delta</th><th>Report</th><th>Error</th>"
+        "<th>Best LF Score</th><th>ThorCam Score</th><th>Delta</th><th>Reg Conf</th><th>Reg Suspect</th>"
+        "<th>Report</th><th>Error</th>"
         "</tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table></body></html>"

@@ -97,6 +97,8 @@ def test_residual_translation_above_cap_is_not_applied():
 
     assert result.residual_applied is False
     assert result.residual_translation_norm > 3.0
+    assert result.registration_suspect is True
+    assert any("residual_translation_norm" in reason for reason in result.registration_suspect_reasons)
     assert any("Residual translation" in warning for warning in result.warnings)
 
 
@@ -233,6 +235,15 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
         csv_rows = list(csv.DictReader(fp))
     assert "params_json" in csv_rows[0]
     assert "config_json" in csv_rows[0]
+    assert "registration_profile" in csv_rows[0]
+    assert "registration_confidence" in csv_rows[0]
+    assert "registration_suspect" in csv_rows[0]
+    assert "registration_suspect_reasons" in csv_rows[0]
+    assert "matched_bead_count" in csv_rows[0]
+    assert "median_bead_error_px" in csv_rows[0]
+    assert "common_fov_fraction" in csv_rows[0]
+    assert "anchor_selection_reason" in csv_rows[0]
+    assert "residual_translation_norm" in csv_rows[0]
     assert [row["source_kind"] for row in csv_rows].count("lf_candidate") == 2
     assert [row["source_kind"] for row in csv_rows].count("thorcam_baseline") == 1
     first_lf_row = next(row for row in csv_rows if row["candidate_id"] == "candidate_a")
@@ -244,8 +255,103 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
     summary = json.loads((output_dir / "trio_benchmark_summary.json").read_text(encoding="utf-8"))
     assert summary["best_candidate"]["row_id"] == "stage2:candidate_a"
     assert summary["config"]["profile_name"] == PROFILE_NAME
+    assert summary["config"]["registration_profile"] == "bead_similarity_v1"
+    assert "registration_confidence" in summary["best_candidate"]["registration"]
+    assert "matched_bead_count" in summary["best_candidate"]["registration"]
     assert "best_lf_minus_thorcam" in summary
     assert result.rows[0].source_kind == "lf_candidate"
+
+
+def test_run_benchmark_auto_anchor_selects_registration_confident_candidate_by_default(tmp_path, monkeypatch):
+    validation = _synthetic_beads((96, 96))
+    mismatched = np.flipud(validation)
+    thorcam = cv.GaussianBlur(validation, (0, 0), 3.0)
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_path = tmp_path / "validation.tif"
+    thorcam_path = tmp_path / "thorcam.tif"
+    _write_image(validation_path, validation)
+    _write_image(thorcam_path, thorcam)
+
+    run_bad = sweep_dir / "bad"
+    run_bad.mkdir()
+    workspace_bad = run_bad / "workspace.npz"
+    np.savez_compressed(workspace_bad, average_rectified_image=mismatched)
+
+    run_good = sweep_dir / "good"
+    run_good.mkdir()
+    workspace_good = run_good / "workspace.npz"
+    np.savez_compressed(workspace_good, average_rectified_image=validation)
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    rows = [
+        SimpleNamespace(
+            row_id="stage2:candidate_bad",
+            stage="stage2",
+            candidate_id="candidate_bad",
+            generation_id="gen1",
+            rank=1,
+            strategy="combined",
+            params={},
+            config={},
+            score=10.0,
+        ),
+        SimpleNamespace(
+            row_id="stage2:candidate_good",
+            stage="stage2",
+            candidate_id="candidate_good",
+            generation_id="gen1",
+            rank=2,
+            strategy="combined",
+            params={},
+            config={},
+            score=8.0,
+        ),
+    ]
+    records = [
+        SimpleNamespace(
+            row_id="stage2:candidate_bad",
+            stage="stage2",
+            candidate_id="candidate_bad",
+            dataset_id="scene_a",
+            generation_id="gen1",
+            workspace_path=str(workspace_bad),
+            preview_path=None,
+            metric_record_path=None,
+        ),
+        SimpleNamespace(
+            row_id="stage2:candidate_good",
+            stage="stage2",
+            candidate_id="candidate_good",
+            dataset_id="scene_a",
+            generation_id="gen1",
+            workspace_path=str(workspace_good),
+            preview_path=None,
+            metric_record_path=None,
+        ),
+    ]
+
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_a",
+            validation_image=validation_path,
+            thorcam_image=thorcam_path,
+            output_dir=output_dir,
+            scale_values=[1.0],
+            top_k=1,
+        )
+    )
+
+    assert result.summary["anchor"]["candidate_id"] == "candidate_good"
+    assert result.summary["anchor"]["registration"]["registration_profile"] == "bead_similarity_v1"
+    assert result.summary["anchor"]["registration"]["anchor_selection_reason"] == "best_registration_confidence"
 
 
 def test_run_benchmark_reads_references_from_validation_workspace(tmp_path, monkeypatch):

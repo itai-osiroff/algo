@@ -6,6 +6,10 @@
     "scale_search": "0.90:1.10:11",
     "top_k": 12,
     "residual_translation_max_px": 5.0,
+    "registration_profile": "bead_similarity_v1",
+    "registration_suspect_residual_px": 15.0,
+    "registration_min_matched_beads": 3,
+    "registration_min_structure_score": 0.10,
     "enable_nonrigid_diagnostic": false
   },
   "scenes": [

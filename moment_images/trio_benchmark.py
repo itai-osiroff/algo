@@ -37,6 +37,13 @@ PROFILE_NAME = "validation_hybrid_v1"
 DEFAULT_SCALE_SEARCH = "0.90:1.10:11"
 DEFAULT_TOP_K = 12
 DEFAULT_RESIDUAL_TRANSLATION_MAX_PX = 5.0
+REGISTRATION_PROFILE_BEAD_SIMILARITY = "bead_similarity_v1"
+REGISTRATION_PROFILE_CENTERED_ECC = "centered_ecc_legacy"
+DEFAULT_REGISTRATION_PROFILE = REGISTRATION_PROFILE_BEAD_SIMILARITY
+DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX = 15.0
+DEFAULT_REGISTRATION_MIN_MATCHED_BEADS = 3
+DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE = 0.10
+DEFAULT_REGISTRATION_MAX_DIM = 768
 BEAD_LOW_CONFIDENCE_WARNING = "low-confidence bead detection; bead and sharpness terms omitted"
 
 
@@ -54,6 +61,10 @@ class BenchmarkConfig:
     scale_values: Optional[Sequence[float]] = None
     top_k: int = DEFAULT_TOP_K
     residual_translation_max_px: float = DEFAULT_RESIDUAL_TRANSLATION_MAX_PX
+    registration_profile: str = DEFAULT_REGISTRATION_PROFILE
+    registration_suspect_residual_px: float = DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX
+    registration_min_matched_beads: int = DEFAULT_REGISTRATION_MIN_MATCHED_BEADS
+    registration_min_structure_score: float = DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE
     enable_nonrigid_diagnostic: bool = False
 
 
@@ -72,6 +83,14 @@ class SimilarityRegistrationResult:
     residual_translation_y: float = 0.0
     residual_translation_norm: float = 0.0
     residual_applied: bool = False
+    registration_profile: str = DEFAULT_REGISTRATION_PROFILE
+    registration_confidence: Optional[float] = None
+    registration_suspect: bool = False
+    registration_suspect_reasons: List[str] = field(default_factory=list)
+    matched_bead_count: int = 0
+    median_bead_error_px: Optional[float] = None
+    common_fov_fraction: Optional[float] = None
+    anchor_selection_reason: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
 
 
@@ -155,13 +174,51 @@ def estimate_similarity_registration(
     moving: np.ndarray,
     *,
     scale_values: Sequence[float],
+    registration_profile: str = DEFAULT_REGISTRATION_PROFILE,
+    registration_suspect_residual_px: float = DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX,
+    registration_min_matched_beads: int = DEFAULT_REGISTRATION_MIN_MATCHED_BEADS,
+    registration_min_structure_score: float = DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE,
 ) -> SimilarityRegistrationResult:
-    """Register ``moving`` onto ``reference`` using scale sweep + Euclidean ECC."""
+    """Register ``moving`` onto ``reference`` using a shear-free similarity transform."""
 
     ref = _as_float_2d(reference)
     mov = _as_float_2d(moving)
     if ref.size == 0 or mov.size == 0:
         raise ValueError("reference and moving images must be non-empty")
+
+    profile = _normalize_registration_profile(registration_profile)
+    if profile == REGISTRATION_PROFILE_CENTERED_ECC:
+        return _estimate_centered_ecc_registration(
+            ref,
+            mov,
+            scale_values=scale_values,
+            registration_profile=profile,
+            registration_suspect_residual_px=registration_suspect_residual_px,
+            registration_min_matched_beads=registration_min_matched_beads,
+            registration_min_structure_score=registration_min_structure_score,
+        )
+    return _estimate_bead_similarity_registration(
+        ref,
+        mov,
+        scale_values=scale_values,
+        registration_profile=profile,
+        registration_suspect_residual_px=registration_suspect_residual_px,
+        registration_min_matched_beads=registration_min_matched_beads,
+        registration_min_structure_score=registration_min_structure_score,
+    )
+
+
+def _estimate_centered_ecc_registration(
+    ref: np.ndarray,
+    mov: np.ndarray,
+    *,
+    scale_values: Sequence[float],
+    registration_profile: str,
+    registration_suspect_residual_px: float,
+    registration_min_matched_beads: int,
+    registration_min_structure_score: float,
+) -> SimilarityRegistrationResult:
+    """Register ``moving`` onto ``reference`` using centered scale sweep + Euclidean ECC."""
 
     ref_norm = _normalize_for_registration(ref)
     best: Optional[Tuple[float, float, np.ndarray, np.ndarray, np.ndarray]] = None
@@ -224,7 +281,7 @@ def estimate_similarity_registration(
         )
         forward = pre_matrix.astype(np.float64)
         scale, rotation_deg, tx, ty = _decompose_similarity(forward)
-        return SimilarityRegistrationResult(
+        result = SimilarityRegistrationResult(
             status="failed",
             aligned_image=aligned.astype(np.float32),
             forward_matrix=forward,
@@ -234,13 +291,23 @@ def estimate_similarity_registration(
             translation_y=ty,
             ecc_score=None,
             ecc_warp_matrix=np.eye(2, 3, dtype=np.float32),
+            registration_profile=registration_profile,
             warnings=warnings or ["similarity registration failed"],
+        )
+        return _with_registration_quality(
+            result,
+            ref,
+            mov.shape,
+            scale_values=scale_values,
+            residual_suspect_px=registration_suspect_residual_px,
+            min_matched_beads=registration_min_matched_beads,
+            min_structure_score=registration_min_structure_score,
         )
 
     score, best_scale, pre_matrix, warp, aligned = best
     forward = _combine_forward_matrix(pre_matrix, warp)
     scale, rotation_deg, tx, ty = _decompose_similarity(forward)
-    return SimilarityRegistrationResult(
+    result = SimilarityRegistrationResult(
         status="aligned",
         aligned_image=aligned.astype(np.float32),
         forward_matrix=forward,
@@ -250,7 +317,137 @@ def estimate_similarity_registration(
         translation_y=ty,
         ecc_score=score,
         ecc_warp_matrix=warp.astype(np.float32),
+        registration_profile=registration_profile,
         warnings=warnings,
+    )
+    return _with_registration_quality(
+        result,
+        ref,
+        mov.shape,
+        scale_values=scale_values,
+        residual_suspect_px=registration_suspect_residual_px,
+        min_matched_beads=registration_min_matched_beads,
+        min_structure_score=registration_min_structure_score,
+    )
+
+
+def _estimate_bead_similarity_registration(
+    ref: np.ndarray,
+    mov: np.ndarray,
+    *,
+    scale_values: Sequence[float],
+    registration_profile: str,
+    registration_suspect_residual_px: float,
+    registration_min_matched_beads: int,
+    registration_min_structure_score: float,
+) -> SimilarityRegistrationResult:
+    ref_channel_full = _registration_channel(ref)
+    mov_channel_full = _registration_channel(mov)
+    ref_channel, mov_channel, ref_scale, mov_scale = _downsample_registration_pair(
+        ref_channel_full,
+        mov_channel_full,
+        max_dim=DEFAULT_REGISTRATION_MAX_DIM,
+    )
+    warnings: List[str] = []
+    best: Optional[Tuple[float, float, np.ndarray, np.ndarray]] = None
+    rotations = _coarse_registration_rotations()
+    for scale in scale_values:
+        if not math.isfinite(float(scale)) or float(scale) <= 0.0:
+            warnings.append(f"invalid scale skipped: {scale}")
+            continue
+        small_scale = float(scale) * ref_scale / mov_scale
+        for rotation_deg in rotations:
+            pre_small = _pre_similarity_matrix(mov_channel.shape, ref_channel.shape, small_scale, rotation_deg)
+            canvas = cv.warpAffine(
+                mov_channel,
+                pre_small,
+                (ref_channel.shape[1], ref_channel.shape[0]),
+                flags=cv.INTER_LINEAR,
+                borderMode=cv.BORDER_CONSTANT,
+                borderValue=0.0,
+            )
+            dx, dy = _phase_translation_on_channels(canvas, ref_channel)
+            for sx, sy in ((dx, dy), (-dx, -dy), (0.0, 0.0)):
+                residual = np.array([[1.0, 0.0, sx], [0.0, 1.0, sy]], dtype=np.float64)
+                forward_small = _matrix_multiply_2x3(residual, pre_small)
+                shifted = cv.warpAffine(
+                    mov_channel,
+                    forward_small.astype(np.float32),
+                    (ref_channel.shape[1], ref_channel.shape[0]),
+                    flags=cv.INTER_LINEAR,
+                    borderMode=cv.BORDER_CONSTANT,
+                    borderValue=0.0,
+                )
+                score = _registration_channel_score(ref_channel, shifted)
+                if best is None or score > best[0]:
+                    best = (score, float(scale), forward_small, shifted)
+
+    if best is None:
+        forward = _pre_similarity_matrix(mov.shape, ref.shape, 1.0, 0.0).astype(np.float64)
+        aligned = cv.warpAffine(
+            mov,
+            forward.astype(np.float32),
+            (ref.shape[1], ref.shape[0]),
+            flags=cv.INTER_LINEAR,
+            borderMode=cv.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+        scale, rotation_deg, tx, ty = _decompose_similarity(forward)
+        result = SimilarityRegistrationResult(
+            status="failed",
+            aligned_image=aligned.astype(np.float32),
+            forward_matrix=forward,
+            scale=scale,
+            rotation_deg=rotation_deg,
+            translation_x=tx,
+            translation_y=ty,
+            ecc_score=None,
+            ecc_warp_matrix=np.eye(2, 3, dtype=np.float32),
+            registration_profile=registration_profile,
+            warnings=warnings or ["bead similarity registration failed"],
+        )
+        return _with_registration_quality(
+            result,
+            ref,
+            mov.shape,
+            scale_values=scale_values,
+            residual_suspect_px=registration_suspect_residual_px,
+            min_matched_beads=registration_min_matched_beads,
+            min_structure_score=registration_min_structure_score,
+        )
+
+    score, _selected_scale, forward_small, _shifted = best
+    forward = _scale_affine_between_resolutions(forward_small, ref_scale=ref_scale, mov_scale=mov_scale)
+    aligned = cv.warpAffine(
+        mov,
+        forward.astype(np.float32),
+        (ref.shape[1], ref.shape[0]),
+        flags=cv.INTER_LINEAR,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    scale, rotation_deg, tx, ty = _decompose_similarity(forward)
+    result = SimilarityRegistrationResult(
+        status="aligned",
+        aligned_image=aligned.astype(np.float32),
+        forward_matrix=forward,
+        scale=scale,
+        rotation_deg=rotation_deg,
+        translation_x=tx,
+        translation_y=ty,
+        ecc_score=score,
+        ecc_warp_matrix=np.eye(2, 3, dtype=np.float32),
+        registration_profile=registration_profile,
+        warnings=warnings,
+    )
+    return _with_registration_quality(
+        result,
+        ref,
+        mov.shape,
+        scale_values=scale_values,
+        residual_suspect_px=registration_suspect_residual_px,
+        min_matched_beads=registration_min_matched_beads,
+        min_structure_score=registration_min_structure_score,
     )
 
 
@@ -260,29 +457,24 @@ def apply_anchor_registration(
     anchor: SimilarityRegistrationResult,
     *,
     residual_translation_max_px: float,
+    scale_values: Optional[Sequence[float]] = None,
+    registration_suspect_residual_px: float = DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX,
+    registration_min_matched_beads: int = DEFAULT_REGISTRATION_MIN_MATCHED_BEADS,
+    registration_min_structure_score: float = DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE,
 ) -> SimilarityRegistrationResult:
     """Apply an anchor similarity transform with capped residual translation."""
 
     ref = _as_float_2d(reference)
     mov = _as_float_2d(moving)
-    pre_matrix = _pre_scale_matrix(mov.shape, ref.shape, anchor.scale)
-    canvas = cv.warpAffine(
+    forward = np.asarray(anchor.forward_matrix, dtype=np.float64).copy()
+    aligned = cv.warpAffine(
         mov,
-        pre_matrix,
+        forward.astype(np.float32),
         (ref.shape[1], ref.shape[0]),
         flags=cv.INTER_LINEAR,
         borderMode=cv.BORDER_CONSTANT,
         borderValue=0.0,
     )
-    aligned = cv.warpAffine(
-        canvas,
-        anchor.ecc_warp_matrix,
-        (ref.shape[1], ref.shape[0]),
-        flags=cv.INTER_LINEAR + cv.WARP_INVERSE_MAP,
-        borderMode=cv.BORDER_CONSTANT,
-        borderValue=0.0,
-    )
-    forward = _combine_forward_matrix(pre_matrix, anchor.ecc_warp_matrix)
     warnings = list(anchor.warnings)
 
     dx, dy = _phase_translation(aligned, ref)
@@ -302,11 +494,11 @@ def apply_anchor_registration(
         dy = 0.0
 
     scale, rotation_deg, tx, ty = _decompose_similarity(forward)
-    return SimilarityRegistrationResult(
+    result = SimilarityRegistrationResult(
         status=anchor.status,
         aligned_image=aligned.astype(np.float32),
         forward_matrix=forward,
-        scale=anchor.scale,
+        scale=scale,
         rotation_deg=rotation_deg,
         translation_x=tx,
         translation_y=ty,
@@ -316,7 +508,18 @@ def apply_anchor_registration(
         residual_translation_y=float(dy),
         residual_translation_norm=norm,
         residual_applied=residual_applied,
+        registration_profile=anchor.registration_profile,
+        anchor_selection_reason=anchor.anchor_selection_reason,
         warnings=_unique_strings(warnings),
+    )
+    return _with_registration_quality(
+        result,
+        ref,
+        mov.shape,
+        scale_values=[anchor.scale] if scale_values is None else scale_values,
+        residual_suspect_px=min(float(registration_suspect_residual_px), max(0.0, float(residual_translation_max_px))),
+        min_matched_beads=registration_min_matched_beads,
+        min_structure_score=registration_min_structure_score,
     )
 
 
@@ -407,12 +610,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             f"dataset_id={cfg.dataset_id!r}."
         )
 
-    anchor_record = _select_anchor(candidate_images, cfg.anchor_row_id)
-    anchor_registration = estimate_similarity_registration(
-        validation,
-        anchor_record.image,
-        scale_values=cast(Sequence[float], cfg.scale_values),
-    )
+    anchor_record, anchor_registration = _select_registration_anchor(validation, candidate_images, cfg)
 
     lf_rows: List[BenchmarkResultRow] = []
     for candidate in candidate_images:
@@ -421,6 +619,10 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             candidate.image,
             anchor_registration,
             residual_translation_max_px=cfg.residual_translation_max_px,
+            scale_values=cast(Sequence[float], cfg.scale_values),
+            registration_suspect_residual_px=cfg.registration_suspect_residual_px,
+            registration_min_matched_beads=cfg.registration_min_matched_beads,
+            registration_min_structure_score=cfg.registration_min_structure_score,
         )
         metrics = compute_validation_metrics(validation, registration.aligned_image)
         row = candidate.row
@@ -455,6 +657,10 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         validation,
         thorcam,
         scale_values=cast(Sequence[float], cfg.scale_values),
+        registration_profile=cfg.registration_profile,
+        registration_suspect_residual_px=cfg.registration_suspect_residual_px,
+        registration_min_matched_beads=cfg.registration_min_matched_beads,
+        registration_min_structure_score=cfg.registration_min_structure_score,
     )
     thor_metrics = compute_validation_metrics(validation, thor_registration.aligned_image)
     thor_row = BenchmarkResultRow(
@@ -516,6 +722,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
     scale_values = list(config.scale_values) if config.scale_values is not None else parse_scale_search(DEFAULT_SCALE_SEARCH)
     generation_scope = _normalize_generation_scope_arg(config.generation_scope)
+    registration_profile = _normalize_registration_profile(config.registration_profile)
     if config.output_dir is None:
         raise ValueError("output_dir is required")
     return BenchmarkConfig(
@@ -531,6 +738,10 @@ def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
         scale_values=scale_values,
         top_k=int(config.top_k),
         residual_translation_max_px=float(config.residual_translation_max_px),
+        registration_profile=registration_profile,
+        registration_suspect_residual_px=float(config.registration_suspect_residual_px),
+        registration_min_matched_beads=int(config.registration_min_matched_beads),
+        registration_min_structure_score=float(config.registration_min_structure_score),
         enable_nonrigid_diagnostic=bool(config.enable_nonrigid_diagnostic),
     )
 
@@ -760,6 +971,69 @@ def _select_anchor(records: Sequence[CandidateImageRecord], anchor_row_id: str) 
     return min(records, key=lambda item: (_optional_int(getattr(item.row, "rank", None)) or 10**9, str(getattr(item.row, "row_id", ""))))
 
 
+def _select_registration_anchor(
+    validation: np.ndarray,
+    records: Sequence[CandidateImageRecord],
+    config: BenchmarkConfig,
+) -> Tuple[CandidateImageRecord, SimilarityRegistrationResult]:
+    if config.anchor_row_id != "auto":
+        anchor_record = _select_anchor(records, config.anchor_row_id)
+        registration = estimate_similarity_registration(
+            validation,
+            anchor_record.image,
+            scale_values=cast(Sequence[float], config.scale_values),
+            registration_profile=config.registration_profile,
+            registration_suspect_residual_px=config.registration_suspect_residual_px,
+            registration_min_matched_beads=config.registration_min_matched_beads,
+            registration_min_structure_score=config.registration_min_structure_score,
+        )
+        registration.anchor_selection_reason = "explicit_anchor_row_id"
+        return anchor_record, registration
+
+    if config.registration_profile == REGISTRATION_PROFILE_CENTERED_ECC:
+        anchor_record = _select_anchor(records, config.anchor_row_id)
+        registration = estimate_similarity_registration(
+            validation,
+            anchor_record.image,
+            scale_values=cast(Sequence[float], config.scale_values),
+            registration_profile=config.registration_profile,
+            registration_suspect_residual_px=config.registration_suspect_residual_px,
+            registration_min_matched_beads=config.registration_min_matched_beads,
+            registration_min_structure_score=config.registration_min_structure_score,
+        )
+        registration.anchor_selection_reason = "saved_rank_auto_legacy_profile"
+        return anchor_record, registration
+
+    evaluated: List[Tuple[float, CandidateImageRecord, SimilarityRegistrationResult]] = []
+    for record in records:
+        registration = estimate_similarity_registration(
+            validation,
+            record.image,
+            scale_values=cast(Sequence[float], config.scale_values),
+            registration_profile=config.registration_profile,
+            registration_suspect_residual_px=config.registration_suspect_residual_px,
+            registration_min_matched_beads=config.registration_min_matched_beads,
+            registration_min_structure_score=config.registration_min_structure_score,
+        )
+        confidence = registration.registration_confidence
+        score = -float("inf") if confidence is None else float(confidence)
+        evaluated.append((score, record, registration))
+    if not evaluated:
+        raise ValueError("anchor selection received no loadable candidates")
+    evaluated.sort(
+        key=lambda item: (
+            item[0],
+            _score_sort_value(item[2].ecc_score),
+            -float(_optional_int(getattr(item[1].row, "rank", None)) or 10**9),
+            str(getattr(item[1].row, "row_id", "")),
+        ),
+        reverse=True,
+    )
+    _score, anchor_record, registration = evaluated[0]
+    registration.anchor_selection_reason = "best_registration_confidence"
+    return anchor_record, registration
+
+
 def _write_results_csv(path: Path, rows: Sequence[BenchmarkResultRow]) -> None:
     fieldnames = [
         "source_kind",
@@ -779,12 +1053,21 @@ def _write_results_csv(path: Path, rows: Sequence[BenchmarkResultRow]) -> None:
         "validation_sharpness",
         "validation_signal_structure_score",
         "registration_status",
+        "registration_profile",
+        "registration_confidence",
+        "registration_suspect",
+        "registration_suspect_reasons",
+        "matched_bead_count",
+        "median_bead_error_px",
+        "common_fov_fraction",
+        "anchor_selection_reason",
         "registration_scale",
         "registration_rotation_deg",
         "registration_translation_x",
         "registration_translation_y",
         "residual_translation_x",
         "residual_translation_y",
+        "residual_translation_norm",
         "residual_applied",
         "params_json",
         "config_json",
@@ -809,12 +1092,21 @@ def _row_to_csv(row: BenchmarkResultRow) -> Dict[str, Any]:
         "saved_rank": "" if row.saved_rank is None else row.saved_rank,
         "saved_score": _csv_float(row.saved_score),
         "registration_status": reg.status,
+        "registration_profile": reg.registration_profile,
+        "registration_confidence": _csv_float(reg.registration_confidence),
+        "registration_suspect": str(bool(reg.registration_suspect)).lower(),
+        "registration_suspect_reasons": "|".join(reg.registration_suspect_reasons),
+        "matched_bead_count": reg.matched_bead_count,
+        "median_bead_error_px": _csv_float(reg.median_bead_error_px),
+        "common_fov_fraction": _csv_float(reg.common_fov_fraction),
+        "anchor_selection_reason": reg.anchor_selection_reason or "",
         "registration_scale": _csv_float(reg.scale),
         "registration_rotation_deg": _csv_float(reg.rotation_deg),
         "registration_translation_x": _csv_float(reg.translation_x),
         "registration_translation_y": _csv_float(reg.translation_y),
         "residual_translation_x": _csv_float(reg.residual_translation_x),
         "residual_translation_y": _csv_float(reg.residual_translation_y),
+        "residual_translation_norm": _csv_float(reg.residual_translation_norm),
         "residual_applied": str(bool(reg.residual_applied)).lower(),
         "params_json": json.dumps(row.params, sort_keys=True, separators=(",", ":")),
         "config_json": json.dumps(row.config, sort_keys=True, separators=(",", ":")),
@@ -875,6 +1167,10 @@ def _build_summary(
             "scale_values": list(config.scale_values or []),
             "top_k": config.top_k,
             "residual_translation_max_px": config.residual_translation_max_px,
+            "registration_profile": config.registration_profile,
+            "registration_suspect_residual_px": config.registration_suspect_residual_px,
+            "registration_min_matched_beads": config.registration_min_matched_beads,
+            "registration_min_structure_score": config.registration_min_structure_score,
             "enable_nonrigid_diagnostic": config.enable_nonrigid_diagnostic,
         },
         "best_candidate": None if best is None else _row_to_summary(best),
@@ -915,6 +1211,14 @@ def _row_to_summary(row: BenchmarkResultRow) -> Dict[str, Any]:
 def _registration_summary(reg: SimilarityRegistrationResult) -> Dict[str, Any]:
     return {
         "status": reg.status,
+        "registration_profile": reg.registration_profile,
+        "registration_confidence": reg.registration_confidence,
+        "registration_suspect": reg.registration_suspect,
+        "registration_suspect_reasons": reg.registration_suspect_reasons,
+        "matched_bead_count": reg.matched_bead_count,
+        "median_bead_error_px": reg.median_bead_error_px,
+        "common_fov_fraction": reg.common_fov_fraction,
+        "anchor_selection_reason": reg.anchor_selection_reason,
         "scale": reg.scale,
         "rotation_deg": reg.rotation_deg,
         "translation_x": reg.translation_x,
@@ -945,6 +1249,9 @@ def _render_report_html(summary: Mapping[str, Any], rows: Sequence[BenchmarkResu
             f"<td>{_html_float(row.metrics.get('validation_structure'))}</td>"
             f"<td>{_html_float(row.metrics.get('validation_bead'))}</td>"
             f"<td>{_html_float(row.metrics.get('validation_sharpness'))}</td>"
+            f"<td>{_html_float(row.registration.registration_confidence)}</td>"
+            f"<td>{html.escape(str(row.registration.registration_suspect).lower())}</td>"
+            f"<td>{_html_float(row.registration.residual_translation_norm)}</td>"
             f"<td><a href=\"figures/{html.escape(overlay)}\">overlay</a></td>"
             f"<td>{html.escape('; '.join(row.warnings))}</td>"
             "</tr>"
@@ -964,7 +1271,7 @@ def _render_report_html(summary: Mapping[str, Any], rows: Sequence[BenchmarkResu
             "<h2>Ranking</h2>",
             "<table><thead><tr><th>Source</th><th>Rank</th><th>Row ID</th><th>Candidate</th>"
             "<th>Hybrid</th><th>Signal</th><th>Structure</th><th>Bead</th><th>Sharpness</th>"
-            "<th>Figure</th><th>Warnings</th></tr></thead><tbody>",
+            "<th>Reg Conf</th><th>Reg Suspect</th><th>Residual Norm</th><th>Figure</th><th>Warnings</th></tr></thead><tbody>",
             *table_rows,
             "</tbody></table>",
             "<h2>Summary JSON</h2>",
@@ -1075,6 +1382,83 @@ def _normalize_for_registration(image: np.ndarray) -> np.ndarray:
     return np.asarray(_robust_unit(image), dtype=np.float32)
 
 
+def _normalize_registration_profile(profile: str) -> str:
+    text = str(profile or DEFAULT_REGISTRATION_PROFILE).strip()
+    if text in {REGISTRATION_PROFILE_BEAD_SIMILARITY, REGISTRATION_PROFILE_CENTERED_ECC}:
+        return text
+    raise ValueError(
+        "unsupported registration profile "
+        f"{profile!r}; expected {REGISTRATION_PROFILE_BEAD_SIMILARITY!r} "
+        f"or {REGISTRATION_PROFILE_CENTERED_ECC!r}"
+    )
+
+
+def _registration_channel(image: np.ndarray) -> np.ndarray:
+    unit = _normalize_for_registration(image)
+    if unit.size == 0:
+        return unit
+    small = cv.GaussianBlur(unit, (0, 0), 1.0)
+    broad = cv.GaussianBlur(unit, (0, 0), 6.0)
+    bead = np.maximum(small - broad, 0.0)
+    structure = _structure_channel(unit)
+    return _robust_unit(0.65 * bead + 0.35 * structure)
+
+
+def _downsample_registration_pair(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    *,
+    max_dim: int,
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    ref, ref_scale = _downsample_for_registration(reference, max_dim=max_dim)
+    mov, mov_scale = _downsample_for_registration(moving, max_dim=max_dim)
+    return ref, mov, ref_scale, mov_scale
+
+
+def _downsample_for_registration(image: np.ndarray, *, max_dim: int) -> Tuple[np.ndarray, float]:
+    arr = np.asarray(image, dtype=np.float32)
+    longest = max(arr.shape[:2]) if arr.ndim >= 2 else 0
+    if longest <= 0 or longest <= max_dim:
+        return arr, 1.0
+    scale = float(max_dim) / float(longest)
+    resized = cv.resize(arr, (0, 0), fx=scale, fy=scale, interpolation=cv.INTER_AREA)
+    return np.asarray(resized, dtype=np.float32), scale
+
+
+def _coarse_registration_rotations() -> List[float]:
+    return [float(value) for value in np.linspace(-30.0, 30.0, 13)]
+
+
+def _phase_translation_on_channels(source: np.ndarray, target: np.ndarray) -> Tuple[float, float]:
+    src = np.asarray(source, dtype=np.float32)
+    tgt = np.asarray(target, dtype=np.float32)
+    if src.shape != tgt.shape or src.size == 0:
+        return 0.0, 0.0
+    if float(np.std(src)) <= 1e-8 or float(np.std(tgt)) <= 1e-8:
+        return 0.0, 0.0
+    try:
+        shift, _response = cv.phaseCorrelate(src, tgt)
+        return float(shift[0]), float(shift[1])
+    except cv.error:
+        return 0.0, 0.0
+
+
+def _registration_channel_score(reference_channel: np.ndarray, moving_channel: np.ndarray) -> float:
+    corr = _correlation(reference_channel, moving_channel)
+    mae = float(np.mean(np.abs(reference_channel - moving_channel)))
+    return 0.80 * max(0.0, corr) + 0.20 * (1.0 - min(1.0, mae))
+
+
+def _scale_affine_between_resolutions(matrix_small: np.ndarray, *, ref_scale: float, mov_scale: float) -> np.ndarray:
+    small = np.vstack([np.asarray(matrix_small, dtype=np.float64), [0.0, 0.0, 1.0]])
+    source_scale = np.array([[mov_scale, 0.0, 0.0], [0.0, mov_scale, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    reference_unscale = np.array(
+        [[1.0 / ref_scale, 0.0, 0.0], [0.0, 1.0 / ref_scale, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    return np.asarray((reference_unscale @ small @ source_scale)[:2, :], dtype=np.float64)
+
+
 def _robust_unit(image: np.ndarray) -> np.ndarray:
     arr = np.asarray(image, dtype=np.float32)
     finite = arr[np.isfinite(arr)]
@@ -1096,6 +1480,21 @@ def _pre_scale_matrix(source_shape: Tuple[int, int], reference_shape: Tuple[int,
     offset_x = (ref_w - (src_w * scale)) / 2.0
     offset_y = (ref_h - (src_h * scale)) / 2.0
     return np.array([[scale, 0.0, offset_x], [0.0, scale, offset_y]], dtype=np.float32)
+
+
+def _pre_similarity_matrix(
+    source_shape: Tuple[int, int],
+    reference_shape: Tuple[int, int],
+    scale: float,
+    rotation_deg: float,
+) -> np.ndarray:
+    src_h, src_w = source_shape[:2]
+    ref_h, ref_w = reference_shape[:2]
+    source_center = (src_w / 2.0, src_h / 2.0)
+    matrix = cv.getRotationMatrix2D(source_center, float(rotation_deg), float(scale)).astype(np.float64)
+    matrix[0, 2] += (ref_w - src_w) / 2.0
+    matrix[1, 2] += (ref_h - src_h) / 2.0
+    return np.asarray(matrix, dtype=np.float32)
 
 
 def _combine_forward_matrix(pre_matrix: np.ndarray, ecc_warp: np.ndarray) -> np.ndarray:
@@ -1290,6 +1689,123 @@ def _local_width(image: np.ndarray, center: Tuple[float, float], radius: int = 8
     return float(math.sqrt(float(np.sum(r2 * patch) / total)))
 
 
+def _with_registration_quality(
+    result: SimilarityRegistrationResult,
+    reference: np.ndarray,
+    moving_shape: Tuple[int, int],
+    *,
+    scale_values: Sequence[float],
+    residual_suspect_px: float,
+    min_matched_beads: int,
+    min_structure_score: float,
+) -> SimilarityRegistrationResult:
+    ref = _robust_unit(reference)
+    aligned = _robust_unit(result.aligned_image)
+    if ref.shape != aligned.shape:
+        min_h = min(ref.shape[0], aligned.shape[0])
+        min_w = min(ref.shape[1], aligned.shape[1])
+        ref = ref[:min_h, :min_w]
+        aligned = aligned[:min_h, :min_w]
+
+    structure = _structure_score(ref, aligned)
+    reference_centers = _detect_bead_centers(ref)
+    aligned_centers = _detect_bead_centers(aligned)
+    matched_count, median_error = _match_bead_centers(reference_centers, aligned_centers, radius=8.0)
+    common_fov = _common_fov_fraction(moving_shape, ref.shape, result.forward_matrix)
+    bead_coverage = matched_count / max(1, len(reference_centers))
+    bead_error_score = 0.0 if median_error is None else max(0.0, 1.0 - float(median_error) / 8.0)
+    bead_quality = bead_coverage * bead_error_score
+    confidence = _clip01(0.45 * bead_quality + 0.40 * structure + 0.15 * common_fov)
+
+    reasons: List[str] = []
+    if result.residual_translation_norm > max(0.0, float(residual_suspect_px)):
+        reasons.append(
+            f"residual_translation_norm>{float(residual_suspect_px):.3f}"
+        )
+    if len(reference_centers) < max(0, int(min_matched_beads)):
+        reasons.append(
+            f"validation_bead_count<{int(min_matched_beads)}"
+        )
+    elif matched_count < max(0, int(min_matched_beads)):
+        reasons.append(f"matched_bead_count<{int(min_matched_beads)}")
+    if structure < float(min_structure_score):
+        reasons.append(f"structure_score<{float(min_structure_score):.3f}")
+    if _scale_at_search_boundary(result.scale, scale_values):
+        reasons.append("scale_at_search_boundary")
+
+    result.registration_confidence = confidence
+    result.registration_suspect = bool(reasons)
+    result.registration_suspect_reasons = reasons
+    result.matched_bead_count = int(matched_count)
+    result.median_bead_error_px = None if median_error is None else float(median_error)
+    result.common_fov_fraction = float(common_fov)
+    if reasons:
+        result.warnings = _unique_strings(result.warnings + [f"registration_suspect:{'|'.join(reasons)}"])
+    else:
+        result.warnings = _unique_strings(result.warnings)
+    return result
+
+
+def _match_bead_centers(
+    reference_centers: Sequence[Tuple[float, float]],
+    moving_centers: Sequence[Tuple[float, float]],
+    *,
+    radius: float,
+) -> Tuple[int, Optional[float]]:
+    if not reference_centers or not moving_centers:
+        return 0, None
+    used: set[int] = set()
+    distances: List[float] = []
+    for vx, vy in reference_centers:
+        best_idx = -1
+        best_dist = float("inf")
+        for idx, (cx, cy) in enumerate(moving_centers):
+            if idx in used:
+                continue
+            dist = float(math.hypot(cx - vx, cy - vy))
+            if dist < best_dist:
+                best_idx = idx
+                best_dist = dist
+        if best_idx >= 0 and best_dist <= radius:
+            used.add(best_idx)
+            distances.append(best_dist)
+    if not distances:
+        return 0, None
+    return len(distances), float(np.median(distances))
+
+
+def _common_fov_fraction(
+    moving_shape: Tuple[int, int],
+    reference_shape: Tuple[int, int],
+    forward_matrix: np.ndarray,
+) -> float:
+    mov_h, mov_w = moving_shape[:2]
+    ref_h, ref_w = reference_shape[:2]
+    if mov_h <= 0 or mov_w <= 0 or ref_h <= 0 or ref_w <= 0:
+        return 0.0
+    mask = np.ones((mov_h, mov_w), dtype=np.float32)
+    warped = cv.warpAffine(
+        mask,
+        np.asarray(forward_matrix, dtype=np.float32),
+        (ref_w, ref_h),
+        flags=cv.INTER_NEAREST,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    return float(np.count_nonzero(warped > 0.5)) / float(warped.size)
+
+
+def _scale_at_search_boundary(scale: float, scale_values: Sequence[float]) -> bool:
+    values = [float(value) for value in scale_values if math.isfinite(float(value)) and float(value) > 0.0]
+    unique = sorted(set(round(value, 12) for value in values))
+    if len(unique) <= 1:
+        return False
+    lower = float(unique[0])
+    upper = float(unique[-1])
+    tolerance = max(1e-6, 0.01 * max(abs(lower), abs(upper)))
+    return abs(float(scale) - lower) <= tolerance or abs(float(scale) - upper) <= tolerance
+
+
 def _weighted_score(values: Mapping[str, Optional[float]], weights: Mapping[str, float]) -> float:
     numerator = 0.0
     denominator = 0.0
@@ -1420,6 +1936,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scale-search", default=DEFAULT_SCALE_SEARCH)
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--residual-translation-max-px", type=float, default=DEFAULT_RESIDUAL_TRANSLATION_MAX_PX)
+    parser.add_argument(
+        "--registration-profile",
+        default=DEFAULT_REGISTRATION_PROFILE,
+        choices=[REGISTRATION_PROFILE_BEAD_SIMILARITY, REGISTRATION_PROFILE_CENTERED_ECC],
+    )
+    parser.add_argument("--registration-suspect-residual-px", type=float, default=DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX)
+    parser.add_argument("--registration-min-matched-beads", type=int, default=DEFAULT_REGISTRATION_MIN_MATCHED_BEADS)
+    parser.add_argument("--registration-min-structure-score", type=float, default=DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE)
     parser.add_argument("--enable-nonrigid-diagnostic", action="store_true")
     return parser
 
@@ -1441,6 +1965,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             scale_values=parse_scale_search(args.scale_search),
             top_k=args.top_k,
             residual_translation_max_px=args.residual_translation_max_px,
+            registration_profile=args.registration_profile,
+            registration_suspect_residual_px=args.registration_suspect_residual_px,
+            registration_min_matched_beads=args.registration_min_matched_beads,
+            registration_min_structure_score=args.registration_min_structure_score,
             enable_nonrigid_diagnostic=args.enable_nonrigid_diagnostic,
         )
     )

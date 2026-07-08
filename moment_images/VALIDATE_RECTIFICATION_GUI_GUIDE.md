@@ -319,6 +319,14 @@ preserve sweep row identity (`row_id`, `stage`, `candidate_id`, `dataset_id`,
 and `generation_id`) so later utilities can join the records back to sweep
 artifacts.
 
+The default registration profile is `bead_similarity_v1`. It keeps the primary
+registration shear-free, auto-selects the LF anchor by bead/structure
+registration confidence, and writes `registration_confidence`,
+`registration_suspect`, `registration_suspect_reasons`, matched bead counts,
+median bead error, common-FOV fraction, and residual translation norm into the
+CSV/JSON/HTML outputs. Use `--registration-profile centered_ecc_legacy` when
+you need to compare against the older centered ECC initializer.
+
 For repeated evaluation across multiple scenes, use a manifest and the batch
 runner:
 

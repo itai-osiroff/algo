@@ -34,7 +34,7 @@ Acceptance criteria:
 
 Recommended investigation order:
 1. First verify the manifest paths, dataset_id values, and reference source labels in each trio_benchmark_summary.json.
-2. Inspect registration metadata for large residual_translation_norm values, low ECC scores, suspicious scale/rotation, and repeated warnings.
+2. Inspect registration metadata for low registration_confidence, registration_suspect=true, registration_suspect_reasons, low matched_bead_count, high median_bead_error_px, large residual_translation_norm values, suspicious scale/rotation, and repeated warnings.
 3. Prefer improving similarity registration initialization and diagnostics before changing metric weights.
 4. If changing registration, add synthetic regression tests covering different FOVs, scale, rotation, sparse beads, and false local optima.
 5. Only tune validation_hybrid_v1 after overlays are visually credible.
