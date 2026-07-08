@@ -248,6 +248,145 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
     assert result.rows[0].source_kind == "lf_candidate"
 
 
+def test_run_benchmark_reads_references_from_validation_workspace(tmp_path, monkeypatch):
+    validation = _synthetic_beads((96, 96))
+    thorcam = cv.GaussianBlur(validation, (0, 0), 3.0)
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    np.savez_compressed(
+        validation_workspace,
+        validation_processed=validation.astype(np.float32),
+        thorcam_processed=thorcam.astype(np.float32),
+    )
+
+    run1 = sweep_dir / "run1"
+    run1.mkdir()
+    workspace1 = run1 / "workspace.npz"
+    np.savez_compressed(workspace1, average_rectified_image=validation)
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    rows = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            generation_id="gen1",
+            rank=1,
+            strategy="combined",
+            params={},
+            config={},
+            score=10.0,
+        )
+    ]
+    records = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            dataset_id="scene_a",
+            generation_id="gen1",
+            workspace_path=str(workspace1),
+            preview_path=None,
+            metric_record_path=None,
+        )
+    ]
+
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_a",
+            validation_image=None,
+            thorcam_image=None,
+            validation_workspace=validation_workspace,
+            output_dir=output_dir,
+            scale_values=[1.0],
+            top_k=1,
+        )
+    )
+
+    assert result.best_lf_row_id == "stage2:candidate_a"
+    summary = json.loads((output_dir / "trio_benchmark_summary.json").read_text(encoding="utf-8"))
+    assert summary["config"]["validation_image"] == f"{validation_workspace}#validation_processed"
+    assert summary["config"]["thorcam_image"] == f"{validation_workspace}#thorcam_processed"
+
+
+def test_run_benchmark_warns_on_failed_validation_workspace_alignment(tmp_path, monkeypatch):
+    validation = _synthetic_beads((96, 96))
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    np.savez_compressed(
+        validation_workspace,
+        validation_processed=validation.astype(np.float32),
+        thorcam_processed=validation.astype(np.float32),
+        validation_auto_align=np.array(True),
+        validation_alignment_status=np.array("low_confidence_match"),
+        thorcam_auto_align=np.array(True),
+        thorcam_alignment_status=np.array("ecc_failed:error"),
+    )
+
+    run1 = sweep_dir / "run1"
+    run1.mkdir()
+    workspace1 = run1 / "workspace.npz"
+    np.savez_compressed(workspace1, average_rectified_image=validation)
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    rows = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            generation_id="gen1",
+            rank=1,
+            strategy="combined",
+            params={},
+            config={},
+            score=10.0,
+        )
+    ]
+    records = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            dataset_id="scene_a",
+            generation_id="gen1",
+            workspace_path=str(workspace1),
+            preview_path=None,
+            metric_record_path=None,
+        )
+    ]
+
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_a",
+            validation_workspace=validation_workspace,
+            output_dir=output_dir,
+            scale_values=[1.0],
+            top_k=1,
+        )
+    )
+
+    warnings = result.summary["warnings"]
+    assert any("validation workspace alignment suspect" in warning for warning in warnings)
+    assert any("validation_alignment_status=low_confidence_match" in warning for warning in warnings)
+    assert any("thorcam_alignment_status=ecc_failed:error" in warning for warning in warnings)
+
+
 def test_run_benchmark_default_generation_scope_matches_sweep_visualization(tmp_path):
     sweep_dir = _create_modern_fixture(
         tmp_path,

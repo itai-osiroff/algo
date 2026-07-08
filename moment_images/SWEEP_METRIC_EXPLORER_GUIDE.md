@@ -447,6 +447,10 @@ the `validation_hybrid_v1` profile, so these outputs can be joined back to
 explorer data later. The metric explorer does not ingest the trio CSV/JSON
 directly yet.
 
+For multi-scene registration and scoring calibration work,
+`moment_images/trio_benchmark_batch.py` runs a JSON manifest of trio scenes and
+writes aggregate CSV/JSON/HTML outputs alongside the per-scene trio reports.
+
 ## Metrics Config File
 
 You can optionally provide a config file with:

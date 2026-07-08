@@ -22,6 +22,7 @@ import numpy as np
 from PIL import Image
 
 from moment_images.reliable_io import write_csv_atomic, write_json_atomic, write_text_atomic
+from moment_images.unpack_workspace import load_workspace_variables
 from moment_images.validate_rectification import load_rectified_reference
 from moment_images.sweep_visualization import (
     GENERATION_SCOPE_ACTIVE,
@@ -43,9 +44,10 @@ BEAD_LOW_CONFIDENCE_WARNING = "low-confidence bead detection; bead and sharpness
 class BenchmarkConfig:
     sweep_dir: Path
     dataset_id: str
-    validation_image: Path
-    thorcam_image: Path
-    output_dir: Path
+    validation_image: Optional[Path] = None
+    thorcam_image: Optional[Path] = None
+    output_dir: Optional[Path] = None
+    validation_workspace: Optional[Path] = None
     stage: Optional[str] = None
     generation_scope: str = GENERATION_SCOPE_ALL
     anchor_row_id: str = "auto"
@@ -117,6 +119,15 @@ class BenchmarkResult:
     best_lf_row_id: Optional[str]
     rows: List[BenchmarkResultRow]
     summary: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ReferenceImages:
+    validation: np.ndarray
+    thorcam: np.ndarray
+    validation_source: str
+    thorcam_source: str
+    warnings: List[str] = field(default_factory=list)
 
 
 def parse_scale_search(spec: str) -> List[float]:
@@ -380,12 +391,13 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     """Run the trio benchmark and write CSV/JSON/HTML artifacts."""
 
     cfg = _normalize_config(config)
+    references = _load_reference_images(cfg)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = cfg.output_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    validation = _load_grayscale_image(cfg.validation_image)
-    thorcam = _load_grayscale_image(cfg.thorcam_image)
+    validation = references.validation
+    thorcam = references.thorcam
     model = load_sweep_visualization_model(cfg.sweep_dir)
     stage = cfg.stage or str(model.primary_stage_name)
     candidate_images, skipped_candidate_warnings = _collect_candidate_images(model, cfg, stage)
@@ -459,7 +471,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         metrics=thor_metrics.metrics,
         registration=thor_registration,
         workspace_path=None,
-        preview_path=str(cfg.thorcam_image),
+        preview_path=references.thorcam_source,
         warnings=_unique_strings(thor_registration.warnings + thor_metrics.warnings),
     )
 
@@ -484,6 +496,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         rows,
         model_warnings=_unique_strings(getattr(model, "warnings", [])),
         skipped_candidate_warnings=skipped_candidate_warnings,
+        reference_sources=references,
     )
     _write_results_csv(cfg.output_dir / "trio_benchmark_results.csv", rows)
     write_json_atomic(
@@ -503,12 +516,15 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
     scale_values = list(config.scale_values) if config.scale_values is not None else parse_scale_search(DEFAULT_SCALE_SEARCH)
     generation_scope = _normalize_generation_scope_arg(config.generation_scope)
+    if config.output_dir is None:
+        raise ValueError("output_dir is required")
     return BenchmarkConfig(
         sweep_dir=Path(config.sweep_dir),
         dataset_id=str(config.dataset_id),
-        validation_image=Path(config.validation_image),
-        thorcam_image=Path(config.thorcam_image),
+        validation_image=None if config.validation_image is None else Path(config.validation_image),
+        thorcam_image=None if config.thorcam_image is None else Path(config.thorcam_image),
         output_dir=Path(config.output_dir),
+        validation_workspace=None if config.validation_workspace is None else Path(config.validation_workspace),
         stage=config.stage,
         generation_scope=generation_scope,
         anchor_row_id=config.anchor_row_id,
@@ -517,6 +533,119 @@ def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
         residual_translation_max_px=float(config.residual_translation_max_px),
         enable_nonrigid_diagnostic=bool(config.enable_nonrigid_diagnostic),
     )
+
+
+def _load_reference_images(config: BenchmarkConfig) -> ReferenceImages:
+    workspace: Optional[Mapping[str, np.ndarray]] = None
+    workspace_path = config.validation_workspace
+    if workspace_path is not None:
+        workspace = load_workspace_variables(Path(workspace_path))
+
+    validation, validation_source = _load_reference_image(
+        image_path=config.validation_image,
+        workspace=workspace,
+        workspace_path=workspace_path,
+        workspace_key="validation_processed",
+        label="validation",
+    )
+    thorcam, thorcam_source = _load_reference_image(
+        image_path=config.thorcam_image,
+        workspace=workspace,
+        workspace_path=workspace_path,
+        workspace_key="thorcam_processed",
+        label="thorcam",
+    )
+    return ReferenceImages(
+        validation=validation,
+        thorcam=thorcam,
+        validation_source=validation_source,
+        thorcam_source=thorcam_source,
+        warnings=_validation_workspace_alignment_warnings(workspace, workspace_path),
+    )
+
+
+def _validation_workspace_alignment_warnings(
+    workspace: Optional[Mapping[str, np.ndarray]],
+    workspace_path: Optional[Path],
+) -> List[str]:
+    if workspace is None or workspace_path is None:
+        return []
+    warnings: List[str] = []
+    for prefix in ("validation", "thorcam"):
+        auto_align = _workspace_bool(workspace.get(f"{prefix}_auto_align"))
+        status = _workspace_text(workspace.get(f"{prefix}_alignment_status"))
+        if auto_align is True and _is_suspect_validation_alignment_status(status):
+            warnings.append(
+                "validation workspace alignment suspect: "
+                f"{prefix}_alignment_status={status}; source={workspace_path}"
+            )
+    return warnings
+
+
+def _is_suspect_validation_alignment_status(status: Optional[str]) -> bool:
+    if not status:
+        return False
+    return (
+        status == "low_confidence_match"
+        or status == "no_containment_match"
+        or status.startswith("ecc_failed:")
+    )
+
+
+def _workspace_text(value: Optional[np.ndarray]) -> Optional[str]:
+    if value is None:
+        return None
+    arr = np.asarray(value)
+    if arr.size != 1:
+        return None
+    item = arr.reshape(-1)[0]
+    if isinstance(item, bytes):
+        return item.decode("utf-8", errors="replace")
+    return str(item)
+
+
+def _workspace_bool(value: Optional[np.ndarray]) -> Optional[bool]:
+    if value is None:
+        return None
+    arr = np.asarray(value)
+    if arr.size != 1:
+        return None
+    item = arr.reshape(-1)[0]
+    if isinstance(item, (np.bool_, bool)):
+        return bool(item)
+    if isinstance(item, (np.integer, int)):
+        return bool(item)
+    if isinstance(item, bytes):
+        text = item.decode("utf-8", errors="replace").strip().lower()
+    else:
+        text = str(item).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def _load_reference_image(
+    *,
+    image_path: Optional[Path],
+    workspace: Optional[Mapping[str, np.ndarray]],
+    workspace_path: Optional[Path],
+    workspace_key: str,
+    label: str,
+) -> Tuple[np.ndarray, str]:
+    if image_path is not None:
+        path = Path(image_path)
+        return _load_grayscale_image(path), str(path)
+    if workspace is None or workspace_path is None:
+        raise ValueError(
+            f"{label} reference is required: provide --{label}-image "
+            "or --validation-workspace"
+        )
+    if workspace_key not in workspace:
+        raise ValueError(f"{workspace_path} does not contain {workspace_key!r}")
+    image = _as_float_2d(np.asarray(workspace[workspace_key]))
+    return image, f"{workspace_path}#{workspace_key}"
 
 
 def _normalize_generation_scope_arg(scope: str) -> str:
@@ -716,6 +845,7 @@ def _build_summary(
     *,
     model_warnings: Sequence[str],
     skipped_candidate_warnings: Sequence[str],
+    reference_sources: ReferenceImages,
 ) -> Dict[str, Any]:
     deltas: Dict[str, Optional[float]] = {}
     if best is not None:
@@ -725,6 +855,7 @@ def _build_summary(
                 deltas[name] = float(value) - float(thor_value)
     warnings = _unique_strings(
         list(model_warnings)
+        + list(reference_sources.warnings)
         + list(skipped_candidate_warnings)
         + [warning for row in rows for warning in row.warnings]
         + (["nonrigid diagnostic requested; primary score remains similarity-only"] if config.enable_nonrigid_diagnostic else [])
@@ -734,8 +865,9 @@ def _build_summary(
             "profile_name": PROFILE_NAME,
             "sweep_dir": str(config.sweep_dir),
             "dataset_id": config.dataset_id,
-            "validation_image": str(config.validation_image),
-            "thorcam_image": str(config.thorcam_image),
+            "validation_image": reference_sources.validation_source,
+            "thorcam_image": reference_sources.thorcam_source,
+            "validation_workspace": None if config.validation_workspace is None else str(config.validation_workspace),
             "output_dir": str(config.output_dir),
             "stage": stage,
             "generation_scope": config.generation_scope,
@@ -1278,8 +1410,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Rank LF sweep candidates against validation/ThorCam image trio.")
     parser.add_argument("--sweep-dir", required=True, type=Path)
     parser.add_argument("--dataset-id", required=True)
-    parser.add_argument("--validation-image", required=True, type=Path)
-    parser.add_argument("--thorcam-image", required=True, type=Path)
+    parser.add_argument("--validation-image", default=None, type=Path)
+    parser.add_argument("--thorcam-image", default=None, type=Path)
+    parser.add_argument("--validation-workspace", default=None, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--stage", default=None)
     parser.add_argument("--generation-scope", default=GENERATION_SCOPE_ALL)
@@ -1301,6 +1434,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             validation_image=args.validation_image,
             thorcam_image=args.thorcam_image,
             output_dir=args.output_dir,
+            validation_workspace=args.validation_workspace,
             stage=args.stage,
             generation_scope=args.generation_scope,
             anchor_row_id=args.anchor_row_id,

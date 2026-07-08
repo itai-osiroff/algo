@@ -29,6 +29,7 @@ For Point Grey / FLIR camera preview and acquisition, see
 | Rectification validation against external cameras | `validate_rectification.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
 | Batch validation image preprocessing | `batch_process_validation_images.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
 | Trio benchmark against validation/ThorCam | `trio_benchmark.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
+| Batch trio benchmark evaluation | `trio_benchmark_batch.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
 | Teledyne mean-variance system gain | `main_thor_gain.py` | [Gain Calibration Guide](GAIN_CALIBRATION_GUIDE.md) |
 | Pairwise image linear gain regression | `pairwise_linear_gain.py` | [Gain Calibration Guide](GAIN_CALIBRATION_GUIDE.md) |
 | Workspace unpacking | `unpack_workspace.py` | [Rectification Guide](RECTIFICATION_GUIDE.md) |
@@ -82,6 +83,19 @@ ThorCam images:
 
 ```bash
 python -m moment_images.trio_benchmark --sweep-dir path/to/sweep_output --dataset-id scene_id --validation-image path/to/validation_processed.tif --thorcam-image path/to/thorcam_processed.tif --output-dir path/to/trio_report
+```
+
+Use a saved `validate_rectification.py` workspace instead of exported reference
+images:
+
+```bash
+python -m moment_images.trio_benchmark --sweep-dir path/to/sweep_output --dataset-id scene_id --validation-workspace path/to/validation_workspace.npz --output-dir path/to/trio_report
+```
+
+Run a manifest of trio scenes:
+
+```bash
+python -m moment_images.trio_benchmark_batch --manifest path/to/trio_manifest.json --output-dir path/to/trio_batch_report
 ```
 
 Compute Teledyne mean-variance gain:

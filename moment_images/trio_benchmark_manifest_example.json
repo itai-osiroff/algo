@@ -1,0 +1,26 @@
+{
+  "defaults": {
+    "stage": "stage2",
+    "generation_scope": "All",
+    "anchor_row_id": "auto",
+    "scale_search": "0.90:1.10:11",
+    "top_k": 12,
+    "residual_translation_max_px": 5.0,
+    "enable_nonrigid_diagnostic": false
+  },
+  "scenes": [
+    {
+      "scene_id": "scene_001",
+      "sweep_dir": "C:/path/to/completed_sweep",
+      "dataset_id": "dataset_or_scene_id",
+      "validation_workspace": "C:/path/to/validation_workspace.npz"
+    },
+    {
+      "scene_id": "scene_002_with_exported_images",
+      "sweep_dir": "C:/path/to/completed_sweep",
+      "dataset_id": "dataset_or_scene_id",
+      "validation_image": "C:/path/to/validation_processed.tif",
+      "thorcam_image": "C:/path/to/thorcam_processed.tif"
+    }
+  ]
+}

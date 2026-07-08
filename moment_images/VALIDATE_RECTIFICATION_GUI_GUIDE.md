@@ -305,9 +305,28 @@ tool only post-processes completed sweep artifacts.
 python -m moment_images.trio_benchmark --sweep-dir path/to/sweep_output --dataset-id scene_id --validation-image path/to/validation_processed.tif --thorcam-image path/to/thorcam_processed.tif --output-dir path/to/trio_report
 ```
 
+The same command can read the processed references directly from a saved
+`validate_rectification.py` workspace:
+
+```bash
+python -m moment_images.trio_benchmark --sweep-dir path/to/sweep_output --dataset-id scene_id --validation-workspace path/to/validation_workspace.npz --output-dir path/to/trio_report
+```
+
 The benchmark writes `trio_benchmark_results.csv`,
 `trio_benchmark_summary.json`, `trio_benchmark_report.html`, and a `figures/`
 folder. Results use the stable `validation_hybrid_v1` metric profile and
 preserve sweep row identity (`row_id`, `stage`, `candidate_id`, `dataset_id`,
 and `generation_id`) so later utilities can join the records back to sweep
 artifacts.
+
+For repeated evaluation across multiple scenes, use a manifest and the batch
+runner:
+
+```bash
+python -m moment_images.trio_benchmark_batch --manifest path/to/trio_manifest.json --output-dir path/to/trio_batch_report
+```
+
+`moment_images/trio_benchmark_manifest_example.json` shows the expected schema.
+Each scene writes its normal trio report under a scene-specific subfolder, while
+the batch output folder also receives `trio_batch_results.csv`,
+`trio_batch_summary.json`, and `trio_batch_report.html`.
