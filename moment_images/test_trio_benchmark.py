@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import cv2 as cv
 import numpy as np
+import pytest
 from PIL import Image
 
 from moment_images.test_sweep_visualization import _create_modern_fixture
@@ -67,6 +68,48 @@ def _write_image(path: Path, image: np.ndarray) -> None:
     Image.fromarray(scaled).save(path)
 
 
+def _manual_similarity_matrix(scale: float, rotation_deg: float, tx: float, ty: float) -> np.ndarray:
+    theta = np.deg2rad(rotation_deg)
+    cos_t = np.cos(theta) * scale
+    sin_t = np.sin(theta) * scale
+    return np.array([[cos_t, -sin_t, tx], [sin_t, cos_t, ty]], dtype=np.float64)
+
+
+def _write_manual_annotations(path: Path, annotations: list[dict]) -> None:
+    path.write_text(json.dumps({"version": 1, "annotations": annotations}), encoding="utf-8")
+
+
+def _manual_annotation(
+    *,
+    scene_id: str,
+    dataset_id: str,
+    source_kind: str,
+    calibration_group: str,
+    reference_shape: tuple[int, int],
+    moving_shape: tuple[int, int],
+    matrix: np.ndarray,
+    anchor_row_id: str | None = None,
+    point_count: int = 3,
+) -> dict:
+    moving_points = np.array([[18.0, 17.0], [72.0, 24.0], [38.0, 82.0]], dtype=np.float64)[:point_count]
+    reference_points = trio_benchmark._transform_points(matrix, moving_points)
+    payload = {
+        "scene_id": scene_id,
+        "dataset_id": dataset_id,
+        "source_kind": source_kind,
+        "calibration_group": calibration_group,
+        "reference_shape": list(reference_shape),
+        "moving_shape": list(moving_shape),
+        "points": [
+            {"moving": [float(mx), float(my)], "reference": [float(rx), float(ry)]}
+            for (mx, my), (rx, ry) in zip(moving_points, reference_points)
+        ],
+    }
+    if anchor_row_id is not None:
+        payload["anchor_row_id"] = anchor_row_id
+    return payload
+
+
 def test_parse_scale_search_returns_inclusive_grid():
     values = parse_scale_search("0.90:1.10:5")
 
@@ -98,6 +141,26 @@ def test_similarity_registration_recovers_no_shear_transform():
         np.linalg.norm(linear[:, 1]),
         rtol=1e-3,
         atol=1e-3,
+    )
+
+
+def test_manual_similarity_fit_recovers_no_shear_transform():
+    expected = _manual_similarity_matrix(1.23, 14.0, 8.5, -6.0)
+    moving_points = np.array([[8.0, 9.0], [44.0, 13.0], [14.0, 51.0], [62.0, 58.0]], dtype=np.float64)
+    reference_points = trio_benchmark._transform_points(expected, moving_points)
+
+    fit = trio_benchmark.fit_manual_similarity_transform(moving_points, reference_points)
+
+    np.testing.assert_allclose(fit.matrix, expected, atol=1e-8)
+    assert fit.point_count == 4
+    assert fit.rms_error_px < 1e-8
+    linear = fit.matrix[:, :2]
+    assert abs(float(np.dot(linear[:, 0], linear[:, 1]))) < 1e-10
+    np.testing.assert_allclose(
+        np.linalg.norm(linear[:, 0]),
+        np.linalg.norm(linear[:, 1]),
+        rtol=1e-10,
+        atol=1e-10,
     )
 
 
@@ -269,6 +332,292 @@ def test_low_confidence_bead_detection_renormalizes_to_image_metrics():
     assert metrics.metrics["validation_sharpness"] is None
     assert metrics.metrics[PROFILE_NAME] == metrics.metrics["validation_signal_structure_score"]
     assert any("low-confidence bead detection" in warning for warning in metrics.warnings)
+
+
+def test_run_benchmark_uses_manual_group_calibration_for_unannotated_scene(tmp_path, monkeypatch):
+    validation = _synthetic_beads((128, 128))
+    moving_shape = (96, 96)
+    manual_matrix = _manual_similarity_matrix(1.18, 8.0, 11.0, -4.0)
+    moving = _warp_reference_to_moving(validation, moving_shape, manual_matrix)
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_path = tmp_path / "validation.tif"
+    thorcam_path = tmp_path / "thorcam.tif"
+    annotations_path = tmp_path / "manual_annotations.json"
+    _write_image(validation_path, validation)
+    _write_image(thorcam_path, moving)
+    _write_manual_annotations(
+        annotations_path,
+        [
+            _manual_annotation(
+                scene_id="annotated_scene",
+                dataset_id="annotated_scene",
+                source_kind="lf",
+                calibration_group="rig_a",
+                reference_shape=validation.shape,
+                moving_shape=moving_shape,
+                matrix=manual_matrix,
+                anchor_row_id="stage2:candidate_a",
+            ),
+            _manual_annotation(
+                scene_id="annotated_scene",
+                dataset_id="annotated_scene",
+                source_kind="thorcam",
+                calibration_group="rig_a",
+                reference_shape=validation.shape,
+                moving_shape=moving_shape,
+                matrix=manual_matrix,
+            ),
+        ],
+    )
+
+    run1 = sweep_dir / "run1"
+    run1.mkdir()
+    workspace1 = run1 / "workspace.npz"
+    np.savez_compressed(workspace1, average_rectified_image=moving)
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    rows = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            generation_id="gen1",
+            rank=1,
+            strategy="combined",
+            params={},
+            config={},
+            score=10.0,
+        )
+    ]
+    records = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            dataset_id="scene_b",
+            generation_id="gen1",
+            workspace_path=str(workspace1),
+            preview_path=None,
+            metric_record_path=None,
+        )
+    ]
+
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_b",
+            validation_image=validation_path,
+            thorcam_image=thorcam_path,
+            output_dir=output_dir,
+            registration_profile="manual_similarity_v1",
+            registration_annotations=annotations_path,
+            registration_calibration_group="rig_a",
+            residual_translation_max_px=0.0,
+            top_k=1,
+        )
+    )
+
+    best = result.summary["best_candidate"]
+    assert result.best_lf_row_id == "stage2:candidate_a"
+    assert best["registration"]["registration_profile"] == "manual_similarity_v1"
+    assert best["registration"]["registration_initializer"] == "group_calibration_median"
+    assert best["registration"]["registration_transform_source"] == "group_calibration"
+    assert best["registration"]["registration_calibration_group"] == "rig_a"
+    assert best["registration"]["registration_point_count"] == 3
+    assert best["registration"]["validation_rankable"] is True
+    assert abs(best["registration"]["scale"] - 1.18) < 1e-6
+    assert abs(best["registration"]["rotation_deg"] - 8.0) < 1e-6
+    assert (output_dir / "trio_registration_calibration.json").exists()
+    assert (output_dir / "figures" / "manual_points_lf.png").exists()
+    assert (output_dir / "figures" / "manual_points_thorcam.png").exists()
+
+
+def test_manual_group_calibration_allows_single_point_scene_translation_override(tmp_path, monkeypatch):
+    validation = _synthetic_beads((128, 128))
+    moving_shape = (96, 96)
+    group_matrix = _manual_similarity_matrix(1.18, 8.0, 11.0, -4.0)
+    scene_matrix = _manual_similarity_matrix(1.18, 8.0, 15.0, -7.0)
+    moving = _warp_reference_to_moving(validation, moving_shape, scene_matrix)
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_path = tmp_path / "validation.tif"
+    thorcam_path = tmp_path / "thorcam.tif"
+    annotations_path = tmp_path / "manual_annotations.json"
+    _write_image(validation_path, validation)
+    _write_image(thorcam_path, moving)
+    _write_manual_annotations(
+        annotations_path,
+        [
+            _manual_annotation(
+                scene_id="annotated_scene",
+                dataset_id="annotated_scene",
+                source_kind="lf",
+                calibration_group="rig_a",
+                reference_shape=validation.shape,
+                moving_shape=moving_shape,
+                matrix=group_matrix,
+                anchor_row_id="stage2:candidate_a",
+            ),
+            _manual_annotation(
+                scene_id="scene_b",
+                dataset_id="scene_b",
+                source_kind="lf",
+                calibration_group="rig_a",
+                reference_shape=validation.shape,
+                moving_shape=moving_shape,
+                matrix=scene_matrix,
+                anchor_row_id="stage2:candidate_a",
+                point_count=1,
+            ),
+            _manual_annotation(
+                scene_id="annotated_scene",
+                dataset_id="annotated_scene",
+                source_kind="thorcam",
+                calibration_group="rig_a",
+                reference_shape=validation.shape,
+                moving_shape=moving_shape,
+                matrix=group_matrix,
+            ),
+            _manual_annotation(
+                scene_id="scene_b",
+                dataset_id="scene_b",
+                source_kind="thorcam",
+                calibration_group="rig_a",
+                reference_shape=validation.shape,
+                moving_shape=moving_shape,
+                matrix=scene_matrix,
+                point_count=1,
+            ),
+        ],
+    )
+
+    run1 = sweep_dir / "run1"
+    run1.mkdir()
+    workspace1 = run1 / "workspace.npz"
+    np.savez_compressed(workspace1, average_rectified_image=moving)
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    rows = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            generation_id="gen1",
+            rank=1,
+            strategy="combined",
+            params={},
+            config={},
+            score=10.0,
+        )
+    ]
+    records = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            dataset_id="scene_b",
+            generation_id="gen1",
+            workspace_path=str(workspace1),
+            preview_path=None,
+            metric_record_path=None,
+        )
+    ]
+
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_b",
+            validation_image=validation_path,
+            thorcam_image=thorcam_path,
+            output_dir=output_dir,
+            registration_profile="manual_similarity_v1",
+            registration_annotations=annotations_path,
+            registration_calibration_group="rig_a",
+            residual_translation_max_px=0.0,
+            top_k=1,
+        )
+    )
+
+    registration = result.summary["best_candidate"]["registration"]
+    assert registration["registration_initializer"] == "group_plus_single_point_translation"
+    assert registration["registration_underconstrained"] is True
+    assert registration["registration_point_count"] == 1
+    assert abs(registration["translation_x"] - 15.0) < 1e-6
+    assert abs(registration["translation_y"] + 7.0) < 1e-6
+
+
+def test_manual_registration_missing_calibration_fails_closed(tmp_path, monkeypatch):
+    validation = _synthetic_beads((64, 64))
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_path = tmp_path / "validation.tif"
+    thorcam_path = tmp_path / "thorcam.tif"
+    _write_image(validation_path, validation)
+    _write_image(thorcam_path, validation)
+
+    run1 = sweep_dir / "run1"
+    run1.mkdir()
+    workspace1 = run1 / "workspace.npz"
+    np.savez_compressed(workspace1, average_rectified_image=validation)
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    rows = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            generation_id="gen1",
+            rank=1,
+            strategy="combined",
+            params={},
+            config={},
+            score=10.0,
+        )
+    ]
+    records = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            dataset_id="scene_a",
+            generation_id="gen1",
+            workspace_path=str(workspace1),
+            preview_path=None,
+            metric_record_path=None,
+        )
+    ]
+
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+
+    with pytest.raises(ValueError, match="manual_similarity_v1 requires registration_annotations"):
+        run_benchmark(
+            BenchmarkConfig(
+                sweep_dir=sweep_dir,
+                dataset_id="scene_a",
+                validation_image=validation_path,
+                thorcam_image=thorcam_path,
+                output_dir=output_dir,
+                registration_profile="manual_similarity_v1",
+                registration_calibration_group="rig_a",
+                top_k=1,
+            )
+        )
 
 
 def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monkeypatch):

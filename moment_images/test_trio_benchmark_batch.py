@@ -85,6 +85,98 @@ def test_run_batch_from_manifest_writes_scene_outputs_and_aggregate_summary(tmp_
     assert scene_summary["config"]["registration_progress"] is True
 
 
+def test_batch_manifest_forwards_manual_calibration_fields(tmp_path):
+    sweep_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        include_workspace=True,
+        stage_mode="single_stage",
+    )
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    reference = np.full((4, 4), 1.25, dtype=np.float32)
+    np.savez_compressed(
+        validation_workspace,
+        validation_processed=reference,
+        thorcam_processed=reference,
+    )
+    annotations_path = tmp_path / "manual_annotations.json"
+    annotations_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "annotations": [
+                    {
+                        "scene_id": "annotated_scene",
+                        "dataset_id": "d1",
+                        "source_kind": "lf",
+                        "calibration_group": "rig_a",
+                        "anchor_row_id": "stage1:s1c0000",
+                        "reference_shape": [4, 4],
+                        "moving_shape": [4, 4],
+                        "points": [
+                            {"moving": [0.0, 0.0], "reference": [0.0, 0.0]},
+                            {"moving": [3.0, 0.0], "reference": [3.0, 0.0]},
+                            {"moving": [0.0, 3.0], "reference": [0.0, 3.0]},
+                        ],
+                    },
+                    {
+                        "scene_id": "annotated_scene",
+                        "dataset_id": "d1",
+                        "source_kind": "thorcam",
+                        "calibration_group": "rig_a",
+                        "reference_shape": [4, 4],
+                        "moving_shape": [4, 4],
+                        "points": [
+                            {"moving": [0.0, 0.0], "reference": [0.0, 0.0]},
+                            {"moving": [3.0, 0.0], "reference": [3.0, 0.0]},
+                            {"moving": [0.0, 3.0], "reference": [0.0, 3.0]},
+                        ],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "trio_manifest.json"
+    output_dir = tmp_path / "batch_output"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "defaults": {
+                    "stage": "stage1",
+                    "top_k": 1,
+                    "registration_profile": "manual_similarity_v1",
+                    "registration_annotations": str(annotations_path),
+                    "registration_calibration_group": "rig_a",
+                    "registration_calibration_mode": "group",
+                },
+                "scenes": [
+                    {
+                        "scene_id": "scene_one",
+                        "sweep_dir": str(sweep_dir),
+                        "dataset_id": "d1",
+                        "validation_workspace": str(validation_workspace),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = run_batch_from_manifest(manifest_path, output_dir)
+
+    assert summary["num_successful"] == 1
+    scene_summary = json.loads(
+        (output_dir / "scene_one" / "trio_benchmark_summary.json").read_text(encoding="utf-8")
+    )
+    assert scene_summary["config"]["registration_profile"] == "manual_similarity_v1"
+    assert scene_summary["config"]["registration_annotations"] == str(annotations_path)
+    assert scene_summary["config"]["registration_calibration_group"] == "rig_a"
+    assert scene_summary["config"]["registration_calibration_mode"] == "group"
+    assert scene_summary["best_candidate"]["registration"]["registration_initializer"] == "group_calibration_median"
+    assert "registration_transform_source" in summary["scenes"][0]
+
+
 def test_batch_main_emits_scene_progress_to_stderr(tmp_path, capsys):
     sweep_dir = _create_modern_fixture(
         tmp_path,

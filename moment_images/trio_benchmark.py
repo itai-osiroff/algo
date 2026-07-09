@@ -43,10 +43,13 @@ DEFAULT_GEOMETRIC_SCALE_SEARCH = "0.50:2.00:31"
 DEFAULT_REGISTRATION_ROTATION_SEARCH = "-45:45:19"
 DEFAULT_TOP_K = 12
 DEFAULT_RESIDUAL_TRANSLATION_MAX_PX = 5.0
+REGISTRATION_PROFILE_MANUAL_SIMILARITY = "manual_similarity_v1"
 REGISTRATION_PROFILE_BEAD_GEOMETRIC = "bead_geometric_v2"
 REGISTRATION_PROFILE_BEAD_SIMILARITY = "bead_similarity_v1"
 REGISTRATION_PROFILE_CENTERED_ECC = "centered_ecc_legacy"
 DEFAULT_REGISTRATION_PROFILE = REGISTRATION_PROFILE_BEAD_GEOMETRIC
+DEFAULT_REGISTRATION_CALIBRATION_GROUP = "default"
+DEFAULT_REGISTRATION_CALIBRATION_MODE = "group"
 DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX = 15.0
 DEFAULT_REGISTRATION_MIN_MATCHED_BEADS = 3
 DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE = 0.10
@@ -65,6 +68,7 @@ BEAD_LOW_CONFIDENCE_WARNING = "low-confidence bead detection; bead and sharpness
 class BenchmarkConfig:
     sweep_dir: Path
     dataset_id: str
+    scene_id: Optional[str] = None
     validation_image: Optional[Path] = None
     thorcam_image: Optional[Path] = None
     output_dir: Optional[Path] = None
@@ -77,6 +81,9 @@ class BenchmarkConfig:
     top_k: int = DEFAULT_TOP_K
     residual_translation_max_px: float = DEFAULT_RESIDUAL_TRANSLATION_MAX_PX
     registration_profile: str = DEFAULT_REGISTRATION_PROFILE
+    registration_annotations: Optional[Path] = None
+    registration_calibration_group: str = DEFAULT_REGISTRATION_CALIBRATION_GROUP
+    registration_calibration_mode: str = DEFAULT_REGISTRATION_CALIBRATION_MODE
     registration_suspect_residual_px: float = DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX
     registration_min_matched_beads: int = DEFAULT_REGISTRATION_MIN_MATCHED_BEADS
     registration_min_structure_score: float = DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE
@@ -117,6 +124,13 @@ class SimilarityRegistrationResult:
     registration_constraint_level: str = "image_only"
     registration_underconstrained: bool = False
     registration_initializer: str = ""
+    registration_calibration_group: Optional[str] = None
+    registration_transform_source: Optional[str] = None
+    registration_point_count: int = 0
+    registration_fit_rms_px: Optional[float] = None
+    validation_rankable: bool = True
+    ranking_exclusion_reason: Optional[str] = None
+    registration_point_pairs: List[Dict[str, List[float]]] = field(default_factory=list)
     registration_refined_score: Optional[float] = None
     registration_hypotheses: List[Dict[str, Any]] = field(default_factory=list)
     registration_runtime_seconds: Optional[float] = None
@@ -262,6 +276,44 @@ class RegistrationHypothesis:
     optimizer_evaluations: int = 0
 
 
+@dataclass(frozen=True)
+class ManualSimilarityFit:
+    matrix: np.ndarray
+    scale: float
+    rotation_deg: float
+    translation_x: float
+    translation_y: float
+    rms_error_px: float
+    point_count: int
+
+
+@dataclass(frozen=True)
+class ManualAnnotationRecord:
+    scene_id: str
+    dataset_id: str
+    source_kind: str
+    calibration_group: str
+    reference_shape: Tuple[int, int]
+    moving_shape: Tuple[int, int]
+    reference_points: np.ndarray
+    moving_points: np.ndarray
+    anchor_row_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ManualResolvedTransform:
+    matrix: np.ndarray
+    calibration_group: str
+    transform_source: str
+    initializer: str
+    point_count: int
+    fit_rms_px: Optional[float]
+    underconstrained: bool
+    source_annotation_scene_id: Optional[str]
+    point_pairs: List[Dict[str, List[float]]] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
 def parse_scale_search(spec: str) -> List[float]:
     """Parse ``start:stop:count`` into an inclusive scale grid."""
 
@@ -293,6 +345,113 @@ def _parse_linear_search(spec: str, *, label: str) -> List[float]:
     return [float(value) for value in np.linspace(start, stop, count)]
 
 
+def fit_manual_similarity_transform(
+    moving_points: Sequence[Sequence[float]],
+    reference_points: Sequence[Sequence[float]],
+) -> ManualSimilarityFit:
+    """Fit a shear-free moving-to-reference similarity transform from point pairs."""
+
+    moving = _as_point_array(moving_points, label="moving_points")
+    reference = _as_point_array(reference_points, label="reference_points")
+    if moving.shape != reference.shape:
+        raise ValueError("moving_points and reference_points must have the same shape")
+    if moving.shape[0] < 2:
+        raise ValueError("at least two point pairs are required for a full similarity fit")
+    moving_mean = np.mean(moving, axis=0)
+    reference_mean = np.mean(reference, axis=0)
+    moving_centered = moving - moving_mean
+    reference_centered = reference - reference_mean
+    variance = float(np.sum(moving_centered * moving_centered))
+    if variance <= 1e-12:
+        raise ValueError("manual similarity fit requires non-degenerate moving points")
+    covariance = moving_centered.T @ reference_centered
+    u, singular_values, vt = np.linalg.svd(covariance)
+    correction = np.eye(2, dtype=np.float64)
+    if np.linalg.det(vt.T @ u.T) < 0.0:
+        correction[-1, -1] = -1.0
+    rotation = vt.T @ correction @ u.T
+    scale = float(np.sum(singular_values * np.diag(correction)) / variance)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("manual similarity fit produced an invalid scale")
+    linear = scale * rotation
+    translation = reference_mean - (linear @ moving_mean)
+    matrix = np.array(
+        [
+            [linear[0, 0], linear[0, 1], translation[0]],
+            [linear[1, 0], linear[1, 1], translation[1]],
+        ],
+        dtype=np.float64,
+    )
+    transformed = _transform_points(matrix, moving)
+    rms_error = float(np.sqrt(np.mean(np.sum((transformed - reference) ** 2, axis=1))))
+    fit_scale, rotation_deg, tx, ty = _decompose_similarity(matrix)
+    return ManualSimilarityFit(
+        matrix=matrix,
+        scale=fit_scale,
+        rotation_deg=rotation_deg,
+        translation_x=tx,
+        translation_y=ty,
+        rms_error_px=rms_error,
+        point_count=int(moving.shape[0]),
+    )
+
+
+def _as_point_array(points: Sequence[Sequence[float]], *, label: str) -> np.ndarray:
+    arr = np.asarray(points, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError(f"{label} must be an Nx2 array of x,y points")
+    if arr.shape[0] == 0:
+        raise ValueError(f"{label} must contain at least one point")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{label} must contain only finite coordinates")
+    return arr
+
+
+def _load_manual_annotation_records(path: Path) -> List[ManualAnnotationRecord]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    raw_annotations = payload.get("annotations") if isinstance(payload, Mapping) else None
+    if not isinstance(raw_annotations, list):
+        raise ValueError("manual registration annotations must contain an 'annotations' list")
+    records: List[ManualAnnotationRecord] = []
+    for index, raw in enumerate(raw_annotations, start=1):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"manual annotation {index} must be an object")
+        points_payload = raw.get("points")
+        if not isinstance(points_payload, list) or not points_payload:
+            raise ValueError(f"manual annotation {index} must contain a non-empty points list")
+        reference_points: List[Sequence[float]] = []
+        moving_points: List[Sequence[float]] = []
+        for point_index, point in enumerate(points_payload, start=1):
+            if not isinstance(point, Mapping):
+                raise ValueError(f"manual annotation {index} point {point_index} must be an object")
+            reference_points.append(cast(Sequence[float], point.get("reference")))
+            moving_points.append(cast(Sequence[float], point.get("moving")))
+        records.append(
+            ManualAnnotationRecord(
+                scene_id=str(raw.get("scene_id", "")),
+                dataset_id=str(raw.get("dataset_id", "")),
+                source_kind=str(raw.get("source_kind", "")).strip().lower(),
+                calibration_group=str(raw.get("calibration_group", DEFAULT_REGISTRATION_CALIBRATION_GROUP)),
+                reference_shape=_parse_annotation_shape(raw.get("reference_shape"), label=f"annotation {index} reference_shape"),
+                moving_shape=_parse_annotation_shape(raw.get("moving_shape"), label=f"annotation {index} moving_shape"),
+                reference_points=_as_point_array(reference_points, label=f"annotation {index} reference points"),
+                moving_points=_as_point_array(moving_points, label=f"annotation {index} moving points"),
+                anchor_row_id=_optional_str(raw.get("anchor_row_id")),
+            )
+        )
+    return records
+
+
+def _parse_annotation_shape(value: Any, *, label: str) -> Tuple[int, int]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) < 2:
+        raise ValueError(f"{label} must be [height, width]")
+    height = int(value[0])
+    width = int(value[1])
+    if height <= 0 or width <= 0:
+        raise ValueError(f"{label} must be positive")
+    return height, width
+
+
 def estimate_similarity_registration(
     reference: np.ndarray,
     moving: np.ndarray,
@@ -321,6 +480,8 @@ def estimate_similarity_registration(
         raise ValueError("reference and moving images must be non-empty")
 
     profile = _normalize_registration_profile(registration_profile)
+    if profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
+        raise ValueError("manual_similarity_v1 requires registration_annotations via run_benchmark")
     if profile == REGISTRATION_PROFILE_CENTERED_ECC:
         return _estimate_centered_ecc_registration(
             ref,
@@ -657,6 +818,304 @@ def _estimate_bead_geometric_registration(
         hypotheses_refined=len(refined),
         optimizer_evaluations=optimizer_evaluations,
     )
+
+
+def _estimate_manual_similarity_registration(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    *,
+    config: BenchmarkConfig,
+    source_kind: str,
+    annotations: Sequence[ManualAnnotationRecord],
+    anchor_record: Optional[CandidateImageRecord] = None,
+    quality_reference_cache: Optional[ValidationMetricReference] = None,
+) -> SimilarityRegistrationResult:
+    started = time.perf_counter()
+    transform = _resolve_manual_transform(
+        annotations,
+        config=config,
+        source_kind=source_kind,
+        reference_shape=reference.shape[:2],
+        moving_shape=moving.shape[:2],
+        anchor_record=anchor_record,
+    )
+    aligned = cv.warpAffine(
+        _as_float_2d(moving),
+        np.asarray(transform.matrix, dtype=np.float32),
+        (reference.shape[1], reference.shape[0]),
+        flags=cv.INTER_LINEAR,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    scale, rotation_deg, tx, ty = _decompose_similarity(transform.matrix)
+    result = SimilarityRegistrationResult(
+        status="aligned",
+        aligned_image=aligned.astype(np.float32),
+        forward_matrix=np.asarray(transform.matrix, dtype=np.float64),
+        scale=scale,
+        rotation_deg=rotation_deg,
+        translation_x=tx,
+        translation_y=ty,
+        ecc_score=None,
+        ecc_warp_matrix=np.eye(2, 3, dtype=np.float32),
+        registration_profile=REGISTRATION_PROFILE_MANUAL_SIMILARITY,
+        registration_constraint_level="single_point" if transform.underconstrained else "full",
+        registration_underconstrained=transform.underconstrained,
+        registration_initializer=transform.initializer,
+        registration_calibration_group=transform.calibration_group,
+        registration_transform_source=transform.transform_source,
+        registration_point_count=transform.point_count,
+        registration_fit_rms_px=transform.fit_rms_px,
+        registration_point_pairs=transform.point_pairs,
+        registration_hypotheses=[
+            {
+                "rank": 1,
+                "initializer": transform.initializer,
+                "constraint_level": "single_point" if transform.underconstrained else "full",
+                "score": None,
+                "refined_score": None,
+                "matched_bead_count": "",
+                "median_bead_error_px": transform.fit_rms_px,
+                "common_fov_fraction": "",
+                "optimizer_evaluations": 0,
+                "scale": scale,
+                "rotation_deg": rotation_deg,
+                "translation_x": tx,
+                "translation_y": ty,
+            }
+        ],
+        warnings=transform.warnings,
+    )
+    result = _with_registration_quality(
+        result,
+        reference,
+        moving.shape[:2],
+        scale_values=cast(Sequence[float], config.scale_values),
+        residual_suspect_px=config.registration_suspect_residual_px,
+        min_matched_beads=config.registration_min_matched_beads,
+        min_structure_score=config.registration_min_structure_score,
+        reference_cache=quality_reference_cache,
+    )
+    result.validation_rankable, result.ranking_exclusion_reason = _registration_rankability(result)
+    return _attach_registration_runtime(
+        result,
+        started=started,
+        timings={"manual_resolution": max(0.0, time.perf_counter() - started)},
+        hypotheses_generated=0,
+        hypotheses_prefiltered=0,
+        hypotheses_dense_scored=0,
+        hypotheses_refined=0,
+        optimizer_evaluations=0,
+    )
+
+
+def _resolve_manual_transform(
+    annotations: Sequence[ManualAnnotationRecord],
+    *,
+    config: BenchmarkConfig,
+    source_kind: str,
+    reference_shape: Tuple[int, int],
+    moving_shape: Tuple[int, int],
+    anchor_record: Optional[CandidateImageRecord],
+) -> ManualResolvedTransform:
+    source = str(source_kind).strip().lower()
+    if source not in {"lf", "thorcam"}:
+        raise ValueError(f"unsupported manual registration source kind: {source_kind!r}")
+    group = str(config.registration_calibration_group or DEFAULT_REGISTRATION_CALIBRATION_GROUP)
+    mode = _normalize_registration_calibration_mode(config.registration_calibration_mode)
+    scene_id = str(config.scene_id or config.dataset_id)
+    dataset_id = str(config.dataset_id)
+    anchor_ids = _anchor_identity_set(anchor_record)
+    group_records = [
+        record
+        for record in annotations
+        if record.source_kind == source and record.calibration_group == group and _manual_annotation_anchor_matches(record, source, anchor_ids)
+    ]
+    if not group_records:
+        raise ValueError(f"manual_similarity_v1 has no annotations for source={source!r}, group={group!r}")
+    mismatched = [
+        record
+        for record in group_records
+        if record.reference_shape != tuple(reference_shape) or record.moving_shape != tuple(moving_shape)
+    ]
+    if mismatched:
+        examples = ", ".join(
+            f"{record.scene_id or record.dataset_id}:ref={record.reference_shape}:mov={record.moving_shape}"
+            for record in mismatched[:3]
+        )
+        raise ValueError(
+            "manual_similarity_v1 incompatible annotation shapes for "
+            f"source={source!r}, group={group!r}; expected ref={tuple(reference_shape)}, "
+            f"moving={tuple(moving_shape)}; got {examples}"
+        )
+    full_records = [record for record in group_records if len(record.moving_points) >= 2]
+    if not full_records:
+        raise ValueError(
+            f"manual_similarity_v1 needs at least one full annotation with two point pairs for "
+            f"source={source!r}, group={group!r}"
+        )
+    scene_records = [
+        record
+        for record in group_records
+        if _manual_annotation_matches_scene(record, scene_id=scene_id, dataset_id=dataset_id)
+    ]
+    if mode == "scene":
+        scene_full = [record for record in scene_records if len(record.moving_points) >= 2]
+        if scene_full:
+            fit = _fit_manual_record(scene_full[-1])
+            return _manual_transform_from_fit(
+                fit,
+                calibration_group=group,
+                transform_source="scene_annotation",
+                initializer="manual_points",
+                source_annotation_scene_id=scene_full[-1].scene_id,
+                point_pairs=_point_pairs_payload(scene_full[-1]),
+            )
+
+    group_transform = _manual_group_transform(full_records, calibration_group=group)
+    scene_single = [record for record in scene_records if len(record.moving_points) == 1]
+    if scene_single:
+        record = scene_single[-1]
+        matrix = _manual_single_point_translation_override(group_transform.matrix, record)
+        return ManualResolvedTransform(
+            matrix=matrix,
+            calibration_group=group,
+            transform_source="group_calibration_with_scene_translation",
+            initializer="group_plus_single_point_translation",
+            point_count=1,
+            fit_rms_px=0.0,
+            underconstrained=True,
+            source_annotation_scene_id=record.scene_id,
+            point_pairs=_point_pairs_payload(record),
+            warnings=["manual registration is underconstrained by one point; group scale/rotation reused"],
+        )
+    return group_transform
+
+
+def _manual_group_transform(
+    records: Sequence[ManualAnnotationRecord],
+    *,
+    calibration_group: str,
+) -> ManualResolvedTransform:
+    fits = [_fit_manual_record(record) for record in records]
+    scales = [fit.scale for fit in fits]
+    rotations = [fit.rotation_deg for fit in fits]
+    tx_values = [fit.translation_x for fit in fits]
+    ty_values = [fit.translation_y for fit in fits]
+    scale = float(math.exp(float(np.median(np.log(np.maximum(scales, 1e-12))))))
+    rotation = float(np.median(rotations))
+    tx = float(np.median(tx_values))
+    ty = float(np.median(ty_values))
+    matrix = _similarity_matrix_from_values(scale, rotation, tx, ty)
+    return ManualResolvedTransform(
+        matrix=matrix,
+        calibration_group=calibration_group,
+        transform_source="group_calibration",
+        initializer="group_calibration_median",
+        point_count=int(sum(fit.point_count for fit in fits)),
+        fit_rms_px=float(np.median([fit.rms_error_px for fit in fits])),
+        underconstrained=False,
+        source_annotation_scene_id=None if len(records) != 1 else records[0].scene_id,
+        point_pairs=[point for record in records for point in _point_pairs_payload(record)],
+    )
+
+
+def _manual_transform_from_fit(
+    fit: ManualSimilarityFit,
+    *,
+    calibration_group: str,
+    transform_source: str,
+    initializer: str,
+    source_annotation_scene_id: Optional[str],
+    point_pairs: List[Dict[str, List[float]]],
+) -> ManualResolvedTransform:
+    return ManualResolvedTransform(
+        matrix=fit.matrix,
+        calibration_group=calibration_group,
+        transform_source=transform_source,
+        initializer=initializer,
+        point_count=fit.point_count,
+        fit_rms_px=fit.rms_error_px,
+        underconstrained=False,
+        source_annotation_scene_id=source_annotation_scene_id,
+        point_pairs=point_pairs,
+    )
+
+
+def _fit_manual_record(record: ManualAnnotationRecord) -> ManualSimilarityFit:
+    return fit_manual_similarity_transform(record.moving_points, record.reference_points)
+
+
+def _manual_single_point_translation_override(
+    group_matrix: np.ndarray,
+    record: ManualAnnotationRecord,
+) -> np.ndarray:
+    moving = np.asarray(record.moving_points[0], dtype=np.float64)
+    reference = np.asarray(record.reference_points[0], dtype=np.float64)
+    matrix = np.asarray(group_matrix, dtype=np.float64).copy()
+    linear = matrix[:, :2]
+    matrix[:, 2] = reference - (linear @ moving)
+    return matrix
+
+
+def _similarity_matrix_from_values(scale: float, rotation_deg: float, tx: float, ty: float) -> np.ndarray:
+    theta = math.radians(float(rotation_deg))
+    cos_t = math.cos(theta) * float(scale)
+    sin_t = math.sin(theta) * float(scale)
+    return np.array([[cos_t, -sin_t, float(tx)], [sin_t, cos_t, float(ty)]], dtype=np.float64)
+
+
+def _point_pairs_payload(record: ManualAnnotationRecord) -> List[Dict[str, List[float]]]:
+    return [
+        {
+            "reference": [float(reference[0]), float(reference[1])],
+            "moving": [float(moving[0]), float(moving[1])],
+        }
+        for reference, moving in zip(record.reference_points, record.moving_points)
+    ]
+
+
+def _anchor_identity_set(anchor_record: Optional[CandidateImageRecord]) -> set[str]:
+    if anchor_record is None:
+        return set()
+    return {
+        text
+        for text in [
+            str(getattr(anchor_record.row, "row_id", "")),
+            str(getattr(anchor_record.row, "candidate_id", "")),
+        ]
+        if text
+    }
+
+
+def _manual_annotation_anchor_matches(record: ManualAnnotationRecord, source_kind: str, anchor_ids: set[str]) -> bool:
+    if source_kind != "lf" or not record.anchor_row_id or not anchor_ids:
+        return True
+    return record.anchor_row_id in anchor_ids
+
+
+def _manual_annotation_matches_scene(
+    record: ManualAnnotationRecord,
+    *,
+    scene_id: str,
+    dataset_id: str,
+) -> bool:
+    return record.scene_id == scene_id or record.dataset_id == dataset_id
+
+
+def _normalize_registration_calibration_mode(value: str) -> str:
+    text = str(value or DEFAULT_REGISTRATION_CALIBRATION_MODE).strip().lower()
+    if text in {"group", "scene"}:
+        return text
+    raise ValueError("registration_calibration_mode must be 'group' or 'scene'")
+
+
+def _registration_rankability(result: SimilarityRegistrationResult) -> Tuple[bool, Optional[str]]:
+    if result.status != "aligned":
+        return False, f"registration_status={result.status}"
+    if result.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY and not result.registration_transform_source:
+        return False, "manual_transform_missing"
+    return True, None
 
 
 def _prepare_geometric_reference(ref: np.ndarray, *, max_dim: int) -> GeometricReferencePrepared:
@@ -1420,6 +1879,13 @@ def apply_anchor_registration(
         registration_constraint_level=anchor.registration_constraint_level,
         registration_underconstrained=anchor.registration_underconstrained,
         registration_initializer=anchor.registration_initializer,
+        registration_calibration_group=anchor.registration_calibration_group,
+        registration_transform_source=anchor.registration_transform_source,
+        registration_point_count=anchor.registration_point_count,
+        registration_fit_rms_px=anchor.registration_fit_rms_px,
+        validation_rankable=anchor.validation_rankable,
+        ranking_exclusion_reason=anchor.ranking_exclusion_reason,
+        registration_point_pairs=list(anchor.registration_point_pairs),
         registration_refined_score=anchor.registration_refined_score,
         registration_hypotheses=anchor.registration_hypotheses,
         registration_runtime_seconds=anchor.registration_runtime_seconds,
@@ -1431,7 +1897,7 @@ def apply_anchor_registration(
         registration_timing_seconds=dict(anchor.registration_timing_seconds),
         warnings=_unique_strings(warnings),
     )
-    return _with_registration_quality(
+    result = _with_registration_quality(
         result,
         ref,
         mov.shape,
@@ -1441,6 +1907,8 @@ def apply_anchor_registration(
         min_structure_score=registration_min_structure_score,
         reference_cache=reference_cache,
     )
+    result.validation_rankable, result.ranking_exclusion_reason = _registration_rankability(result)
+    return result
 
 
 def compute_validation_metrics(
@@ -1547,6 +2015,11 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         if cfg.registration_profile == REGISTRATION_PROFILE_BEAD_GEOMETRIC
         else None
     )
+    manual_annotations: List[ManualAnnotationRecord] = []
+    if cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
+        if cfg.registration_annotations is None:
+            raise ValueError("manual_similarity_v1 requires registration_annotations")
+        manual_annotations = _load_manual_annotation_records(cfg.registration_annotations)
     model = load_sweep_visualization_model(cfg.sweep_dir)
     stage = cfg.stage or str(model.primary_stage_name)
     candidate_images, skipped_candidate_warnings = _collect_candidate_images(model, cfg, stage)
@@ -1556,13 +2029,28 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             f"dataset_id={cfg.dataset_id!r}."
         )
 
-    anchor_record, anchor_registration = _select_registration_anchor(
-        validation,
-        candidate_images,
-        cfg,
-        geometric_reference_cache=geometric_reference_cache,
-        quality_reference_cache=metric_reference_cache,
-    )
+    if cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
+        anchor_record = _select_anchor(candidate_images, cfg.anchor_row_id)
+        anchor_registration = _estimate_manual_similarity_registration(
+            validation,
+            anchor_record.image,
+            config=cfg,
+            source_kind="lf",
+            annotations=manual_annotations,
+            anchor_record=anchor_record,
+            quality_reference_cache=metric_reference_cache,
+        )
+        anchor_registration.anchor_selection_reason = (
+            "explicit_anchor_row_id" if cfg.anchor_row_id != "auto" else "saved_rank_auto_manual_profile"
+        )
+    else:
+        anchor_record, anchor_registration = _select_registration_anchor(
+            validation,
+            candidate_images,
+            cfg,
+            geometric_reference_cache=geometric_reference_cache,
+            quality_reference_cache=metric_reference_cache,
+        )
 
     lf_rows: List[BenchmarkResultRow] = []
     for candidate in candidate_images:
@@ -1602,29 +2090,48 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             )
         )
 
-    lf_rows.sort(key=lambda item: _score_sort_value(item.metrics.get(PROFILE_NAME)), reverse=True)
-    for idx, row in enumerate(lf_rows, start=1):
-        row.validation_rank = idx
-
-    thor_registration = estimate_similarity_registration(
-        validation,
-        thorcam,
-        scale_values=cast(Sequence[float], cfg.scale_values),
-        rotation_values=cast(Sequence[float], cfg.rotation_values),
-        registration_top_hypotheses=cfg.registration_top_hypotheses,
-        registration_diagnostics_top_n=cfg.registration_diagnostics_top_n,
-        registration_coarse_max_dim=cfg.registration_coarse_max_dim,
-        registration_refine_max_dim=cfg.registration_refine_max_dim,
-        registration_prefilter_hypotheses=cfg.registration_prefilter_hypotheses,
-        registration_dense_hypotheses=cfg.registration_dense_hypotheses,
-        registration_refine_max_evals=cfg.registration_refine_max_evals,
-        registration_profile=cfg.registration_profile,
-        registration_suspect_residual_px=cfg.registration_suspect_residual_px,
-        registration_min_matched_beads=cfg.registration_min_matched_beads,
-        registration_min_structure_score=cfg.registration_min_structure_score,
-        geometric_reference_cache=geometric_reference_cache,
-        quality_reference_cache=metric_reference_cache,
+    lf_rows.sort(
+        key=lambda item: (
+            bool(item.registration.validation_rankable),
+            _score_sort_value(item.metrics.get(PROFILE_NAME)),
+        ),
+        reverse=True,
     )
+    rank = 1
+    for row in lf_rows:
+        if row.registration.validation_rankable:
+            row.validation_rank = rank
+            rank += 1
+
+    if cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
+        thor_registration = _estimate_manual_similarity_registration(
+            validation,
+            thorcam,
+            config=cfg,
+            source_kind="thorcam",
+            annotations=manual_annotations,
+            quality_reference_cache=metric_reference_cache,
+        )
+    else:
+        thor_registration = estimate_similarity_registration(
+            validation,
+            thorcam,
+            scale_values=cast(Sequence[float], cfg.scale_values),
+            rotation_values=cast(Sequence[float], cfg.rotation_values),
+            registration_top_hypotheses=cfg.registration_top_hypotheses,
+            registration_diagnostics_top_n=cfg.registration_diagnostics_top_n,
+            registration_coarse_max_dim=cfg.registration_coarse_max_dim,
+            registration_refine_max_dim=cfg.registration_refine_max_dim,
+            registration_prefilter_hypotheses=cfg.registration_prefilter_hypotheses,
+            registration_dense_hypotheses=cfg.registration_dense_hypotheses,
+            registration_refine_max_evals=cfg.registration_refine_max_evals,
+            registration_profile=cfg.registration_profile,
+            registration_suspect_residual_px=cfg.registration_suspect_residual_px,
+            registration_min_matched_beads=cfg.registration_min_matched_beads,
+            registration_min_structure_score=cfg.registration_min_structure_score,
+            geometric_reference_cache=geometric_reference_cache,
+            quality_reference_cache=metric_reference_cache,
+        )
     thor_metrics = compute_validation_metrics(validation, thor_registration.aligned_image, reference_cache=metric_reference_cache)
     thor_row = BenchmarkResultRow(
         source_kind="thorcam_baseline",
@@ -1646,6 +2153,9 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     rows = lf_rows + [thor_row]
     _write_bead_detection_figure(figures_dir / "validation_beads.png", validation)
+    if cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
+        _write_manual_points_figure(figures_dir / "manual_points_lf.png", validation, anchor_record.image, anchor_registration)
+        _write_manual_points_figure(figures_dir / "manual_points_thorcam.png", validation, thorcam, thor_registration)
     top_rows = lf_rows[: max(0, cfg.top_k)]
     for row in top_rows:
         _write_comparison_figures(figures_dir, validation, row)
@@ -1657,7 +2167,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     if cfg.enable_nonrigid_diagnostic:
         _write_affine_diagnostic_figure(figures_dir, validation, thor_row)
 
-    best = lf_rows[0] if lf_rows else None
+    best = next((row for row in lf_rows if row.registration.validation_rankable), None)
     summary = _build_summary(
         cfg,
         stage,
@@ -1672,6 +2182,13 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     )
     _write_results_csv(cfg.output_dir / "trio_benchmark_results.csv", rows)
     _write_registration_hypotheses_csv(cfg.output_dir / "registration_hypotheses.csv", rows)
+    if cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
+        _write_manual_calibration_artifact(
+            cfg.output_dir / "trio_registration_calibration.json",
+            cfg,
+            anchor_registration,
+            thor_registration,
+        )
     write_json_atomic(
         cfg.output_dir / "trio_benchmark_summary.json",
         summary,
@@ -1704,6 +2221,7 @@ def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
     return BenchmarkConfig(
         sweep_dir=Path(config.sweep_dir),
         dataset_id=str(config.dataset_id),
+        scene_id=None if config.scene_id is None else str(config.scene_id),
         validation_image=None if config.validation_image is None else Path(config.validation_image),
         thorcam_image=None if config.thorcam_image is None else Path(config.thorcam_image),
         output_dir=Path(config.output_dir),
@@ -1716,6 +2234,11 @@ def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
         top_k=int(config.top_k),
         residual_translation_max_px=float(config.residual_translation_max_px),
         registration_profile=registration_profile,
+        registration_annotations=None if config.registration_annotations is None else Path(config.registration_annotations),
+        registration_calibration_group=str(
+            config.registration_calibration_group or DEFAULT_REGISTRATION_CALIBRATION_GROUP
+        ),
+        registration_calibration_mode=_normalize_registration_calibration_mode(config.registration_calibration_mode),
         registration_suspect_residual_px=float(config.registration_suspect_residual_px),
         registration_min_matched_beads=int(config.registration_min_matched_beads),
         registration_min_structure_score=float(config.registration_min_structure_score),
@@ -2091,6 +2614,12 @@ def _write_results_csv(path: Path, rows: Sequence[BenchmarkResultRow]) -> None:
         "registration_constraint_level",
         "registration_underconstrained",
         "registration_initializer",
+        "registration_calibration_group",
+        "registration_transform_source",
+        "registration_point_count",
+        "registration_fit_rms_px",
+        "validation_rankable",
+        "ranking_exclusion_reason",
         "registration_refined_score",
         "registration_runtime_seconds",
         "hypotheses_generated",
@@ -2195,6 +2724,12 @@ def _row_to_csv(row: BenchmarkResultRow) -> Dict[str, Any]:
         "registration_constraint_level": reg.registration_constraint_level,
         "registration_underconstrained": str(bool(reg.registration_underconstrained)).lower(),
         "registration_initializer": reg.registration_initializer,
+        "registration_calibration_group": reg.registration_calibration_group or "",
+        "registration_transform_source": reg.registration_transform_source or "",
+        "registration_point_count": reg.registration_point_count,
+        "registration_fit_rms_px": _csv_float(reg.registration_fit_rms_px),
+        "validation_rankable": str(bool(reg.validation_rankable)).lower(),
+        "ranking_exclusion_reason": reg.ranking_exclusion_reason or "",
         "registration_refined_score": _csv_float(reg.registration_refined_score),
         "registration_runtime_seconds": _csv_float(reg.registration_runtime_seconds),
         "hypotheses_generated": reg.hypotheses_generated,
@@ -2259,6 +2794,7 @@ def _build_summary(
             "profile_name": PROFILE_NAME,
             "sweep_dir": str(config.sweep_dir),
             "dataset_id": config.dataset_id,
+            "scene_id": config.scene_id,
             "validation_image": reference_sources.validation_source,
             "thorcam_image": reference_sources.thorcam_source,
             "validation_workspace": None if config.validation_workspace is None else str(config.validation_workspace),
@@ -2271,6 +2807,9 @@ def _build_summary(
             "top_k": config.top_k,
             "residual_translation_max_px": config.residual_translation_max_px,
             "registration_profile": config.registration_profile,
+            "registration_annotations": None if config.registration_annotations is None else str(config.registration_annotations),
+            "registration_calibration_group": config.registration_calibration_group,
+            "registration_calibration_mode": config.registration_calibration_mode,
             "registration_suspect_residual_px": config.registration_suspect_residual_px,
             "registration_min_matched_beads": config.registration_min_matched_beads,
             "registration_min_structure_score": config.registration_min_structure_score,
@@ -2333,6 +2872,13 @@ def _registration_summary(reg: SimilarityRegistrationResult) -> Dict[str, Any]:
         "registration_constraint_level": reg.registration_constraint_level,
         "registration_underconstrained": reg.registration_underconstrained,
         "registration_initializer": reg.registration_initializer,
+        "registration_calibration_group": reg.registration_calibration_group,
+        "registration_transform_source": reg.registration_transform_source,
+        "registration_point_count": reg.registration_point_count,
+        "registration_fit_rms_px": reg.registration_fit_rms_px,
+        "validation_rankable": reg.validation_rankable,
+        "ranking_exclusion_reason": reg.ranking_exclusion_reason,
+        "registration_point_pairs": reg.registration_point_pairs,
         "registration_refined_score": reg.registration_refined_score,
         "registration_runtime_seconds": reg.registration_runtime_seconds,
         "hypotheses_generated": reg.hypotheses_generated,
@@ -2376,6 +2922,8 @@ def _render_report_html(summary: Mapping[str, Any], rows: Sequence[BenchmarkResu
             f"<td>{html.escape(str(row.registration.registration_suspect).lower())}</td>"
             f"<td>{html.escape(row.registration.registration_constraint_level)}</td>"
             f"<td>{html.escape(row.registration.registration_initializer)}</td>"
+            f"<td>{html.escape(row.registration.registration_transform_source or '')}</td>"
+            f"<td>{html.escape(str(row.registration.validation_rankable).lower())}</td>"
             f"<td>{_html_float(row.registration.residual_translation_norm)}</td>"
             f"<td><a href=\"figures/{html.escape(overlay)}\">overlay</a></td>"
             f"<td>{html.escape('; '.join(row.warnings))}</td>"
@@ -2397,7 +2945,7 @@ def _render_report_html(summary: Mapping[str, Any], rows: Sequence[BenchmarkResu
             "<table><thead><tr><th>Source</th><th>Rank</th><th>Row ID</th><th>Candidate</th>"
             "<th>Hybrid</th><th>Signal</th><th>Structure</th><th>Bead</th><th>Sharpness</th>"
             "<th>Reg Conf</th><th>Reg Suspect</th><th>Constraint</th><th>Initializer</th>"
-            "<th>Residual Norm</th><th>Figure</th><th>Warnings</th></tr></thead><tbody>",
+            "<th>Transform Source</th><th>Rankable</th><th>Residual Norm</th><th>Figure</th><th>Warnings</th></tr></thead><tbody>",
             *table_rows,
             "</tbody></table>",
             "<h2>Summary JSON</h2>",
@@ -2478,6 +3026,87 @@ def _write_bead_detection_figure(path: Path, image: np.ndarray) -> None:
     Image.fromarray(out).save(path)
 
 
+def _write_manual_points_figure(
+    path: Path,
+    validation: np.ndarray,
+    moving: np.ndarray,
+    registration: SimilarityRegistrationResult,
+) -> None:
+    val = _robust_unit(validation)
+    aligned = _robust_unit(
+        cv.warpAffine(
+            _as_float_2d(moving),
+            np.asarray(registration.forward_matrix, dtype=np.float32),
+            (val.shape[1], val.shape[0]),
+            flags=cv.INTER_LINEAR,
+            borderMode=cv.BORDER_CONSTANT,
+            borderValue=0.0,
+        )
+    )
+    overlay = np.zeros((val.shape[0], val.shape[1], 3), dtype=np.float32)
+    overlay[..., 0] = val
+    overlay[..., 1] = aligned
+    out = np.asarray(np.clip(overlay * 255.0, 0.0, 255.0), dtype=np.uint8)
+    for pair in registration.registration_point_pairs[:200]:
+        reference = pair.get("reference", [])
+        moving_point = pair.get("moving", [])
+        if len(reference) >= 2:
+            cv.circle(out, (int(round(reference[0])), int(round(reference[1]))), 4, (255, 0, 0), 1)
+        if len(moving_point) >= 2:
+            transformed = _transform_points(registration.forward_matrix, np.asarray([moving_point], dtype=np.float64))[0]
+            cv.drawMarker(
+                out,
+                (int(round(transformed[0])), int(round(transformed[1]))),
+                (0, 255, 255),
+                markerType=cv.MARKER_CROSS,
+                markerSize=9,
+                thickness=1,
+            )
+    Image.fromarray(out).save(path)
+
+
+def _write_manual_calibration_artifact(
+    path: Path,
+    config: BenchmarkConfig,
+    lf_registration: SimilarityRegistrationResult,
+    thor_registration: SimilarityRegistrationResult,
+) -> None:
+    payload = {
+        "version": 1,
+        "registration_profile": REGISTRATION_PROFILE_MANUAL_SIMILARITY,
+        "annotations_path": None if config.registration_annotations is None else str(config.registration_annotations),
+        "calibration_group": config.registration_calibration_group,
+        "calibration_mode": config.registration_calibration_mode,
+        "scene_id": config.scene_id,
+        "dataset_id": config.dataset_id,
+        "sources": {
+            "lf": _manual_registration_artifact_summary(lf_registration),
+            "thorcam": _manual_registration_artifact_summary(thor_registration),
+        },
+    }
+    write_json_atomic(path, payload, sort_keys=True, create_backup=False)
+
+
+def _manual_registration_artifact_summary(registration: SimilarityRegistrationResult) -> Dict[str, Any]:
+    return {
+        "status": registration.status,
+        "transform_source": registration.registration_transform_source,
+        "initializer": registration.registration_initializer,
+        "point_count": registration.registration_point_count,
+        "fit_rms_px": registration.registration_fit_rms_px,
+        "underconstrained": registration.registration_underconstrained,
+        "rankable": registration.validation_rankable,
+        "ranking_exclusion_reason": registration.ranking_exclusion_reason,
+        "scale": registration.scale,
+        "rotation_deg": registration.rotation_deg,
+        "translation_x": registration.translation_x,
+        "translation_y": registration.translation_y,
+        "forward_matrix": np.asarray(registration.forward_matrix, dtype=float).tolist(),
+        "point_pairs": registration.registration_point_pairs,
+        "warnings": registration.warnings,
+    }
+
+
 def _figure_prefix(row: BenchmarkResultRow) -> str:
     if row.source_kind == "thorcam_baseline":
         return "baseline_thorcam"
@@ -2525,6 +3154,7 @@ def _normalize_for_registration(image: np.ndarray) -> np.ndarray:
 def _normalize_registration_profile(profile: str) -> str:
     text = str(profile or DEFAULT_REGISTRATION_PROFILE).strip()
     if text in {
+        REGISTRATION_PROFILE_MANUAL_SIMILARITY,
         REGISTRATION_PROFILE_BEAD_GEOMETRIC,
         REGISTRATION_PROFILE_BEAD_SIMILARITY,
         REGISTRATION_PROFILE_CENTERED_ECC,
@@ -2533,13 +3163,16 @@ def _normalize_registration_profile(profile: str) -> str:
     raise ValueError(
         "unsupported registration profile "
         f"{profile!r}; expected {REGISTRATION_PROFILE_BEAD_GEOMETRIC!r}, "
-        f"{REGISTRATION_PROFILE_BEAD_SIMILARITY!r}, or {REGISTRATION_PROFILE_CENTERED_ECC!r}"
+        f"{REGISTRATION_PROFILE_BEAD_SIMILARITY!r}, {REGISTRATION_PROFILE_CENTERED_ECC!r}, "
+        f"or {REGISTRATION_PROFILE_MANUAL_SIMILARITY!r}"
     )
 
 
 def _default_scale_values_for_registration_profile(profile: str) -> List[float]:
     if profile == REGISTRATION_PROFILE_BEAD_GEOMETRIC:
         return parse_scale_search(DEFAULT_GEOMETRIC_SCALE_SEARCH)
+    if profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
+        return [1.0]
     return parse_scale_search(DEFAULT_SCALE_SEARCH)
 
 
@@ -3162,11 +3795,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--registration-profile",
         default=DEFAULT_REGISTRATION_PROFILE,
         choices=[
+            REGISTRATION_PROFILE_MANUAL_SIMILARITY,
             REGISTRATION_PROFILE_BEAD_GEOMETRIC,
             REGISTRATION_PROFILE_BEAD_SIMILARITY,
             REGISTRATION_PROFILE_CENTERED_ECC,
         ],
     )
+    parser.add_argument("--registration-annotations", default=None, type=Path)
+    parser.add_argument("--registration-calibration-group", default=DEFAULT_REGISTRATION_CALIBRATION_GROUP)
+    parser.add_argument("--registration-calibration-mode", default=DEFAULT_REGISTRATION_CALIBRATION_MODE, choices=["group", "scene"])
     parser.add_argument("--registration-suspect-residual-px", type=float, default=DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX)
     parser.add_argument("--registration-min-matched-beads", type=int, default=DEFAULT_REGISTRATION_MIN_MATCHED_BEADS)
     parser.add_argument("--registration-min-structure-score", type=float, default=DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE)
@@ -3189,6 +3826,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         BenchmarkConfig(
             sweep_dir=args.sweep_dir,
             dataset_id=args.dataset_id,
+            scene_id=args.dataset_id,
             validation_image=args.validation_image,
             thorcam_image=args.thorcam_image,
             output_dir=args.output_dir,
@@ -3201,6 +3839,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             top_k=args.top_k,
             residual_translation_max_px=args.residual_translation_max_px,
             registration_profile=args.registration_profile,
+            registration_annotations=args.registration_annotations,
+            registration_calibration_group=args.registration_calibration_group,
+            registration_calibration_mode=args.registration_calibration_mode,
             registration_suspect_residual_px=args.registration_suspect_residual_px,
             registration_min_matched_beads=args.registration_min_matched_beads,
             registration_min_structure_score=args.registration_min_structure_score,

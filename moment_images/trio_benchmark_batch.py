@@ -21,6 +21,8 @@ from moment_images.trio_benchmark import (
     DEFAULT_REGISTRATION_PREFILTER_HYPOTHESES,
     DEFAULT_REGISTRATION_DENSE_HYPOTHESES,
     DEFAULT_REGISTRATION_REFINE_MAX_EVALS,
+    DEFAULT_REGISTRATION_CALIBRATION_GROUP,
+    DEFAULT_REGISTRATION_CALIBRATION_MODE,
     DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX,
     DEFAULT_REGISTRATION_ROTATION_SEARCH,
     DEFAULT_REGISTRATION_TOP_HYPOTHESES,
@@ -108,9 +110,11 @@ def _scene_to_benchmark_config(
     validation_image = _optional_path(merged.get("validation_image"), manifest_base)
     thorcam_image = _optional_path(merged.get("thorcam_image"), manifest_base)
     validation_workspace = _optional_path(merged.get("validation_workspace"), manifest_base)
+    registration_annotations = _optional_path(merged.get("registration_annotations"), manifest_base)
     return BenchmarkConfig(
         sweep_dir=sweep_dir,
         dataset_id=str(_required_value(merged, "dataset_id")),
+        scene_id=str(merged.get("scene_id", merged.get("dataset_id", ""))),
         validation_image=validation_image,
         thorcam_image=thorcam_image,
         validation_workspace=validation_workspace,
@@ -152,6 +156,13 @@ def _scene_to_benchmark_config(
             merged.get("registration_refine_max_evals", DEFAULT_REGISTRATION_REFINE_MAX_EVALS)
         ),
         registration_progress=bool(merged.get("registration_progress", False)),
+        registration_annotations=registration_annotations,
+        registration_calibration_group=str(
+            merged.get("registration_calibration_group", DEFAULT_REGISTRATION_CALIBRATION_GROUP)
+        ),
+        registration_calibration_mode=str(
+            merged.get("registration_calibration_mode", DEFAULT_REGISTRATION_CALIBRATION_MODE)
+        ),
         enable_nonrigid_diagnostic=bool(merged.get("enable_nonrigid_diagnostic", False)),
     )
 
@@ -187,6 +198,12 @@ def _successful_scene_summary(
         "registration_constraint_level": best_registration.get("registration_constraint_level"),
         "registration_underconstrained": best_registration.get("registration_underconstrained"),
         "registration_initializer": best_registration.get("registration_initializer"),
+        "registration_calibration_group": best_registration.get("registration_calibration_group"),
+        "registration_transform_source": best_registration.get("registration_transform_source"),
+        "registration_point_count": best_registration.get("registration_point_count"),
+        "registration_fit_rms_px": best_registration.get("registration_fit_rms_px"),
+        "validation_rankable": best_registration.get("validation_rankable"),
+        "ranking_exclusion_reason": best_registration.get("ranking_exclusion_reason"),
         "registration_runtime_seconds": best_registration.get("registration_runtime_seconds"),
         "hypotheses_generated": best_registration.get("hypotheses_generated"),
         "hypotheses_prefiltered": best_registration.get("hypotheses_prefiltered"),
@@ -218,6 +235,12 @@ def _failed_scene_summary(scene_id: str, scene: Mapping[str, Any], scene_dir: Pa
         "registration_constraint_level": None,
         "registration_underconstrained": None,
         "registration_initializer": None,
+        "registration_calibration_group": None,
+        "registration_transform_source": None,
+        "registration_point_count": None,
+        "registration_fit_rms_px": None,
+        "validation_rankable": None,
+        "ranking_exclusion_reason": None,
         "registration_runtime_seconds": None,
         "hypotheses_generated": None,
         "hypotheses_prefiltered": None,
@@ -248,6 +271,12 @@ def _write_batch_csv(path: Path, scene_summaries: Sequence[Mapping[str, Any]]) -
         "registration_constraint_level",
         "registration_underconstrained",
         "registration_initializer",
+        "registration_calibration_group",
+        "registration_transform_source",
+        "registration_point_count",
+        "registration_fit_rms_px",
+        "validation_rankable",
+        "ranking_exclusion_reason",
         "registration_runtime_seconds",
         "hypotheses_generated",
         "hypotheses_prefiltered",
