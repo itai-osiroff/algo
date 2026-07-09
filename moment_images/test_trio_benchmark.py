@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 
 from moment_images.test_sweep_visualization import _create_modern_fixture
+import moment_images.trio_benchmark as trio_benchmark
 from moment_images.trio_benchmark import (
     PROFILE_NAME,
     BenchmarkConfig,
@@ -158,6 +159,34 @@ def test_geometric_registration_reports_single_bead_underconstrained_without_mat
     assert not any("matched_bead_count<3" in reason for reason in result.registration_suspect_reasons)
 
 
+def test_geometric_registration_respects_hypothesis_runtime_limits():
+    reference = _synthetic_beads((190, 190))
+    moving_shape = (150, 150)
+    center = (moving_shape[1] / 2.0, moving_shape[0] / 2.0)
+    moving_to_reference = cv.getRotationMatrix2D(center, 11.0, 1.28).astype(np.float32)
+    moving_to_reference[:, 2] += np.array([24.0, -9.0], dtype=np.float32)
+    moving = _warp_reference_to_moving(reference, moving_shape, moving_to_reference)
+
+    result = estimate_similarity_registration(
+        reference,
+        moving,
+        scale_values=parse_scale_search("0.50:2.00:31"),
+        registration_profile="bead_geometric_v2",
+        registration_prefilter_hypotheses=7,
+        registration_dense_hypotheses=3,
+        registration_top_hypotheses=2,
+        registration_refine_max_evals=30,
+    )
+
+    assert result.status == "aligned"
+    assert result.hypotheses_generated >= result.hypotheses_prefiltered
+    assert result.hypotheses_prefiltered <= 7
+    assert result.hypotheses_dense_scored <= 3
+    assert result.hypotheses_refined <= 2
+    assert result.optimizer_evaluations > 0
+    assert result.registration_runtime_seconds is not None
+
+
 def _robust_unit_for_test(image: np.ndarray) -> np.ndarray:
     arr = np.asarray(image, dtype=np.float32)
     low = float(np.percentile(arr, 1.0))
@@ -209,6 +238,25 @@ def test_validation_metrics_penalize_blur_and_center_errors():
     assert sharp_metrics.metrics[PROFILE_NAME] > blurred_metrics.metrics[PROFILE_NAME]
     assert sharp_metrics.metrics["validation_sharpness"] > blurred_metrics.metrics["validation_sharpness"]
     assert sharp_metrics.metrics["validation_bead"] > shifted_metrics.metrics["validation_bead"]
+
+
+def test_validation_metrics_accept_prepared_reference_cache():
+    validation = _synthetic_beads()
+    blurred = cv.GaussianBlur(validation, (0, 0), 3.0)
+    reference_cache = trio_benchmark._prepare_validation_metric_reference(validation)
+
+    direct = compute_validation_metrics(validation, blurred)
+    cached = compute_validation_metrics(validation, blurred, reference_cache=reference_cache)
+
+    for name, value in direct.metrics.items():
+        cached_value = cached.metrics[name]
+        if value is None:
+            assert cached_value is None
+        else:
+            assert cached_value is not None
+            np.testing.assert_allclose(cached_value, value, rtol=1e-6, atol=1e-6)
+    assert cached.weights_used == direct.weights_used
+    assert cached.bead_count == direct.bead_count
 
 
 def test_low_confidence_bead_detection_renormalizes_to_image_metrics():
@@ -337,6 +385,12 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
     assert "registration_underconstrained" in csv_rows[0]
     assert "registration_initializer" in csv_rows[0]
     assert "registration_refined_score" in csv_rows[0]
+    assert "registration_runtime_seconds" in csv_rows[0]
+    assert "hypotheses_generated" in csv_rows[0]
+    assert "hypotheses_prefiltered" in csv_rows[0]
+    assert "hypotheses_dense_scored" in csv_rows[0]
+    assert "hypotheses_refined" in csv_rows[0]
+    assert "optimizer_evaluations" in csv_rows[0]
     assert [row["source_kind"] for row in csv_rows].count("lf_candidate") == 2
     assert [row["source_kind"] for row in csv_rows].count("thorcam_baseline") == 1
     first_lf_row = next(row for row in csv_rows if row["candidate_id"] == "candidate_a")
@@ -353,6 +407,14 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
     assert "matched_bead_count" in summary["best_candidate"]["registration"]
     assert "registration_constraint_level" in summary["best_candidate"]["registration"]
     assert "registration_initializer" in summary["best_candidate"]["registration"]
+    assert "registration_runtime_seconds" in summary["best_candidate"]["registration"]
+    assert "hypotheses_dense_scored" in summary["best_candidate"]["registration"]
+    assert summary["config"]["registration_coarse_max_dim"] == 384
+    assert summary["config"]["registration_refine_max_dim"] == 768
+    assert summary["config"]["registration_prefilter_hypotheses"] == 256
+    assert summary["config"]["registration_dense_hypotheses"] == 64
+    assert summary["config"]["registration_refine_max_evals"] == 120
+    assert summary["config"]["registration_progress"] is False
     assert "best_lf_minus_thorcam" in summary
     assert result.rows[0].source_kind == "lf_candidate"
 

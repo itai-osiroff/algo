@@ -6,6 +6,7 @@ import argparse
 import html
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -15,6 +16,11 @@ from moment_images.trio_benchmark import (
     DEFAULT_REGISTRATION_MIN_MATCHED_BEADS,
     DEFAULT_REGISTRATION_MIN_STRUCTURE_SCORE,
     DEFAULT_REGISTRATION_PROFILE,
+    DEFAULT_REGISTRATION_COARSE_MAX_DIM,
+    DEFAULT_REGISTRATION_REFINE_MAX_DIM,
+    DEFAULT_REGISTRATION_PREFILTER_HYPOTHESES,
+    DEFAULT_REGISTRATION_DENSE_HYPOTHESES,
+    DEFAULT_REGISTRATION_REFINE_MAX_EVALS,
     DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX,
     DEFAULT_REGISTRATION_ROTATION_SEARCH,
     DEFAULT_REGISTRATION_TOP_HYPOTHESES,
@@ -49,6 +55,7 @@ def run_batch_from_manifest(manifest_path: Path, output_dir: Path) -> Dict[str, 
         scene = _mapping(raw_scene)
         scene_id = str(scene.get("scene_id") or f"scene_{index:03d}")
         scene_dir = output_dir / _safe_scene_dir_name(scene_id)
+        print(f"Starting scene {index}/{len(scenes)}: {scene_id}", file=sys.stderr, flush=True)
         try:
             benchmark_config = _scene_to_benchmark_config(
                 scene,
@@ -58,9 +65,11 @@ def run_batch_from_manifest(manifest_path: Path, output_dir: Path) -> Dict[str, 
             )
             result = run_benchmark(benchmark_config)
             scene_summaries.append(_successful_scene_summary(scene_id, benchmark_config, scene_dir, result.summary))
+            print(f"Finished scene {index}/{len(scenes)}: {scene_id}", file=sys.stderr, flush=True)
         except Exception as exc:
             scene_dir.mkdir(parents=True, exist_ok=True)
             scene_summaries.append(_failed_scene_summary(scene_id, scene, scene_dir, exc))
+            print(f"Failed scene {index}/{len(scenes)}: {scene_id}: {type(exc).__name__}", file=sys.stderr, flush=True)
 
     summary = {
         "manifest_path": str(manifest_path),
@@ -131,6 +140,18 @@ def _scene_to_benchmark_config(
         registration_diagnostics_top_n=int(
             merged.get("registration_diagnostics_top_n", DEFAULT_REGISTRATION_DIAGNOSTICS_TOP_N)
         ),
+        registration_coarse_max_dim=int(merged.get("registration_coarse_max_dim", DEFAULT_REGISTRATION_COARSE_MAX_DIM)),
+        registration_refine_max_dim=int(merged.get("registration_refine_max_dim", DEFAULT_REGISTRATION_REFINE_MAX_DIM)),
+        registration_prefilter_hypotheses=int(
+            merged.get("registration_prefilter_hypotheses", DEFAULT_REGISTRATION_PREFILTER_HYPOTHESES)
+        ),
+        registration_dense_hypotheses=int(
+            merged.get("registration_dense_hypotheses", DEFAULT_REGISTRATION_DENSE_HYPOTHESES)
+        ),
+        registration_refine_max_evals=int(
+            merged.get("registration_refine_max_evals", DEFAULT_REGISTRATION_REFINE_MAX_EVALS)
+        ),
+        registration_progress=bool(merged.get("registration_progress", False)),
         enable_nonrigid_diagnostic=bool(merged.get("enable_nonrigid_diagnostic", False)),
     )
 
@@ -146,6 +167,7 @@ def _successful_scene_summary(
     deltas = _mapping(benchmark_summary.get("best_lf_minus_thorcam", {}))
     best_metrics = _mapping(best.get("metrics", {}))
     thor_metrics = _mapping(thorcam.get("metrics", {}))
+    best_registration = _mapping(best.get("registration", {}))
     return {
         "scene_id": scene_id,
         "status": "ok",
@@ -160,11 +182,17 @@ def _successful_scene_summary(
         "thorcam_validation_hybrid_v1": thor_metrics.get(PROFILE_NAME),
         "best_lf_minus_thorcam_validation_hybrid_v1": deltas.get(PROFILE_NAME),
         "registration_profile": config.registration_profile,
-        "registration_confidence": _mapping(best.get("registration", {})).get("registration_confidence"),
-        "registration_suspect": _mapping(best.get("registration", {})).get("registration_suspect"),
-        "registration_constraint_level": _mapping(best.get("registration", {})).get("registration_constraint_level"),
-        "registration_underconstrained": _mapping(best.get("registration", {})).get("registration_underconstrained"),
-        "registration_initializer": _mapping(best.get("registration", {})).get("registration_initializer"),
+        "registration_confidence": best_registration.get("registration_confidence"),
+        "registration_suspect": best_registration.get("registration_suspect"),
+        "registration_constraint_level": best_registration.get("registration_constraint_level"),
+        "registration_underconstrained": best_registration.get("registration_underconstrained"),
+        "registration_initializer": best_registration.get("registration_initializer"),
+        "registration_runtime_seconds": best_registration.get("registration_runtime_seconds"),
+        "hypotheses_generated": best_registration.get("hypotheses_generated"),
+        "hypotheses_prefiltered": best_registration.get("hypotheses_prefiltered"),
+        "hypotheses_dense_scored": best_registration.get("hypotheses_dense_scored"),
+        "hypotheses_refined": best_registration.get("hypotheses_refined"),
+        "optimizer_evaluations": best_registration.get("optimizer_evaluations"),
         "warnings": list(benchmark_summary.get("warnings", [])),
         "error": None,
     }
@@ -190,6 +218,12 @@ def _failed_scene_summary(scene_id: str, scene: Mapping[str, Any], scene_dir: Pa
         "registration_constraint_level": None,
         "registration_underconstrained": None,
         "registration_initializer": None,
+        "registration_runtime_seconds": None,
+        "hypotheses_generated": None,
+        "hypotheses_prefiltered": None,
+        "hypotheses_dense_scored": None,
+        "hypotheses_refined": None,
+        "optimizer_evaluations": None,
         "warnings": [],
         "error": f"{type(exc).__name__}: {exc}",
     }
@@ -214,6 +248,12 @@ def _write_batch_csv(path: Path, scene_summaries: Sequence[Mapping[str, Any]]) -
         "registration_constraint_level",
         "registration_underconstrained",
         "registration_initializer",
+        "registration_runtime_seconds",
+        "hypotheses_generated",
+        "hypotheses_prefiltered",
+        "hypotheses_dense_scored",
+        "hypotheses_refined",
+        "optimizer_evaluations",
         "warnings",
         "error",
     ]
