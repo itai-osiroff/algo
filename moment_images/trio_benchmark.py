@@ -43,6 +43,7 @@ DEFAULT_GEOMETRIC_SCALE_SEARCH = "0.50:2.00:31"
 DEFAULT_REGISTRATION_ROTATION_SEARCH = "-45:45:19"
 DEFAULT_TOP_K = 12
 DEFAULT_RESIDUAL_TRANSLATION_MAX_PX = 5.0
+REGISTRATION_PROFILE_VALIDATE_WORKSPACE = "validate_workspace_transform_v1"
 REGISTRATION_PROFILE_MANUAL_SIMILARITY = "manual_similarity_v1"
 REGISTRATION_PROFILE_BEAD_GEOMETRIC = "bead_geometric_v2"
 REGISTRATION_PROFILE_BEAD_SIMILARITY = "bead_similarity_v1"
@@ -81,6 +82,7 @@ class BenchmarkConfig:
     top_k: int = DEFAULT_TOP_K
     residual_translation_max_px: float = DEFAULT_RESIDUAL_TRANSLATION_MAX_PX
     registration_profile: str = DEFAULT_REGISTRATION_PROFILE
+    use_validation_workspace_transforms: bool = False
     registration_annotations: Optional[Path] = None
     registration_calibration_group: str = DEFAULT_REGISTRATION_CALIBRATION_GROUP
     registration_calibration_mode: str = DEFAULT_REGISTRATION_CALIBRATION_MODE
@@ -196,6 +198,7 @@ class ReferenceImages:
     validation_source: str
     thorcam_source: str
     warnings: List[str] = field(default_factory=list)
+    workspace_transform_info: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -482,6 +485,8 @@ def estimate_similarity_registration(
     profile = _normalize_registration_profile(registration_profile)
     if profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
         raise ValueError("manual_similarity_v1 requires registration_annotations via run_benchmark")
+    if profile == REGISTRATION_PROFILE_VALIDATE_WORKSPACE:
+        raise ValueError("validate_workspace_transform_v1 requires validation_workspace via run_benchmark")
     if profile == REGISTRATION_PROFILE_CENTERED_ECC:
         return _estimate_centered_ecc_registration(
             ref,
@@ -907,6 +912,67 @@ def _estimate_manual_similarity_registration(
         hypotheses_refined=0,
         optimizer_evaluations=0,
     )
+
+
+def _workspace_grid_identity_registration(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    *,
+    config: BenchmarkConfig,
+    initializer: str,
+    transform_source: str,
+    quality_reference_cache: Optional[ValidationMetricReference] = None,
+) -> SimilarityRegistrationResult:
+    ref = _as_float_2d(reference)
+    mov = _as_float_2d(moving)
+    matrix = np.eye(2, 3, dtype=np.float64)
+    aligned = cv.warpAffine(
+        mov,
+        matrix.astype(np.float32),
+        (ref.shape[1], ref.shape[0]),
+        flags=cv.INTER_LINEAR,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    result = SimilarityRegistrationResult(
+        status="aligned",
+        aligned_image=aligned.astype(np.float32),
+        forward_matrix=matrix,
+        scale=1.0,
+        rotation_deg=0.0,
+        translation_x=0.0,
+        translation_y=0.0,
+        ecc_score=None,
+        ecc_warp_matrix=np.eye(2, 3, dtype=np.float32),
+        registration_profile=REGISTRATION_PROFILE_VALIDATE_WORKSPACE,
+        registration_constraint_level="workspace_transform",
+        registration_underconstrained=False,
+        registration_initializer=initializer,
+        registration_transform_source=transform_source,
+        validation_rankable=True,
+    )
+    result = _with_registration_quality(
+        result,
+        ref,
+        mov.shape[:2],
+        scale_values=[1.0],
+        residual_suspect_px=config.registration_suspect_residual_px,
+        min_matched_beads=config.registration_min_matched_beads,
+        min_structure_score=config.registration_min_structure_score,
+        reference_cache=quality_reference_cache,
+    )
+    result.validation_rankable, result.ranking_exclusion_reason = _registration_rankability(result)
+    return result
+
+
+def _workspace_transform_source_for(references: ReferenceImages, source_kind: str) -> str:
+    sources = references.workspace_transform_info.get("sources", {})
+    source_info: Mapping[str, Any] = {}
+    if isinstance(sources, Mapping):
+        raw = sources.get(source_kind, {})
+        if isinstance(raw, Mapping):
+            source_info = raw
+    return str(source_info.get("transform_source") or f"{source_kind}_alignment_final_warp_matrix")
 
 
 def _resolve_manual_transform(
@@ -2029,7 +2095,20 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             f"dataset_id={cfg.dataset_id!r}."
         )
 
-    if cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
+    if cfg.use_validation_workspace_transforms:
+        anchor_record = _select_anchor(candidate_images, cfg.anchor_row_id)
+        anchor_registration = _workspace_grid_identity_registration(
+            validation,
+            anchor_record.image,
+            config=cfg,
+            initializer="validation_workspace_identity_lf",
+            transform_source="identity_lf_grid",
+            quality_reference_cache=metric_reference_cache,
+        )
+        anchor_registration.anchor_selection_reason = (
+            "explicit_anchor_row_id" if cfg.anchor_row_id != "auto" else "saved_rank_auto_workspace_transform"
+        )
+    elif cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
         anchor_record = _select_anchor(candidate_images, cfg.anchor_row_id)
         anchor_registration = _estimate_manual_similarity_registration(
             validation,
@@ -2103,7 +2182,17 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             row.validation_rank = rank
             rank += 1
 
-    if cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
+    if cfg.use_validation_workspace_transforms:
+        thor_source = _workspace_transform_source_for(references, "thorcam")
+        thor_registration = _workspace_grid_identity_registration(
+            validation,
+            thorcam,
+            config=cfg,
+            initializer="validation_workspace_transform",
+            transform_source=thor_source,
+            quality_reference_cache=metric_reference_cache,
+        )
+    elif cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
         thor_registration = _estimate_manual_similarity_registration(
             validation,
             thorcam,
@@ -2156,6 +2245,17 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     if cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
         _write_manual_points_figure(figures_dir / "manual_points_lf.png", validation, anchor_record.image, anchor_registration)
         _write_manual_points_figure(figures_dir / "manual_points_thorcam.png", validation, thorcam, thor_registration)
+    if cfg.use_validation_workspace_transforms:
+        _write_workspace_transform_diagnostic_figure(
+            figures_dir / "validation_workspace_validation_overlay.png",
+            validation,
+            validation,
+        )
+        _write_workspace_transform_diagnostic_figure(
+            figures_dir / "validation_workspace_thorcam_overlay.png",
+            validation,
+            thorcam,
+        )
     top_rows = lf_rows[: max(0, cfg.top_k)]
     for row in top_rows:
         _write_comparison_figures(figures_dir, validation, row)
@@ -2189,6 +2289,14 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             anchor_registration,
             thor_registration,
         )
+    if cfg.use_validation_workspace_transforms:
+        _write_validation_workspace_transform_artifact(
+            cfg.output_dir / "trio_validation_workspace_transforms.json",
+            cfg,
+            references,
+            anchor_registration,
+            thor_registration,
+        )
     write_json_atomic(
         cfg.output_dir / "trio_benchmark_summary.json",
         summary,
@@ -2205,7 +2313,15 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
 def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
     generation_scope = _normalize_generation_scope_arg(config.generation_scope)
-    registration_profile = _normalize_registration_profile(config.registration_profile)
+    use_validation_workspace_transforms = bool(
+        config.use_validation_workspace_transforms
+        or str(config.registration_profile).strip() == REGISTRATION_PROFILE_VALIDATE_WORKSPACE
+    )
+    registration_profile = (
+        REGISTRATION_PROFILE_VALIDATE_WORKSPACE
+        if use_validation_workspace_transforms
+        else _normalize_registration_profile(config.registration_profile)
+    )
     scale_values = (
         list(config.scale_values)
         if config.scale_values is not None
@@ -2234,6 +2350,7 @@ def _normalize_config(config: BenchmarkConfig) -> BenchmarkConfig:
         top_k=int(config.top_k),
         residual_translation_max_px=float(config.residual_translation_max_px),
         registration_profile=registration_profile,
+        use_validation_workspace_transforms=use_validation_workspace_transforms,
         registration_annotations=None if config.registration_annotations is None else Path(config.registration_annotations),
         registration_calibration_group=str(
             config.registration_calibration_group or DEFAULT_REGISTRATION_CALIBRATION_GROUP
@@ -2259,6 +2376,10 @@ def _load_reference_images(config: BenchmarkConfig) -> ReferenceImages:
     workspace_path = config.validation_workspace
     if workspace_path is not None:
         workspace = load_workspace_variables(Path(workspace_path))
+    if config.use_validation_workspace_transforms:
+        if workspace is None or workspace_path is None:
+            raise ValueError("use_validation_workspace_transforms requires --validation-workspace")
+        return _load_reference_images_from_workspace_transforms(workspace, workspace_path, config)
 
     validation, validation_source = _load_reference_image(
         image_path=config.validation_image,
@@ -2281,6 +2402,104 @@ def _load_reference_images(config: BenchmarkConfig) -> ReferenceImages:
         thorcam_source=thorcam_source,
         warnings=_validation_workspace_alignment_warnings(workspace, workspace_path),
     )
+
+
+def _load_reference_images_from_workspace_transforms(
+    workspace: Mapping[str, np.ndarray],
+    workspace_path: Path,
+    config: BenchmarkConfig,
+) -> ReferenceImages:
+    if "rectified_image" not in workspace:
+        raise ValueError(f"{workspace_path} does not contain 'rectified_image'")
+    rectified = _as_float_2d(np.asarray(workspace["rectified_image"]))
+    warnings = _validation_workspace_alignment_warnings(workspace, workspace_path)
+    if config.registration_annotations is not None:
+        warnings.append(
+            "use_validation_workspace_transforms enabled; registration_annotations ignored"
+        )
+    validation, validation_info = _warp_workspace_processed_to_rectified_grid(
+        workspace,
+        workspace_path,
+        prefix="validation",
+        rectified_shape=rectified.shape,
+    )
+    thorcam, thorcam_info = _warp_workspace_processed_to_rectified_grid(
+        workspace,
+        workspace_path,
+        prefix="thorcam",
+        rectified_shape=rectified.shape,
+    )
+    warnings.extend(validation_info["warnings"])
+    warnings.extend(thorcam_info["warnings"])
+    transform_info = {
+        "workspace_path": str(workspace_path),
+        "rectified_grid_shape": [int(rectified.shape[0]), int(rectified.shape[1])],
+        "sources": {
+            "validation": validation_info,
+            "thorcam": thorcam_info,
+        },
+    }
+    return ReferenceImages(
+        validation=validation,
+        thorcam=thorcam,
+        validation_source=f"{workspace_path}#validation_processed->{validation_info['transform_source']}",
+        thorcam_source=f"{workspace_path}#thorcam_processed->{thorcam_info['transform_source']}",
+        warnings=_unique_strings(warnings),
+        workspace_transform_info=transform_info,
+    )
+
+
+def _warp_workspace_processed_to_rectified_grid(
+    workspace: Mapping[str, np.ndarray],
+    workspace_path: Path,
+    *,
+    prefix: str,
+    rectified_shape: Tuple[int, int],
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    image_key = f"{prefix}_processed"
+    matrix_key = f"{prefix}_alignment_final_warp_matrix"
+    if image_key not in workspace:
+        raise ValueError(f"{workspace_path} does not contain {image_key!r}")
+    source = _as_float_2d(np.asarray(workspace[image_key]))
+    matrix = _workspace_affine_matrix(workspace.get(matrix_key))
+    warnings: List[str] = []
+    transform_source = matrix_key
+    if matrix is None:
+        if tuple(source.shape[:2]) != tuple(rectified_shape):
+            raise ValueError(
+                f"{workspace_path} has no usable {matrix_key!r} and {image_key!r} shape "
+                f"{tuple(source.shape[:2])} differs from rectified grid {tuple(rectified_shape)}"
+            )
+        matrix = np.eye(2, 3, dtype=np.float32)
+        transform_source = "identity_workspace_same_shape"
+        warnings.append(f"{prefix}:{transform_source}:{matrix_key}")
+    warped = cv.warpAffine(
+        source,
+        np.asarray(matrix, dtype=np.float32),
+        (int(rectified_shape[1]), int(rectified_shape[0])),
+        flags=cv.INTER_LINEAR | cv.WARP_INVERSE_MAP,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0.0,
+    )
+    info: Dict[str, Any] = {
+        "image_key": image_key,
+        "matrix_key": matrix_key,
+        "transform_source": transform_source,
+        "source_shape": [int(source.shape[0]), int(source.shape[1])],
+        "output_shape": [int(rectified_shape[0]), int(rectified_shape[1])],
+        "matrix": np.asarray(matrix, dtype=float).tolist(),
+        "warnings": warnings,
+    }
+    return warped.astype(np.float32), info
+
+
+def _workspace_affine_matrix(value: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.shape != (2, 3) or not np.all(np.isfinite(arr)):
+        return None
+    return arr
 
 
 def _validation_workspace_alignment_warnings(
@@ -2807,6 +3026,7 @@ def _build_summary(
             "top_k": config.top_k,
             "residual_translation_max_px": config.residual_translation_max_px,
             "registration_profile": config.registration_profile,
+            "use_validation_workspace_transforms": config.use_validation_workspace_transforms,
             "registration_annotations": None if config.registration_annotations is None else str(config.registration_annotations),
             "registration_calibration_group": config.registration_calibration_group,
             "registration_calibration_mode": config.registration_calibration_mode,
@@ -3087,6 +3307,43 @@ def _write_manual_calibration_artifact(
     write_json_atomic(path, payload, sort_keys=True, create_backup=False)
 
 
+def _write_validation_workspace_transform_artifact(
+    path: Path,
+    config: BenchmarkConfig,
+    references: ReferenceImages,
+    lf_registration: SimilarityRegistrationResult,
+    thor_registration: SimilarityRegistrationResult,
+) -> None:
+    payload = {
+        "version": 1,
+        "registration_profile": REGISTRATION_PROFILE_VALIDATE_WORKSPACE,
+        "validation_workspace": None if config.validation_workspace is None else str(config.validation_workspace),
+        "scene_id": config.scene_id,
+        "dataset_id": config.dataset_id,
+        "workspace_transform_info": references.workspace_transform_info,
+        "sources": {
+            "lf": _manual_registration_artifact_summary(lf_registration),
+            "thorcam": _manual_registration_artifact_summary(thor_registration),
+        },
+        "warnings": references.warnings,
+    }
+    write_json_atomic(path, payload, sort_keys=True, create_backup=False)
+
+
+def _write_workspace_transform_diagnostic_figure(path: Path, reference: np.ndarray, warped: np.ndarray) -> None:
+    ref = _robust_unit(reference)
+    mov = _robust_unit(warped)
+    if ref.shape != mov.shape:
+        min_h = min(ref.shape[0], mov.shape[0])
+        min_w = min(ref.shape[1], mov.shape[1])
+        ref = ref[:min_h, :min_w]
+        mov = mov[:min_h, :min_w]
+    overlay = np.zeros((ref.shape[0], ref.shape[1], 3), dtype=np.float32)
+    overlay[..., 0] = ref
+    overlay[..., 1] = mov
+    _save_unit_image(path, overlay)
+
+
 def _manual_registration_artifact_summary(registration: SimilarityRegistrationResult) -> Dict[str, Any]:
     return {
         "status": registration.status,
@@ -3154,6 +3411,7 @@ def _normalize_for_registration(image: np.ndarray) -> np.ndarray:
 def _normalize_registration_profile(profile: str) -> str:
     text = str(profile or DEFAULT_REGISTRATION_PROFILE).strip()
     if text in {
+        REGISTRATION_PROFILE_VALIDATE_WORKSPACE,
         REGISTRATION_PROFILE_MANUAL_SIMILARITY,
         REGISTRATION_PROFILE_BEAD_GEOMETRIC,
         REGISTRATION_PROFILE_BEAD_SIMILARITY,
@@ -3164,7 +3422,7 @@ def _normalize_registration_profile(profile: str) -> str:
         "unsupported registration profile "
         f"{profile!r}; expected {REGISTRATION_PROFILE_BEAD_GEOMETRIC!r}, "
         f"{REGISTRATION_PROFILE_BEAD_SIMILARITY!r}, {REGISTRATION_PROFILE_CENTERED_ECC!r}, "
-        f"or {REGISTRATION_PROFILE_MANUAL_SIMILARITY!r}"
+        f"{REGISTRATION_PROFILE_MANUAL_SIMILARITY!r}, or {REGISTRATION_PROFILE_VALIDATE_WORKSPACE!r}"
     )
 
 
@@ -3172,6 +3430,8 @@ def _default_scale_values_for_registration_profile(profile: str) -> List[float]:
     if profile == REGISTRATION_PROFILE_BEAD_GEOMETRIC:
         return parse_scale_search(DEFAULT_GEOMETRIC_SCALE_SEARCH)
     if profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
+        return [1.0]
+    if profile == REGISTRATION_PROFILE_VALIDATE_WORKSPACE:
         return [1.0]
     return parse_scale_search(DEFAULT_SCALE_SEARCH)
 
@@ -3795,12 +4055,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--registration-profile",
         default=DEFAULT_REGISTRATION_PROFILE,
         choices=[
+            REGISTRATION_PROFILE_VALIDATE_WORKSPACE,
             REGISTRATION_PROFILE_MANUAL_SIMILARITY,
             REGISTRATION_PROFILE_BEAD_GEOMETRIC,
             REGISTRATION_PROFILE_BEAD_SIMILARITY,
             REGISTRATION_PROFILE_CENTERED_ECC,
         ],
     )
+    parser.add_argument("--use-validation-workspace-transforms", action="store_true")
     parser.add_argument("--registration-annotations", default=None, type=Path)
     parser.add_argument("--registration-calibration-group", default=DEFAULT_REGISTRATION_CALIBRATION_GROUP)
     parser.add_argument("--registration-calibration-mode", default=DEFAULT_REGISTRATION_CALIBRATION_MODE, choices=["group", "scene"])
@@ -3839,6 +4101,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             top_k=args.top_k,
             residual_translation_max_px=args.residual_translation_max_px,
             registration_profile=args.registration_profile,
+            use_validation_workspace_transforms=args.use_validation_workspace_transforms,
             registration_annotations=args.registration_annotations,
             registration_calibration_group=args.registration_calibration_group,
             registration_calibration_mode=args.registration_calibration_mode,

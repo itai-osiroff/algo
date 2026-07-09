@@ -129,6 +129,7 @@ def _scene_to_benchmark_config(
             merged.get("residual_translation_max_px", DEFAULT_RESIDUAL_TRANSLATION_MAX_PX)
         ),
         registration_profile=str(merged.get("registration_profile", DEFAULT_REGISTRATION_PROFILE)),
+        use_validation_workspace_transforms=bool(merged.get("use_validation_workspace_transforms", False)),
         registration_suspect_residual_px=float(
             merged.get("registration_suspect_residual_px", DEFAULT_REGISTRATION_SUSPECT_RESIDUAL_PX)
         ),
@@ -192,7 +193,7 @@ def _successful_scene_summary(
         "best_validation_hybrid_v1": best_metrics.get(PROFILE_NAME),
         "thorcam_validation_hybrid_v1": thor_metrics.get(PROFILE_NAME),
         "best_lf_minus_thorcam_validation_hybrid_v1": deltas.get(PROFILE_NAME),
-        "registration_profile": config.registration_profile,
+        "registration_profile": best_registration.get("registration_profile", config.registration_profile),
         "registration_confidence": best_registration.get("registration_confidence"),
         "registration_suspect": best_registration.get("registration_suspect"),
         "registration_constraint_level": best_registration.get("registration_constraint_level"),

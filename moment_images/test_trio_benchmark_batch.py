@@ -177,6 +177,59 @@ def test_batch_manifest_forwards_manual_calibration_fields(tmp_path):
     assert "registration_transform_source" in summary["scenes"][0]
 
 
+def test_batch_manifest_forwards_validation_workspace_transform_flag(tmp_path):
+    sweep_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        include_workspace=True,
+        stage_mode="single_stage",
+    )
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    reference = np.full((4, 4), 1.25, dtype=np.float32)
+    identity = np.eye(2, 3, dtype=np.float32)
+    np.savez_compressed(
+        validation_workspace,
+        rectified_image=reference,
+        validation_processed=reference,
+        thorcam_processed=reference,
+        validation_alignment_final_warp_matrix=identity,
+        thorcam_alignment_final_warp_matrix=identity,
+    )
+    manifest_path = tmp_path / "trio_manifest.json"
+    output_dir = tmp_path / "batch_output"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "defaults": {
+                    "stage": "stage1",
+                    "top_k": 1,
+                    "use_validation_workspace_transforms": True,
+                },
+                "scenes": [
+                    {
+                        "scene_id": "scene_one",
+                        "sweep_dir": str(sweep_dir),
+                        "dataset_id": "d1",
+                        "validation_workspace": str(validation_workspace),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = run_batch_from_manifest(manifest_path, output_dir)
+
+    assert summary["num_successful"] == 1
+    assert summary["scenes"][0]["registration_profile"] == "validate_workspace_transform_v1"
+    assert summary["scenes"][0]["registration_transform_source"] == "identity_lf_grid"
+    scene_summary = json.loads(
+        (output_dir / "scene_one" / "trio_benchmark_summary.json").read_text(encoding="utf-8")
+    )
+    assert scene_summary["config"]["use_validation_workspace_transforms"] is True
+    assert scene_summary["config"]["registration_profile"] == "validate_workspace_transform_v1"
+
+
 def test_batch_main_emits_scene_progress_to_stderr(tmp_path, capsys):
     sweep_dir = _create_modern_fixture(
         tmp_path,
