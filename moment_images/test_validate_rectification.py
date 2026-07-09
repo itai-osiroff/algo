@@ -5,13 +5,18 @@ matplotlib.use("Agg")
 import cv2 as cv
 import matplotlib.pyplot as plt
 import numpy as np
+import pytest
 
+import moment_images.validate_rectification as validate_rectification
 from moment_images.validate_rectification import (
+    AlignmentPointSet,
+    AlignmentResult,
     VALIDATION_MODE_FIT,
     VALIDATION_MODE_PRESERVE,
     ValidationImageResult,
     ValidationOptions,
     _apply_intensity_window,
+    _estimate_similarity_reference_to_input,
     _save_workspace_data,
     _scale_image,
     auto_align_images,
@@ -152,6 +157,127 @@ def test_anisotropic_scale_translation_alignment_finds_expected_roi():
     assert h == corrected.shape[0]
     assert abs(x - 28) <= 3
     assert abs(y - 24) <= 3
+
+
+def test_estimate_similarity_from_single_point_returns_translation():
+    points = AlignmentPointSet(
+        reference_points=((10.0, 15.0),),
+        input_points=((13.5, 9.0),),
+    )
+
+    matrix, rmse = _estimate_similarity_reference_to_input(points)
+
+    np.testing.assert_allclose(
+        matrix,
+        np.array([[1.0, 0.0, 3.5], [0.0, 1.0, -6.0]], dtype=np.float32),
+        rtol=0.0,
+        atol=1e-6,
+    )
+    assert rmse == pytest.approx(0.0, abs=1e-6)
+
+
+def test_estimate_similarity_from_three_points_recovers_rotation_scale_translation():
+    angle = np.deg2rad(30.0)
+    scale = 1.25
+    tx = 7.0
+    ty = -4.5
+    expected = np.array(
+        [
+            [scale * np.cos(angle), -scale * np.sin(angle), tx],
+            [scale * np.sin(angle), scale * np.cos(angle), ty],
+        ],
+        dtype=np.float32,
+    )
+    reference_points = np.array(
+        [
+            [10.0, 15.0],
+            [40.0, 12.0],
+            [20.0, 55.0],
+        ],
+        dtype=np.float32,
+    )
+    input_points_h = np.column_stack([reference_points, np.ones(reference_points.shape[0], dtype=np.float32)])
+    input_points = input_points_h @ expected.T
+    points = AlignmentPointSet(
+        reference_points=tuple(map(tuple, reference_points.tolist())),
+        input_points=tuple(map(tuple, input_points.tolist())),
+    )
+
+    matrix, rmse = _estimate_similarity_reference_to_input(points)
+
+    np.testing.assert_allclose(matrix, expected, rtol=0.0, atol=1e-5)
+    assert rmse == pytest.approx(0.0, abs=1e-5)
+
+
+def test_estimate_similarity_rejects_duplicate_points():
+    points = AlignmentPointSet(
+        reference_points=((5.0, 5.0), (5.0, 5.0)),
+        input_points=((10.0, 10.0), (11.0, 10.0)),
+    )
+
+    with pytest.raises(ValueError, match="zero variance"):
+        _estimate_similarity_reference_to_input(points)
+
+
+def test_point_guided_alignment_warps_input_to_reference_grid_and_masks_border():
+    ref = _synthetic_reference()
+    point_matrix = np.array([[1.0, 0.0, 5.0], [0.0, 1.0, -3.0]], dtype=np.float32)
+    target = cv.warpAffine(
+        ref,
+        point_matrix,
+        (ref.shape[1], ref.shape[0]),
+        flags=cv.INTER_LINEAR,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    points = AlignmentPointSet(
+        reference_points=((35.0, 30.0),),
+        input_points=((40.0, 27.0),),
+    )
+    options = ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=False)
+
+    alignment = auto_align_images(ref, target, options=options, point_pairs=points)
+    comp = prepare_images_for_comparison(ref, target, options=options, alignment_result=alignment)
+
+    assert alignment.match_found
+    assert alignment.alignment_model == "point_similarity"
+    assert alignment.aligned_image.shape == ref.shape
+    assert alignment.valid_mask is not None
+    assert comp.match_found
+    assert comp.registered_valid_mask is not None
+    assert not bool(comp.registered_valid_mask[10, -1])
+    assert comp.diff_native_image is not None
+    assert np.isnan(comp.diff_native_image[10, -1])
+    valid_diff = comp.diff_native_image[comp.registered_valid_mask]
+    assert float(np.nanmean(valid_diff)) < 1e-4
+
+
+def test_point_guided_alignment_keeps_point_result_when_residual_ecc_fails(monkeypatch):
+    ref = _synthetic_reference()
+    target = np.roll(ref, shift=2, axis=1)
+    points = AlignmentPointSet(
+        reference_points=((35.0, 30.0),),
+        input_points=((37.0, 30.0),),
+    )
+    options = ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=True)
+
+    def fail_ecc(_ref_img, _target_img):
+        raise cv.error("forced failure")
+
+    monkeypatch.setattr(validate_rectification, "_ecc_align_same_size", fail_ecc)
+
+    alignment = auto_align_images(
+        ref,
+        target,
+        options=options,
+        point_pairs=points,
+        run_ecc_after_points=True,
+    )
+
+    assert alignment.status.startswith("point_aligned_residual_ecc_failed")
+    assert alignment.alignment_model == "point_similarity"
+    assert alignment.residual_warp_matrix is None
+    np.testing.assert_allclose(alignment.point_transform_matrix, np.array([[1.0, 0.0, 2.0], [0.0, 1.0, 0.0]]))
 
 
 def test_differing_shapes_still_produce_figures_without_crash():
@@ -442,3 +568,93 @@ def test_save_workspace_data_persists_resize_processing_flags(tmp_path):
         assert bool(workspace["validation_preserve_flux_sum"]) is True
         assert bool(workspace["thorcam_preblur_before_resize"]) is False
         assert bool(workspace["thorcam_preserve_flux_sum"]) is False
+        assert workspace["validation_alignment_point_reference_points"].shape == (0, 2)
+        assert workspace["validation_alignment_point_input_points"].shape == (0, 2)
+        assert np.isnan(workspace["validation_alignment_point_transform_matrix"]).all()
+        assert np.isnan(workspace["validation_alignment_residual_warp_matrix"]).all()
+        assert np.isnan(workspace["validation_alignment_final_warp_matrix"]).all()
+
+
+def test_save_workspace_data_persists_point_alignment_metadata(tmp_path):
+    rectified = np.zeros((8, 8), dtype=np.float32)
+    val_path = tmp_path / "val.png"
+    thor_path = tmp_path / "thor.png"
+    save_path = tmp_path / "validation_workspace.npz"
+
+    assert cv.imwrite(str(val_path), np.full((8, 8), 80, dtype=np.uint8))
+    assert cv.imwrite(str(thor_path), np.full((8, 8), 140, dtype=np.uint8))
+
+    points = AlignmentPointSet(
+        reference_points=((1.0, 2.0), (5.0, 2.0)),
+        input_points=((2.0, 3.0), (6.0, 3.0)),
+    )
+    point_matrix = np.array([[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]], dtype=np.float32)
+    residual_matrix = np.array([[1.0, 0.0, 0.25], [0.0, 1.0, -0.5]], dtype=np.float32)
+    final_matrix = np.array([[1.0, 0.0, 1.25], [0.0, 1.0, 0.5]], dtype=np.float32)
+    alignment = AlignmentResult(
+        aligned_image=rectified.copy(),
+        status="point_aligned_with_residual_ecc",
+        mode=VALIDATION_MODE_PRESERVE,
+        match_found=True,
+        warp_matrix=final_matrix,
+        roi_reference=(0, 0, 8, 8),
+        roi_input=(0, 0, 8, 8),
+        alignment_model="point_similarity+translation_ecc",
+        point_pairs=points,
+        point_transform_matrix=point_matrix,
+        residual_warp_matrix=residual_matrix,
+        point_rmse=0.125,
+    )
+    val_result = ValidationImageResult(
+        processed_image=rectified.copy(),
+        options=ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=True),
+        alignment_result=alignment,
+        scale_x=1.0,
+        scale_y=1.0,
+        preblur_before_resize=True,
+        preserve_flux_sum=True,
+        intensity_min=0.0,
+        intensity_max=255.0,
+        crop_box=None,
+        rotation_deg=0,
+        flip_h=False,
+        flip_v=False,
+        alignment_points=points,
+        point_alignment_enabled=True,
+        point_alignment_residual_ecc=True,
+    )
+    thor_result = ValidationImageResult(
+        processed_image=rectified.copy(),
+        options=ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=False),
+        alignment_result=None,
+        scale_x=1.0,
+        scale_y=1.0,
+        preblur_before_resize=True,
+        preserve_flux_sum=True,
+        intensity_min=0.0,
+        intensity_max=255.0,
+        crop_box=None,
+        rotation_deg=0,
+        flip_h=False,
+        flip_v=False,
+    )
+
+    _save_workspace_data(
+        save_path=str(save_path),
+        rectified_img=rectified,
+        val_path=str(val_path),
+        thor_path=str(thor_path),
+        val_result=val_result,
+        thor_result=thor_result,
+    )
+
+    with np.load(save_path) as workspace:
+        np.testing.assert_allclose(workspace["validation_alignment_point_reference_points"], np.array(points.reference_points))
+        np.testing.assert_allclose(workspace["validation_alignment_point_input_points"], np.array(points.input_points))
+        np.testing.assert_allclose(workspace["validation_alignment_point_transform_matrix"], point_matrix)
+        np.testing.assert_allclose(workspace["validation_alignment_residual_warp_matrix"], residual_matrix)
+        np.testing.assert_allclose(workspace["validation_alignment_final_warp_matrix"], final_matrix)
+        assert workspace["validation_alignment_model"].item() == "point_similarity+translation_ecc"
+        assert float(workspace["validation_alignment_point_rmse"]) == pytest.approx(0.125)
+        assert bool(workspace["validation_point_alignment_enabled"]) is True
+        assert bool(workspace["validation_point_alignment_residual_ecc"]) is True
