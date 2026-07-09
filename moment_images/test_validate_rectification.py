@@ -101,6 +101,23 @@ def test_fit_reference_alignment_preserves_processed_input_geometry():
     assert aligned.roi_input == (0, 0, target.shape[1], target.shape[0])
 
 
+def test_auto_align_disabled_returns_identity_final_matrix():
+    ref = _synthetic_reference()
+    target = ref.copy()
+    options = ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=False)
+
+    aligned = auto_align_images(ref, target, options=options)
+
+    assert aligned.status == "auto_align_disabled"
+    assert aligned.alignment_model == "none"
+    np.testing.assert_allclose(
+        aligned.warp_matrix,
+        np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        rtol=0.0,
+        atol=1e-6,
+    )
+
+
 def test_joint_normalization_diff_exposes_offset():
     ref = np.tile(np.linspace(0, 100, 120, dtype=np.float32), (80, 1))
     target = ref + 20.0
@@ -157,6 +174,59 @@ def test_anisotropic_scale_translation_alignment_finds_expected_roi():
     assert h == corrected.shape[0]
     assert abs(x - 28) <= 3
     assert abs(y - 24) <= 3
+
+
+def test_target_in_reference_alignment_saves_full_grid_transform(monkeypatch):
+    ref = _synthetic_reference()
+    target = ref[24:104, 28:118].copy()
+    roi_warp = np.array([[1.0, 0.0, 0.5], [0.0, 1.0, -0.25]], dtype=np.float32)
+
+    monkeypatch.setattr(
+        validate_rectification,
+        "_find_containment_match",
+        lambda _ref, _target: ("target_in_reference", 28, 24, 1.0),
+    )
+
+    def fake_ecc(ref_roi, target_roi):
+        assert ref_roi.shape == target_roi.shape == target.shape
+        return target_roi.copy(), 0.99, roi_warp.copy()
+
+    monkeypatch.setattr(validate_rectification, "_ecc_align_same_size", fake_ecc)
+
+    options = ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=True)
+    alignment = auto_align_images(ref, target, options=options)
+
+    assert alignment.status == "aligned_target_in_reference"
+    assert alignment.roi_reference == (28, 24, target.shape[1], target.shape[0])
+    expected = np.array([[1.0, 0.0, -27.5], [0.0, 1.0, -24.25]], dtype=np.float32)
+    np.testing.assert_allclose(alignment.warp_matrix, expected, rtol=0.0, atol=1e-6)
+
+
+def test_reference_in_target_alignment_saves_full_grid_transform(monkeypatch):
+    ref = _synthetic_reference()
+    target = np.pad(ref, ((24, 10), (28, 12)), mode="constant")
+    roi_warp = np.array([[1.0, 0.0, 0.5], [0.0, 1.0, -0.25]], dtype=np.float32)
+
+    monkeypatch.setattr(
+        validate_rectification,
+        "_find_containment_match",
+        lambda _ref, _target: ("reference_in_target", 28, 24, 1.0),
+    )
+
+    def fake_ecc(ref_img, target_roi):
+        assert ref_img.shape == ref.shape
+        assert target_roi.shape == ref.shape
+        return ref_img.copy(), 0.99, roi_warp.copy()
+
+    monkeypatch.setattr(validate_rectification, "_ecc_align_same_size", fake_ecc)
+
+    options = ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=True)
+    alignment = auto_align_images(ref, target, options=options)
+
+    assert alignment.status == "aligned_reference_in_target"
+    assert alignment.roi_input == (28, 24, ref.shape[1], ref.shape[0])
+    expected = np.array([[1.0, 0.0, 28.5], [0.0, 1.0, 23.75]], dtype=np.float32)
+    np.testing.assert_allclose(alignment.warp_matrix, expected, rtol=0.0, atol=1e-6)
 
 
 def test_estimate_similarity_from_single_point_returns_translation():
@@ -509,6 +579,7 @@ def test_apply_intensity_window_clips_without_rescaling():
 
 def test_save_workspace_data_persists_resize_processing_flags(tmp_path):
     rectified = np.zeros((8, 8), dtype=np.float32)
+    validation_processed = np.zeros((6, 5), dtype=np.float32)
     val_path = tmp_path / "val.png"
     thor_path = tmp_path / "thor.png"
     save_path = tmp_path / "validation_workspace.npz"
@@ -520,7 +591,7 @@ def test_save_workspace_data_persists_resize_processing_flags(tmp_path):
 
     opts = ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=False)
     val_result = ValidationImageResult(
-        processed_image=rectified.copy(),
+        processed_image=validation_processed,
         options=opts,
         alignment_result=None,
         scale_x=1.0,
@@ -572,7 +643,11 @@ def test_save_workspace_data_persists_resize_processing_flags(tmp_path):
         assert workspace["validation_alignment_point_input_points"].shape == (0, 2)
         assert np.isnan(workspace["validation_alignment_point_transform_matrix"]).all()
         assert np.isnan(workspace["validation_alignment_residual_warp_matrix"]).all()
-        assert np.isnan(workspace["validation_alignment_final_warp_matrix"]).all()
+        np.testing.assert_allclose(
+            workspace["validation_alignment_final_warp_matrix"],
+            np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(workspace["validation_alignment_output_shape"], np.array([6, 5], dtype=np.int32))
 
 
 def test_save_workspace_data_persists_point_alignment_metadata(tmp_path):

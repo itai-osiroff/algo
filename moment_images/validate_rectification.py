@@ -341,6 +341,26 @@ def _compose_reference_to_source_matrices(
     return np.asarray(composed[:2, :], dtype=np.float32)
 
 
+def _identity_affine_matrix() -> np.ndarray:
+    return np.eye(2, 3, dtype=np.float32)
+
+
+def _target_roi_matrix_to_reference_grid(matrix: np.ndarray, roi_x: int, roi_y: int) -> np.ndarray:
+    """Convert a target-in-reference ROI-local warp to full reference-grid coordinates."""
+    adjusted = np.asarray(matrix, dtype=np.float32).copy()
+    adjusted[0, 2] -= adjusted[0, 0] * float(roi_x) + adjusted[0, 1] * float(roi_y)
+    adjusted[1, 2] -= adjusted[1, 0] * float(roi_x) + adjusted[1, 1] * float(roi_y)
+    return adjusted
+
+
+def _source_roi_matrix_to_full_source(matrix: np.ndarray, roi_x: int, roi_y: int) -> np.ndarray:
+    """Convert a reference-in-target ROI-local warp to full source-image coordinates."""
+    adjusted = np.asarray(matrix, dtype=np.float32).copy()
+    adjusted[0, 2] += float(roi_x)
+    adjusted[1, 2] += float(roi_y)
+    return adjusted
+
+
 def _warp_to_grid(
     source: np.ndarray,
     source_from_grid: np.ndarray,
@@ -768,6 +788,7 @@ def _point_guided_align_images(
             status=f"point_alignment_failed:{type(exc).__name__}",
             mode=opts.mode,
             match_found=False,
+            warp_matrix=_identity_affine_matrix(),
             alignment_model=ALIGNMENT_MODEL_POINT_SIMILARITY,
             point_pairs=normalized_points,
         )
@@ -844,6 +865,7 @@ def auto_align_images(
                 status=f"point_alignment_failed:{type(exc).__name__}",
                 mode=opts.mode,
                 match_found=False,
+                warp_matrix=_identity_affine_matrix(),
                 alignment_model=ALIGNMENT_MODEL_POINT_SIMILARITY,
                 point_pairs=point_pairs,
             )
@@ -867,6 +889,7 @@ def auto_align_images(
             status="auto_align_disabled",
             mode=opts.mode,
             match_found=ref.shape == target.shape,
+            warp_matrix=_identity_affine_matrix(),
             roi_reference=(0, 0, ref.shape[1], ref.shape[0]) if ref.shape == target.shape else None,
             roi_input=(0, 0, target.shape[1], target.shape[0]) if ref.shape == target.shape else None,
             alignment_model=ALIGNMENT_MODEL_NONE,
@@ -915,6 +938,7 @@ def auto_align_images(
                 status="no_containment_match",
                 mode=VALIDATION_MODE_PRESERVE,
                 match_found=False,
+                warp_matrix=_identity_affine_matrix(),
             )
 
         mode, x, y, score = match_result
@@ -925,11 +949,13 @@ def auto_align_images(
                 mode=mode,
                 match_found=False,
                 match_score=score,
+                warp_matrix=_identity_affine_matrix(),
             )
 
         if mode == "target_in_reference":
             ref_roi = ref[y:y + tgt_h, x:x + tgt_w]
             aligned_img, cc, warp = _ecc_align_same_size(ref_roi, target)
+            full_warp = _target_roi_matrix_to_reference_grid(warp, x, y)
             return AlignmentResult(
                 aligned_image=aligned_img,
                 status="aligned_target_in_reference",
@@ -937,13 +963,14 @@ def auto_align_images(
                 match_found=True,
                 match_score=score,
                 ecc_score=cc,
-                warp_matrix=warp,
+                warp_matrix=full_warp,
                 roi_reference=(x, y, tgt_w, tgt_h),
                 roi_input=(0, 0, tgt_w, tgt_h),
             )
 
         target_roi = target[y:y + ref_h, x:x + ref_w]
         aligned_roi, cc, warp = _ecc_align_same_size(ref, target_roi)
+        full_warp = _source_roi_matrix_to_full_source(warp, x, y)
         aligned_full = target.copy()
         aligned_full[y:y + ref_h, x:x + ref_w] = aligned_roi
         return AlignmentResult(
@@ -953,7 +980,7 @@ def auto_align_images(
             match_found=True,
             match_score=score,
             ecc_score=cc,
-            warp_matrix=warp,
+            warp_matrix=full_warp,
             roi_reference=(0, 0, ref_w, ref_h),
             roi_input=(x, y, ref_w, ref_h),
         )
@@ -964,6 +991,7 @@ def auto_align_images(
             status=f"ecc_failed:{type(exc).__name__}",
             mode=opts.mode,
             match_found=False,
+            warp_matrix=_identity_affine_matrix(),
         )
 
 
@@ -2485,17 +2513,46 @@ def _affine_matrix_array(matrix: np.ndarray | None) -> np.ndarray:
     return arr
 
 
+def _final_affine_matrix_array(matrix: np.ndarray | None) -> np.ndarray:
+    arr = _affine_matrix_array(matrix)
+    if not np.all(np.isfinite(arr)):
+        return _identity_affine_matrix()
+    return arr
+
+
+def _shape_to_array(shape: tuple[int, int]) -> np.ndarray:
+    return np.array([int(shape[0]), int(shape[1])], dtype=np.int32)
+
+
 def _result_point_set(result: ValidationImageResult) -> AlignmentPointSet:
     if result.alignment_result is not None and result.alignment_result.point_pairs is not None:
         return result.alignment_result.point_pairs.normalized()
     return result.alignment_points.normalized()
 
 
-def _point_alignment_workspace_data(prefix: str, result: ValidationImageResult) -> dict[str, np.ndarray]:
+def _alignment_output_shape(
+    alignment: AlignmentResult | None,
+    reference_shape: tuple[int, int],
+    processed_shape: tuple[int, int],
+) -> tuple[int, int]:
+    if alignment is None or alignment.alignment_model == ALIGNMENT_MODEL_NONE or not alignment.match_found:
+        return processed_shape
+    if alignment.mode == VALIDATION_MODE_FIT:
+        return processed_shape
+    return reference_shape
+
+
+def _alignment_workspace_data(
+    prefix: str,
+    result: ValidationImageResult,
+    reference_shape: tuple[int, int],
+) -> dict[str, np.ndarray]:
     alignment = result.alignment_result
     points = _result_point_set(result)
     point_rmse = np.nan if alignment is None or alignment.point_rmse is None else float(alignment.point_rmse)
     alignment_model = ALIGNMENT_MODEL_NONE if alignment is None else alignment.alignment_model
+    processed_shape = (int(result.processed_image.shape[0]), int(result.processed_image.shape[1]))
+    output_shape = _alignment_output_shape(alignment, reference_shape, processed_shape)
     return {
         f"{prefix}_alignment_point_reference_points": _point_set_array(points, "reference_points"),
         f"{prefix}_alignment_point_input_points": _point_set_array(points, "input_points"),
@@ -2506,7 +2563,10 @@ def _point_alignment_workspace_data(prefix: str, result: ValidationImageResult) 
         f"{prefix}_alignment_residual_warp_matrix": _affine_matrix_array(
             None if alignment is None else alignment.residual_warp_matrix
         ),
-        f"{prefix}_alignment_final_warp_matrix": _affine_matrix_array(None if alignment is None else alignment.warp_matrix),
+        f"{prefix}_alignment_final_warp_matrix": _final_affine_matrix_array(
+            None if alignment is None else alignment.warp_matrix
+        ),
+        f"{prefix}_alignment_output_shape": _shape_to_array(output_shape),
         f"{prefix}_alignment_model": np.array(alignment_model),
         f"{prefix}_point_alignment_enabled": np.array(bool(result.point_alignment_enabled)),
         f"{prefix}_point_alignment_residual_ecc": np.array(bool(result.point_alignment_residual_ecc)),
@@ -2599,8 +2659,9 @@ def _save_workspace_data(
             None if thor_result.alignment_result is None else thor_result.alignment_result.roi_input
         ),
     }
-    vars_to_save.update(_point_alignment_workspace_data("validation", val_result))
-    vars_to_save.update(_point_alignment_workspace_data("thorcam", thor_result))
+    reference_shape = (int(rectified_img.shape[0]), int(rectified_img.shape[1]))
+    vars_to_save.update(_alignment_workspace_data("validation", val_result, reference_shape))
+    vars_to_save.update(_alignment_workspace_data("thorcam", thor_result, reference_shape))
     im_process.save_workspace_variables(save_path, vars_to_save)
 
 

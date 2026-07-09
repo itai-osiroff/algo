@@ -234,6 +234,15 @@ def _workspace_image_shape(data: np.lib.npyio.NpzFile, key: str) -> tuple[int, i
     return int(arr.shape[0]), int(arr.shape[1])
 
 
+def _workspace_shape_pair(data: np.lib.npyio.NpzFile, key: str) -> tuple[int, int] | None:
+    if key not in data:
+        return None
+    arr = np.asarray(data[key], dtype=np.int64).ravel()
+    if arr.size < 2 or np.any(arr[:2] <= 0):
+        return None
+    return int(arr[0]), int(arr[1])
+
+
 def _alignment_output_shape(
     data: np.lib.npyio.NpzFile,
     prefix: BatchPresetPrefix,
@@ -241,6 +250,9 @@ def _alignment_output_shape(
 ) -> tuple[int, int] | None:
     if final_alignment_matrix is None:
         return None
+    explicit_shape = _workspace_shape_pair(data, f"{prefix}_alignment_output_shape")
+    if explicit_shape is not None:
+        return explicit_shape
     mode = _string_item(data, f"{prefix}_mode", "preserve_scale")
     if mode == "fit_reference":
         return _workspace_image_shape(data, f"{prefix}_processed")

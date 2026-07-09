@@ -33,41 +33,47 @@ def _write_validation_workspace(
     *,
     validation_matrix: np.ndarray | None = None,
     thorcam_matrix: np.ndarray | None = None,
+    validation_output_shape: tuple[int, int] | None = None,
+    thorcam_output_shape: tuple[int, int] | None = None,
 ) -> None:
     rectified = np.zeros((6, 7), dtype=np.float32)
     validation_processed = np.zeros((8, 9), dtype=np.float32)
     thorcam_processed = np.zeros((5, 4), dtype=np.float32)
     nan_matrix = np.full((2, 3), np.nan, dtype=np.float32)
-    np.savez_compressed(
-        path,
-        rectified_image=rectified,
-        validation_processed=validation_processed,
-        validation_mode=np.array("preserve_scale"),
-        validation_scale_factors=np.array([0.75, 1.25], dtype=np.float32),
-        validation_preblur_before_resize=np.array(False),
-        validation_preserve_flux_sum=np.array(True),
-        validation_intensity_window=np.array([12.0, 40.0], dtype=np.float32),
-        validation_crop_box=np.array([1, 2, 5, 9], dtype=np.int32),
-        validation_rotation_deg=np.array(90, dtype=np.int32),
-        validation_flip_h=np.array(True),
-        validation_flip_v=np.array(False),
-        validation_alignment_status=np.array("point_aligned"),
-        validation_alignment_model=np.array("point_similarity"),
-        validation_alignment_final_warp_matrix=nan_matrix if validation_matrix is None else validation_matrix,
-        thorcam_processed=thorcam_processed,
-        thorcam_mode=np.array("fit_reference"),
-        thorcam_scale_factors=np.array([1.5, 0.5], dtype=np.float32),
-        thorcam_preblur_before_resize=np.array(True),
-        thorcam_preserve_flux_sum=np.array(False),
-        thorcam_intensity_window=np.array([3.0, 55.0], dtype=np.float32),
-        thorcam_crop_box=np.array([-1, -1, -1, -1], dtype=np.int32),
-        thorcam_rotation_deg=np.array(180, dtype=np.int32),
-        thorcam_flip_h=np.array(False),
-        thorcam_flip_v=np.array(True),
-        thorcam_alignment_status=np.array("not_run"),
-        thorcam_alignment_model=np.array("none"),
-        thorcam_alignment_final_warp_matrix=nan_matrix if thorcam_matrix is None else thorcam_matrix,
-    )
+    payload = {
+        "rectified_image": rectified,
+        "validation_processed": validation_processed,
+        "validation_mode": np.array("preserve_scale"),
+        "validation_scale_factors": np.array([0.75, 1.25], dtype=np.float32),
+        "validation_preblur_before_resize": np.array(False),
+        "validation_preserve_flux_sum": np.array(True),
+        "validation_intensity_window": np.array([12.0, 40.0], dtype=np.float32),
+        "validation_crop_box": np.array([1, 2, 5, 9], dtype=np.int32),
+        "validation_rotation_deg": np.array(90, dtype=np.int32),
+        "validation_flip_h": np.array(True),
+        "validation_flip_v": np.array(False),
+        "validation_alignment_status": np.array("point_aligned"),
+        "validation_alignment_model": np.array("point_similarity"),
+        "validation_alignment_final_warp_matrix": nan_matrix if validation_matrix is None else validation_matrix,
+        "thorcam_processed": thorcam_processed,
+        "thorcam_mode": np.array("fit_reference"),
+        "thorcam_scale_factors": np.array([1.5, 0.5], dtype=np.float32),
+        "thorcam_preblur_before_resize": np.array(True),
+        "thorcam_preserve_flux_sum": np.array(False),
+        "thorcam_intensity_window": np.array([3.0, 55.0], dtype=np.float32),
+        "thorcam_crop_box": np.array([-1, -1, -1, -1], dtype=np.int32),
+        "thorcam_rotation_deg": np.array(180, dtype=np.int32),
+        "thorcam_flip_h": np.array(False),
+        "thorcam_flip_v": np.array(True),
+        "thorcam_alignment_status": np.array("not_run"),
+        "thorcam_alignment_model": np.array("none"),
+        "thorcam_alignment_final_warp_matrix": nan_matrix if thorcam_matrix is None else thorcam_matrix,
+    }
+    if validation_output_shape is not None:
+        payload["validation_alignment_output_shape"] = np.array(validation_output_shape, dtype=np.int32)
+    if thorcam_output_shape is not None:
+        payload["thorcam_alignment_output_shape"] = np.array(thorcam_output_shape, dtype=np.int32)
+    np.savez_compressed(path, **payload)
 
 
 def test_apply_processing_pipeline_matches_validation_chain():
@@ -152,6 +158,21 @@ def test_load_workspace_batch_preset_reads_thorcam_settings(tmp_path: Path):
     assert preset.options.preblur_before_resize is True
     assert preset.options.preserve_flux_sum is False
     assert preset.output_shape == (5, 4)
+    np.testing.assert_allclose(preset.final_alignment_matrix, final_matrix)
+
+
+def test_load_workspace_batch_preset_prefers_saved_alignment_output_shape(tmp_path: Path):
+    workspace_path = tmp_path / "validation_workspace.npz"
+    final_matrix = np.eye(2, 3, dtype=np.float32)
+    _write_validation_workspace(
+        workspace_path,
+        validation_matrix=final_matrix,
+        validation_output_shape=(8, 9),
+    )
+
+    preset = load_workspace_batch_preset(workspace_path, "validation")
+
+    assert preset.output_shape == (8, 9)
     np.testing.assert_allclose(preset.final_alignment_matrix, final_matrix)
 
 
