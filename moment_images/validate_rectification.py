@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Literal
 
 import cv2 as cv
@@ -32,9 +32,14 @@ MIN_TEMPLATE_MATCH_SCORE = 0.20
 VALIDATION_MODE_PRESERVE = "preserve_scale"
 VALIDATION_MODE_FIT = "fit_reference"
 ALIGNMENT_MODEL_TRANSLATION_ECC = "translation_ecc"
+ALIGNMENT_MODEL_NONE = "none"
+ALIGNMENT_MODEL_POINT_SIMILARITY = "point_similarity"
+ALIGNMENT_MODEL_POINT_SIMILARITY_ECC = "point_similarity+translation_ecc"
 PREVIEW_DEBOUNCE_MS = 140
 SCALE_MIN = 0.001
 SCALE_MAX = 8.0
+MAX_ALIGNMENT_POINT_PAIRS = 3
+VALID_MASK_THRESHOLD = 0.999
 
 ValidationMode = Literal["preserve_scale", "fit_reference"]
 AlignmentModel = Literal["translation_ecc"]
@@ -78,6 +83,30 @@ class ValidationOptions:
         )
 
 
+@dataclass(frozen=True)
+class AlignmentPointSet:
+    """Paired landmarks between the displayed reference grid and processed input."""
+
+    reference_points: tuple[tuple[float, float], ...] = ()
+    input_points: tuple[tuple[float, float], ...] = ()
+
+    def normalized(self) -> "AlignmentPointSet":
+        ref = _normalize_point_sequence(self.reference_points, "reference_points")
+        inp = _normalize_point_sequence(self.input_points, "input_points")
+        if len(ref) != len(inp):
+            raise ValueError("Alignment point sets must contain the same number of reference and input points.")
+        if len(ref) > MAX_ALIGNMENT_POINT_PAIRS:
+            raise ValueError(f"Alignment supports at most {MAX_ALIGNMENT_POINT_PAIRS} point pairs.")
+        return AlignmentPointSet(reference_points=ref, input_points=inp)
+
+    @property
+    def pair_count(self) -> int:
+        return len(self.reference_points)
+
+    def is_empty(self) -> bool:
+        return self.pair_count == 0 and len(self.input_points) == 0
+
+
 @dataclass
 class AlignmentResult:
     """Alignment output including diagnostics and ROI mapping."""
@@ -91,6 +120,12 @@ class AlignmentResult:
     warp_matrix: np.ndarray | None = None
     roi_reference: tuple[int, int, int, int] | None = None  # (x, y, w, h)
     roi_input: tuple[int, int, int, int] | None = None  # (x, y, w, h)
+    alignment_model: str = ALIGNMENT_MODEL_TRANSLATION_ECC
+    point_pairs: AlignmentPointSet | None = None
+    point_transform_matrix: np.ndarray | None = None
+    residual_warp_matrix: np.ndarray | None = None
+    point_rmse: float | None = None
+    valid_mask: np.ndarray | None = None
 
 
 @dataclass
@@ -112,6 +147,7 @@ class ComparisonData:
     diff_normalized_image: np.ndarray | None = None
     overlay_native_image: np.ndarray | None = None
     overlay_normalized_image: np.ndarray | None = None
+    registered_valid_mask: np.ndarray | None = None
 
 
 @dataclass
@@ -131,6 +167,9 @@ class ValidationImageResult:
     rotation_deg: int
     flip_h: bool
     flip_v: bool
+    alignment_points: AlignmentPointSet = field(default_factory=AlignmentPointSet)
+    point_alignment_enabled: bool = False
+    point_alignment_residual_ecc: bool = False
 
 
 def _average_rectified_from_stack(stack: np.ndarray) -> np.ndarray:
@@ -204,6 +243,147 @@ def _resolve_options(
     if prefer_smaller_pixels_contained:
         threshold = MIN_TEMPLATE_MATCH_SCORE
     return ValidationOptions(mode=mode, auto_align=False, template_score_threshold=threshold).normalized()
+
+
+def _normalize_point_sequence(
+    points: tuple[tuple[float, float], ...] | list[tuple[float, float]] | np.ndarray,
+    label: str,
+) -> tuple[tuple[float, float], ...]:
+    arr = np.asarray(points, dtype=np.float64)
+    if arr.size == 0:
+        return ()
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError(f"{label} must be an Nx2 point array.")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{label} must contain only finite coordinates.")
+    return tuple((float(x), float(y)) for x, y in arr)
+
+
+def _point_set_to_arrays(point_pairs: AlignmentPointSet) -> tuple[np.ndarray, np.ndarray]:
+    normalized = point_pairs.normalized()
+    if normalized.pair_count < 1:
+        raise ValueError("Point-guided alignment requires at least one point pair.")
+    ref = np.asarray(normalized.reference_points, dtype=np.float64)
+    inp = np.asarray(normalized.input_points, dtype=np.float64)
+    return ref, inp
+
+
+def _apply_affine_to_points(points_xy: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points_xy, dtype=np.float64)
+    mat = np.asarray(matrix, dtype=np.float64)
+    hom = np.column_stack([pts, np.ones(pts.shape[0], dtype=np.float64)])
+    return hom @ mat.T
+
+
+def _estimate_similarity_reference_to_input(point_pairs: AlignmentPointSet) -> tuple[np.ndarray, float]:
+    """
+    Estimate the similarity transform from reference-grid points to input points.
+
+    The returned 2x3 matrix maps output/reference coordinates into source/input
+    coordinates and is therefore suitable for cv.warpAffine(..., WARP_INVERSE_MAP).
+    """
+    ref, inp = _point_set_to_arrays(point_pairs)
+    if ref.shape[0] == 1:
+        delta = inp[0] - ref[0]
+        matrix = np.array(
+            [[1.0, 0.0, delta[0]], [0.0, 1.0, delta[1]]],
+            dtype=np.float32,
+        )
+        return matrix, 0.0
+
+    ref_mean = np.mean(ref, axis=0)
+    inp_mean = np.mean(inp, axis=0)
+    ref_centered = ref - ref_mean
+    inp_centered = inp - inp_mean
+    ref_variance = float(np.sum(ref_centered * ref_centered))
+    inp_variance = float(np.sum(inp_centered * inp_centered))
+    if ref_variance <= 1e-12 or inp_variance <= 1e-12:
+        raise ValueError("Cannot estimate point similarity from zero variance point sets.")
+
+    covariance = ref_centered.T @ inp_centered
+    u_mat, singular_values, vt_mat = np.linalg.svd(covariance)
+    d_mat = np.eye(2, dtype=np.float64)
+    if np.linalg.det(vt_mat.T @ u_mat.T) < 0.0:
+        d_mat[-1, -1] = -1.0
+    rotation = vt_mat.T @ d_mat @ u_mat.T
+    scale = float(np.trace(np.diag(singular_values) @ d_mat) / ref_variance)
+    if not np.isfinite(scale) or abs(scale) <= 1e-12:
+        raise ValueError("Cannot estimate point similarity with a non-finite or zero scale.")
+
+    translation = inp_mean - scale * (rotation @ ref_mean)
+    matrix64 = np.array(
+        [
+            [scale * rotation[0, 0], scale * rotation[0, 1], translation[0]],
+            [scale * rotation[1, 0], scale * rotation[1, 1], translation[1]],
+        ],
+        dtype=np.float64,
+    )
+    predicted = _apply_affine_to_points(ref, matrix64)
+    residual = predicted - inp
+    rmse = float(np.sqrt(np.mean(np.sum(residual * residual, axis=1))))
+    return np.asarray(matrix64, dtype=np.float32), rmse
+
+
+def _affine_to_homogeneous(matrix: np.ndarray) -> np.ndarray:
+    mat = np.asarray(matrix, dtype=np.float64)
+    if mat.shape != (2, 3):
+        raise ValueError("Expected a 2x3 affine matrix.")
+    return np.vstack([mat, np.array([0.0, 0.0, 1.0], dtype=np.float64)])
+
+
+def _compose_reference_to_source_matrices(
+    source_from_intermediate: np.ndarray,
+    intermediate_from_reference: np.ndarray,
+) -> np.ndarray:
+    composed = _affine_to_homogeneous(source_from_intermediate) @ _affine_to_homogeneous(
+        intermediate_from_reference
+    )
+    return np.asarray(composed[:2, :], dtype=np.float32)
+
+
+def _warp_to_grid(
+    source: np.ndarray,
+    source_from_grid: np.ndarray,
+    output_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    out_h, out_w = output_shape
+    matrix = np.asarray(source_from_grid, dtype=np.float32)
+    aligned = cv.warpAffine(
+        np.asarray(source, dtype=np.float32),
+        matrix,
+        (out_w, out_h),
+        flags=cv.INTER_LINEAR | cv.WARP_INVERSE_MAP,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=np.nan,
+    )
+    source_mask = np.ones(source.shape[:2], dtype=np.float32)
+    warped_mask = cv.warpAffine(
+        source_mask,
+        matrix,
+        (out_w, out_h),
+        flags=cv.INTER_NEAREST | cv.WARP_INVERSE_MAP,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return aligned.astype(np.float32), np.asarray(warped_mask >= VALID_MASK_THRESHOLD, dtype=bool)
+
+
+def _reference_grid_for_alignment(
+    ref: np.ndarray,
+    target: np.ndarray,
+    mode: str,
+) -> tuple[np.ndarray, tuple[int, int, int, int], tuple[int, int, int, int]]:
+    ref_h, ref_w = ref.shape[:2]
+    tgt_h, tgt_w = target.shape[:2]
+    if mode == VALIDATION_MODE_FIT:
+        ref_grid = ref if (tgt_h, tgt_w) == (ref_h, ref_w) else cv.resize(
+            ref, (tgt_w, tgt_h), interpolation=cv.INTER_LINEAR
+        )
+        roi = (0, 0, tgt_w, tgt_h)
+        return np.asarray(ref_grid, dtype=np.float32), roi, roi
+
+    roi = (0, 0, ref_w, ref_h)
+    return np.asarray(ref, dtype=np.float32), roi, roi
 
 
 def _to_gray_float32(image: Image.Image | np.ndarray) -> np.ndarray:
@@ -353,6 +533,35 @@ def _joint_norm_bounds(
 
 def _joint_finite_bounds(img_a: np.ndarray, img_b: np.ndarray) -> tuple[float, float]:
     return _joint_norm_bounds(img_a, img_b, (0.0, 100.0))
+
+
+def _joint_norm_bounds_masked(
+    img_a: np.ndarray,
+    img_b: np.ndarray,
+    percentiles: tuple[float, float],
+    mask: np.ndarray,
+) -> tuple[float, float]:
+    p_low, p_high = _sanitize_percentiles(percentiles)
+    mask_bool = np.asarray(mask, dtype=bool)
+    if mask_bool.shape != img_a.shape or mask_bool.shape != img_b.shape:
+        return _joint_norm_bounds(img_a, img_b, percentiles)
+    values = np.concatenate(
+        [
+            np.asarray(img_a, dtype=np.float32)[mask_bool].ravel(),
+            np.asarray(img_b, dtype=np.float32)[mask_bool].ravel(),
+        ]
+    )
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    low = float(np.percentile(finite, p_low))
+    high = float(np.percentile(finite, p_high))
+    if high <= low:
+        low = float(np.min(finite))
+        high = float(np.max(finite))
+    if high <= low:
+        high = low + 1.0
+    return low, high
 
 
 def _normalize_with_bounds(image: np.ndarray, low: float, high: float) -> np.ndarray:
@@ -542,6 +751,66 @@ def _ecc_align_same_size(ref_img: np.ndarray, target_img: np.ndarray) -> tuple[n
     return aligned_img.astype(np.float32), float(cc), warp_matrix
 
 
+def _point_guided_align_images(
+    ref: np.ndarray,
+    target: np.ndarray,
+    opts: ValidationOptions,
+    point_pairs: AlignmentPointSet,
+    *,
+    run_ecc_after_points: bool = False,
+) -> AlignmentResult:
+    normalized_points = point_pairs.normalized()
+    try:
+        point_matrix, point_rmse = _estimate_similarity_reference_to_input(normalized_points)
+    except Exception as exc:
+        return AlignmentResult(
+            aligned_image=target.copy(),
+            status=f"point_alignment_failed:{type(exc).__name__}",
+            mode=opts.mode,
+            match_found=False,
+            alignment_model=ALIGNMENT_MODEL_POINT_SIMILARITY,
+            point_pairs=normalized_points,
+        )
+
+    ref_grid, roi_reference, roi_input = _reference_grid_for_alignment(ref, target, opts.mode)
+    output_shape = ref_grid.shape[:2]
+    point_aligned, valid_mask = _warp_to_grid(target, point_matrix, output_shape)
+
+    final_matrix = point_matrix
+    residual_matrix: np.ndarray | None = None
+    ecc_score: float | None = None
+    aligned_image = point_aligned
+    status = "point_aligned"
+    alignment_model = ALIGNMENT_MODEL_POINT_SIMILARITY
+
+    if run_ecc_after_points:
+        try:
+            _, ecc_score, residual_matrix = _ecc_align_same_size(ref_grid, point_aligned)
+            final_matrix = _compose_reference_to_source_matrices(point_matrix, residual_matrix)
+            aligned_image, valid_mask = _warp_to_grid(target, final_matrix, output_shape)
+            status = "point_aligned_with_residual_ecc"
+            alignment_model = ALIGNMENT_MODEL_POINT_SIMILARITY_ECC
+        except Exception as exc:
+            status = f"point_aligned_residual_ecc_failed:{type(exc).__name__}"
+
+    return AlignmentResult(
+        aligned_image=aligned_image,
+        status=status,
+        mode=opts.mode,
+        match_found=True,
+        ecc_score=ecc_score,
+        warp_matrix=final_matrix,
+        roi_reference=roi_reference,
+        roi_input=roi_input,
+        alignment_model=alignment_model,
+        point_pairs=normalized_points,
+        point_transform_matrix=point_matrix,
+        residual_warp_matrix=residual_matrix,
+        point_rmse=point_rmse,
+        valid_mask=valid_mask,
+    )
+
+
 def auto_align_images(
     ref_img: np.ndarray,
     target_img: np.ndarray,
@@ -549,6 +818,8 @@ def auto_align_images(
     *,
     resize_to_reference: bool | None = None,
     prefer_smaller_pixels_contained: bool = False,  # backward compatibility
+    point_pairs: AlignmentPointSet | None = None,
+    run_ecc_after_points: bool = False,
 ) -> AlignmentResult:
     """
     Align target_img to ref_img using the requested strategy.
@@ -564,6 +835,32 @@ def auto_align_images(
     ref = _to_gray_float32(ref_img)
     target = _to_gray_float32(target_img)
 
+    if point_pairs is not None:
+        try:
+            normalized_point_pairs = point_pairs.normalized()
+        except Exception as exc:
+            return AlignmentResult(
+                aligned_image=target.copy(),
+                status=f"point_alignment_failed:{type(exc).__name__}",
+                mode=opts.mode,
+                match_found=False,
+                alignment_model=ALIGNMENT_MODEL_POINT_SIMILARITY,
+                point_pairs=point_pairs,
+            )
+        if normalized_point_pairs.is_empty():
+            point_pairs = None
+        else:
+            point_pairs = normalized_point_pairs
+
+    if point_pairs is not None:
+        return _point_guided_align_images(
+            ref,
+            target,
+            opts,
+            point_pairs,
+            run_ecc_after_points=run_ecc_after_points,
+        )
+
     if not opts.auto_align:
         return AlignmentResult(
             aligned_image=target.copy(),
@@ -572,6 +869,7 @@ def auto_align_images(
             match_found=ref.shape == target.shape,
             roi_reference=(0, 0, ref.shape[1], ref.shape[0]) if ref.shape == target.shape else None,
             roi_input=(0, 0, target.shape[1], target.shape[0]) if ref.shape == target.shape else None,
+            alignment_model=ALIGNMENT_MODEL_NONE,
         )
 
     if opts.align_model != ALIGNMENT_MODEL_TRANSLATION_ECC:
@@ -704,6 +1002,7 @@ def prepare_images_for_comparison(
     score: float | None = None
     ecc_score: float | None = None
     match_found = False
+    registered_valid_mask: np.ndarray | None = None
 
     if opts.mode == VALIDATION_MODE_FIT:
         if alignment_result is not None:
@@ -713,6 +1012,8 @@ def prepare_images_for_comparison(
             score = alignment_result.match_score
             ecc_score = alignment_result.ecc_score
             match_found = alignment_result.match_found
+            if alignment_result.valid_mask is not None:
+                registered_valid_mask = np.asarray(alignment_result.valid_mask, dtype=bool)
         else:
             reg_input = target
             status = "fit_reference_reference_resized_to_input_without_alignment"
@@ -731,10 +1032,17 @@ def prepare_images_for_comparison(
         if alignment_result is not None and alignment_result.roi_reference and alignment_result.roi_input:
             reg_ref = _crop_by_roi(ref, alignment_result.roi_reference)
             reg_input = _crop_by_roi(aligned_target, alignment_result.roi_input)
+            if alignment_result.valid_mask is not None:
+                registered_valid_mask = _crop_by_roi(
+                    np.asarray(alignment_result.valid_mask, dtype=bool),
+                    alignment_result.roi_input,
+                ).astype(bool)
             match_found = alignment_result.match_found
         elif aligned_target.shape == ref.shape:
             reg_ref = ref
             reg_input = aligned_target
+            if alignment_result is not None and alignment_result.valid_mask is not None:
+                registered_valid_mask = np.asarray(alignment_result.valid_mask, dtype=bool)
             match_found = True
             if alignment_result is None:
                 status = "preserve_same_shape_without_alignment"
@@ -773,6 +1081,11 @@ def prepare_images_for_comparison(
         min_w = min(reg_ref.shape[1], reg_input.shape[1])
         reg_ref = reg_ref[:min_h, :min_w]
         reg_input = reg_input[:min_h, :min_w]
+        if registered_valid_mask is not None:
+            registered_valid_mask = registered_valid_mask[:min_h, :min_w]
+
+    if registered_valid_mask is not None and registered_valid_mask.shape != reg_ref.shape:
+        registered_valid_mask = None
 
     registered_native_low: float | None = None
     registered_native_high: float | None = None
@@ -780,23 +1093,61 @@ def prepare_images_for_comparison(
     diff_normalized_image: np.ndarray | None = None
     overlay_native_image: np.ndarray | None = None
     overlay_normalized_image: np.ndarray | None = None
+    finite_comparison_mask: np.ndarray | None = None
     if match_found and reg_ref.size > 0 and reg_input.size > 0 and reg_ref.shape == reg_input.shape:
-        registered_native_low, registered_native_high = _joint_finite_bounds(reg_ref, reg_input)
-        diff_native_image = np.abs(reg_ref - reg_input)
-        overlay_native_image = np.zeros((reg_ref.shape[0], reg_ref.shape[1], 3), dtype=np.float32)
-        overlay_native_image[..., 0] = _normalize_with_bounds(reg_ref, registered_native_low, registered_native_high)
-        overlay_native_image[..., 1] = _normalize_with_bounds(reg_input, registered_native_low, registered_native_high)
+        finite_comparison_mask = np.isfinite(reg_ref) & np.isfinite(reg_input)
+        if registered_valid_mask is not None:
+            finite_comparison_mask &= registered_valid_mask
 
-        reg_ref_norm, reg_input_norm = _joint_normalize_pair(reg_ref, reg_input, opts.joint_norm_percentiles)
-        diff_normalized_image = np.abs(reg_ref_norm - reg_input_norm)
+    if finite_comparison_mask is not None and np.any(finite_comparison_mask):
+        if registered_valid_mask is None:
+            registered_native_low, registered_native_high = _joint_finite_bounds(reg_ref, reg_input)
+            reg_ref_norm, reg_input_norm = _joint_normalize_pair(reg_ref, reg_input, opts.joint_norm_percentiles)
+        else:
+            registered_native_low, registered_native_high = _joint_norm_bounds_masked(
+                reg_ref,
+                reg_input,
+                (0.0, 100.0),
+                finite_comparison_mask,
+            )
+            norm_low, norm_high = _joint_norm_bounds_masked(
+                reg_ref,
+                reg_input,
+                opts.joint_norm_percentiles,
+                finite_comparison_mask,
+            )
+            reg_ref_norm = _normalize_with_bounds(reg_ref, norm_low, norm_high)
+            reg_input_norm = _normalize_with_bounds(reg_input, norm_low, norm_high)
+
+        diff_native_image = np.full(reg_ref.shape, np.nan, dtype=np.float32)
+        diff_native_image[finite_comparison_mask] = np.abs(reg_ref - reg_input)[finite_comparison_mask]
+        overlay_native_image = np.zeros((reg_ref.shape[0], reg_ref.shape[1], 3), dtype=np.float32)
+        overlay_native_image[..., 0] = np.where(
+            finite_comparison_mask,
+            _normalize_with_bounds(reg_ref, registered_native_low, registered_native_high),
+            0.0,
+        )
+        overlay_native_image[..., 1] = np.where(
+            finite_comparison_mask,
+            _normalize_with_bounds(reg_input, registered_native_low, registered_native_high),
+            0.0,
+        )
+
+        diff_normalized_image = np.full(reg_ref.shape, np.nan, dtype=np.float32)
+        diff_normalized_image[finite_comparison_mask] = np.abs(reg_ref_norm - reg_input_norm)[finite_comparison_mask]
         overlay_normalized_image = np.zeros((reg_ref_norm.shape[0], reg_ref_norm.shape[1], 3), dtype=np.float32)
-        overlay_normalized_image[..., 0] = reg_ref_norm
-        overlay_normalized_image[..., 1] = reg_input_norm
+        overlay_normalized_image[..., 0] = np.where(finite_comparison_mask, reg_ref_norm, 0.0)
+        overlay_normalized_image[..., 1] = np.where(finite_comparison_mask, reg_input_norm, 0.0)
 
     return ComparisonData(
         mode=mode,
         status=status,
-        match_found=bool(match_found and reg_ref.shape == reg_input.shape and reg_ref.size > 0),
+        match_found=bool(
+            match_found
+            and reg_ref.shape == reg_input.shape
+            and reg_ref.size > 0
+            and (finite_comparison_mask is None or np.any(finite_comparison_mask))
+        ),
         score=score,
         ecc_score=ecc_score,
         as_is_reference=ref,
@@ -809,6 +1160,7 @@ def prepare_images_for_comparison(
         diff_normalized_image=diff_normalized_image,
         overlay_native_image=overlay_native_image,
         overlay_normalized_image=overlay_normalized_image,
+        registered_valid_mask=registered_valid_mask,
     )
 
 
@@ -1040,6 +1392,8 @@ class GuidedValidationEditor:
         self.preblur_before_resize = True
         self.preserve_flux_sum = True
         self.alignment_result: AlignmentResult | None = None
+        self.alignment_points = AlignmentPointSet()
+        self._pending_reference_point: tuple[float, float] | None = None
         self._alignment_dirty = True
         self._preview_job: str | None = None
         self._crop_selector: RectangleSelector | None = None
@@ -1056,27 +1410,34 @@ class GuidedValidationEditor:
 
         self.mode_var = tk.StringVar(value=VALIDATION_MODE_PRESERVE)
         self.auto_align_var = tk.BooleanVar(value=False)
+        self.point_pick_var = tk.BooleanVar(value=False)
+        self.use_points_var = tk.BooleanVar(value=False)
         self.scale_x_var = tk.StringVar(value=f"{self.scale_x_value:.4f}")
         self.scale_y_var = tk.StringVar(value=f"{self.scale_y_value:.4f}")
         self.preblur_var = tk.BooleanVar(value=self.preblur_before_resize)
         self.preserve_flux_var = tk.BooleanVar(value=self.preserve_flux_sum)
         self.scale_status_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="")
+        self.points_status_var = tk.StringVar(value="Points: 0/3")
         self.hover_status_var = tk.StringVar(value="Hover: move cursor over an image to inspect pixel values")
         self.reset_section_var = tk.StringVar(value="geometry")
 
         self.fig_as_is: Figure | None = None
+        self.fig_points: Figure | None = None
         self.fig_registered: Figure | None = None
         self.fig_diff_native: Figure | None = None
         self.fig_diff_norm: Figure | None = None
         self.fig_overlay_native: Figure | None = None
         self.fig_overlay_norm: Figure | None = None
         self.canvas_as_is: FigureCanvasTkAgg | None = None
+        self.canvas_points: FigureCanvasTkAgg | None = None
         self.canvas_registered: FigureCanvasTkAgg | None = None
         self.canvas_diff_native: FigureCanvasTkAgg | None = None
         self.canvas_diff_norm: FigureCanvasTkAgg | None = None
         self.canvas_overlay_native: FigureCanvasTkAgg | None = None
         self.canvas_overlay_norm: FigureCanvasTkAgg | None = None
+        self._points_ref_ax: plt.Axes | None = None
+        self._points_input_ax: plt.Axes | None = None
 
         self._init_ui()
         self._schedule_preview()
@@ -1150,6 +1511,24 @@ class GuidedValidationEditor:
             command=self._on_auto_align_toggle,
         ).pack(side=tk.LEFT, padx=6)
         tk.Button(align_frame, text="Run Alignment", command=self._run_alignment).pack(side=tk.LEFT, padx=4)
+        tk.Checkbutton(
+            align_frame,
+            text="Point Pick",
+            variable=self.point_pick_var,
+            command=self._on_point_pick_toggle,
+        ).pack(side=tk.LEFT, padx=(8, 2))
+        tk.Checkbutton(
+            align_frame,
+            text="Use Points",
+            variable=self.use_points_var,
+            command=self._on_use_points_toggle,
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(align_frame, text="Undo Point", command=self._undo_alignment_point).pack(side=tk.LEFT, padx=2)
+        tk.Button(align_frame, text="Clear Points", command=self._clear_alignment_points_from_ui).pack(
+            side=tk.LEFT,
+            padx=2,
+        )
+        tk.Label(align_frame, textvariable=self.points_status_var, fg="purple").pack(side=tk.LEFT, padx=(4, 2))
 
         intensity_frame = tk.LabelFrame(row_intensity, text="Intensity")
         intensity_frame.pack(side=tk.LEFT, padx=4, pady=2)
@@ -1205,12 +1584,14 @@ class GuidedValidationEditor:
         notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=4)
 
         tab_as_is = ttk.Frame(notebook)
+        tab_points = ttk.Frame(notebook)
         tab_registered = ttk.Frame(notebook)
         tab_diff_native = ttk.Frame(notebook)
         tab_diff_norm = ttk.Frame(notebook)
         tab_overlay_native = ttk.Frame(notebook)
         tab_overlay_norm = ttk.Frame(notebook)
         notebook.add(tab_as_is, text="As-Is")
+        notebook.add(tab_points, text="Alignment Points")
         notebook.add(tab_registered, text="Registered ROI")
         notebook.add(tab_diff_native, text="Diff (Native)")
         notebook.add(tab_diff_norm, text="Diff (Norm)")
@@ -1221,6 +1602,11 @@ class GuidedValidationEditor:
         self.canvas_as_is = FigureCanvasTkAgg(self.fig_as_is, master=tab_as_is)
         self.canvas_as_is.draw()
         self.canvas_as_is.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self.fig_points = Figure(figsize=(10, 7), dpi=100)
+        self.canvas_points = FigureCanvasTkAgg(self.fig_points, master=tab_points)
+        self.canvas_points.draw()
+        self.canvas_points.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         self.fig_registered = Figure(figsize=(10, 7), dpi=100)
         self.canvas_registered = FigureCanvasTkAgg(self.fig_registered, master=tab_registered)
@@ -1253,6 +1639,7 @@ class GuidedValidationEditor:
     def _bind_hover_readout(self) -> None:
         for canvas in (
             self.canvas_as_is,
+            self.canvas_points,
             self.canvas_registered,
             self.canvas_diff_native,
             self.canvas_diff_norm,
@@ -1263,6 +1650,8 @@ class GuidedValidationEditor:
                 continue
             canvas.mpl_connect("motion_notify_event", self._on_canvas_hover)
             canvas.mpl_connect("figure_leave_event", self._on_canvas_leave)
+        if self.canvas_points is not None:
+            self.canvas_points.mpl_connect("button_press_event", self._on_points_canvas_click)
 
     def _on_canvas_leave(self, _event: object) -> None:
         self.hover_status_var.set("Hover: move cursor over an image to inspect pixel values")
@@ -1316,6 +1705,129 @@ class GuidedValidationEditor:
         )
         self.hover_status_var.set(f"{title} | x={ix}, y={iy}, value=[{values_text}]")
 
+    def _alignment_reference_display_image(self, processed: np.ndarray) -> np.ndarray:
+        if self._current_options().mode == VALIDATION_MODE_FIT:
+            return cv.resize(
+                self.reference_image,
+                (processed.shape[1], processed.shape[0]),
+                interpolation=cv.INTER_LINEAR,
+            )
+        return self.reference_image
+
+    def _point_alignment_enabled(self) -> bool:
+        return bool(self.use_points_var.get()) and self.alignment_points.pair_count > 0
+
+    def _active_alignment_points(self) -> AlignmentPointSet | None:
+        if not self._point_alignment_enabled():
+            return None
+        return self.alignment_points.normalized()
+
+    def _format_points_status(self) -> str:
+        count = self.alignment_points.pair_count
+        suffix = "enabled" if self._point_alignment_enabled() else "disabled"
+        if self._pending_reference_point is not None:
+            return f"Points: {count}/3, click matching input ({suffix})"
+        if self.point_pick_var.get():
+            return f"Points: {count}/3, click reference first ({suffix})"
+        return f"Points: {count}/3 ({suffix})"
+
+    def _update_points_status(self, message: str | None = None) -> None:
+        if message:
+            self.points_status_var.set(message)
+        else:
+            self.points_status_var.set(self._format_points_status())
+
+    def _clear_alignment_points(self, *, disable_use_points: bool = True) -> None:
+        self.alignment_points = AlignmentPointSet()
+        self._pending_reference_point = None
+        if disable_use_points:
+            self.use_points_var.set(False)
+        self._invalidate_alignment()
+        self._update_points_status()
+
+    def _clear_alignment_points_from_ui(self) -> None:
+        self._clear_alignment_points(disable_use_points=True)
+        self._schedule_preview()
+
+    def _undo_alignment_point(self) -> None:
+        if self._pending_reference_point is not None:
+            self._pending_reference_point = None
+            self._update_points_status("Points: pending reference cleared")
+            self._schedule_preview()
+            return
+
+        if self.alignment_points.pair_count == 0:
+            self._update_points_status("Points: nothing to undo")
+            return
+
+        self.alignment_points = AlignmentPointSet(
+            reference_points=self.alignment_points.reference_points[:-1],
+            input_points=self.alignment_points.input_points[:-1],
+        )
+        if self.alignment_points.pair_count == 0:
+            self.use_points_var.set(False)
+        self._invalidate_alignment()
+        self._update_points_status()
+        self._schedule_preview()
+
+    def _on_point_pick_toggle(self) -> None:
+        if not self.point_pick_var.get():
+            self._pending_reference_point = None
+        self._update_points_status()
+        self._schedule_preview()
+
+    def _on_use_points_toggle(self) -> None:
+        self._invalidate_alignment()
+        if self.use_points_var.get() and self.alignment_points.pair_count == 0:
+            self._update_points_status("Points: collect at least one pair before using points")
+        else:
+            self._update_points_status()
+        self._schedule_preview()
+
+    def _on_points_canvas_click(self, event: object) -> None:
+        if not self.point_pick_var.get():
+            return
+        button = getattr(event, "button", None)
+        if button != 1:
+            return
+        ax = getattr(event, "inaxes", None)
+        xdata = getattr(event, "xdata", None)
+        ydata = getattr(event, "ydata", None)
+        if ax is None or xdata is None or ydata is None:
+            return
+        point = (float(xdata), float(ydata))
+
+        if ax is self._points_ref_ax:
+            if self.alignment_points.pair_count >= MAX_ALIGNMENT_POINT_PAIRS:
+                self._update_points_status("Points: maximum of 3 pairs reached")
+                return
+            self._pending_reference_point = point
+            self._update_points_status()
+            self._schedule_preview()
+            return
+
+        if ax is self._points_input_ax:
+            if self._pending_reference_point is None:
+                self._update_points_status("Points: click reference point first")
+                return
+            if self.alignment_points.pair_count >= MAX_ALIGNMENT_POINT_PAIRS:
+                self._pending_reference_point = None
+                self._update_points_status("Points: maximum of 3 pairs reached")
+                return
+            ref_points = list(self.alignment_points.reference_points)
+            input_points = list(self.alignment_points.input_points)
+            ref_points.append(self._pending_reference_point)
+            input_points.append(point)
+            self.alignment_points = AlignmentPointSet(
+                reference_points=tuple(ref_points),
+                input_points=tuple(input_points),
+            ).normalized()
+            self._pending_reference_point = None
+            self.use_points_var.set(True)
+            self._invalidate_alignment()
+            self._update_points_status()
+            self._schedule_preview()
+
     def _parse_scale_value(self, raw_value: str, axis_label: str) -> tuple[float | None, str | None]:
         value_text = raw_value.strip()
         if value_text == "":
@@ -1345,7 +1857,7 @@ class GuidedValidationEditor:
         self.scale_y_value = new_y
         self.scale_status_var.set("")
         if changed:
-            self._invalidate_alignment()
+            self._clear_alignment_points()
         return True
 
     def _on_scale_entry_change(self, _event: tk.Event) -> None:
@@ -1368,17 +1880,17 @@ class GuidedValidationEditor:
 
     def _rotate(self, delta_deg: int) -> None:
         self.rotation_deg = (self.rotation_deg + delta_deg) % 360
-        self._invalidate_alignment()
+        self._clear_alignment_points()
         self._schedule_preview()
 
     def _flip_h(self) -> None:
         self.flip_h = not self.flip_h
-        self._invalidate_alignment()
+        self._clear_alignment_points()
         self._schedule_preview()
 
     def _flip_v(self) -> None:
         self.flip_v = not self.flip_v
-        self._invalidate_alignment()
+        self._clear_alignment_points()
         self._schedule_preview()
 
     def _toggle_crop(self) -> None:
@@ -1411,7 +1923,7 @@ class GuidedValidationEditor:
         y1 = max(0, min(y1, geom_h))
         if x1 > x0 and y1 > y0:
             self.crop_box = (x0, y0, x1, y1)
-            self._invalidate_alignment()
+            self._clear_alignment_points()
             self._schedule_preview()
 
     def _on_intensity_change(self, _value: str) -> None:
@@ -1428,10 +1940,11 @@ class GuidedValidationEditor:
         self._schedule_preview()
 
     def _on_mode_change(self, _event: tk.Event) -> None:
-        self._invalidate_alignment()
+        self._clear_alignment_points()
         self._schedule_preview()
 
     def _on_auto_align_toggle(self) -> None:
+        self._invalidate_alignment()
         self._schedule_preview()
 
     def _current_options(self, auto_align_override: bool | None = None) -> ValidationOptions:
@@ -1492,8 +2005,15 @@ class GuidedValidationEditor:
         if not self._apply_scale_entries(commit=True):
             return
         processed = self._build_processed_image()
-        options = self._current_options(auto_align_override=True)
-        self.alignment_result = auto_align_images(self.reference_image, processed, options=options)
+        point_pairs = self._active_alignment_points()
+        options = self._current_options(auto_align_override=True if point_pairs is None else self.auto_align_var.get())
+        self.alignment_result = auto_align_images(
+            self.reference_image,
+            processed,
+            options=options,
+            point_pairs=point_pairs,
+            run_ecc_after_points=point_pairs is not None and options.auto_align,
+        )
         self._alignment_dirty = False
         self._schedule_preview()
 
@@ -1514,8 +2034,10 @@ class GuidedValidationEditor:
         options = self._current_options()
         processed = self._build_processed_image()
 
+        point_pairs = self._active_alignment_points()
+        alignment_requested = options.auto_align or point_pairs is not None
         alignment_for_preview: AlignmentResult | None = None
-        if options.auto_align and not self._alignment_dirty and self.alignment_result is not None:
+        if alignment_requested and not self._alignment_dirty and self.alignment_result is not None:
             alignment_for_preview = self.alignment_result
 
         comp_data = prepare_images_for_comparison(
@@ -1528,6 +2050,7 @@ class GuidedValidationEditor:
         crop_preview_for_norm = self._build_crop_preview_image(apply_scale=False)
 
         self._render_as_is_tab(crop_preview, crop_preview_for_norm)
+        self._render_points_tab(processed)
         self._render_registered_tab(comp_data)
         self._render_diff_native_tab(comp_data)
         self._render_diff_norm_tab(comp_data)
@@ -1550,9 +2073,18 @@ class GuidedValidationEditor:
                 if alignment_for_preview.ecc_score is not None:
                     status_parts.append(f"ECC={alignment_for_preview.ecc_score:.3f}")
         else:
-            status_parts.append("Alignment=disabled")
+            if point_pairs is not None:
+                if self._alignment_dirty or alignment_for_preview is None:
+                    status_parts.append("Alignment=point stale (click Run Alignment)")
+                else:
+                    status_parts.append(f"Alignment={alignment_for_preview.status}")
+            else:
+                status_parts.append("Alignment=disabled")
+        if self.alignment_points.pair_count > 0 or self.point_pick_var.get() or self.use_points_var.get():
+            status_parts.append(self._format_points_status())
         status_parts.append(f"Compare={comp_data.status}")
         self.status_var.set(" | ".join(status_parts))
+        self._update_points_status()
 
     def _render_as_is_tab(
         self,
@@ -1623,6 +2155,75 @@ class GuidedValidationEditor:
         )
         self._crop_selector.set_active(self.crop_active)
         self.canvas_as_is.draw()
+
+    def _render_points_tab(self, processed: np.ndarray) -> None:
+        if self.fig_points is None or self.canvas_points is None:
+            return
+        self.fig_points.clf()
+        ax_ref = self.fig_points.add_subplot(121)
+        ax_input = self.fig_points.add_subplot(122)
+        self._points_ref_ax = ax_ref
+        self._points_input_ax = ax_input
+
+        ref_display = self._alignment_reference_display_image(processed)
+        ref_low, ref_high = _finite_display_bounds(ref_display)
+        input_low, input_high = _finite_display_bounds(processed)
+        _imshow_with_colorbar(
+            ax_ref,
+            ref_display,
+            cmap="gray",
+            vmin=ref_low,
+            vmax=ref_high,
+        )
+        _imshow_with_colorbar(
+            ax_input,
+            processed,
+            cmap="gray",
+            vmin=input_low,
+            vmax=input_high,
+        )
+        ref_mode = "fit grid" if self._current_options().mode == VALIDATION_MODE_FIT else "native grid"
+        ax_ref.set_title(f"Reference Points ({ref_mode})")
+        ax_input.set_title("Input Points (processed)")
+
+        for idx, (ref_pt, input_pt) in enumerate(
+            zip(self.alignment_points.reference_points, self.alignment_points.input_points),
+            start=1,
+        ):
+            ref_x, ref_y = ref_pt
+            input_x, input_y = input_pt
+            ax_ref.plot(ref_x, ref_y, marker="o", markersize=7, markerfacecolor="none", markeredgecolor="yellow")
+            ax_input.plot(
+                input_x,
+                input_y,
+                marker="o",
+                markersize=7,
+                markerfacecolor="none",
+                markeredgecolor="yellow",
+            )
+            ax_ref.text(ref_x + 2, ref_y + 2, str(idx), color="yellow", fontsize=10, weight="bold")
+            ax_input.text(input_x + 2, input_y + 2, str(idx), color="yellow", fontsize=10, weight="bold")
+
+        if self._pending_reference_point is not None:
+            pending_x, pending_y = self._pending_reference_point
+            ax_ref.plot(
+                pending_x,
+                pending_y,
+                marker="x",
+                markersize=8,
+                markeredgewidth=2,
+                color="cyan",
+            )
+            ax_ref.text(
+                pending_x + 2,
+                pending_y + 2,
+                "pending",
+                color="cyan",
+                fontsize=9,
+                weight="bold",
+            )
+
+        self.canvas_points.draw()
 
     def _render_registered_tab(self, comp_data: ComparisonData) -> None:
         if self.fig_registered is None or self.canvas_registered is None:
@@ -1751,6 +2352,7 @@ class GuidedValidationEditor:
             self.flip_h = False
             self.flip_v = False
             self.crop_box = None
+            self._clear_alignment_points()
         elif section == "intensity":
             self.scale_intensity_min.set(self.raw_min_val)
             self.scale_intensity_max.set(self.raw_max_val)
@@ -1765,9 +2367,9 @@ class GuidedValidationEditor:
             self.preblur_var.set(True)
             self.preserve_flux_sum = True
             self.preserve_flux_var.set(True)
+            self._clear_alignment_points()
         elif section == "alignment":
-            self.alignment_result = None
-            self._alignment_dirty = True
+            self._clear_alignment_points()
             self._schedule_preview()
             return
         self._invalidate_alignment()
@@ -1780,6 +2382,7 @@ class GuidedValidationEditor:
         self.crop_box = None
         self.crop_active = False
         self.btn_crop.config(text="Crop OFF")
+        self.point_pick_var.set(False)
         self.scale_intensity_min.set(self.raw_min_val)
         self.scale_intensity_max.set(self.raw_max_val)
         self.intensity_min_value = self.raw_min_val
@@ -1794,6 +2397,7 @@ class GuidedValidationEditor:
         self.preserve_flux_var.set(True)
         self.mode_var.set(VALIDATION_MODE_PRESERVE)
         self.auto_align_var.set(False)
+        self._clear_alignment_points()
         self._invalidate_alignment()
         self._schedule_preview()
 
@@ -1803,9 +2407,17 @@ class GuidedValidationEditor:
         options = self._current_options()
         processed = self._build_processed_image()
         alignment_result: AlignmentResult | None = None
-        if options.auto_align:
+        point_pairs = self._active_alignment_points()
+        alignment_requested = options.auto_align or point_pairs is not None
+        if alignment_requested:
             if self._alignment_dirty or self.alignment_result is None:
-                alignment_result = auto_align_images(self.reference_image, processed, options=options)
+                alignment_result = auto_align_images(
+                    self.reference_image,
+                    processed,
+                    options=options,
+                    point_pairs=point_pairs,
+                    run_ecc_after_points=point_pairs is not None and options.auto_align,
+                )
             else:
                 alignment_result = self.alignment_result
         self._result = ValidationImageResult(
@@ -1822,6 +2434,9 @@ class GuidedValidationEditor:
             rotation_deg=self.rotation_deg,
             flip_h=self.flip_h,
             flip_v=self.flip_v,
+            alignment_points=self.alignment_points,
+            point_alignment_enabled=point_pairs is not None,
+            point_alignment_residual_ecc=point_pairs is not None and options.auto_align,
         )
         self.top.destroy()
 
@@ -1845,6 +2460,57 @@ def _crop_box_to_array(crop_box: tuple[int, int, int, int] | None) -> np.ndarray
     if crop_box is None:
         return np.array([-1, -1, -1, -1], dtype=np.int32)
     return np.array(crop_box, dtype=np.int32)
+
+
+def _empty_point_array() -> np.ndarray:
+    return np.empty((0, 2), dtype=np.float32)
+
+
+def _point_set_array(points: AlignmentPointSet | None, attr: str) -> np.ndarray:
+    if points is None:
+        return _empty_point_array()
+    normalized = points.normalized()
+    raw_points = getattr(normalized, attr)
+    if not raw_points:
+        return _empty_point_array()
+    return np.asarray(raw_points, dtype=np.float32)
+
+
+def _affine_matrix_array(matrix: np.ndarray | None) -> np.ndarray:
+    if matrix is None:
+        return np.full((2, 3), np.nan, dtype=np.float32)
+    arr = np.asarray(matrix, dtype=np.float32)
+    if arr.shape != (2, 3):
+        return np.full((2, 3), np.nan, dtype=np.float32)
+    return arr
+
+
+def _result_point_set(result: ValidationImageResult) -> AlignmentPointSet:
+    if result.alignment_result is not None and result.alignment_result.point_pairs is not None:
+        return result.alignment_result.point_pairs.normalized()
+    return result.alignment_points.normalized()
+
+
+def _point_alignment_workspace_data(prefix: str, result: ValidationImageResult) -> dict[str, np.ndarray]:
+    alignment = result.alignment_result
+    points = _result_point_set(result)
+    point_rmse = np.nan if alignment is None or alignment.point_rmse is None else float(alignment.point_rmse)
+    alignment_model = ALIGNMENT_MODEL_NONE if alignment is None else alignment.alignment_model
+    return {
+        f"{prefix}_alignment_point_reference_points": _point_set_array(points, "reference_points"),
+        f"{prefix}_alignment_point_input_points": _point_set_array(points, "input_points"),
+        f"{prefix}_alignment_point_rmse": np.array(point_rmse, dtype=np.float32),
+        f"{prefix}_alignment_point_transform_matrix": _affine_matrix_array(
+            None if alignment is None else alignment.point_transform_matrix
+        ),
+        f"{prefix}_alignment_residual_warp_matrix": _affine_matrix_array(
+            None if alignment is None else alignment.residual_warp_matrix
+        ),
+        f"{prefix}_alignment_final_warp_matrix": _affine_matrix_array(None if alignment is None else alignment.warp_matrix),
+        f"{prefix}_alignment_model": np.array(alignment_model),
+        f"{prefix}_point_alignment_enabled": np.array(bool(result.point_alignment_enabled)),
+        f"{prefix}_point_alignment_residual_ecc": np.array(bool(result.point_alignment_residual_ecc)),
+    }
 
 
 def _options_to_json_array(options: ValidationOptions) -> np.ndarray:
@@ -1933,6 +2599,8 @@ def _save_workspace_data(
             None if thor_result.alignment_result is None else thor_result.alignment_result.roi_input
         ),
     }
+    vars_to_save.update(_point_alignment_workspace_data("validation", val_result))
+    vars_to_save.update(_point_alignment_workspace_data("thorcam", thor_result))
     im_process.save_workspace_variables(save_path, vars_to_save)
 
 

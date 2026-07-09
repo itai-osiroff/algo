@@ -36,6 +36,7 @@ if __package__ is None or __package__ == "":
         _apply_intensity_window,
         _scale_image,
         _to_gray_float32,
+        _warp_to_grid,
     )
 else:
     from . import im_process
@@ -47,12 +48,14 @@ else:
         _apply_intensity_window,
         _scale_image,
         _to_gray_float32,
+        _warp_to_grid,
     )
 
 
 SUPPORTED_EXTENSIONS: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 FLOAT32_SAFE_EXTENSIONS: tuple[str, ...] = (".tif", ".tiff")
 FLOAT32_OUTPUT_EXTENSION = ".tiff"
+BatchPresetPrefix = Literal["validation", "thorcam"]
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,22 @@ class BatchProcessOptions:
             preblur_before_resize=bool(self.preblur_before_resize),
             preserve_flux_sum=bool(self.preserve_flux_sum),
         )
+
+
+@dataclass(frozen=True)
+class BatchAlignmentPreset:
+    """Validation-workspace preset for batch preprocessing and optional fixed alignment."""
+
+    source_prefix: BatchPresetPrefix
+    options: BatchProcessOptions
+    final_alignment_matrix: np.ndarray | None = None
+    output_shape: tuple[int, int] | None = None
+    alignment_status: str = "not_run"
+    alignment_model: str = "none"
+
+    @property
+    def has_fixed_alignment(self) -> bool:
+        return self.final_alignment_matrix is not None and self.output_shape is not None
 
 
 @dataclass(frozen=True)
@@ -156,7 +175,120 @@ def build_output_path(input_path: str | Path, output_dir: str | Path) -> Path:
     return destination_dir / f"{source.stem}_processed{output_suffix}"
 
 
-def apply_processing_pipeline(image_array: np.ndarray, options: BatchProcessOptions) -> np.ndarray:
+def _array_item(data: np.lib.npyio.NpzFile, key: str, default: object) -> object:
+    if key not in data:
+        return default
+    arr = np.asarray(data[key])
+    if arr.shape == ():
+        return arr.item()
+    return arr
+
+
+def _string_item(data: np.lib.npyio.NpzFile, key: str, default: str = "") -> str:
+    value = _array_item(data, key, default)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _bool_item(data: np.lib.npyio.NpzFile, key: str, default: bool = False) -> bool:
+    return bool(_array_item(data, key, default))
+
+
+def _float_pair(data: np.lib.npyio.NpzFile, key: str, default: tuple[float, float]) -> tuple[float, float]:
+    if key not in data:
+        return default
+    arr = np.asarray(data[key], dtype=np.float64).ravel()
+    if arr.size < 2 or not np.all(np.isfinite(arr[:2])):
+        return default
+    return float(arr[0]), float(arr[1])
+
+
+def _crop_box_from_workspace(data: np.lib.npyio.NpzFile, key: str) -> tuple[int, int, int, int] | None:
+    if key not in data:
+        return None
+    arr = np.asarray(data[key], dtype=np.int64).ravel()
+    if arr.size < 4 or np.any(arr[:4] < 0):
+        return None
+    x0, y0, x1, y1 = (int(v) for v in arr[:4])
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def _alignment_matrix_from_workspace(data: np.lib.npyio.NpzFile, key: str) -> np.ndarray | None:
+    if key not in data:
+        return None
+    matrix = np.asarray(data[key], dtype=np.float32)
+    if matrix.shape != (2, 3) or not np.all(np.isfinite(matrix)):
+        return None
+    return matrix
+
+
+def _workspace_image_shape(data: np.lib.npyio.NpzFile, key: str) -> tuple[int, int] | None:
+    if key not in data:
+        return None
+    arr = np.asarray(data[key])
+    if arr.ndim < 2:
+        return None
+    return int(arr.shape[0]), int(arr.shape[1])
+
+
+def _alignment_output_shape(
+    data: np.lib.npyio.NpzFile,
+    prefix: BatchPresetPrefix,
+    final_alignment_matrix: np.ndarray | None,
+) -> tuple[int, int] | None:
+    if final_alignment_matrix is None:
+        return None
+    mode = _string_item(data, f"{prefix}_mode", "preserve_scale")
+    if mode == "fit_reference":
+        return _workspace_image_shape(data, f"{prefix}_processed")
+    return _workspace_image_shape(data, "rectified_image") or _workspace_image_shape(data, f"{prefix}_processed")
+
+
+def load_workspace_batch_preset(path: str | Path, prefix: BatchPresetPrefix) -> BatchAlignmentPreset:
+    """Load batch preprocessing and fixed-alignment settings from validation_workspace.npz."""
+    if prefix not in {"validation", "thorcam"}:
+        raise ValueError("prefix must be 'validation' or 'thorcam'.")
+
+    with np.load(path) as data:
+        scale_x, scale_y = _float_pair(data, f"{prefix}_scale_factors", (1.0, 1.0))
+        intensity_min, intensity_max = _float_pair(data, f"{prefix}_intensity_window", (0.0, 1.0))
+        final_alignment_matrix = _alignment_matrix_from_workspace(data, f"{prefix}_alignment_final_warp_matrix")
+        options = BatchProcessOptions(
+            rotation_deg=int(_array_item(data, f"{prefix}_rotation_deg", 0)),
+            flip_h=_bool_item(data, f"{prefix}_flip_h", False),
+            flip_v=_bool_item(data, f"{prefix}_flip_v", False),
+            crop_box=_crop_box_from_workspace(data, f"{prefix}_crop_box"),
+            apply_intensity_window=f"{prefix}_intensity_window" in data,
+            intensity_min=intensity_min,
+            intensity_max=intensity_max,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            preblur_before_resize=_bool_item(data, f"{prefix}_preblur_before_resize", True),
+            preserve_flux_sum=_bool_item(data, f"{prefix}_preserve_flux_sum", True),
+        ).normalized()
+        output_shape = _alignment_output_shape(data, prefix, final_alignment_matrix)
+        alignment_status = _string_item(data, f"{prefix}_alignment_status", "not_run")
+        alignment_model = _string_item(data, f"{prefix}_alignment_model", "none")
+
+    return BatchAlignmentPreset(
+        source_prefix=prefix,
+        options=options,
+        final_alignment_matrix=final_alignment_matrix,
+        output_shape=output_shape,
+        alignment_status=alignment_status,
+        alignment_model=alignment_model,
+    )
+
+
+def apply_processing_pipeline(
+    image_array: np.ndarray,
+    options: BatchProcessOptions,
+    *,
+    alignment_preset: BatchAlignmentPreset | None = None,
+) -> np.ndarray:
     """Apply the same processing order used by GuidedValidationEditor."""
     opts = options.normalized()
     if not (SCALE_MIN <= opts.scale_x <= SCALE_MAX and SCALE_MIN <= opts.scale_y <= SCALE_MAX):
@@ -181,6 +313,12 @@ def apply_processing_pipeline(image_array: np.ndarray, options: BatchProcessOpti
         preblur_before_resize=opts.preblur_before_resize,
         preserve_flux_sum=opts.preserve_flux_sum,
     )
+    if alignment_preset is not None and alignment_preset.has_fixed_alignment:
+        processed, _ = _warp_to_grid(
+            processed,
+            alignment_preset.final_alignment_matrix,
+            alignment_preset.output_shape,
+        )
     return np.asarray(processed, dtype=np.float32)
 
 
@@ -196,6 +334,8 @@ def process_single_image(
     input_path: str | Path,
     output_dir: str | Path,
     options: BatchProcessOptions,
+    *,
+    alignment_preset: BatchAlignmentPreset | None = None,
 ) -> BatchFileResult:
     """Process one image and return status without raising to caller."""
     src = Path(input_path)
@@ -220,7 +360,7 @@ def process_single_image(
 
     try:
         source_array = np.asarray(loaded)
-        processed = apply_processing_pipeline(source_array, options)
+        processed = apply_processing_pipeline(source_array, options, alignment_preset=alignment_preset)
         save_processed_image(dst, processed)
     except Exception as exc:  # noqa: BLE001 - batch should continue on per-file failure
         return BatchFileResult(
@@ -241,6 +381,8 @@ def process_folder(
     input_dir: str | Path,
     output_dir: str | Path,
     options: BatchProcessOptions,
+    *,
+    alignment_preset: BatchAlignmentPreset | None = None,
 ) -> BatchRunSummary:
     """Process all supported files in ``input_dir`` and collect summary stats."""
     input_paths = list_supported_images(input_dir)
@@ -249,7 +391,7 @@ def process_folder(
 
     summary = BatchRunSummary()
     for src in input_paths:
-        result = process_single_image(src, output_path, options)
+        result = process_single_image(src, output_path, options, alignment_preset=alignment_preset)
         if result.status == "processed":
             summary.processed.append(result)
         elif result.status == "skipped":
@@ -283,7 +425,10 @@ class BatchValidationProcessorGUI:
         self.scale_y_var = tk.StringVar(value="1.0")
         self.preblur_var = tk.BooleanVar(value=True)
         self.preserve_flux_var = tk.BooleanVar(value=True)
+        self.preset_prefix_var = tk.StringVar(value="validation")
+        self.preset_status_var = tk.StringVar(value="Preset: none")
         self.status_var = tk.StringVar(value="Ready.")
+        self.alignment_preset: BatchAlignmentPreset | None = None
 
         self._build_ui()
 
@@ -354,6 +499,40 @@ class BatchValidationProcessorGUI:
         )
 
         row += 1
+        preset_frame = ttk.LabelFrame(frame, text="Workspace Preset")
+        preset_frame.grid(row=row, column=0, columnspan=3, sticky="we", pady=4)
+        ttk.Label(preset_frame, text="Source").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        ttk.Combobox(
+            preset_frame,
+            textvariable=self.preset_prefix_var,
+            values=["validation", "thorcam"],
+            width=12,
+            state="readonly",
+        ).grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        ttk.Button(preset_frame, text="Load Workspace Preset", command=self._load_workspace_preset).grid(
+            row=0,
+            column=2,
+            sticky="w",
+            padx=4,
+            pady=4,
+        )
+        ttk.Button(preset_frame, text="Clear Preset", command=self._clear_workspace_preset).grid(
+            row=0,
+            column=3,
+            sticky="w",
+            padx=4,
+            pady=4,
+        )
+        ttk.Label(preset_frame, textvariable=self.preset_status_var, foreground="purple").grid(
+            row=1,
+            column=0,
+            columnspan=4,
+            sticky="w",
+            padx=4,
+            pady=(0, 4),
+        )
+
+        row += 1
         actions_frame = ttk.Frame(frame)
         actions_frame.grid(row=row, column=0, columnspan=3, sticky="we", pady=(10, 0))
         ttk.Button(actions_frame, text="Process", command=self._run_processing).pack(side=tk.RIGHT, padx=4)
@@ -373,6 +552,66 @@ class BatchValidationProcessorGUI:
         selection = filedialog.askdirectory(title="Select Output Folder")
         if selection:
             self.output_dir_var.set(selection)
+
+    def _apply_options_to_controls(self, options: BatchProcessOptions) -> None:
+        opts = options.normalized()
+        self.rotation_var.set(str(opts.rotation_deg))
+        self.flip_h_var.set(opts.flip_h)
+        self.flip_v_var.set(opts.flip_v)
+        self.crop_enabled_var.set(opts.crop_box is not None)
+        if opts.crop_box is None:
+            self.crop_x0_var.set("0")
+            self.crop_y0_var.set("0")
+            self.crop_x1_var.set("0")
+            self.crop_y1_var.set("0")
+        else:
+            x0, y0, x1, y1 = opts.crop_box
+            self.crop_x0_var.set(str(x0))
+            self.crop_y0_var.set(str(y0))
+            self.crop_x1_var.set(str(x1))
+            self.crop_y1_var.set(str(y1))
+        self.intensity_enabled_var.set(opts.apply_intensity_window)
+        self.intensity_min_var.set(f"{opts.intensity_min:.6g}")
+        self.intensity_max_var.set(f"{opts.intensity_max:.6g}")
+        self.scale_x_var.set(f"{opts.scale_x:.6g}")
+        self.scale_y_var.set(f"{opts.scale_y:.6g}")
+        self.preblur_var.set(opts.preblur_before_resize)
+        self.preserve_flux_var.set(opts.preserve_flux_sum)
+
+    def _preset_status_text(self, preset: BatchAlignmentPreset | None) -> str:
+        if preset is None:
+            return "Preset: none"
+        alignment_text = "fixed alignment on" if preset.has_fixed_alignment else "preprocessing only"
+        return (
+            f"Preset: {preset.source_prefix} | {alignment_text} | "
+            f"model={preset.alignment_model} | status={preset.alignment_status}"
+        )
+
+    def _load_workspace_preset(self) -> None:
+        selection = filedialog.askopenfilename(
+            title="Select validation_workspace.npz",
+            filetypes=[("Validation Workspace", "*.npz"), ("NPZ Files", "*.npz")],
+        )
+        if not selection:
+            return
+        prefix = self.preset_prefix_var.get()
+        if prefix not in {"validation", "thorcam"}:
+            messagebox.showerror("Invalid Preset Source", "Preset source must be validation or thorcam.")
+            return
+        try:
+            preset = load_workspace_batch_preset(selection, prefix)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001 - GUI should surface workspace import errors
+            messagebox.showerror("Preset Load Failed", str(exc))
+            return
+        self.alignment_preset = preset
+        self._apply_options_to_controls(preset.options)
+        self.preset_status_var.set(self._preset_status_text(preset))
+        self.status_var.set(f"Loaded {prefix} preset.")
+
+    def _clear_workspace_preset(self) -> None:
+        self.alignment_preset = None
+        self.preset_status_var.set(self._preset_status_text(None))
+        self.status_var.set("Preset cleared.")
 
     def _parse_options(self) -> BatchProcessOptions | None:
         try:
@@ -463,7 +702,12 @@ class BatchValidationProcessorGUI:
         self.root.config(cursor="watch")
 
         try:
-            summary = process_folder(input_path, output_path, options)
+            summary = process_folder(
+                input_path,
+                output_path,
+                options,
+                alignment_preset=self.alignment_preset,
+            )
         except Exception as exc:  # noqa: BLE001 - surface unexpected batch errors to GUI
             messagebox.showerror("Processing Error", str(exc))
             self.status_var.set("Failed.")
@@ -483,6 +727,8 @@ class BatchValidationProcessorGUI:
             f"Skipped (existing): {len(summary.skipped)}",
             f"Failed: {len(summary.failed)}",
         ]
+        if self.alignment_preset is not None:
+            details.append(f"Preset: {self._preset_status_text(self.alignment_preset)}")
         if summary.failed:
             details.append("")
             details.append("Failures:")
