@@ -38,6 +38,10 @@ from moment_images.sweep_visualization import (
 
 
 PROFILE_NAME = "validation_hybrid_v1"
+FULL_GRID_PROFILE_NAME = "validation_hybrid_full_grid_v1"
+VALID_FOV_FRACTION_NAME = "validation_valid_fov_fraction"
+COMMON_FOV_TOO_SMALL_WARNING = "common-fov metric support too small"
+MIN_COMMON_FOV_PIXELS = 16
 DEFAULT_SCALE_SEARCH = "0.90:1.10:11"
 DEFAULT_GEOMETRIC_SCALE_SEARCH = "0.50:2.00:31"
 DEFAULT_REGISTRATION_ROTATION_SEARCH = "-45:45:19"
@@ -142,6 +146,7 @@ class SimilarityRegistrationResult:
     hypotheses_refined: int = 0
     optimizer_evaluations: int = 0
     registration_timing_seconds: Dict[str, float] = field(default_factory=dict)
+    valid_mask: Optional[np.ndarray] = None
     warnings: List[str] = field(default_factory=list)
 
 
@@ -197,6 +202,8 @@ class ReferenceImages:
     thorcam: np.ndarray
     validation_source: str
     thorcam_source: str
+    validation_mask: Optional[np.ndarray] = None
+    thorcam_mask: Optional[np.ndarray] = None
     warnings: List[str] = field(default_factory=list)
     workspace_transform_info: Dict[str, Any] = field(default_factory=dict)
 
@@ -921,6 +928,7 @@ def _workspace_grid_identity_registration(
     config: BenchmarkConfig,
     initializer: str,
     transform_source: str,
+    valid_mask: Optional[np.ndarray] = None,
     quality_reference_cache: Optional[ValidationMetricReference] = None,
 ) -> SimilarityRegistrationResult:
     ref = _as_float_2d(reference)
@@ -950,6 +958,7 @@ def _workspace_grid_identity_registration(
         registration_initializer=initializer,
         registration_transform_source=transform_source,
         validation_rankable=True,
+        valid_mask=None if valid_mask is None else np.asarray(valid_mask, dtype=bool),
     )
     result = _with_registration_quality(
         result,
@@ -2019,25 +2028,85 @@ def compute_validation_metrics(
     candidate_image: np.ndarray,
     *,
     reference_cache: Optional[ValidationMetricReference] = None,
+    reference_mask: Optional[np.ndarray] = None,
+    candidate_mask: Optional[np.ndarray] = None,
 ) -> ValidationMetricResult:
     """Compute validation agreement metrics for one registered candidate."""
 
-    validation = _robust_unit(_as_float_2d(validation_image))
-    candidate = _robust_unit(_as_float_2d(candidate_image))
-    if validation.shape != candidate.shape:
-        min_h = min(validation.shape[0], candidate.shape[0])
-        min_w = min(validation.shape[1], candidate.shape[1])
-        validation = validation[:min_h, :min_w]
-        candidate = candidate[:min_h, :min_w]
+    validation_raw, candidate_raw, ref_mask, cand_mask = _crop_metric_inputs(
+        _as_float_2d(validation_image),
+        _as_float_2d(candidate_image),
+        reference_mask,
+        candidate_mask,
+    )
+    reference_valid = ref_mask & np.isfinite(validation_raw)
+    candidate_valid = cand_mask & np.isfinite(candidate_raw)
+    metric_mask = reference_valid & candidate_valid
+    reference_valid_count = int(np.count_nonzero(reference_valid))
+    metric_count = int(np.count_nonzero(metric_mask))
+    valid_fov_fraction = (
+        float(metric_count) / float(reference_valid_count)
+        if reference_valid_count > 0
+        else 0.0
+    )
+
+    full_grid = _compute_validation_metrics_core(
+        validation_raw,
+        candidate_raw,
+        metric_mask=None,
+        reference_cache=reference_cache,
+    )
+    if metric_count < MIN_COMMON_FOV_PIXELS:
+        metrics = _empty_validation_metric_result().metrics
+        metrics[FULL_GRID_PROFILE_NAME] = full_grid.metrics.get(PROFILE_NAME)
+        metrics[VALID_FOV_FRACTION_NAME] = _clip01(valid_fov_fraction)
+        return ValidationMetricResult(
+            metrics=metrics,
+            weights_used={},
+            bead_count=0,
+            warnings=[COMMON_FOV_TOO_SMALL_WARNING],
+        )
+
+    common = _compute_validation_metrics_core(
+        validation_raw,
+        candidate_raw,
+        metric_mask=None if _mask_is_all_true(metric_mask) else metric_mask,
+        reference_cache=reference_cache if _mask_is_all_true(metric_mask) else None,
+    )
+    metrics = dict(common.metrics)
+    metrics[FULL_GRID_PROFILE_NAME] = full_grid.metrics.get(PROFILE_NAME)
+    metrics[VALID_FOV_FRACTION_NAME] = _clip01(valid_fov_fraction)
+    return ValidationMetricResult(
+        metrics=metrics,
+        weights_used=common.weights_used,
+        bead_count=common.bead_count,
+        warnings=common.warnings,
+    )
+
+
+def _compute_validation_metrics_core(
+    validation_image: np.ndarray,
+    candidate_image: np.ndarray,
+    *,
+    metric_mask: Optional[np.ndarray],
+    reference_cache: Optional[ValidationMetricReference],
+) -> ValidationMetricResult:
+    validation = _robust_unit_masked(validation_image, metric_mask)
+    candidate = _robust_unit_masked(candidate_image, metric_mask)
+    if metric_mask is not None:
+        validation = np.where(metric_mask, validation, 0.0).astype(np.float32)
+        candidate = np.where(metric_mask, candidate, 0.0).astype(np.float32)
     prepared = (
         reference_cache
         if reference_cache is not None and reference_cache.validation_unit.shape == validation.shape
         else _prepare_validation_metric_reference_from_unit(validation)
     )
 
-    adjusted = _fit_gain_offset(candidate, prepared.validation_unit)
-    signal = _signal_score(prepared.validation_unit, adjusted)
-    structure = max(0.0, _correlation(prepared.structure_channel, _structure_channel(adjusted)))
+    adjusted = _fit_gain_offset(candidate, prepared.validation_unit, mask=metric_mask)
+    if metric_mask is not None:
+        adjusted = np.where(metric_mask, adjusted, 0.0).astype(np.float32)
+    signal = _signal_score(prepared.validation_unit, adjusted, mask=metric_mask)
+    structure = max(0.0, _correlation(prepared.structure_channel, _structure_channel(adjusted), mask=metric_mask))
     signal_structure = _weighted_score(
         {"signal": signal, "structure": structure},
         {"signal": 0.30, "structure": 0.20},
@@ -2056,7 +2125,7 @@ def compute_validation_metrics(
     else:
         candidate_centers = _detect_bead_centers(adjusted)
         bead = _bead_score(centers, candidate_centers)
-        sharpness = _sharpness_score(prepared.validation_unit, adjusted, centers)
+        sharpness = _sharpness_score(prepared.validation_unit, adjusted, centers, mask=metric_mask)
         weights_used = {
             "validation_signal": 0.30,
             "validation_structure": 0.20,
@@ -2097,6 +2166,8 @@ def _empty_validation_metric_result() -> ValidationMetricResult:
             "validation_bead": None,
             "validation_sharpness": None,
             "validation_signal_structure_score": None,
+            FULL_GRID_PROFILE_NAME: None,
+            VALID_FOV_FRACTION_NAME: None,
         },
         weights_used={},
         bead_count=0,
@@ -2117,6 +2188,40 @@ def _prepare_validation_metric_reference_from_unit(validation_unit: np.ndarray) 
     )
 
 
+def _crop_metric_inputs(
+    validation: np.ndarray,
+    candidate: np.ndarray,
+    reference_mask: Optional[np.ndarray],
+    candidate_mask: Optional[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    shapes = [validation.shape[:2], candidate.shape[:2]]
+    if reference_mask is not None:
+        shapes.append(np.asarray(reference_mask).shape[:2])
+    if candidate_mask is not None:
+        shapes.append(np.asarray(candidate_mask).shape[:2])
+    min_h = min(int(shape[0]) for shape in shapes)
+    min_w = min(int(shape[1]) for shape in shapes)
+    validation_cropped = np.asarray(validation[:min_h, :min_w], dtype=np.float32)
+    candidate_cropped = np.asarray(candidate[:min_h, :min_w], dtype=np.float32)
+    ref_mask = _coerce_metric_mask(reference_mask, (min_h, min_w))
+    cand_mask = _coerce_metric_mask(candidate_mask, (min_h, min_w))
+    return validation_cropped, candidate_cropped, ref_mask, cand_mask
+
+
+def _coerce_metric_mask(mask: Optional[np.ndarray], shape: Tuple[int, int]) -> np.ndarray:
+    if mask is None:
+        return np.ones(shape, dtype=bool)
+    arr = np.asarray(mask, dtype=bool)
+    return np.asarray(arr[: shape[0], : shape[1]], dtype=bool)
+
+
+def _mask_is_all_true(mask: Optional[np.ndarray]) -> bool:
+    if mask is None:
+        return True
+    arr = np.asarray(mask, dtype=bool)
+    return bool(arr.size > 0 and np.all(arr))
+
+
 def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     """Run the trio benchmark and write CSV/JSON/HTML artifacts."""
 
@@ -2128,6 +2233,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     validation = references.validation
     thorcam = references.thorcam
+    validation_mask = _coerce_metric_mask(references.validation_mask, validation.shape[:2])
     metric_reference_cache = _prepare_validation_metric_reference(validation)
     geometric_reference_cache = (
         _prepare_geometric_reference_cache(validation, cfg)
@@ -2197,7 +2303,13 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             registration_min_structure_score=cfg.registration_min_structure_score,
             reference_cache=metric_reference_cache,
         )
-        metrics = compute_validation_metrics(validation, registration.aligned_image, reference_cache=metric_reference_cache)
+        metrics = compute_validation_metrics(
+            validation,
+            registration.aligned_image,
+            reference_cache=metric_reference_cache,
+            reference_mask=validation_mask,
+            candidate_mask=registration.valid_mask,
+        )
         row = candidate.row
         record = candidate.record
         lf_rows.append(
@@ -2252,6 +2364,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 config=cfg,
                 initializer="validation_workspace_transform",
                 transform_source=thor_source,
+                valid_mask=references.thorcam_mask,
                 quality_reference_cache=metric_reference_cache,
             )
     elif cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
@@ -2284,7 +2397,13 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             quality_reference_cache=metric_reference_cache,
         )
     thor_metrics = (
-        compute_validation_metrics(validation, thor_registration.aligned_image, reference_cache=metric_reference_cache)
+        compute_validation_metrics(
+            validation,
+            thor_registration.aligned_image,
+            reference_cache=metric_reference_cache,
+            reference_mask=validation_mask,
+            candidate_mask=thor_registration.valid_mask,
+        )
         if thor_registration.status == "aligned" and thor_registration.validation_rankable
         else _empty_validation_metric_result()
     )
@@ -2466,6 +2585,8 @@ def _load_reference_images(config: BenchmarkConfig) -> ReferenceImages:
         thorcam=thorcam,
         validation_source=validation_source,
         thorcam_source=thorcam_source,
+        validation_mask=np.isfinite(validation),
+        thorcam_mask=np.isfinite(thorcam),
         warnings=_validation_workspace_alignment_warnings(workspace, workspace_path),
     )
 
@@ -2483,14 +2604,14 @@ def _load_reference_images_from_workspace_transforms(
         warnings.append(
             "use_validation_workspace_transforms enabled; registration_annotations ignored"
         )
-    validation, validation_info = _warp_workspace_processed_to_rectified_grid(
+    validation, validation_info, validation_mask = _warp_workspace_processed_to_rectified_grid(
         workspace,
         workspace_path,
         prefix="validation",
         rectified_shape=rectified.shape,
         required=True,
     )
-    thorcam, thorcam_info = _warp_workspace_processed_to_rectified_grid(
+    thorcam, thorcam_info, thorcam_mask = _warp_workspace_processed_to_rectified_grid(
         workspace,
         workspace_path,
         prefix="thorcam",
@@ -2512,6 +2633,8 @@ def _load_reference_images_from_workspace_transforms(
         thorcam=thorcam,
         validation_source=f"{workspace_path}#validation_processed->{validation_info['transform_source']}",
         thorcam_source=f"{workspace_path}#thorcam_processed->{thorcam_info['transform_source']}",
+        validation_mask=validation_mask,
+        thorcam_mask=thorcam_mask,
         warnings=_unique_strings(warnings),
         workspace_transform_info=transform_info,
     )
@@ -2524,7 +2647,7 @@ def _warp_workspace_processed_to_rectified_grid(
     prefix: str,
     rectified_shape: Tuple[int, int],
     required: bool,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
+) -> Tuple[np.ndarray, Dict[str, Any], np.ndarray]:
     image_key = f"{prefix}_processed"
     matrix_key = f"{prefix}_alignment_final_warp_matrix"
     if image_key not in workspace:
@@ -2589,14 +2712,14 @@ def _warp_workspace_processed_to_rectified_grid(
                 f"{image_key!r} shape {source_shape}, replay shape {replay_output_shape}, "
                 f"rectified grid {rectified_output_shape}"
             )
-        return np.zeros(rectified_output_shape, dtype=np.float32), info
+        return np.zeros(rectified_output_shape, dtype=np.float32), info, np.zeros(rectified_output_shape, dtype=bool)
 
     if matrix is None:
         raise ValueError(f"{workspace_path} has no usable {matrix_key!r}")
     if replay_output_shape is None:
         raise ValueError(f"{workspace_path} has no usable {prefix}_alignment_output_shape")
 
-    warped, _valid_mask = _warp_to_grid(source, np.asarray(matrix, dtype=np.float32), replay_output_shape)
+    warped, valid_mask = _warp_to_grid(source, np.asarray(matrix, dtype=np.float32), replay_output_shape)
     warped = np.nan_to_num(warped, nan=0.0, posinf=0.0, neginf=0.0)
     info = _workspace_transform_source_info(
         image_key=image_key,
@@ -2617,7 +2740,7 @@ def _warp_workspace_processed_to_rectified_grid(
         alignment_model=alignment_model,
         warnings=warnings,
     )
-    return warped.astype(np.float32), info
+    return warped.astype(np.float32), info, np.asarray(valid_mask, dtype=bool)
 
 
 def _workspace_transform_source_info(
@@ -3039,6 +3162,8 @@ def _write_results_csv(path: Path, rows: Sequence[BenchmarkResultRow]) -> None:
         "saved_rank",
         "saved_score",
         PROFILE_NAME,
+        FULL_GRID_PROFILE_NAME,
+        VALID_FOV_FRACTION_NAME,
         "validation_signal",
         "validation_structure",
         "validation_bead",
@@ -3195,6 +3320,8 @@ def _row_to_csv(row: BenchmarkResultRow) -> Dict[str, Any]:
     }
     for metric_name in [
         PROFILE_NAME,
+        FULL_GRID_PROFILE_NAME,
+        VALID_FOV_FRACTION_NAME,
         "validation_signal",
         "validation_structure",
         "validation_bead",
@@ -3357,6 +3484,8 @@ def _render_report_html(summary: Mapping[str, Any], rows: Sequence[BenchmarkResu
             f"<td>{html.escape(row.row_id)}</td>"
             f"<td>{html.escape(row.candidate_id)}</td>"
             f"<td>{_html_float(score)}</td>"
+            f"<td>{_html_float(row.metrics.get(VALID_FOV_FRACTION_NAME))}</td>"
+            f"<td>{_html_float(row.metrics.get(FULL_GRID_PROFILE_NAME))}</td>"
             f"<td>{_html_float(row.metrics.get('validation_signal'))}</td>"
             f"<td>{_html_float(row.metrics.get('validation_structure'))}</td>"
             f"<td>{_html_float(row.metrics.get('validation_bead'))}</td>"
@@ -3386,7 +3515,7 @@ def _render_report_html(summary: Mapping[str, Any], rows: Sequence[BenchmarkResu
             f"<p><strong>Best LF row:</strong> {html.escape(best_text)}</p>",
             "<h2>Ranking</h2>",
             "<table><thead><tr><th>Source</th><th>Rank</th><th>Row ID</th><th>Candidate</th>"
-            "<th>Hybrid</th><th>Signal</th><th>Structure</th><th>Bead</th><th>Sharpness</th>"
+            "<th>Hybrid</th><th>Valid FOV</th><th>Full-grid Hybrid</th><th>Signal</th><th>Structure</th><th>Bead</th><th>Sharpness</th>"
             "<th>Reg Conf</th><th>Reg Suspect</th><th>Constraint</th><th>Initializer</th>"
             "<th>Transform Source</th><th>Rankable</th><th>Residual Norm</th><th>Figure</th><th>Warnings</th></tr></thead><tbody>",
             *table_rows,
@@ -3750,6 +3879,24 @@ def _robust_unit(image: np.ndarray) -> np.ndarray:
     return np.asarray(np.clip((arr - low) / (high - low), 0.0, 1.0), dtype=np.float32)
 
 
+def _robust_unit_masked(image: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
+    if mask is None:
+        return _robust_unit(image)
+    arr = np.asarray(image, dtype=np.float32)
+    valid = np.asarray(mask, dtype=bool) & np.isfinite(arr)
+    finite = arr[valid]
+    if finite.size == 0:
+        return np.zeros_like(arr, dtype=np.float32)
+    low = float(np.percentile(finite, 1.0))
+    high = float(np.percentile(finite, 99.5))
+    if high <= low:
+        low = float(np.min(finite))
+        high = float(np.max(finite))
+    if high <= low:
+        return np.zeros_like(arr, dtype=np.float32)
+    return np.asarray(np.clip((arr - low) / (high - low), 0.0, 1.0), dtype=np.float32)
+
+
 def _pre_scale_matrix(source_shape: Tuple[int, int], reference_shape: Tuple[int, int], scale: float) -> np.ndarray:
     src_h, src_w = source_shape[:2]
     ref_h, ref_w = reference_shape[:2]
@@ -3858,14 +4005,16 @@ def _apply_best_translation(source: np.ndarray, target: np.ndarray, dx: float, d
     return shifted, sx, sy
 
 
-def _fit_gain_offset(candidate: np.ndarray, validation: np.ndarray) -> np.ndarray:
+def _fit_gain_offset(candidate: np.ndarray, validation: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
     x = np.asarray(candidate, dtype=np.float64).reshape(-1)
     y = np.asarray(validation, dtype=np.float64).reshape(-1)
-    mask = np.isfinite(x) & np.isfinite(y)
-    if int(np.count_nonzero(mask)) < 2:
+    finite_mask = np.isfinite(x) & np.isfinite(y)
+    if mask is not None:
+        finite_mask &= np.asarray(mask, dtype=bool).reshape(-1)
+    if int(np.count_nonzero(finite_mask)) < 2:
         return np.asarray(candidate, dtype=np.float32)
-    x_valid = x[mask]
-    y_valid = y[mask]
+    x_valid = x[finite_mask]
+    y_valid = y[finite_mask]
     design = np.column_stack([x_valid, np.ones_like(x_valid)])
     try:
         gain, offset = np.linalg.lstsq(design, y_valid, rcond=None)[0]
@@ -3875,8 +4024,15 @@ def _fit_gain_offset(candidate: np.ndarray, validation: np.ndarray) -> np.ndarra
     return np.asarray(np.clip(adjusted, 0.0, 1.0), dtype=np.float32)
 
 
-def _signal_score(validation: np.ndarray, candidate: np.ndarray) -> float:
-    mae = float(np.mean(np.abs(validation - candidate)))
+def _signal_score(validation: np.ndarray, candidate: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
+    diff = np.abs(validation - candidate)
+    if mask is not None:
+        valid = np.asarray(mask, dtype=bool) & np.isfinite(diff)
+        if int(np.count_nonzero(valid)) == 0:
+            return 0.0
+        mae = float(np.mean(diff[valid]))
+    else:
+        mae = float(np.mean(diff))
     return 1.0 - min(1.0, mae)
 
 
@@ -3958,11 +4114,18 @@ def _bead_score(validation_centers: Sequence[Tuple[float, float]], candidate_cen
     return 1.0 - min(1.0, (distance_penalty + miss_rate + false_rate) / 3.0)
 
 
-def _sharpness_score(validation: np.ndarray, candidate: np.ndarray, centers: Sequence[Tuple[float, float]]) -> float:
+def _sharpness_score(
+    validation: np.ndarray,
+    candidate: np.ndarray,
+    centers: Sequence[Tuple[float, float]],
+    mask: Optional[np.ndarray] = None,
+) -> float:
     scores: List[float] = []
     for center in centers:
-        val_width = _local_width(validation, center)
-        cand_width = _local_width(candidate, center)
+        if mask is not None and not _mask_has_local_support(mask, center):
+            continue
+        val_width = _local_width(validation, center, mask=mask)
+        cand_width = _local_width(candidate, center, mask=mask)
         if val_width is None or cand_width is None:
             continue
         excess = max(0.0, cand_width - val_width)
@@ -3972,7 +4135,12 @@ def _sharpness_score(validation: np.ndarray, candidate: np.ndarray, centers: Seq
     return float(np.mean(scores))
 
 
-def _local_width(image: np.ndarray, center: Tuple[float, float], radius: int = 8) -> Optional[float]:
+def _local_width(
+    image: np.ndarray,
+    center: Tuple[float, float],
+    radius: int = 8,
+    mask: Optional[np.ndarray] = None,
+) -> Optional[float]:
     arr = np.asarray(image, dtype=np.float32)
     cx, cy = center
     x0 = max(0, int(math.floor(cx)) - radius)
@@ -3982,6 +4150,11 @@ def _local_width(image: np.ndarray, center: Tuple[float, float], radius: int = 8
     patch = arr[y0:y1, x0:x1]
     if patch.size == 0:
         return None
+    if mask is not None:
+        patch_mask = np.asarray(mask, dtype=bool)[y0:y1, x0:x1]
+        if patch_mask.shape != patch.shape or int(np.count_nonzero(patch_mask)) == 0:
+            return None
+        patch = np.where(patch_mask, patch, 0.0)
     patch = patch - float(np.min(patch))
     total = float(np.sum(patch))
     if total <= 1e-8:
@@ -3991,6 +4164,19 @@ def _local_width(image: np.ndarray, center: Tuple[float, float], radius: int = 8
     yy = yy + y0 - cy
     r2 = np.square(xx) + np.square(yy)
     return float(math.sqrt(float(np.sum(r2 * patch) / total)))
+
+
+def _mask_has_local_support(mask: np.ndarray, center: Tuple[float, float], radius: int = 8) -> bool:
+    arr = np.asarray(mask, dtype=bool)
+    cx, cy = center
+    x0 = max(0, int(math.floor(cx)) - radius)
+    x1 = min(arr.shape[1], int(math.floor(cx)) + radius + 1)
+    y0 = max(0, int(math.floor(cy)) - radius)
+    y1 = min(arr.shape[0], int(math.floor(cy)) + radius + 1)
+    patch = arr[y0:y1, x0:x1]
+    if patch.size == 0:
+        return False
+    return float(np.count_nonzero(patch)) / float(patch.size) >= 0.75
 
 
 def _with_registration_quality(
@@ -4006,22 +4192,27 @@ def _with_registration_quality(
 ) -> SimilarityRegistrationResult:
     ref = _robust_unit(reference)
     aligned = _robust_unit(result.aligned_image)
+    valid_mask = _registration_valid_mask(result, moving_shape, ref.shape)
     if ref.shape != aligned.shape:
         min_h = min(ref.shape[0], aligned.shape[0])
         min_w = min(ref.shape[1], aligned.shape[1])
         ref = ref[:min_h, :min_w]
         aligned = aligned[:min_h, :min_w]
-    prepared = (
-        reference_cache
-        if reference_cache is not None and reference_cache.validation_unit.shape == ref.shape
-        else _prepare_validation_metric_reference_from_unit(ref)
-    )
+        valid_mask = valid_mask[:min_h, :min_w]
 
-    structure = max(0.0, _correlation(prepared.structure_channel, _structure_channel(aligned)))
-    reference_centers = prepared.bead_centers
-    aligned_centers = _detect_bead_centers(aligned)
+    quality_mask = valid_mask & np.isfinite(ref) & np.isfinite(aligned)
+    if int(np.count_nonzero(quality_mask)) >= MIN_COMMON_FOV_PIXELS:
+        ref_unit = np.where(quality_mask, _robust_unit_masked(reference[: ref.shape[0], : ref.shape[1]], quality_mask), 0.0)
+        aligned_unit = np.where(quality_mask, _robust_unit_masked(result.aligned_image[: aligned.shape[0], : aligned.shape[1]], quality_mask), 0.0)
+        structure = max(0.0, _correlation(_structure_channel(ref_unit), _structure_channel(aligned_unit), mask=quality_mask))
+        reference_centers = _detect_bead_centers(ref_unit)
+        aligned_centers = _detect_bead_centers(aligned_unit)
+    else:
+        structure = 0.0
+        reference_centers = []
+        aligned_centers = []
     matched_count, median_error = _match_bead_centers(reference_centers, aligned_centers, radius=8.0)
-    common_fov = _common_fov_fraction(moving_shape, ref.shape, result.forward_matrix)
+    common_fov = float(np.count_nonzero(valid_mask)) / float(max(1, valid_mask.size))
     bead_coverage = matched_count / max(1, len(reference_centers))
     bead_error_score = 0.0 if median_error is None else max(0.0, 1.0 - float(median_error) / 8.0)
     bead_quality = bead_coverage * bead_error_score
@@ -4060,6 +4251,7 @@ def _with_registration_quality(
     result.matched_bead_count = int(matched_count)
     result.median_bead_error_px = None if median_error is None else float(median_error)
     result.common_fov_fraction = float(common_fov)
+    result.valid_mask = valid_mask
     if reasons:
         result.warnings = _unique_strings(result.warnings + [f"registration_suspect:{'|'.join(reasons)}"])
     else:
@@ -4128,6 +4320,50 @@ def _common_fov_fraction(
     return float(np.count_nonzero(warped > 0.5)) / float(warped.size)
 
 
+def _registration_valid_mask(
+    result: SimilarityRegistrationResult,
+    moving_shape: Tuple[int, int],
+    reference_shape: Tuple[int, int],
+) -> np.ndarray:
+    if result.valid_mask is not None:
+        mask = np.asarray(result.valid_mask, dtype=bool)
+        if mask.shape == tuple(reference_shape[:2]):
+            return mask.copy()
+        if mask.shape == tuple(moving_shape[:2]):
+            return _warp_mask_to_reference(mask, result.forward_matrix, reference_shape)
+        out = np.zeros(tuple(reference_shape[:2]), dtype=bool)
+        min_h = min(mask.shape[0], out.shape[0])
+        min_w = min(mask.shape[1], out.shape[1])
+        out[:min_h, :min_w] = mask[:min_h, :min_w]
+        return out
+    return _valid_mask_from_transform(moving_shape, result.forward_matrix, reference_shape)
+
+
+def _valid_mask_from_transform(
+    moving_shape: Tuple[int, int],
+    matrix: np.ndarray,
+    reference_shape: Tuple[int, int],
+) -> np.ndarray:
+    return _warp_mask_to_reference(np.ones(tuple(moving_shape[:2]), dtype=bool), matrix, reference_shape)
+
+
+def _warp_mask_to_reference(
+    mask: np.ndarray,
+    matrix: np.ndarray,
+    reference_shape: Tuple[int, int],
+) -> np.ndarray:
+    ref_h, ref_w = int(reference_shape[0]), int(reference_shape[1])
+    warped = cv.warpAffine(
+        np.asarray(mask, dtype=np.uint8),
+        np.asarray(matrix, dtype=np.float32),
+        (ref_w, ref_h),
+        flags=cv.INTER_NEAREST,
+        borderMode=cv.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return np.asarray(warped > 0, dtype=bool)
+
+
 def _common_fov_fraction_analytic(
     moving_shape: Tuple[int, int],
     reference_shape: Tuple[int, int],
@@ -4181,14 +4417,16 @@ def _weighted_score(values: Mapping[str, Optional[float]], weights: Mapping[str,
     return numerator / denominator
 
 
-def _correlation(a: np.ndarray, b: np.ndarray) -> float:
+def _correlation(a: np.ndarray, b: np.ndarray, mask: Optional[np.ndarray] = None) -> float:
     x = np.asarray(a, dtype=np.float64).reshape(-1)
     y = np.asarray(b, dtype=np.float64).reshape(-1)
-    mask = np.isfinite(x) & np.isfinite(y)
-    if int(np.count_nonzero(mask)) < 2:
+    finite_mask = np.isfinite(x) & np.isfinite(y)
+    if mask is not None:
+        finite_mask &= np.asarray(mask, dtype=bool).reshape(-1)
+    if int(np.count_nonzero(finite_mask)) < 2:
         return 0.0
-    x = x[mask]
-    y = y[mask]
+    x = x[finite_mask]
+    y = y[finite_mask]
     x = x - float(np.mean(x))
     y = y - float(np.mean(y))
     denom = float(np.linalg.norm(x) * np.linalg.norm(y))

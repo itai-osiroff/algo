@@ -64,6 +64,8 @@ def test_run_batch_from_manifest_writes_scene_outputs_and_aggregate_summary(tmp_
     assert "registration_initializer" in summary["scenes"][0]
     assert "registration_runtime_seconds" in summary["scenes"][0]
     assert "hypotheses_dense_scored" in summary["scenes"][0]
+    assert "best_validation_valid_fov_fraction" in summary["scenes"][0]
+    assert "thorcam_validation_valid_fov_fraction" in summary["scenes"][0]
     assert (scene_dir / "trio_benchmark_results.csv").exists()
     assert (scene_dir / "trio_benchmark_summary.json").exists()
     assert (output_dir / "trio_batch_summary.json").exists()
@@ -76,6 +78,8 @@ def test_run_batch_from_manifest_writes_scene_outputs_and_aggregate_summary(tmp_
     assert "registration_initializer" in rows[0]
     assert "registration_runtime_seconds" in rows[0]
     assert "hypotheses_dense_scored" in rows[0]
+    assert "best_validation_valid_fov_fraction" in rows[0]
+    assert "thorcam_validation_valid_fov_fraction" in rows[0]
     scene_summary = json.loads((scene_dir / "trio_benchmark_summary.json").read_text(encoding="utf-8"))
     assert scene_summary["config"]["registration_coarse_max_dim"] == 96
     assert scene_summary["config"]["registration_refine_max_dim"] == 128

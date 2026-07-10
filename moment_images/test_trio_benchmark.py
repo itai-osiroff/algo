@@ -11,7 +11,9 @@ from PIL import Image
 from moment_images.test_sweep_visualization import _create_modern_fixture
 import moment_images.trio_benchmark as trio_benchmark
 from moment_images.trio_benchmark import (
+    FULL_GRID_PROFILE_NAME,
     PROFILE_NAME,
+    VALID_FOV_FRACTION_NAME,
     BenchmarkConfig,
     apply_anchor_registration,
     compute_validation_metrics,
@@ -355,6 +357,25 @@ def test_validation_metrics_penalize_blur_and_center_errors():
     assert sharp_metrics.metrics["validation_bead"] > shifted_metrics.metrics["validation_bead"]
 
 
+def test_validation_metrics_rank_on_common_fov_not_zero_filled_borders():
+    validation = _synthetic_beads()
+    validation[120:150, 120:150] = 1.0
+    candidate_mask = np.zeros_like(validation, dtype=bool)
+    candidate_mask[:100, :130] = True
+    candidate = validation.copy()
+    candidate[~candidate_mask] = 0.0
+
+    metrics = compute_validation_metrics(validation, candidate, candidate_mask=candidate_mask)
+
+    assert metrics.metrics[PROFILE_NAME] is not None
+    assert metrics.metrics[PROFILE_NAME] > 0.95
+    assert metrics.metrics[FULL_GRID_PROFILE_NAME] is not None
+    assert metrics.metrics[FULL_GRID_PROFILE_NAME] < metrics.metrics[PROFILE_NAME] - 0.10
+    assert metrics.metrics[VALID_FOV_FRACTION_NAME] == pytest.approx(
+        float(np.count_nonzero(candidate_mask)) / float(candidate_mask.size)
+    )
+
+
 def test_validation_metrics_accept_prepared_reference_cache():
     validation = _synthetic_beads()
     blurred = cv.GaussianBlur(validation, (0, 0), 3.0)
@@ -372,6 +393,21 @@ def test_validation_metrics_accept_prepared_reference_cache():
             np.testing.assert_allclose(cached_value, value, rtol=1e-6, atol=1e-6)
     assert cached.weights_used == direct.weights_used
     assert cached.bead_count == direct.bead_count
+
+
+def test_validation_metrics_too_small_common_fov_blanks_primary_score():
+    validation = _synthetic_beads((80, 80))
+    candidate = validation.copy()
+    candidate_mask = np.zeros_like(validation, dtype=bool)
+    candidate_mask[:2, :2] = True
+
+    metrics = compute_validation_metrics(validation, candidate, candidate_mask=candidate_mask)
+
+    assert metrics.metrics[PROFILE_NAME] is None
+    assert metrics.metrics["validation_signal"] is None
+    assert metrics.metrics[FULL_GRID_PROFILE_NAME] is not None
+    assert metrics.metrics[VALID_FOV_FRACTION_NAME] == pytest.approx(4.0 / float(validation.size))
+    assert any("common-fov metric support too small" in warning for warning in metrics.warnings)
 
 
 def test_low_confidence_bead_detection_renormalizes_to_image_metrics():
@@ -679,6 +715,8 @@ def test_validate_workspace_transform_accepts_successful_identity_with_explicit_
     assert thor_registration["status"] == "aligned"
     assert thor_registration["validation_rankable"] is True
     assert thorcam["metrics"][PROFILE_NAME] is not None
+    assert thorcam["metrics"][VALID_FOV_FRACTION_NAME] == pytest.approx((32.0 * 21.0) / (64.0 * 64.0))
+    assert 0.0 < thor_registration["common_fov_fraction"] < 1.0
     assert PROFILE_NAME in result.summary["best_lf_minus_thorcam"]
 
     transform_payload = json.loads(
@@ -1396,6 +1434,8 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
     assert "matched_bead_count" in csv_rows[0]
     assert "median_bead_error_px" in csv_rows[0]
     assert "common_fov_fraction" in csv_rows[0]
+    assert FULL_GRID_PROFILE_NAME in csv_rows[0]
+    assert VALID_FOV_FRACTION_NAME in csv_rows[0]
     assert "anchor_selection_reason" in csv_rows[0]
     assert "residual_translation_norm" in csv_rows[0]
     assert "registration_constraint_level" in csv_rows[0]
