@@ -4,6 +4,12 @@ import csv
 import numpy as np
 
 from moment_images.test_sweep_visualization import _create_modern_fixture
+from moment_images.trio_benchmark import (
+    METRIC_BEAD_COUNT_NAME,
+    METRIC_CANDIDATE_ROI_COVERAGE_NAME,
+    METRIC_ROI_FRACTION_NAME,
+    THORCAM_FOV_PROFILE_NAME,
+)
 from moment_images.trio_benchmark_batch import main, run_batch_from_manifest
 
 
@@ -16,10 +22,14 @@ def test_run_batch_from_manifest_writes_scene_outputs_and_aggregate_summary(tmp_
     )
     validation_workspace = tmp_path / "validation_workspace.npz"
     reference = np.full((4, 4), 1.25, dtype=np.float32)
+    identity = np.eye(2, 3, dtype=np.float32)
     np.savez_compressed(
         validation_workspace,
+        rectified_image=reference,
         validation_processed=reference,
         thorcam_processed=reference,
+        validation_alignment_final_warp_matrix=identity,
+        thorcam_alignment_final_warp_matrix=identity,
     )
     manifest_path = tmp_path / "trio_manifest.json"
     output_dir = tmp_path / "batch_output"
@@ -36,6 +46,7 @@ def test_run_batch_from_manifest_writes_scene_outputs_and_aggregate_summary(tmp_
                     "registration_dense_hypotheses": 3,
                     "registration_refine_max_evals": 20,
                     "registration_progress": True,
+                    "use_validation_workspace_transforms": True,
                 },
                 "scenes": [
                     {
@@ -64,6 +75,12 @@ def test_run_batch_from_manifest_writes_scene_outputs_and_aggregate_summary(tmp_
     assert "registration_initializer" in summary["scenes"][0]
     assert "registration_runtime_seconds" in summary["scenes"][0]
     assert "hypotheses_dense_scored" in summary["scenes"][0]
+    assert "best_validation_hybrid_thorcam_fov_v1" in summary["scenes"][0]
+    assert "thorcam_validation_hybrid_thorcam_fov_v1" in summary["scenes"][0]
+    assert "best_lf_minus_thorcam_validation_hybrid_thorcam_fov_v1" in summary["scenes"][0]
+    assert "best_validation_metric_roi_fraction" in summary["scenes"][0]
+    assert "best_validation_metric_bead_count" in summary["scenes"][0]
+    assert "best_validation_metric_candidate_roi_coverage" in summary["scenes"][0]
     assert "best_validation_valid_fov_fraction" in summary["scenes"][0]
     assert "thorcam_validation_valid_fov_fraction" in summary["scenes"][0]
     assert (scene_dir / "trio_benchmark_results.csv").exists()
@@ -78,9 +95,21 @@ def test_run_batch_from_manifest_writes_scene_outputs_and_aggregate_summary(tmp_
     assert "registration_initializer" in rows[0]
     assert "registration_runtime_seconds" in rows[0]
     assert "hypotheses_dense_scored" in rows[0]
+    assert "best_validation_hybrid_thorcam_fov_v1" in rows[0]
+    assert "thorcam_validation_hybrid_thorcam_fov_v1" in rows[0]
+    assert "best_lf_minus_thorcam_validation_hybrid_thorcam_fov_v1" in rows[0]
+    assert "best_validation_metric_roi_fraction" in rows[0]
+    assert "best_validation_metric_bead_count" in rows[0]
+    assert "best_validation_metric_candidate_roi_coverage" in rows[0]
     assert "best_validation_valid_fov_fraction" in rows[0]
     assert "thorcam_validation_valid_fov_fraction" in rows[0]
     scene_summary = json.loads((scene_dir / "trio_benchmark_summary.json").read_text(encoding="utf-8"))
+    assert scene_summary["config"]["primary_score_name"] == THORCAM_FOV_PROFILE_NAME
+    best_metrics = scene_summary["best_candidate"]["metrics"]
+    assert THORCAM_FOV_PROFILE_NAME in best_metrics
+    assert METRIC_ROI_FRACTION_NAME in best_metrics
+    assert METRIC_BEAD_COUNT_NAME in best_metrics
+    assert METRIC_CANDIDATE_ROI_COVERAGE_NAME in best_metrics
     assert scene_summary["config"]["registration_coarse_max_dim"] == 96
     assert scene_summary["config"]["registration_refine_max_dim"] == 128
     assert scene_summary["config"]["registration_prefilter_hypotheses"] == 5
@@ -280,7 +309,10 @@ def test_batch_workspace_transform_invalid_thorcam_keeps_scene_successful(tmp_pa
     assert summary["num_successful"] == 1
     scene = summary["scenes"][0]
     assert scene["status"] == "ok"
-    assert scene["best_lf_candidate_id"]
+    assert scene["best_lf_candidate_id"] is None
+    assert scene["best_validation_hybrid_thorcam_fov_v1"] is None
+    assert scene["thorcam_validation_hybrid_thorcam_fov_v1"] is None
+    assert scene["best_lf_minus_thorcam_validation_hybrid_thorcam_fov_v1"] is None
     assert scene["thorcam_validation_hybrid_v1"] is None
     assert scene["best_lf_minus_thorcam_validation_hybrid_v1"] is None
     scene_summary = json.loads(
@@ -290,6 +322,11 @@ def test_batch_workspace_transform_invalid_thorcam_keeps_scene_successful(tmp_pa
     assert thor_registration["status"] == "failed"
     assert thor_registration["validation_rankable"] is False
     assert thor_registration["ranking_exclusion_reason"] == "missing_output_shape"
+    with (output_dir / "scene_one" / "trio_benchmark_results.csv").open(newline="", encoding="utf-8") as fp:
+        csv_rows = list(csv.DictReader(fp))
+    lf_row = next(row for row in csv_rows if row["source_kind"] == "lf_candidate")
+    assert lf_row["validation_rankable"] == "false"
+    assert lf_row["ranking_exclusion_reason"] == "thorcam_fov_roi_unavailable"
 
 
 def test_batch_main_emits_scene_progress_to_stderr(tmp_path, capsys):

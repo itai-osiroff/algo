@@ -23,6 +23,14 @@ from moment_images.trio_benchmark import (
 )
 
 
+THORCAM_FOV_PROFILE_NAME = "validation_hybrid_thorcam_fov_v1"
+METRIC_ROI_SOURCE_NAME = "validation_metric_roi_source"
+METRIC_ROI_FRACTION_NAME = "validation_metric_roi_fraction"
+METRIC_ROI_PIXEL_COUNT_NAME = "validation_metric_roi_pixel_count"
+METRIC_BEAD_COUNT_NAME = "validation_metric_bead_count"
+METRIC_CANDIDATE_ROI_COVERAGE_NAME = "validation_metric_candidate_roi_coverage"
+
+
 def _synthetic_beads(shape: tuple[int, int] = (160, 160)) -> np.ndarray:
     image = np.zeros(shape, dtype=np.float32)
     for x, y, radius, value in [
@@ -118,6 +126,53 @@ def _write_validation_transform_workspace(
         payload["validation_alignment_output_shape"] = np.array(validation_shape, dtype=np.int32)
         payload["thorcam_alignment_output_shape"] = np.array(thorcam_shape, dtype=np.int32)
     np.savez_compressed(path, **payload)
+
+
+def _install_fake_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+    sweep_dir: Path,
+    *,
+    dataset_id: str,
+    candidates: list[tuple[str, np.ndarray]],
+) -> None:
+    rows = []
+    records = []
+    for rank, (candidate_id, image) in enumerate(candidates, start=1):
+        run_dir = sweep_dir / f"run_{rank:03d}_{candidate_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        workspace = run_dir / "workspace.npz"
+        np.savez_compressed(workspace, average_rectified_image=np.asarray(image, dtype=np.float32))
+        row_id = f"stage2:{candidate_id}"
+        rows.append(
+            SimpleNamespace(
+                row_id=row_id,
+                stage="stage2",
+                candidate_id=candidate_id,
+                generation_id="gen1",
+                rank=rank,
+                strategy="combined",
+                params={},
+                config={},
+                score=float(100 - rank),
+            )
+        )
+        records.append(
+            SimpleNamespace(
+                row_id=row_id,
+                stage="stage2",
+                candidate_id=candidate_id,
+                dataset_id=dataset_id,
+                generation_id="gen1",
+                workspace_path=str(workspace),
+                preview_path=None,
+                metric_record_path=None,
+            )
+        )
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
 
 
 def _source_from_grid_image(reference: np.ndarray, source_shape: tuple[int, int], matrix: np.ndarray) -> np.ndarray:
@@ -615,7 +670,8 @@ def test_validate_workspace_transform_invalid_thorcam_identity_shape_mismatch_is
 
     thorcam = result.summary["thorcam_baseline"]
     thor_registration = thorcam["registration"]
-    assert result.best_lf_row_id == "stage2:candidate_a"
+    assert result.best_lf_row_id is None
+    assert result.summary["best_candidate"] is None
     assert thor_registration["status"] == "failed"
     assert thor_registration["validation_rankable"] is False
     assert thor_registration["ranking_exclusion_reason"] == "not_run"
@@ -634,6 +690,10 @@ def test_validate_workspace_transform_invalid_thorcam_identity_shape_mismatch_is
 
     with (output_dir / "trio_benchmark_results.csv").open(newline="", encoding="utf-8") as fp:
         csv_rows = list(csv.DictReader(fp))
+    lf_row = next(row for row in csv_rows if row["source_kind"] == "lf_candidate")
+    assert lf_row["validation_rankable"] == "false"
+    assert lf_row["ranking_exclusion_reason"] == "thorcam_fov_roi_unavailable"
+    assert lf_row[THORCAM_FOV_PROFILE_NAME] == ""
     thorcam_row = next(row for row in csv_rows if row["source_kind"] == "thorcam_baseline")
     assert thorcam_row[PROFILE_NAME] == ""
     assert thorcam_row["validation_rankable"] == "false"
@@ -729,6 +789,187 @@ def test_validate_workspace_transform_accepts_successful_identity_with_explicit_
     assert thorcam_info["alignment_output_shape"] == [64, 64]
     assert thorcam_info["replay_output_shape"] == [64, 64]
     assert thorcam_info["replay_shape_matches_rectified"] is True
+
+
+def test_validate_workspace_transform_ranks_lf_on_fixed_thorcam_fov(tmp_path, monkeypatch):
+    rectified = np.zeros((80, 80), dtype=np.float32)
+    for x, y, radius, value in [
+        (12, 12, 3, 1.0),
+        (31, 16, 3, 0.9),
+        (22, 33, 3, 0.85),
+        (62, 20, 4, 0.95),
+        (55, 62, 4, 0.8),
+        (72, 70, 3, 0.75),
+    ]:
+        cv.circle(rectified, (x, y), radius, value, -1)
+    rectified = cv.GaussianBlur(rectified, (0, 0), 0.8)
+    identity = np.eye(2, 3, dtype=np.float32)
+    thorcam_processed = rectified[:40, :40]
+
+    roi_good = rectified.copy()
+    roi_good[40:, :] = 0.0
+    roi_good[:, 40:] = 0.0
+    outside_good = rectified.copy()
+    outside_good[:40, :40] = cv.GaussianBlur(outside_good[:40, :40], (0, 0), 4.0)
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    _write_validation_transform_workspace(
+        validation_workspace,
+        rectified=rectified,
+        validation_processed=rectified,
+        thorcam_processed=thorcam_processed,
+        validation_matrix=identity,
+        thorcam_matrix=identity,
+        thorcam_alignment_status="aligned_target_in_reference",
+        thorcam_alignment_model="translation_ecc",
+        thorcam_alignment_output_shape=rectified.shape,
+    )
+    _install_fake_sweep(
+        monkeypatch,
+        sweep_dir,
+        dataset_id="scene_a",
+        candidates=[("outside_good", outside_good), ("roi_good", roi_good)],
+    )
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_a",
+            validation_workspace=validation_workspace,
+            output_dir=output_dir,
+            use_validation_workspace_transforms=True,
+            residual_translation_max_px=0.0,
+            top_k=2,
+        )
+    )
+
+    assert result.summary["config"]["primary_score_name"] == THORCAM_FOV_PROFILE_NAME
+    assert result.best_lf_row_id == "stage2:roi_good"
+    best_metrics = result.summary["best_candidate"]["metrics"]
+    thor_metrics = result.summary["thorcam_baseline"]["metrics"]
+    assert best_metrics[THORCAM_FOV_PROFILE_NAME] > best_metrics[PROFILE_NAME]
+    assert best_metrics[METRIC_ROI_SOURCE_NAME] == "thorcam_valid_fov"
+    assert best_metrics[METRIC_ROI_FRACTION_NAME] == pytest.approx((40.0 * 40.0) / (80.0 * 80.0))
+    assert best_metrics[METRIC_ROI_PIXEL_COUNT_NAME] == 1600
+    assert best_metrics[METRIC_CANDIDATE_ROI_COVERAGE_NAME] == pytest.approx(1.0)
+    assert thor_metrics[METRIC_CANDIDATE_ROI_COVERAGE_NAME] == pytest.approx(1.0)
+    assert THORCAM_FOV_PROFILE_NAME in result.summary["best_lf_minus_thorcam"]
+
+    with (output_dir / "trio_benchmark_results.csv").open(newline="", encoding="utf-8") as fp:
+        csv_rows = list(csv.DictReader(fp))
+    assert THORCAM_FOV_PROFILE_NAME in csv_rows[0]
+    assert METRIC_ROI_FRACTION_NAME in csv_rows[0]
+    assert METRIC_CANDIDATE_ROI_COVERAGE_NAME in csv_rows[0]
+
+
+def test_thorcam_fov_metric_ignores_validation_features_outside_thorcam_fov():
+    validation = np.zeros((80, 80), dtype=np.float32)
+    for x, y, radius, value in [
+        (12, 12, 3, 1.0),
+        (31, 16, 3, 0.9),
+        (22, 33, 3, 0.85),
+        (62, 20, 4, 0.95),
+        (55, 62, 4, 0.8),
+    ]:
+        cv.circle(validation, (x, y), radius, value, -1)
+    validation = cv.GaussianBlur(validation, (0, 0), 0.8)
+    roi_mask = np.zeros_like(validation, dtype=bool)
+    roi_mask[:40, :40] = True
+    candidate = validation.copy()
+    candidate[40:, :] = 0.0
+    candidate[:, 40:] = 0.0
+
+    row_local = compute_validation_metrics(validation, candidate)
+    thorcam_roi = trio_benchmark.compute_validation_metrics_for_fixed_roi(
+        validation,
+        candidate,
+        metric_roi_mask=roi_mask,
+    )
+
+    assert row_local.metrics[PROFILE_NAME] < thorcam_roi.metrics[THORCAM_FOV_PROFILE_NAME]
+    assert thorcam_roi.metrics[THORCAM_FOV_PROFILE_NAME] > 0.95
+    assert thorcam_roi.metrics[METRIC_ROI_FRACTION_NAME] == pytest.approx(0.25)
+    assert thorcam_roi.metrics[METRIC_BEAD_COUNT_NAME] == 3
+
+
+def test_thorcam_fov_ranking_rejects_candidate_missing_roi_coverage(tmp_path, monkeypatch):
+    rectified = _synthetic_beads((80, 80))
+    identity = np.eye(2, 3, dtype=np.float32)
+    thorcam_processed = rectified[:40, :40]
+    full_candidate = rectified.copy()
+    partial_candidate = rectified[:25, :40]
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    _write_validation_transform_workspace(
+        validation_workspace,
+        rectified=rectified,
+        validation_processed=rectified,
+        thorcam_processed=thorcam_processed,
+        validation_matrix=identity,
+        thorcam_matrix=identity,
+        thorcam_alignment_status="aligned_target_in_reference",
+        thorcam_alignment_model="translation_ecc",
+        thorcam_alignment_output_shape=rectified.shape,
+    )
+    _install_fake_sweep(
+        monkeypatch,
+        sweep_dir,
+        dataset_id="scene_a",
+        candidates=[("partial", partial_candidate), ("full", full_candidate)],
+    )
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_a",
+            validation_workspace=validation_workspace,
+            output_dir=output_dir,
+            use_validation_workspace_transforms=True,
+            residual_translation_max_px=0.0,
+            top_k=2,
+        )
+    )
+
+    assert result.best_lf_row_id == "stage2:full"
+    partial = next(row for row in result.rows if row.candidate_id == "partial")
+    assert partial.validation_rank is None
+    assert partial.registration.validation_rankable is False
+    assert partial.registration.ranking_exclusion_reason == "thorcam_fov_coverage_below_minimum"
+    assert partial.metrics[METRIC_CANDIDATE_ROI_COVERAGE_NAME] < 0.95
+
+
+def test_thorcam_fov_sparse_roi_keeps_single_bead_sharpness_terms():
+    validation = np.zeros((80, 80), dtype=np.float32)
+    cv.circle(validation, (21, 19), 4, 1.0, -1)
+    cv.circle(validation, (62, 60), 4, 0.9, -1)
+    validation = cv.GaussianBlur(validation, (0, 0), 0.8)
+    roi_mask = np.zeros_like(validation, dtype=bool)
+    roi_mask[:40, :40] = True
+    candidate = validation.copy()
+    blurred = cv.GaussianBlur(candidate, (0, 0), 4.0)
+
+    sharp_metrics = trio_benchmark.compute_validation_metrics_for_fixed_roi(
+        validation,
+        candidate,
+        metric_roi_mask=roi_mask,
+    )
+    blurred_metrics = trio_benchmark.compute_validation_metrics_for_fixed_roi(
+        validation,
+        blurred,
+        metric_roi_mask=roi_mask,
+    )
+
+    assert sharp_metrics.metrics[METRIC_BEAD_COUNT_NAME] == 1
+    assert sharp_metrics.metrics["validation_bead"] is not None
+    assert sharp_metrics.metrics["validation_sharpness"] is not None
+    assert sharp_metrics.metrics[THORCAM_FOV_PROFILE_NAME] > blurred_metrics.metrics[THORCAM_FOV_PROFILE_NAME]
+    assert any("sparse validation bead evidence" in warning for warning in sharp_metrics.warnings)
 
 
 def test_validate_workspace_transform_validation_identity_shape_mismatch_fails_closed(tmp_path, monkeypatch):
@@ -1792,21 +2033,26 @@ def test_run_benchmark_default_generation_scope_matches_sweep_visualization(tmp_
         include_workspace=True,
         stage_mode="single_stage",
     )
-    validation = _synthetic_beads((16, 16))
-    validation_path = tmp_path / "validation_scope.tif"
-    thorcam_path = tmp_path / "thorcam_scope.tif"
-    _write_image(validation_path, validation)
-    _write_image(thorcam_path, validation)
+    validation = np.full((4, 4), 1.25, dtype=np.float32)
+    identity = np.eye(2, 3, dtype=np.float32)
+    validation_workspace = tmp_path / "validation_scope_workspace.npz"
+    _write_validation_transform_workspace(
+        validation_workspace,
+        rectified=validation,
+        validation_processed=validation,
+        thorcam_processed=validation,
+        validation_matrix=identity,
+        thorcam_matrix=identity,
+    )
 
     result = run_benchmark(
         BenchmarkConfig(
             sweep_dir=sweep_dir,
             dataset_id="d1",
-            validation_image=validation_path,
-            thorcam_image=thorcam_path,
+            validation_workspace=validation_workspace,
             output_dir=tmp_path / "scope_out",
             stage="stage1",
-            scale_values=[1.0],
+            use_validation_workspace_transforms=True,
             top_k=1,
         )
     )
@@ -1822,7 +2068,6 @@ def test_run_benchmark_uses_candidate_preview_when_run_record_missing(tmp_path):
         stage_mode="two_stage",
     )
     validation = np.full((16, 16), 127, dtype=np.float32)
-    validation[4:12, 4:12] = 255
     validation_path = tmp_path / "validation_preview.tif"
     thorcam_path = tmp_path / "thorcam_preview.tif"
     _write_image(validation_path, validation)
@@ -1853,7 +2098,6 @@ def test_run_benchmark_reports_skipped_candidate_artifacts(tmp_path):
         stage_mode="single_stage",
     )
     validation = np.full((16, 16), 127, dtype=np.float32)
-    validation[4:12, 4:12] = 255
     validation_path = tmp_path / "validation_skipped.tif"
     thorcam_path = tmp_path / "thorcam_skipped.tif"
     _write_image(validation_path, validation)

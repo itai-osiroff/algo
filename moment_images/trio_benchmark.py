@@ -38,10 +38,20 @@ from moment_images.sweep_visualization import (
 
 
 PROFILE_NAME = "validation_hybrid_v1"
+THORCAM_FOV_PROFILE_NAME = "validation_hybrid_thorcam_fov_v1"
 FULL_GRID_PROFILE_NAME = "validation_hybrid_full_grid_v1"
 VALID_FOV_FRACTION_NAME = "validation_valid_fov_fraction"
+METRIC_ROI_SOURCE_NAME = "validation_metric_roi_source"
+METRIC_ROI_FRACTION_NAME = "validation_metric_roi_fraction"
+METRIC_ROI_PIXEL_COUNT_NAME = "validation_metric_roi_pixel_count"
+METRIC_BEAD_COUNT_NAME = "validation_metric_bead_count"
+METRIC_CANDIDATE_ROI_COVERAGE_NAME = "validation_metric_candidate_roi_coverage"
 COMMON_FOV_TOO_SMALL_WARNING = "common-fov metric support too small"
+THORCAM_FOV_ROI_UNAVAILABLE_WARNING = "thorcam-fov metric ROI unavailable"
+THORCAM_FOV_COVERAGE_TOO_LOW_WARNING = "thorcam-fov candidate ROI coverage below minimum"
+SPARSE_BEAD_EVIDENCE_WARNING = "sparse validation bead evidence in fixed ROI"
 MIN_COMMON_FOV_PIXELS = 16
+MIN_THORCAM_FOV_ROI_COVERAGE = 0.95
 DEFAULT_SCALE_SEARCH = "0.90:1.10:11"
 DEFAULT_GEOMETRIC_SCALE_SEARCH = "0.50:2.00:31"
 DEFAULT_REGISTRATION_ROTATION_SEARCH = "-45:45:19"
@@ -152,7 +162,7 @@ class SimilarityRegistrationResult:
 
 @dataclass
 class ValidationMetricResult:
-    metrics: Dict[str, Optional[float]]
+    metrics: Dict[str, Any]
     weights_used: Dict[str, float]
     bead_count: int
     warnings: List[str] = field(default_factory=list)
@@ -180,7 +190,7 @@ class BenchmarkResultRow:
     saved_rank: Optional[int]
     validation_rank: Optional[int]
     saved_score: Optional[float]
-    metrics: Dict[str, Optional[float]]
+    metrics: Dict[str, Any]
     registration: SimilarityRegistrationResult
     workspace_path: Optional[str] = None
     preview_path: Optional[str] = None
@@ -2055,6 +2065,7 @@ def compute_validation_metrics(
         candidate_raw,
         metric_mask=None,
         reference_cache=reference_cache,
+        profile_name=PROFILE_NAME,
     )
     if metric_count < MIN_COMMON_FOV_PIXELS:
         metrics = _empty_validation_metric_result().metrics
@@ -2072,6 +2083,7 @@ def compute_validation_metrics(
         candidate_raw,
         metric_mask=None if _mask_is_all_true(metric_mask) else metric_mask,
         reference_cache=reference_cache if _mask_is_all_true(metric_mask) else None,
+        profile_name=PROFILE_NAME,
     )
     metrics = dict(common.metrics)
     metrics[FULL_GRID_PROFILE_NAME] = full_grid.metrics.get(PROFILE_NAME)
@@ -2084,12 +2096,174 @@ def compute_validation_metrics(
     )
 
 
+def compute_validation_metrics_for_fixed_roi(
+    validation_image: np.ndarray,
+    candidate_image: np.ndarray,
+    *,
+    metric_roi_mask: np.ndarray,
+    reference_mask: Optional[np.ndarray] = None,
+    candidate_mask: Optional[np.ndarray] = None,
+    roi_source: str = "thorcam_valid_fov",
+) -> ValidationMetricResult:
+    """Compute validation metrics on a fixed scene-level ROI for all candidates."""
+
+    validation_raw, candidate_raw, ref_mask, cand_mask, roi_mask = _crop_metric_inputs_with_roi(
+        _as_float_2d(validation_image),
+        _as_float_2d(candidate_image),
+        reference_mask,
+        candidate_mask,
+        metric_roi_mask,
+    )
+    reference_valid = ref_mask & np.isfinite(validation_raw)
+    candidate_valid = cand_mask & np.isfinite(candidate_raw)
+    roi_reference_valid = roi_mask & reference_valid
+    metric_mask = roi_reference_valid & candidate_valid
+    reference_valid_count = int(np.count_nonzero(reference_valid))
+    roi_pixel_count = int(np.count_nonzero(roi_reference_valid))
+    metric_count = int(np.count_nonzero(metric_mask))
+    roi_fraction = (
+        float(roi_pixel_count) / float(reference_valid_count)
+        if reference_valid_count > 0
+        else 0.0
+    )
+    candidate_roi_coverage = (
+        float(metric_count) / float(roi_pixel_count)
+        if roi_pixel_count > 0
+        else 0.0
+    )
+    metadata: Dict[str, Any] = {
+        METRIC_ROI_SOURCE_NAME: str(roi_source),
+        METRIC_ROI_FRACTION_NAME: _clip01(roi_fraction),
+        METRIC_ROI_PIXEL_COUNT_NAME: roi_pixel_count,
+        METRIC_CANDIDATE_ROI_COVERAGE_NAME: _clip01(candidate_roi_coverage),
+    }
+    if roi_pixel_count < MIN_COMMON_FOV_PIXELS or metric_count < MIN_COMMON_FOV_PIXELS:
+        metrics = _empty_validation_metric_result().metrics
+        metrics[THORCAM_FOV_PROFILE_NAME] = None
+        metrics.update(metadata)
+        metrics[METRIC_BEAD_COUNT_NAME] = 0
+        return ValidationMetricResult(
+            metrics=metrics,
+            weights_used={},
+            bead_count=0,
+            warnings=[COMMON_FOV_TOO_SMALL_WARNING],
+        )
+
+    result = _compute_validation_metrics_core(
+        validation_raw,
+        candidate_raw,
+        metric_mask=None if _mask_is_all_true(metric_mask) else metric_mask,
+        reference_cache=None,
+        profile_name=THORCAM_FOV_PROFILE_NAME,
+        allow_sparse_bead_terms=True,
+    )
+    metrics = dict(result.metrics)
+    metrics.update(metadata)
+    metrics[METRIC_BEAD_COUNT_NAME] = int(result.bead_count)
+    warnings = list(result.warnings)
+    if candidate_roi_coverage < MIN_THORCAM_FOV_ROI_COVERAGE:
+        warnings.append(THORCAM_FOV_COVERAGE_TOO_LOW_WARNING)
+    return ValidationMetricResult(
+        metrics=metrics,
+        weights_used=result.weights_used,
+        bead_count=result.bead_count,
+        warnings=_unique_strings(warnings),
+    )
+
+
+def _combined_validation_metrics(
+    validation_image: np.ndarray,
+    candidate_image: np.ndarray,
+    *,
+    reference_cache: Optional[ValidationMetricReference],
+    reference_mask: Optional[np.ndarray],
+    candidate_mask: Optional[np.ndarray],
+    metric_roi_mask: Optional[np.ndarray],
+) -> ValidationMetricResult:
+    diagnostic = compute_validation_metrics(
+        validation_image,
+        candidate_image,
+        reference_cache=reference_cache,
+        reference_mask=reference_mask,
+        candidate_mask=candidate_mask,
+    )
+    if metric_roi_mask is None:
+        metrics = dict(diagnostic.metrics)
+        metrics[THORCAM_FOV_PROFILE_NAME] = None
+        metrics[METRIC_ROI_SOURCE_NAME] = ""
+        metrics[METRIC_ROI_FRACTION_NAME] = None
+        metrics[METRIC_ROI_PIXEL_COUNT_NAME] = None
+        metrics[METRIC_BEAD_COUNT_NAME] = None
+        metrics[METRIC_CANDIDATE_ROI_COVERAGE_NAME] = None
+        return ValidationMetricResult(
+            metrics=metrics,
+            weights_used=diagnostic.weights_used,
+            bead_count=diagnostic.bead_count,
+            warnings=_unique_strings(diagnostic.warnings + [THORCAM_FOV_ROI_UNAVAILABLE_WARNING]),
+        )
+    primary = compute_validation_metrics_for_fixed_roi(
+        validation_image,
+        candidate_image,
+        metric_roi_mask=metric_roi_mask,
+        reference_mask=reference_mask,
+        candidate_mask=candidate_mask,
+    )
+    metrics = dict(diagnostic.metrics)
+    metrics.update(primary.metrics)
+    return ValidationMetricResult(
+        metrics=metrics,
+        weights_used=primary.weights_used,
+        bead_count=primary.bead_count,
+        warnings=_unique_strings(diagnostic.warnings + primary.warnings),
+    )
+
+
+def _thorcam_metric_roi_mask(
+    validation_mask: np.ndarray,
+    thor_registration: SimilarityRegistrationResult,
+) -> Optional[np.ndarray]:
+    if thor_registration.status != "aligned" or not thor_registration.validation_rankable:
+        return None
+    if thor_registration.valid_mask is None:
+        return None
+    ref_mask = _coerce_metric_mask(validation_mask, thor_registration.aligned_image.shape[:2])
+    thor_mask = _coerce_metric_mask(thor_registration.valid_mask, thor_registration.aligned_image.shape[:2])
+    roi_mask = ref_mask & thor_mask & np.isfinite(thor_registration.aligned_image)
+    if int(np.count_nonzero(roi_mask)) < MIN_COMMON_FOV_PIXELS:
+        return None
+    return np.asarray(roi_mask, dtype=bool)
+
+
+def _apply_thorcam_fov_rankability(
+    registration: SimilarityRegistrationResult,
+    metrics: Mapping[str, Any],
+    metric_roi_mask: Optional[np.ndarray],
+) -> None:
+    if not registration.validation_rankable:
+        return
+    if metric_roi_mask is None:
+        registration.validation_rankable = False
+        registration.ranking_exclusion_reason = "thorcam_fov_roi_unavailable"
+        return
+    score = metrics.get(THORCAM_FOV_PROFILE_NAME)
+    if not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+        registration.validation_rankable = False
+        registration.ranking_exclusion_reason = "thorcam_fov_score_unavailable"
+        return
+    coverage = _optional_float(metrics.get(METRIC_CANDIDATE_ROI_COVERAGE_NAME))
+    if coverage is None or coverage < MIN_THORCAM_FOV_ROI_COVERAGE:
+        registration.validation_rankable = False
+        registration.ranking_exclusion_reason = "thorcam_fov_coverage_below_minimum"
+
+
 def _compute_validation_metrics_core(
     validation_image: np.ndarray,
     candidate_image: np.ndarray,
     *,
     metric_mask: Optional[np.ndarray],
     reference_cache: Optional[ValidationMetricReference],
+    profile_name: str,
+    allow_sparse_bead_terms: bool = False,
 ) -> ValidationMetricResult:
     validation = _robust_unit_masked(validation_image, metric_mask)
     candidate = _robust_unit_masked(candidate_image, metric_mask)
@@ -2116,13 +2290,15 @@ def _compute_validation_metrics_core(
     warnings: List[str] = []
     bead: Optional[float]
     sharpness: Optional[float]
-    if len(centers) < 3:
+    if len(centers) == 0 or (len(centers) < 3 and not allow_sparse_bead_terms):
         bead = None
         sharpness = None
         warnings.append(BEAD_LOW_CONFIDENCE_WARNING)
         weights_used = {"validation_signal": 0.60, "validation_structure": 0.40}
         hybrid = signal_structure
     else:
+        if len(centers) < 3:
+            warnings.append(SPARSE_BEAD_EVIDENCE_WARNING)
         candidate_centers = _detect_bead_centers(adjusted)
         bead = _bead_score(centers, candidate_centers)
         sharpness = _sharpness_score(prepared.validation_unit, adjusted, centers, mask=metric_mask)
@@ -2144,7 +2320,7 @@ def _compute_validation_metrics_core(
 
     return ValidationMetricResult(
         metrics={
-            PROFILE_NAME: _clip01(hybrid),
+            profile_name: _clip01(hybrid),
             "validation_signal": _clip01(signal),
             "validation_structure": _clip01(structure),
             "validation_bead": None if bead is None else _clip01(bead),
@@ -2161,6 +2337,7 @@ def _empty_validation_metric_result() -> ValidationMetricResult:
     return ValidationMetricResult(
         metrics={
             PROFILE_NAME: None,
+            THORCAM_FOV_PROFILE_NAME: None,
             "validation_signal": None,
             "validation_structure": None,
             "validation_bead": None,
@@ -2168,6 +2345,11 @@ def _empty_validation_metric_result() -> ValidationMetricResult:
             "validation_signal_structure_score": None,
             FULL_GRID_PROFILE_NAME: None,
             VALID_FOV_FRACTION_NAME: None,
+            METRIC_ROI_SOURCE_NAME: "",
+            METRIC_ROI_FRACTION_NAME: None,
+            METRIC_ROI_PIXEL_COUNT_NAME: None,
+            METRIC_BEAD_COUNT_NAME: None,
+            METRIC_CANDIDATE_ROI_COVERAGE_NAME: None,
         },
         weights_used={},
         bead_count=0,
@@ -2206,6 +2388,28 @@ def _crop_metric_inputs(
     ref_mask = _coerce_metric_mask(reference_mask, (min_h, min_w))
     cand_mask = _coerce_metric_mask(candidate_mask, (min_h, min_w))
     return validation_cropped, candidate_cropped, ref_mask, cand_mask
+
+
+def _crop_metric_inputs_with_roi(
+    validation: np.ndarray,
+    candidate: np.ndarray,
+    reference_mask: Optional[np.ndarray],
+    candidate_mask: Optional[np.ndarray],
+    metric_roi_mask: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    shapes = [validation.shape[:2], candidate.shape[:2], np.asarray(metric_roi_mask).shape[:2]]
+    if reference_mask is not None:
+        shapes.append(np.asarray(reference_mask).shape[:2])
+    if candidate_mask is not None:
+        shapes.append(np.asarray(candidate_mask).shape[:2])
+    min_h = min(int(shape[0]) for shape in shapes)
+    min_w = min(int(shape[1]) for shape in shapes)
+    validation_cropped = np.asarray(validation[:min_h, :min_w], dtype=np.float32)
+    candidate_cropped = np.asarray(candidate[:min_h, :min_w], dtype=np.float32)
+    ref_mask = _coerce_metric_mask(reference_mask, (min_h, min_w))
+    cand_mask = _coerce_metric_mask(candidate_mask, (min_h, min_w))
+    roi_mask = _coerce_metric_mask(metric_roi_mask, (min_h, min_w))
+    return validation_cropped, candidate_cropped, ref_mask, cand_mask, roi_mask
 
 
 def _coerce_metric_mask(mask: Optional[np.ndarray], shape: Tuple[int, int]) -> np.ndarray:
@@ -2303,13 +2507,6 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             registration_min_structure_score=cfg.registration_min_structure_score,
             reference_cache=metric_reference_cache,
         )
-        metrics = compute_validation_metrics(
-            validation,
-            registration.aligned_image,
-            reference_cache=metric_reference_cache,
-            reference_mask=validation_mask,
-            candidate_mask=registration.valid_mask,
-        )
         row = candidate.row
         record = candidate.record
         lf_rows.append(
@@ -2324,28 +2521,15 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 saved_rank=_optional_int(getattr(row, "rank", None)),
                 validation_rank=None,
                 saved_score=_optional_float(getattr(row, "score", None)),
-                metrics=metrics.metrics,
+                metrics={},
                 registration=registration,
                 workspace_path=candidate.workspace_path,
                 preview_path=candidate.preview_path,
                 params=_jsonable_mapping(getattr(row, "params", {})),
                 config=_jsonable_mapping(getattr(row, "config", {})),
-                warnings=_unique_strings(candidate.warnings + registration.warnings + metrics.warnings),
+                warnings=_unique_strings(candidate.warnings + registration.warnings),
             )
         )
-
-    lf_rows.sort(
-        key=lambda item: (
-            bool(item.registration.validation_rankable),
-            _score_sort_value(item.metrics.get(PROFILE_NAME)),
-        ),
-        reverse=True,
-    )
-    rank = 1
-    for row in lf_rows:
-        if row.registration.validation_rankable:
-            row.validation_rank = rank
-            rank += 1
 
     if cfg.use_validation_workspace_transforms:
         thor_source = _workspace_transform_source_for(references, "thorcam")
@@ -2396,17 +2580,18 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             geometric_reference_cache=geometric_reference_cache,
             quality_reference_cache=metric_reference_cache,
         )
-    thor_metrics = (
-        compute_validation_metrics(
-            validation,
-            thor_registration.aligned_image,
-            reference_cache=metric_reference_cache,
-            reference_mask=validation_mask,
-            candidate_mask=thor_registration.valid_mask,
-        )
-        if thor_registration.status == "aligned" and thor_registration.validation_rankable
-        else _empty_validation_metric_result()
-    )
+    metric_roi_mask = _thorcam_metric_roi_mask(validation_mask, thor_registration)
+    thor_metrics = _combined_validation_metrics(
+        validation,
+        thor_registration.aligned_image,
+        reference_cache=metric_reference_cache,
+        reference_mask=validation_mask,
+        candidate_mask=thor_registration.valid_mask,
+        metric_roi_mask=metric_roi_mask,
+    ) if thor_registration.status == "aligned" and thor_registration.validation_rankable else _empty_validation_metric_result()
+    if metric_roi_mask is None and thor_registration.status == "aligned" and thor_registration.validation_rankable:
+        thor_registration.validation_rankable = False
+        thor_registration.ranking_exclusion_reason = "thorcam_fov_roi_unavailable"
     thor_row = BenchmarkResultRow(
         source_kind="thorcam_baseline",
         row_id="thorcam_baseline",
@@ -2424,6 +2609,32 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         preview_path=references.thorcam_source,
         warnings=_unique_strings(thor_registration.warnings + thor_metrics.warnings),
     )
+
+    for row in lf_rows:
+        row_metrics = _combined_validation_metrics(
+            validation,
+            row.registration.aligned_image,
+            reference_cache=metric_reference_cache,
+            reference_mask=validation_mask,
+            candidate_mask=row.registration.valid_mask,
+            metric_roi_mask=metric_roi_mask,
+        )
+        row.metrics = row_metrics.metrics
+        _apply_thorcam_fov_rankability(row.registration, row.metrics, metric_roi_mask)
+        row.warnings = _unique_strings(row.warnings + row_metrics.warnings + row.registration.warnings)
+
+    lf_rows.sort(
+        key=lambda item: (
+            bool(item.registration.validation_rankable),
+            _score_sort_value(item.metrics.get(THORCAM_FOV_PROFILE_NAME)),
+        ),
+        reverse=True,
+    )
+    rank = 1
+    for row in lf_rows:
+        if row.registration.validation_rankable:
+            row.validation_rank = rank
+            rank += 1
 
     rows = lf_rows + [thor_row]
     _write_bead_detection_figure(figures_dir / "validation_beads.png", validation)
@@ -3161,9 +3372,15 @@ def _write_results_csv(path: Path, rows: Sequence[BenchmarkResultRow]) -> None:
         "strategy",
         "saved_rank",
         "saved_score",
+        THORCAM_FOV_PROFILE_NAME,
         PROFILE_NAME,
         FULL_GRID_PROFILE_NAME,
         VALID_FOV_FRACTION_NAME,
+        METRIC_ROI_SOURCE_NAME,
+        METRIC_ROI_FRACTION_NAME,
+        METRIC_ROI_PIXEL_COUNT_NAME,
+        METRIC_BEAD_COUNT_NAME,
+        METRIC_CANDIDATE_ROI_COVERAGE_NAME,
         "validation_signal",
         "validation_structure",
         "validation_bead",
@@ -3319,9 +3536,14 @@ def _row_to_csv(row: BenchmarkResultRow) -> Dict[str, Any]:
         "warnings": "; ".join(row.warnings),
     }
     for metric_name in [
+        THORCAM_FOV_PROFILE_NAME,
         PROFILE_NAME,
         FULL_GRID_PROFILE_NAME,
         VALID_FOV_FRACTION_NAME,
+        METRIC_ROI_FRACTION_NAME,
+        METRIC_ROI_PIXEL_COUNT_NAME,
+        METRIC_BEAD_COUNT_NAME,
+        METRIC_CANDIDATE_ROI_COVERAGE_NAME,
         "validation_signal",
         "validation_structure",
         "validation_bead",
@@ -3329,6 +3551,7 @@ def _row_to_csv(row: BenchmarkResultRow) -> Dict[str, Any]:
         "validation_signal_structure_score",
     ]:
         payload[metric_name] = _csv_float(row.metrics.get(metric_name))
+    payload[METRIC_ROI_SOURCE_NAME] = str(row.metrics.get(METRIC_ROI_SOURCE_NAME) or "")
     return payload
 
 
@@ -3361,6 +3584,7 @@ def _build_summary(
     return {
         "config": {
             "profile_name": PROFILE_NAME,
+            "primary_score_name": THORCAM_FOV_PROFILE_NAME,
             "sweep_dir": str(config.sweep_dir),
             "dataset_id": config.dataset_id,
             "scene_id": config.scene_id,
@@ -3475,7 +3699,7 @@ def _registration_summary(reg: SimilarityRegistrationResult) -> Dict[str, Any]:
 def _render_report_html(summary: Mapping[str, Any], rows: Sequence[BenchmarkResultRow], figures_dir: Path) -> str:
     table_rows = []
     for row in rows:
-        score = row.metrics.get(PROFILE_NAME)
+        score = row.metrics.get(THORCAM_FOV_PROFILE_NAME)
         overlay = _overlay_filename(row)
         table_rows.append(
             "<tr>"
@@ -3484,6 +3708,11 @@ def _render_report_html(summary: Mapping[str, Any], rows: Sequence[BenchmarkResu
             f"<td>{html.escape(row.row_id)}</td>"
             f"<td>{html.escape(row.candidate_id)}</td>"
             f"<td>{_html_float(score)}</td>"
+            f"<td>{_html_float(row.metrics.get(PROFILE_NAME))}</td>"
+            f"<td>{html.escape(str(row.metrics.get(METRIC_ROI_SOURCE_NAME) or ''))}</td>"
+            f"<td>{_html_float(row.metrics.get(METRIC_ROI_FRACTION_NAME))}</td>"
+            f"<td>{_html_float(row.metrics.get(METRIC_BEAD_COUNT_NAME))}</td>"
+            f"<td>{_html_float(row.metrics.get(METRIC_CANDIDATE_ROI_COVERAGE_NAME))}</td>"
             f"<td>{_html_float(row.metrics.get(VALID_FOV_FRACTION_NAME))}</td>"
             f"<td>{_html_float(row.metrics.get(FULL_GRID_PROFILE_NAME))}</td>"
             f"<td>{_html_float(row.metrics.get('validation_signal'))}</td>"
@@ -3511,11 +3740,13 @@ def _render_report_html(summary: Mapping[str, Any], rows: Sequence[BenchmarkResu
             "th,td{border:1px solid #ddd;padding:6px;font-size:13px;}th{background:#f2f2f2;text-align:left;}"
             "code{background:#f7f7f7;padding:2px 4px;}</style></head><body>",
             "<h1>Trio Benchmark Report</h1>",
-            f"<p><strong>Profile:</strong> <code>{PROFILE_NAME}</code></p>",
+            f"<p><strong>Primary profile:</strong> <code>{THORCAM_FOV_PROFILE_NAME}</code></p>",
+            f"<p><strong>Diagnostic profile:</strong> <code>{PROFILE_NAME}</code></p>",
             f"<p><strong>Best LF row:</strong> {html.escape(best_text)}</p>",
             "<h2>Ranking</h2>",
             "<table><thead><tr><th>Source</th><th>Rank</th><th>Row ID</th><th>Candidate</th>"
-            "<th>Hybrid</th><th>Valid FOV</th><th>Full-grid Hybrid</th><th>Signal</th><th>Structure</th><th>Bead</th><th>Sharpness</th>"
+            "<th>ThorCam-FOV Hybrid</th><th>Row-local Hybrid</th><th>ROI Source</th><th>ROI Fraction</th><th>ROI Beads</th><th>Candidate ROI Coverage</th>"
+            "<th>Valid FOV</th><th>Full-grid Hybrid</th><th>Signal</th><th>Structure</th><th>Bead</th><th>Sharpness</th>"
             "<th>Reg Conf</th><th>Reg Suspect</th><th>Constraint</th><th>Initializer</th>"
             "<th>Transform Source</th><th>Rankable</th><th>Residual Norm</th><th>Figure</th><th>Warnings</th></tr></thead><tbody>",
             *table_rows,

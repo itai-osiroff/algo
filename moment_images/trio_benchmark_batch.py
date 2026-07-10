@@ -31,6 +31,10 @@ from moment_images.trio_benchmark import (
     DEFAULT_TOP_K,
     VALID_FOV_FRACTION_NAME,
     FULL_GRID_PROFILE_NAME,
+    THORCAM_FOV_PROFILE_NAME,
+    METRIC_ROI_FRACTION_NAME,
+    METRIC_BEAD_COUNT_NAME,
+    METRIC_CANDIDATE_ROI_COVERAGE_NAME,
     PROFILE_NAME,
     BenchmarkConfig,
     parse_rotation_search,
@@ -79,6 +83,7 @@ def run_batch_from_manifest(manifest_path: Path, output_dir: Path) -> Dict[str, 
         "manifest_path": str(manifest_path),
         "output_dir": str(output_dir),
         "profile_name": PROFILE_NAME,
+        "primary_score_name": THORCAM_FOV_PROFILE_NAME,
         "num_scenes": len(scene_summaries),
         "num_successful": sum(1 for scene in scene_summaries if scene["status"] == "ok"),
         "num_failed": sum(1 for scene in scene_summaries if scene["status"] != "ok"),
@@ -192,9 +197,18 @@ def _successful_scene_summary(
         "summary_path": str(scene_dir / "trio_benchmark_summary.json"),
         "best_lf_row_id": best.get("row_id"),
         "best_lf_candidate_id": best.get("candidate_id"),
+        "best_validation_hybrid_thorcam_fov_v1": best_metrics.get(THORCAM_FOV_PROFILE_NAME),
+        "thorcam_validation_hybrid_thorcam_fov_v1": thor_metrics.get(THORCAM_FOV_PROFILE_NAME),
+        "best_lf_minus_thorcam_validation_hybrid_thorcam_fov_v1": deltas.get(THORCAM_FOV_PROFILE_NAME),
         "best_validation_hybrid_v1": best_metrics.get(PROFILE_NAME),
         "thorcam_validation_hybrid_v1": thor_metrics.get(PROFILE_NAME),
         "best_lf_minus_thorcam_validation_hybrid_v1": deltas.get(PROFILE_NAME),
+        "best_validation_metric_roi_fraction": best_metrics.get(METRIC_ROI_FRACTION_NAME),
+        "thorcam_validation_metric_roi_fraction": thor_metrics.get(METRIC_ROI_FRACTION_NAME),
+        "best_validation_metric_bead_count": best_metrics.get(METRIC_BEAD_COUNT_NAME),
+        "thorcam_validation_metric_bead_count": thor_metrics.get(METRIC_BEAD_COUNT_NAME),
+        "best_validation_metric_candidate_roi_coverage": best_metrics.get(METRIC_CANDIDATE_ROI_COVERAGE_NAME),
+        "thorcam_validation_metric_candidate_roi_coverage": thor_metrics.get(METRIC_CANDIDATE_ROI_COVERAGE_NAME),
         "best_validation_valid_fov_fraction": best_metrics.get(VALID_FOV_FRACTION_NAME),
         "thorcam_validation_valid_fov_fraction": thor_metrics.get(VALID_FOV_FRACTION_NAME),
         "best_validation_hybrid_full_grid_v1": best_metrics.get(FULL_GRID_PROFILE_NAME),
@@ -233,9 +247,18 @@ def _failed_scene_summary(scene_id: str, scene: Mapping[str, Any], scene_dir: Pa
         "summary_path": None,
         "best_lf_row_id": None,
         "best_lf_candidate_id": None,
+        "best_validation_hybrid_thorcam_fov_v1": None,
+        "thorcam_validation_hybrid_thorcam_fov_v1": None,
+        "best_lf_minus_thorcam_validation_hybrid_thorcam_fov_v1": None,
         "best_validation_hybrid_v1": None,
         "thorcam_validation_hybrid_v1": None,
         "best_lf_minus_thorcam_validation_hybrid_v1": None,
+        "best_validation_metric_roi_fraction": None,
+        "thorcam_validation_metric_roi_fraction": None,
+        "best_validation_metric_bead_count": None,
+        "thorcam_validation_metric_bead_count": None,
+        "best_validation_metric_candidate_roi_coverage": None,
+        "thorcam_validation_metric_candidate_roi_coverage": None,
         "best_validation_valid_fov_fraction": None,
         "thorcam_validation_valid_fov_fraction": None,
         "best_validation_hybrid_full_grid_v1": None,
@@ -273,9 +296,18 @@ def _write_batch_csv(path: Path, scene_summaries: Sequence[Mapping[str, Any]]) -
         "report_path",
         "best_lf_row_id",
         "best_lf_candidate_id",
+        "best_validation_hybrid_thorcam_fov_v1",
+        "thorcam_validation_hybrid_thorcam_fov_v1",
+        "best_lf_minus_thorcam_validation_hybrid_thorcam_fov_v1",
         "best_validation_hybrid_v1",
         "thorcam_validation_hybrid_v1",
         "best_lf_minus_thorcam_validation_hybrid_v1",
+        "best_validation_metric_roi_fraction",
+        "thorcam_validation_metric_roi_fraction",
+        "best_validation_metric_bead_count",
+        "thorcam_validation_metric_bead_count",
+        "best_validation_metric_candidate_roi_coverage",
+        "thorcam_validation_metric_candidate_roi_coverage",
         "best_validation_valid_fov_fraction",
         "thorcam_validation_valid_fov_fraction",
         "best_validation_hybrid_full_grid_v1",
@@ -324,11 +356,13 @@ def _render_batch_html(summary: Mapping[str, Any]) -> str:
             f"<td>{html.escape(str(scene_map.get('scene_id', '')))}</td>"
             f"<td>{html.escape(str(scene_map.get('status', '')))}</td>"
             f"<td>{html.escape(str(scene_map.get('best_lf_row_id', '') or ''))}</td>"
+            f"<td>{_html_float(scene_map.get('best_validation_hybrid_thorcam_fov_v1'))}</td>"
+            f"<td>{_html_float(scene_map.get('thorcam_validation_hybrid_thorcam_fov_v1'))}</td>"
+            f"<td>{_html_float(scene_map.get('best_lf_minus_thorcam_validation_hybrid_thorcam_fov_v1'))}</td>"
+            f"<td>{_html_float(scene_map.get('best_validation_metric_roi_fraction'))}</td>"
+            f"<td>{_html_float(scene_map.get('best_validation_metric_bead_count'))}</td>"
+            f"<td>{_html_float(scene_map.get('best_validation_metric_candidate_roi_coverage'))}</td>"
             f"<td>{_html_float(scene_map.get('best_validation_hybrid_v1'))}</td>"
-            f"<td>{_html_float(scene_map.get('best_validation_valid_fov_fraction'))}</td>"
-            f"<td>{_html_float(scene_map.get('thorcam_validation_hybrid_v1'))}</td>"
-            f"<td>{_html_float(scene_map.get('thorcam_validation_valid_fov_fraction'))}</td>"
-            f"<td>{_html_float(scene_map.get('best_lf_minus_thorcam_validation_hybrid_v1'))}</td>"
             f"<td>{_html_float(scene_map.get('registration_confidence'))}</td>"
             f"<td>{html.escape(str(scene_map.get('registration_suspect') or ''))}</td>"
             f"<td>{html.escape(str(scene_map.get('registration_constraint_level') or ''))}</td>"
@@ -347,7 +381,7 @@ def _render_batch_html(summary: Mapping[str, Any]) -> str:
         f"successful: {int(summary.get('num_successful', 0))}; "
         f"failed: {int(summary.get('num_failed', 0))}</p>"
         "<table><thead><tr><th>Scene</th><th>Status</th><th>Best LF Row</th>"
-        "<th>Best LF Score</th><th>Best LF FOV</th><th>ThorCam Score</th><th>ThorCam FOV</th><th>Delta</th><th>Reg Conf</th><th>Reg Suspect</th><th>Constraint</th>"
+        "<th>Best LF ThorCam-FOV Score</th><th>ThorCam Score</th><th>Delta</th><th>ROI Fraction</th><th>ROI Beads</th><th>Candidate ROI Coverage</th><th>Row-local Score</th><th>Reg Conf</th><th>Reg Suspect</th><th>Constraint</th>"
         "<th>Report</th><th>Error</th>"
         "</tr></thead><tbody>"
         + "\n".join(rows)
