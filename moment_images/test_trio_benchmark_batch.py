@@ -285,7 +285,7 @@ def test_batch_workspace_transform_invalid_thorcam_keeps_scene_successful(tmp_pa
     thor_registration = scene_summary["thorcam_baseline"]["registration"]
     assert thor_registration["status"] == "failed"
     assert thor_registration["validation_rankable"] is False
-    assert thor_registration["ranking_exclusion_reason"] == "workspace_transform_identity_shape_mismatch"
+    assert thor_registration["ranking_exclusion_reason"] == "missing_output_shape"
 
 
 def test_batch_main_emits_scene_progress_to_stderr(tmp_path, capsys):

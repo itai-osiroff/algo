@@ -87,15 +87,35 @@ def _write_validation_transform_workspace(
     thorcam_processed: np.ndarray,
     validation_matrix: np.ndarray,
     thorcam_matrix: np.ndarray,
+    validation_alignment_status: str | None = "point_aligned",
+    thorcam_alignment_status: str | None = "aligned_preserve_same_shape",
+    validation_alignment_model: str | None = "point_similarity",
+    thorcam_alignment_model: str | None = "translation_ecc",
+    validation_alignment_output_shape: tuple[int, int] | None = None,
+    thorcam_alignment_output_shape: tuple[int, int] | None = None,
+    include_alignment_output_shape: bool = True,
 ) -> None:
-    np.savez_compressed(
-        path,
-        rectified_image=np.asarray(rectified, dtype=np.float32),
-        validation_processed=np.asarray(validation_processed, dtype=np.float32),
-        thorcam_processed=np.asarray(thorcam_processed, dtype=np.float32),
-        validation_alignment_final_warp_matrix=np.asarray(validation_matrix, dtype=np.float32),
-        thorcam_alignment_final_warp_matrix=np.asarray(thorcam_matrix, dtype=np.float32),
-    )
+    payload = {
+        "rectified_image": np.asarray(rectified, dtype=np.float32),
+        "validation_processed": np.asarray(validation_processed, dtype=np.float32),
+        "thorcam_processed": np.asarray(thorcam_processed, dtype=np.float32),
+        "validation_alignment_final_warp_matrix": np.asarray(validation_matrix, dtype=np.float32),
+        "thorcam_alignment_final_warp_matrix": np.asarray(thorcam_matrix, dtype=np.float32),
+    }
+    if validation_alignment_status is not None:
+        payload["validation_alignment_status"] = np.array(validation_alignment_status)
+    if thorcam_alignment_status is not None:
+        payload["thorcam_alignment_status"] = np.array(thorcam_alignment_status)
+    if validation_alignment_model is not None:
+        payload["validation_alignment_model"] = np.array(validation_alignment_model)
+    if thorcam_alignment_model is not None:
+        payload["thorcam_alignment_model"] = np.array(thorcam_alignment_model)
+    if include_alignment_output_shape:
+        validation_shape = validation_alignment_output_shape or tuple(rectified.shape[:2])
+        thorcam_shape = thorcam_alignment_output_shape or tuple(rectified.shape[:2])
+        payload["validation_alignment_output_shape"] = np.array(validation_shape, dtype=np.int32)
+        payload["thorcam_alignment_output_shape"] = np.array(thorcam_shape, dtype=np.int32)
+    np.savez_compressed(path, **payload)
 
 
 def _source_from_grid_image(reference: np.ndarray, source_shape: tuple[int, int], matrix: np.ndarray) -> np.ndarray:
@@ -452,7 +472,7 @@ def test_run_benchmark_uses_validate_workspace_transform_grid(tmp_path, monkeypa
     assert (output_dir / "figures" / "validation_workspace_thorcam_overlay.png").exists()
 
 
-def test_validate_workspace_transform_uses_identity_when_same_shape_matrix_missing(tmp_path, monkeypatch):
+def test_validate_workspace_transform_missing_validation_matrix_fails_even_when_same_shape(tmp_path, monkeypatch):
     rectified = _synthetic_beads((64, 64))
     nan_matrix = np.full((2, 3), np.nan, dtype=np.float32)
 
@@ -469,59 +489,23 @@ def test_validate_workspace_transform_uses_identity_when_same_shape_matrix_missi
         thorcam_matrix=nan_matrix,
     )
 
-    run1 = sweep_dir / "run1"
-    run1.mkdir()
-    workspace1 = run1 / "workspace.npz"
-    np.savez_compressed(workspace1, average_rectified_image=rectified)
-
     model = SimpleNamespace(primary_stage_name="stage2")
-    rows = [
-        SimpleNamespace(
-            row_id="stage2:candidate_a",
-            stage="stage2",
-            candidate_id="candidate_a",
-            generation_id="gen1",
-            rank=1,
-            strategy="combined",
-            params={},
-            config={},
-            score=10.0,
-        )
-    ]
-    records = [
-        SimpleNamespace(
-            row_id="stage2:candidate_a",
-            stage="stage2",
-            candidate_id="candidate_a",
-            dataset_id="scene_a",
-            generation_id="gen1",
-            workspace_path=str(workspace1),
-            preview_path=None,
-            metric_record_path=None,
-        )
-    ]
-
     monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
-    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
-    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: [])
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: [])
 
-    result = run_benchmark(
-        BenchmarkConfig(
-            sweep_dir=sweep_dir,
-            dataset_id="scene_a",
-            validation_workspace=validation_workspace,
-            output_dir=output_dir,
-            use_validation_workspace_transforms=True,
-            residual_translation_max_px=0.0,
-            top_k=1,
+    with pytest.raises(ValueError, match="missing_matrix"):
+        run_benchmark(
+            BenchmarkConfig(
+                sweep_dir=sweep_dir,
+                dataset_id="scene_a",
+                validation_workspace=validation_workspace,
+                output_dir=output_dir,
+                use_validation_workspace_transforms=True,
+                residual_translation_max_px=0.0,
+                top_k=1,
+            )
         )
-    )
-
-    warnings = result.summary["warnings"]
-    assert any("identity_workspace_same_shape" in warning for warning in warnings)
-    assert result.summary["thorcam_baseline"]["registration"]["registration_transform_source"] == (
-        "identity_workspace_same_shape"
-    )
 
 
 def test_validate_workspace_transform_invalid_thorcam_identity_shape_mismatch_is_unrankable(
@@ -541,6 +525,8 @@ def test_validate_workspace_transform_invalid_thorcam_identity_shape_mismatch_is
         thorcam_processed=rectified[:32, :21],
         validation_matrix=identity,
         thorcam_matrix=identity,
+        thorcam_alignment_status="not_run",
+        thorcam_alignment_model="none",
     )
 
     run1 = sweep_dir / "run1"
@@ -596,7 +582,7 @@ def test_validate_workspace_transform_invalid_thorcam_identity_shape_mismatch_is
     assert result.best_lf_row_id == "stage2:candidate_a"
     assert thor_registration["status"] == "failed"
     assert thor_registration["validation_rankable"] is False
-    assert thor_registration["ranking_exclusion_reason"] == "workspace_transform_identity_shape_mismatch"
+    assert thor_registration["ranking_exclusion_reason"] == "not_run"
     assert thorcam["metrics"][PROFILE_NAME] is None
     assert PROFILE_NAME not in result.summary["best_lf_minus_thorcam"]
 
@@ -605,16 +591,106 @@ def test_validate_workspace_transform_invalid_thorcam_identity_shape_mismatch_is
     )
     thorcam_info = transform_payload["workspace_transform_info"]["sources"]["thorcam"]
     assert thorcam_info["valid_for_scoring"] is False
-    assert thorcam_info["invalid_reason"] == "workspace_transform_identity_shape_mismatch"
+    assert thorcam_info["invalid_reason"] == "not_run"
     assert thorcam_info["source_shape_matches_rectified"] is False
     assert thorcam_info["matrix_is_identity"] is True
+    assert thorcam_info["replay_shape_matches_rectified"] is True
 
     with (output_dir / "trio_benchmark_results.csv").open(newline="", encoding="utf-8") as fp:
         csv_rows = list(csv.DictReader(fp))
     thorcam_row = next(row for row in csv_rows if row["source_kind"] == "thorcam_baseline")
     assert thorcam_row[PROFILE_NAME] == ""
     assert thorcam_row["validation_rankable"] == "false"
-    assert thorcam_row["ranking_exclusion_reason"] == "workspace_transform_identity_shape_mismatch"
+    assert thorcam_row["ranking_exclusion_reason"] == "not_run"
+
+
+def test_validate_workspace_transform_accepts_successful_identity_with_explicit_rectified_shape(
+    tmp_path, monkeypatch
+):
+    rectified = _synthetic_beads((64, 64))
+    identity = np.eye(2, 3, dtype=np.float32)
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    _write_validation_transform_workspace(
+        validation_workspace,
+        rectified=rectified,
+        validation_processed=rectified,
+        thorcam_processed=rectified[:32, :21],
+        validation_matrix=identity,
+        thorcam_matrix=identity,
+        thorcam_alignment_status="aligned_target_in_reference",
+        thorcam_alignment_model="translation_ecc",
+        thorcam_alignment_output_shape=rectified.shape,
+    )
+
+    run1 = sweep_dir / "run1"
+    run1.mkdir()
+    workspace1 = run1 / "workspace.npz"
+    np.savez_compressed(workspace1, average_rectified_image=rectified)
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    rows = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            generation_id="gen1",
+            rank=1,
+            strategy="combined",
+            params={},
+            config={},
+            score=10.0,
+        )
+    ]
+    records = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            dataset_id="scene_a",
+            generation_id="gen1",
+            workspace_path=str(workspace1),
+            preview_path=None,
+            metric_record_path=None,
+        )
+    ]
+
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_a",
+            validation_workspace=validation_workspace,
+            output_dir=output_dir,
+            use_validation_workspace_transforms=True,
+            residual_translation_max_px=0.0,
+            top_k=1,
+        )
+    )
+
+    thorcam = result.summary["thorcam_baseline"]
+    thor_registration = thorcam["registration"]
+    assert thor_registration["status"] == "aligned"
+    assert thor_registration["validation_rankable"] is True
+    assert thorcam["metrics"][PROFILE_NAME] is not None
+    assert PROFILE_NAME in result.summary["best_lf_minus_thorcam"]
+
+    transform_payload = json.loads(
+        (output_dir / "trio_validation_workspace_transforms.json").read_text(encoding="utf-8")
+    )
+    thorcam_info = transform_payload["workspace_transform_info"]["sources"]["thorcam"]
+    assert thorcam_info["valid_for_replay"] is True
+    assert thorcam_info["valid_for_scoring"] is True
+    assert thorcam_info["invalid_reason"] is None
+    assert thorcam_info["alignment_output_shape"] == [64, 64]
+    assert thorcam_info["replay_output_shape"] == [64, 64]
+    assert thorcam_info["replay_shape_matches_rectified"] is True
 
 
 def test_validate_workspace_transform_validation_identity_shape_mismatch_fails_closed(tmp_path, monkeypatch):
@@ -632,6 +708,8 @@ def test_validate_workspace_transform_validation_identity_shape_mismatch_fails_c
         thorcam_processed=rectified,
         validation_matrix=identity,
         thorcam_matrix=identity,
+        validation_alignment_status="not_run",
+        validation_alignment_model="none",
     )
 
     model = SimpleNamespace(primary_stage_name="stage2")
@@ -639,7 +717,7 @@ def test_validate_workspace_transform_validation_identity_shape_mismatch_fails_c
     monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: [])
     monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: [])
 
-    with pytest.raises(ValueError, match="workspace_transform_identity_shape_mismatch"):
+    with pytest.raises(ValueError, match="not_run"):
         run_benchmark(
             BenchmarkConfig(
                 sweep_dir=sweep_dir,
@@ -650,6 +728,164 @@ def test_validate_workspace_transform_validation_identity_shape_mismatch_fails_c
                 top_k=1,
             )
         )
+
+
+def test_validate_workspace_transform_validation_output_shape_mismatch_fails_closed(tmp_path, monkeypatch):
+    rectified = _synthetic_beads((64, 64))
+    validation_matrix = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, 3.0]], dtype=np.float32)
+    validation_processed = _source_from_grid_image(rectified, (78, 80), validation_matrix)
+    identity = np.eye(2, 3, dtype=np.float32)
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    _write_validation_transform_workspace(
+        validation_workspace,
+        rectified=rectified,
+        validation_processed=validation_processed,
+        thorcam_processed=rectified,
+        validation_matrix=validation_matrix,
+        thorcam_matrix=identity,
+        validation_alignment_output_shape=(63, 64),
+    )
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: [])
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: [])
+
+    with pytest.raises(ValueError, match="output_shape_mismatch"):
+        run_benchmark(
+            BenchmarkConfig(
+                sweep_dir=sweep_dir,
+                dataset_id="scene_a",
+                validation_workspace=validation_workspace,
+                output_dir=output_dir,
+                use_validation_workspace_transforms=True,
+                top_k=1,
+            )
+        )
+
+
+def test_validate_workspace_transform_validation_missing_status_shape_mismatch_fails_closed(
+    tmp_path, monkeypatch
+):
+    rectified = _synthetic_beads((64, 64))
+    validation_matrix = np.array([[1.0, 0.0, 4.0], [0.0, 1.0, 3.0]], dtype=np.float32)
+    validation_processed = _source_from_grid_image(rectified, (78, 80), validation_matrix)
+    identity = np.eye(2, 3, dtype=np.float32)
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    _write_validation_transform_workspace(
+        validation_workspace,
+        rectified=rectified,
+        validation_processed=validation_processed,
+        thorcam_processed=rectified,
+        validation_matrix=validation_matrix,
+        thorcam_matrix=identity,
+        validation_alignment_status=None,
+        validation_alignment_model=None,
+        validation_alignment_output_shape=rectified.shape,
+    )
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: [])
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: [])
+
+    with pytest.raises(ValueError, match="suspect_alignment_status"):
+        run_benchmark(
+            BenchmarkConfig(
+                sweep_dir=sweep_dir,
+                dataset_id="scene_a",
+                validation_workspace=validation_workspace,
+                output_dir=output_dir,
+                use_validation_workspace_transforms=True,
+                top_k=1,
+            )
+        )
+
+
+def test_validate_workspace_transform_missing_output_shape_is_unrankable_for_thorcam(tmp_path, monkeypatch):
+    rectified = _synthetic_beads((64, 64))
+    identity = np.eye(2, 3, dtype=np.float32)
+
+    sweep_dir = tmp_path / "sweep"
+    sweep_dir.mkdir()
+    output_dir = tmp_path / "benchmark"
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    _write_validation_transform_workspace(
+        validation_workspace,
+        rectified=rectified,
+        validation_processed=rectified,
+        thorcam_processed=rectified[:32, :21],
+        validation_matrix=identity,
+        thorcam_matrix=identity,
+        include_alignment_output_shape=False,
+    )
+
+    run1 = sweep_dir / "run1"
+    run1.mkdir()
+    workspace1 = run1 / "workspace.npz"
+    np.savez_compressed(workspace1, average_rectified_image=rectified)
+
+    model = SimpleNamespace(primary_stage_name="stage2")
+    rows = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            generation_id="gen1",
+            rank=1,
+            strategy="combined",
+            params={},
+            config={},
+            score=10.0,
+        )
+    ]
+    records = [
+        SimpleNamespace(
+            row_id="stage2:candidate_a",
+            stage="stage2",
+            candidate_id="candidate_a",
+            dataset_id="scene_a",
+            generation_id="gen1",
+            workspace_path=str(workspace1),
+            preview_path=None,
+            metric_record_path=None,
+        )
+    ]
+
+    monkeypatch.setattr("moment_images.trio_benchmark.load_sweep_visualization_model", lambda path: model)
+    monkeypatch.setattr("moment_images.trio_benchmark.candidate_rows_for_generation_scope", lambda model, scope: rows)
+    monkeypatch.setattr("moment_images.trio_benchmark.run_records_for_generation_scope", lambda model, scope: records)
+
+    result = run_benchmark(
+        BenchmarkConfig(
+            sweep_dir=sweep_dir,
+            dataset_id="scene_a",
+            validation_workspace=validation_workspace,
+            output_dir=output_dir,
+            use_validation_workspace_transforms=True,
+            residual_translation_max_px=0.0,
+            top_k=1,
+        )
+    )
+
+    thorcam = result.summary["thorcam_baseline"]
+    assert thorcam["registration"]["status"] == "failed"
+    assert thorcam["registration"]["ranking_exclusion_reason"] == "missing_output_shape"
+    transform_payload = json.loads(
+        (output_dir / "trio_validation_workspace_transforms.json").read_text(encoding="utf-8")
+    )
+    thorcam_info = transform_payload["workspace_transform_info"]["sources"]["thorcam"]
+    assert thorcam_info["alignment_output_shape"] is None
+    assert thorcam_info["valid_for_replay"] is False
+    assert thorcam_info["valid_for_scoring"] is False
 
 
 def test_validate_workspace_transform_missing_matrix_different_shape_fails_closed(tmp_path, monkeypatch):

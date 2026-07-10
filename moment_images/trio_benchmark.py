@@ -27,7 +27,7 @@ from scipy import optimize
 
 from moment_images.reliable_io import write_csv_atomic, write_json_atomic, write_text_atomic
 from moment_images.unpack_workspace import load_workspace_variables
-from moment_images.validate_rectification import load_rectified_reference
+from moment_images.validate_rectification import _warp_to_grid, load_rectified_reference
 from moment_images.sweep_visualization import (
     GENERATION_SCOPE_ACTIVE,
     GENERATION_SCOPE_ALL,
@@ -2531,22 +2531,36 @@ def _warp_workspace_processed_to_rectified_grid(
         raise ValueError(f"{workspace_path} does not contain {image_key!r}")
     source = _as_float_2d(np.asarray(workspace[image_key]))
     source_shape = tuple(int(value) for value in source.shape[:2])
-    output_shape = tuple(int(value) for value in rectified_shape)
-    source_shape_matches_rectified = source_shape == output_shape
+    rectified_output_shape = tuple(int(value) for value in rectified_shape)
+    source_shape_matches_rectified = source_shape == rectified_output_shape
+    alignment_status = _workspace_text(workspace.get(f"{prefix}_alignment_status"))
+    alignment_model = _workspace_text(workspace.get(f"{prefix}_alignment_model"))
+    alignment_output_shape = _workspace_shape_pair(workspace.get(f"{prefix}_alignment_output_shape"))
     matrix = _workspace_affine_matrix(workspace.get(matrix_key))
     warnings: List[str] = []
     transform_source = matrix_key
     invalid_reason: Optional[str] = None
+    replay_output_shape: Optional[Tuple[int, int]] = alignment_output_shape
     if matrix is None:
-        if not source_shape_matches_rectified:
-            invalid_reason = "workspace_transform_missing_matrix_shape_mismatch"
-        else:
-            matrix = np.eye(2, 3, dtype=np.float32)
-            transform_source = "identity_workspace_same_shape"
-            warnings.append(f"{prefix}:{transform_source}:{matrix_key}")
+        invalid_reason = "missing_matrix"
     matrix_is_identity = bool(matrix is not None and _is_identity_affine_matrix(matrix))
-    if matrix is not None and matrix_is_identity and not source_shape_matches_rectified:
-        invalid_reason = "workspace_transform_identity_shape_mismatch"
+
+    if replay_output_shape is None:
+        if source_shape_matches_rectified:
+            replay_output_shape = rectified_output_shape
+        elif invalid_reason is None:
+            invalid_reason = "missing_output_shape"
+    replay_shape_matches_rectified = replay_output_shape == rectified_output_shape if replay_output_shape is not None else False
+
+    status_reason = _workspace_alignment_status_invalid_reason(
+        alignment_status,
+        matrix_is_identity=matrix_is_identity,
+        source_shape_matches_rectified=source_shape_matches_rectified,
+    )
+    if invalid_reason is None and status_reason is not None:
+        invalid_reason = status_reason
+    if invalid_reason is None and not replay_shape_matches_rectified:
+        invalid_reason = "output_shape_mismatch"
 
     if invalid_reason is not None:
         warnings.append(f"{prefix}:{invalid_reason}:{matrix_key}")
@@ -2555,45 +2569,52 @@ def _warp_workspace_processed_to_rectified_grid(
             matrix_key=matrix_key,
             transform_source=transform_source,
             source_shape=source_shape,
-            output_shape=output_shape,
+            rectified_grid_shape=rectified_output_shape,
+            alignment_output_shape=alignment_output_shape,
+            replay_output_shape=replay_output_shape,
             matrix=matrix,
             matrix_is_identity=matrix_is_identity,
             source_shape_matches_rectified=source_shape_matches_rectified,
+            replay_shape_matches_rectified=bool(replay_shape_matches_rectified),
+            valid_for_replay=_workspace_replayable(invalid_reason),
             valid_for_scoring=False,
             invalid_reason=invalid_reason,
-            alignment_status=_workspace_text(workspace.get(f"{prefix}_alignment_status")),
+            alignment_status=alignment_status,
+            alignment_model=alignment_model,
             warnings=warnings,
         )
         if required:
             raise ValueError(
                 f"{workspace_path} has invalid {matrix_key!r}: {invalid_reason}; "
-                f"{image_key!r} shape {source_shape} differs from rectified grid {output_shape}"
+                f"{image_key!r} shape {source_shape}, replay shape {replay_output_shape}, "
+                f"rectified grid {rectified_output_shape}"
             )
-        return np.zeros(output_shape, dtype=np.float32), info
+        return np.zeros(rectified_output_shape, dtype=np.float32), info
 
     if matrix is None:
         raise ValueError(f"{workspace_path} has no usable {matrix_key!r}")
+    if replay_output_shape is None:
+        raise ValueError(f"{workspace_path} has no usable {prefix}_alignment_output_shape")
 
-    warped = cv.warpAffine(
-        source,
-        np.asarray(matrix, dtype=np.float32),
-        (int(rectified_shape[1]), int(rectified_shape[0])),
-        flags=cv.INTER_LINEAR | cv.WARP_INVERSE_MAP,
-        borderMode=cv.BORDER_CONSTANT,
-        borderValue=0.0,
-    )
+    warped, _valid_mask = _warp_to_grid(source, np.asarray(matrix, dtype=np.float32), replay_output_shape)
+    warped = np.nan_to_num(warped, nan=0.0, posinf=0.0, neginf=0.0)
     info = _workspace_transform_source_info(
         image_key=image_key,
         matrix_key=matrix_key,
         transform_source=transform_source,
         source_shape=source_shape,
-        output_shape=output_shape,
+        rectified_grid_shape=rectified_output_shape,
+        alignment_output_shape=alignment_output_shape,
+        replay_output_shape=replay_output_shape,
         matrix=matrix,
         matrix_is_identity=matrix_is_identity,
         source_shape_matches_rectified=source_shape_matches_rectified,
+        replay_shape_matches_rectified=bool(replay_shape_matches_rectified),
+        valid_for_replay=True,
         valid_for_scoring=True,
         invalid_reason=None,
-        alignment_status=_workspace_text(workspace.get(f"{prefix}_alignment_status")),
+        alignment_status=alignment_status,
+        alignment_model=alignment_model,
         warnings=warnings,
     )
     return warped.astype(np.float32), info
@@ -2605,13 +2626,18 @@ def _workspace_transform_source_info(
     matrix_key: str,
     transform_source: str,
     source_shape: Tuple[int, int],
-    output_shape: Tuple[int, int],
+    rectified_grid_shape: Tuple[int, int],
+    alignment_output_shape: Optional[Tuple[int, int]],
+    replay_output_shape: Optional[Tuple[int, int]],
     matrix: Optional[np.ndarray],
     matrix_is_identity: bool,
     source_shape_matches_rectified: bool,
+    replay_shape_matches_rectified: bool,
+    valid_for_replay: bool,
     valid_for_scoring: bool,
     invalid_reason: Optional[str],
     alignment_status: Optional[str],
+    alignment_model: Optional[str],
     warnings: Sequence[str],
 ) -> Dict[str, Any]:
     info: Dict[str, Any] = {
@@ -2619,16 +2645,35 @@ def _workspace_transform_source_info(
         "matrix_key": matrix_key,
         "transform_source": transform_source,
         "source_shape": [int(source_shape[0]), int(source_shape[1])],
-        "output_shape": [int(output_shape[0]), int(output_shape[1])],
+        "output_shape": [int(rectified_grid_shape[0]), int(rectified_grid_shape[1])],
+        "rectified_grid_shape": [int(rectified_grid_shape[0]), int(rectified_grid_shape[1])],
+        "alignment_output_shape": None
+        if alignment_output_shape is None
+        else [int(alignment_output_shape[0]), int(alignment_output_shape[1])],
+        "replay_output_shape": None
+        if replay_output_shape is None
+        else [int(replay_output_shape[0]), int(replay_output_shape[1])],
         "matrix": None if matrix is None else np.asarray(matrix, dtype=float).tolist(),
         "matrix_is_identity": bool(matrix_is_identity),
         "source_shape_matches_rectified": bool(source_shape_matches_rectified),
+        "replay_shape_matches_rectified": bool(replay_shape_matches_rectified),
+        "valid_for_replay": bool(valid_for_replay),
         "valid_for_scoring": bool(valid_for_scoring),
         "invalid_reason": invalid_reason,
         "alignment_status": alignment_status,
+        "alignment_model": alignment_model,
         "warnings": list(warnings),
     }
     return info
+
+
+def _workspace_shape_pair(value: Optional[np.ndarray]) -> Optional[Tuple[int, int]]:
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=np.int64).ravel()
+    if arr.size < 2 or np.any(arr[:2] <= 0):
+        return None
+    return int(arr[0]), int(arr[1])
 
 
 def _workspace_affine_matrix(value: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -2642,6 +2687,42 @@ def _workspace_affine_matrix(value: Optional[np.ndarray]) -> Optional[np.ndarray
 
 def _is_identity_affine_matrix(matrix: np.ndarray) -> bool:
     return bool(np.allclose(np.asarray(matrix, dtype=np.float32), np.eye(2, 3, dtype=np.float32), atol=1e-6))
+
+
+def _workspace_replayable(invalid_reason: str) -> bool:
+    return invalid_reason == "output_shape_mismatch"
+
+
+def _workspace_alignment_status_invalid_reason(
+    status: Optional[str],
+    *,
+    matrix_is_identity: bool,
+    source_shape_matches_rectified: bool,
+) -> Optional[str]:
+    text = "" if status is None else str(status).strip()
+    if not text:
+        return None if source_shape_matches_rectified and matrix_is_identity else "suspect_alignment_status"
+    if text == "not_run":
+        return None if source_shape_matches_rectified and matrix_is_identity else "not_run"
+    if text == "auto_align_disabled":
+        return (
+            None
+            if source_shape_matches_rectified and matrix_is_identity
+            else "identity_without_successful_alignment"
+        )
+    if _is_suspect_validation_alignment_status(text):
+        return "suspect_alignment_status"
+    if _is_successful_validation_alignment_status(text):
+        return None
+    return "suspect_alignment_status"
+
+
+def _is_successful_validation_alignment_status(status: str) -> bool:
+    return (
+        status.startswith("aligned_")
+        or status == "point_aligned"
+        or status == "point_aligned_with_residual_ecc"
+    )
 
 
 def _validation_workspace_alignment_warnings(
