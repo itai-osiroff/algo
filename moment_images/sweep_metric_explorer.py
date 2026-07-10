@@ -35,6 +35,31 @@ from moment_images.sweep_visualization import (
     generation_scope_options,
     load_sweep_visualization_model,
 )
+from moment_images.trio_oracle_metrics import (
+    DEFAULT_TRIO_SEED_TOP_K,
+    TRIO_BEAD_COUNT,
+    TRIO_CANDIDATE_ROI_COVERAGE,
+    TRIO_DELTA_VS_THORCAM,
+    TRIO_FULL_GRID_SCORE,
+    TRIO_LF_SOURCE_KIND,
+    TRIO_METADATA_EXPORT_FIELDS,
+    TRIO_ORACLE_CACHE_FILENAME,
+    TRIO_ORACLE_PROFILE_NAME,
+    TRIO_PRIMARY_SCORE,
+    TRIO_ROI_FRACTION,
+    TRIO_ROI_PIXEL_COUNT,
+    TRIO_ROW_LOCAL_SCORE,
+    TRIO_THORCAM_SOURCE_KIND,
+    TRIO_VALID_FOV_FRACTION,
+    TrioOracleImport,
+    TrioOracleRecord,
+    find_trio_record_for_identity,
+    import_trio_oracle_results,
+    load_trio_oracle_import,
+    trio_cache_path,
+    trio_record_key,
+    trio_rankable,
+)
 
 
 REGISTRY_VERSION = "2026-06-24-tamura-v1"
@@ -246,6 +271,16 @@ class ComparisonReferenceImage:
 
 
 @dataclass
+class TrioOracleJoinSummary:
+    """Summary of imported trio rows joined to explorer records."""
+
+    record_count: int = 0
+    matched_count: int = 0
+    unmatched_count: int = 0
+    rankable_count: int = 0
+
+
+@dataclass
 class SweepMetricExplorerModel:
     """Canonical model used by the raw metric explorer."""
 
@@ -264,6 +299,13 @@ class SweepMetricExplorerModel:
     search_results: List[SearchResult]
     warnings: List[str]
     scoring_config: Dict[str, float]
+    trio_oracle_path: Optional[Path] = None
+    trio_oracle_records: Dict[Tuple[str, str, str, Optional[str]], TrioOracleRecord] = field(default_factory=dict)
+    trio_oracle_sources: List[str] = field(default_factory=list)
+    trio_oracle_record_count: int = 0
+    trio_oracle_matched_count: int = 0
+    trio_oracle_unmatched_count: int = 0
+    trio_oracle_rankable_count: int = 0
     generation_scope: str = "All"
     hydrate_mode: str = HYDRATE_MODE_EAGER
 
@@ -296,6 +338,13 @@ def _coerce_float(value: object) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return numeric if math.isfinite(numeric) else None
+
+
+def _optional_str(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
 
 
 def _compact_json(value: object) -> str:
@@ -737,6 +786,114 @@ def build_metric_registry() -> Dict[str, MetricDescriptor]:
             representation=representation,
             description="Tamura coefficient focus metric recomputed from the workspace artifact.",
         )
+    oracle_metrics = {
+        TRIO_PRIMARY_SCORE: (
+            "Trio Validation Score (ThorCam FOV)",
+            "External validation score on the ThorCam-overlap FOV imported from trio_benchmark.",
+            "oracle",
+            "max",
+        ),
+        TRIO_ROW_LOCAL_SCORE: (
+            "Trio Validation Score (Row Local)",
+            "External validation score on each row's valid FOV imported from trio_benchmark.",
+            "oracle",
+            "max",
+        ),
+        TRIO_FULL_GRID_SCORE: (
+            "Trio Validation Score (Full Grid)",
+            "External validation score on the full validation grid imported from trio_benchmark.",
+            "oracle",
+            "max",
+        ),
+        TRIO_DELTA_VS_THORCAM: (
+            "Trio LF - ThorCam Delta",
+            "Difference between LF and ThorCam validation scores on the ThorCam-overlap FOV.",
+            "oracle",
+            "max",
+        ),
+        TRIO_VALID_FOV_FRACTION: (
+            "Trio Valid FOV Fraction",
+            "Fraction of validation grid with valid candidate support in trio_benchmark.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        TRIO_ROI_FRACTION: (
+            "Trio Metric ROI Fraction",
+            "Fraction of validation grid used by the trio metric ROI.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        TRIO_ROI_PIXEL_COUNT: (
+            "Trio Metric ROI Pixels",
+            "Pixel count used by the trio metric ROI.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        TRIO_BEAD_COUNT: (
+            "Trio Metric Bead Count",
+            "Validation bead count used by trio metric scoring.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        TRIO_CANDIDATE_ROI_COVERAGE: (
+            "Trio Candidate ROI Coverage",
+            "Fraction of the trio metric ROI covered by the candidate.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        "registration_confidence": (
+            "Trio Registration Confidence",
+            "Registration confidence reported by trio_benchmark.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        "matched_bead_count": (
+            "Trio Matched Beads",
+            "Matched bead count reported by trio_benchmark registration.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        "median_bead_error_px": (
+            "Trio Median Bead Error",
+            "Median bead registration error in pixels reported by trio_benchmark.",
+            "oracle_diagnostic",
+            "min",
+        ),
+        "common_fov_fraction": (
+            "Trio Common FOV Fraction",
+            "Common field-of-view fraction reported by trio_benchmark registration.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        "registration_fit_rms_px": (
+            "Trio Registration Fit RMS",
+            "Manual/point registration fit RMS in pixels reported by trio_benchmark.",
+            "oracle_diagnostic",
+            "min",
+        ),
+        "registration_refined_score": (
+            "Trio Registration Refined Score",
+            "Refined registration hypothesis score reported by trio_benchmark.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        "registration_runtime_seconds": (
+            "Trio Registration Runtime",
+            "Registration runtime reported by trio_benchmark.",
+            "oracle_diagnostic",
+            "min",
+        ),
+    }
+    for name, (label, description, category, direction) in oracle_metrics.items():
+        registry[name] = MetricDescriptor(
+            name=name,
+            label=label,
+            direction=direction,
+            category=category,
+            representation="external_oracle",
+            description=description,
+            read_only=True,
+        )
     return registry
 
 
@@ -804,6 +961,8 @@ def _blend_profile_weights(
 def _default_profiles(
     metric_registry: Mapping[str, MetricDescriptor],
     scoring_weights: Mapping[str, float],
+    *,
+    include_trio_oracle: bool = False,
 ) -> List[RankingProfileSpec]:
     old_weights = {
         name: float(weight)
@@ -818,7 +977,7 @@ def _default_profiles(
 
     new_weights = _default_new_metric_weights(metric_registry)
     hybrid = _blend_profile_weights(old_weights, new_weights)
-    return [
+    profiles = [
         RankingProfileSpec(
             name="saved_original",
             label="Saved Original",
@@ -862,6 +1021,17 @@ def _default_profiles(
             built_in=True,
         ),
     ]
+    if include_trio_oracle:
+        profiles.append(
+            RankingProfileSpec(
+                name=TRIO_ORACLE_PROFILE_NAME,
+                label="Trio Oracle (ThorCam FOV)",
+                metric_weights={TRIO_PRIMARY_SCORE: 1.0},
+                description="External validation-oracle ranking imported from trio_benchmark.",
+                built_in=True,
+            )
+        )
+    return profiles
 
 
 def _load_config_payload(path: Optional[Path]) -> Tuple[Optional[Dict[str, object]], Optional[str], List[str]]:
@@ -885,15 +1055,25 @@ def _resolve_metric_config(
     metric_registry: Mapping[str, MetricDescriptor],
     scoring_weights: Mapping[str, float],
     config_path: Optional[Path],
+    *,
+    include_trio_oracle: bool = False,
 ) -> Tuple[MetricExplorerConfig, List[str]]:
     warnings: List[str] = []
-    default_profiles = _default_profiles(metric_registry, scoring_weights)
+    default_profiles = _default_profiles(
+        metric_registry,
+        scoring_weights,
+        include_trio_oracle=include_trio_oracle,
+    )
     default_profile = "hybrid_default"
     auto_path = None if config_path is not None else review_dir / "metrics_config.json"
     payload, source_path, read_warnings = _load_config_payload(config_path or auto_path)
     warnings.extend(read_warnings)
 
-    enabled_metrics = list(metric_registry.keys())
+    enabled_metrics = [
+        name
+        for name, descriptor in metric_registry.items()
+        if include_trio_oracle or descriptor.category not in {"oracle", "oracle_diagnostic"}
+    ]
     profiles = list(default_profiles)
     search_defaults = SearchDefaults()
     if payload is not None:
@@ -961,9 +1141,25 @@ def _resolve_metric_config(
                 search_defaults_raw.get("allow_negative_weights", False)
             )
 
+    oracle_metric_names = set(_oracle_metric_names(metric_registry))
+    if not include_trio_oracle:
+        blocked_enabled = sorted(set(enabled_metrics) & oracle_metric_names)
+        if blocked_enabled and payload is not None:
+            warnings.append(
+                "Trio oracle metrics were configured but no trio results are loaded; "
+                f"dropped: {', '.join(blocked_enabled)}."
+            )
+        enabled_metrics = [name for name in enabled_metrics if name not in oracle_metric_names]
+
     enabled_set = set(enabled_metrics)
     filtered_profiles: List[RankingProfileSpec] = []
     for profile in profiles:
+        blocked_profile_metrics = sorted(set(profile.metric_weights) & oracle_metric_names)
+        if blocked_profile_metrics and not include_trio_oracle:
+            warnings.append(
+                f"Profile {profile.name!r} references trio oracle metrics but no trio results are loaded; "
+                f"dropped: {', '.join(blocked_profile_metrics)}."
+            )
         enabled_weights = {
             metric_name: float(weight)
             for metric_name, weight in profile.metric_weights.items()
@@ -1412,6 +1608,285 @@ def _build_raw_records(
     return raw_records, _stable_unique_strings(warnings), cache_path, cache_entries
 
 
+def _trio_record_lookup(import_data: Optional[TrioOracleImport]) -> Dict[Tuple[str, str, str, Optional[str]], TrioOracleRecord]:
+    if import_data is None:
+        return {}
+    return {trio_record_key(record): record for record in import_data.records}
+
+
+def _find_trio_record_for_raw_record(
+    record: RawMetricRecord,
+    trio_lookup: Mapping[Tuple[str, str, str, Optional[str]], TrioOracleRecord],
+) -> Optional[TrioOracleRecord]:
+    return find_trio_record_for_identity(
+        trio_lookup,
+        stage=record.stage,
+        candidate_id=record.candidate_id,
+        dataset_id=record.dataset_id,
+        generation_id=record.generation_id,
+    )
+
+
+def _apply_trio_oracle_import(
+    raw_records: Sequence[RawMetricRecord],
+    import_data: Optional[TrioOracleImport],
+) -> Tuple[Dict[Tuple[str, str, str, Optional[str]], TrioOracleRecord], List[str], TrioOracleJoinSummary]:
+    if import_data is None:
+        return {}, [], TrioOracleJoinSummary()
+    trio_lookup = _trio_record_lookup(import_data)
+    lf_records = [record for record in import_data.records if record.source_kind == TRIO_LF_SOURCE_KIND]
+    summary = TrioOracleJoinSummary(
+        record_count=len(lf_records),
+        rankable_count=sum(1 for record in lf_records if trio_rankable(record)),
+    )
+    warnings: List[str] = []
+    matched_keys: set[Tuple[str, str, str, Optional[str]]] = set()
+    for record in raw_records:
+        trio_record = _find_trio_record_for_raw_record(record, trio_lookup)
+        if trio_record is None:
+            continue
+        matched_keys.add(trio_record_key(trio_record))
+        for metric_name, value in trio_record.metrics.items():
+            record.metrics[metric_name] = float(value)
+        baseline = import_data.baselines.get(record.dataset_id, {})
+        baseline_score = baseline.get(TRIO_PRIMARY_SCORE)
+        candidate_score = trio_record.metrics.get(TRIO_PRIMARY_SCORE)
+        if trio_rankable(trio_record) and baseline_score is not None and candidate_score is not None:
+            record.metrics[TRIO_DELTA_VS_THORCAM] = float(candidate_score) - float(baseline_score)
+        rank = trio_record.validation_rank
+        rank_text = "" if rank is None else f"rank={rank}"
+        diagnostic_lines = [
+            f"trio_oracle:{rank_text}".rstrip(":"),
+            *[f"trio:{item}" for item in trio_record.warnings],
+        ]
+        for name in (
+            "validation_rankable",
+            "ranking_exclusion_reason",
+            "registration_confidence",
+            "registration_suspect",
+            "registration_constraint_level",
+            "registration_transform_source",
+        ):
+            if name in trio_record.diagnostics:
+                diagnostic_lines.append(f"trio_{name}={trio_record.diagnostics[name]}")
+        record.warnings = _stable_unique_strings([*record.warnings, *diagnostic_lines])
+    unmatched = [
+        record
+        for key, record in trio_lookup.items()
+        if key not in matched_keys and record.source_kind == TRIO_LF_SOURCE_KIND
+    ]
+    summary.matched_count = len(matched_keys)
+    summary.unmatched_count = len(unmatched)
+    if unmatched:
+        warnings.append(f"{len(unmatched)} imported trio LF rows did not match explorer candidates.")
+    return trio_lookup, _stable_unique_strings(warnings), summary
+
+
+def _oracle_metric_names(metric_registry: Mapping[str, MetricDescriptor]) -> List[str]:
+    return [
+        name
+        for name, descriptor in metric_registry.items()
+        if descriptor.category in {"oracle", "oracle_diagnostic"}
+    ]
+
+
+def _profile_search_metric_names(
+    metric_names: Sequence[str],
+    metric_registry: Mapping[str, MetricDescriptor],
+) -> List[str]:
+    return [
+        name
+        for name in metric_names
+        if name in metric_registry and metric_registry[name].category not in {"oracle", "oracle_diagnostic"}
+    ]
+
+
+def _profile_uses_rankable_oracle(
+    profile: RankingProfileSpec,
+    metric_registry: Mapping[str, MetricDescriptor],
+) -> bool:
+    return any(
+        metric_registry.get(metric_name) is not None
+        and metric_registry[metric_name].category == "oracle"
+        for metric_name in profile.metric_weights
+    )
+
+
+def _ensure_trio_oracle_config(
+    config: MetricExplorerConfig,
+    metric_registry: Mapping[str, MetricDescriptor],
+    import_data: Optional[TrioOracleImport],
+) -> None:
+    if import_data is None or not import_data.records:
+        return
+    for metric_name in _oracle_metric_names(metric_registry):
+        if metric_name not in config.enabled_metrics:
+            config.enabled_metrics.append(metric_name)
+    if TRIO_ORACLE_PROFILE_NAME not in {profile.name for profile in config.profiles}:
+        config.profiles.append(
+            RankingProfileSpec(
+                name=TRIO_ORACLE_PROFILE_NAME,
+                label="Trio Oracle (ThorCam FOV)",
+                metric_weights={TRIO_PRIMARY_SCORE: 1.0},
+                description="External validation-oracle ranking imported from trio_benchmark.",
+                built_in=True,
+            )
+        )
+
+
+def _trio_record_for_raw_record(
+    model: SweepMetricExplorerModel,
+    record: RawMetricRecord,
+) -> Optional[TrioOracleRecord]:
+    return _find_trio_record_for_raw_record(record, model.trio_oracle_records)
+
+
+def _trio_rankable(record: RawMetricRecord, trio_record: Optional[TrioOracleRecord]) -> bool:
+    if trio_record is None:
+        return TRIO_PRIMARY_SCORE in record.metrics
+    return trio_rankable(trio_record)
+
+
+def _candidate_row_lookup_for_seeds(
+    model: SweepMetricExplorerModel,
+) -> Dict[Tuple[str, str], CandidateVisualizationRow]:
+    lookup: Dict[Tuple[str, str], CandidateVisualizationRow] = {}
+    for row in candidate_rows_for_generation_scope(model.base_model, model.generation_scope):
+        lookup[(row.stage, row.row_id)] = row
+        lookup.setdefault((row.stage, row.candidate_id), row)
+    return lookup
+
+
+def _validation_refinement_seed_rows(
+    model: SweepMetricExplorerModel,
+    *,
+    top_k: int = DEFAULT_TRIO_SEED_TOP_K,
+) -> List[Dict[str, object]]:
+    candidate_lookup = _candidate_row_lookup_for_seeds(model)
+    grouped: Dict[Tuple[str, str], List[Tuple[float, RawMetricRecord, Optional[TrioOracleRecord]]]] = {}
+    for record in model.raw_records:
+        score = record.metrics.get(TRIO_PRIMARY_SCORE)
+        if score is None or not math.isfinite(float(score)):
+            continue
+        trio_record = _trio_record_for_raw_record(model, record)
+        if not _trio_rankable(record, trio_record):
+            continue
+        grouped.setdefault((record.stage, record.dataset_id), []).append((float(score), record, trio_record))
+
+    seed_rows: List[Dict[str, object]] = []
+    for (stage_name, dataset_id), scored_records in sorted(grouped.items()):
+        scored_records.sort(
+            key=lambda item: (
+                item[0],
+                0 if item[2] is None or item[2].validation_rank is None else -item[2].validation_rank,
+                item[1].candidate_id,
+            ),
+            reverse=True,
+        )
+        for rank, (score, record, trio_record) in enumerate(scored_records[:top_k], start=1):
+            candidate_row = candidate_lookup.get((record.stage, record.row_id)) or candidate_lookup.get(
+                (record.stage, record.candidate_id)
+            )
+            seed_rows.append(
+                {
+                    "stage": record.stage,
+                    "dataset_id": dataset_id,
+                    "rank": rank,
+                    "candidate_id": record.candidate_id,
+                    "row_id": record.row_id,
+                    "generation_id": record.generation_id,
+                    "strategy": record.strategy,
+                    "oracle_score": score,
+                    "thorcam_delta": record.metrics.get(TRIO_DELTA_VS_THORCAM),
+                    "validation_rank": trio_record.validation_rank if trio_record is not None else None,
+                    "workspace_path": record.workspace_path,
+                    "preview_path": record.preview_path,
+                    "trio_report_path": trio_record.report_path if trio_record is not None else None,
+                    "trio_overlay_path": trio_record.overlay_path if trio_record is not None else None,
+                    "trio_diff_path": trio_record.diff_path if trio_record is not None else None,
+                    "params": dict(candidate_row.params) if candidate_row is not None else {},
+                    "config": dict(candidate_row.config) if candidate_row is not None else {},
+                    "warnings": list(record.warnings),
+                }
+            )
+    return seed_rows
+
+
+def export_validation_refinement_seeds(
+    model: SweepMetricExplorerModel,
+    output_dir: Path,
+    *,
+    top_k: int = DEFAULT_TRIO_SEED_TOP_K,
+) -> Tuple[Path, Path, int]:
+    export_dir = Path(output_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    seed_rows = _validation_refinement_seed_rows(model, top_k=top_k)
+    json_path = export_dir / "validation_refinement_seeds.json"
+    csv_path = export_dir / "validation_refinement_seeds.csv"
+    write_json_atomic(
+        json_path,
+        {
+            "generated_at": _utc_now_iso(),
+            "top_k": top_k,
+            "source": "trio_oracle_metrics",
+            "trio_oracle_path": str(model.trio_oracle_path) if model.trio_oracle_path is not None else None,
+            "trio_oracle_sources": list(model.trio_oracle_sources),
+            "seeds": seed_rows,
+        },
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+    write_csv_atomic(
+        csv_path,
+        [
+            "stage",
+            "dataset_id",
+            "rank",
+            "candidate_id",
+            "row_id",
+            "generation_id",
+            "strategy",
+            "oracle_score",
+            "thorcam_delta",
+            "validation_rank",
+            "workspace_path",
+            "preview_path",
+            "trio_report_path",
+            "trio_overlay_path",
+            "trio_diff_path",
+            "params_json",
+            "config_json",
+            "warnings_json",
+        ],
+        (
+            {
+                "stage": row["stage"],
+                "dataset_id": row["dataset_id"],
+                "rank": row["rank"],
+                "candidate_id": row["candidate_id"],
+                "row_id": row["row_id"],
+                "generation_id": row["generation_id"],
+                "strategy": row["strategy"],
+                "oracle_score": row["oracle_score"],
+                "thorcam_delta": row["thorcam_delta"],
+                "validation_rank": row["validation_rank"],
+                "workspace_path": row["workspace_path"],
+                "preview_path": row["preview_path"],
+                "trio_report_path": row["trio_report_path"],
+                "trio_overlay_path": row["trio_overlay_path"],
+                "trio_diff_path": row["trio_diff_path"],
+                "params_json": _compact_json(row["params"]),
+                "config_json": _compact_json(row["config"]),
+                "warnings_json": _compact_json(row["warnings"]),
+            }
+            for row in seed_rows
+        ),
+        create_backup=True,
+    )
+    return json_path, csv_path, len(seed_rows)
+
+
 def _merge_model_warnings(model: SweepMetricExplorerModel, items: Iterable[str]) -> None:
     model.warnings = _stable_unique_strings([*model.warnings, *list(items)])
 
@@ -1562,7 +2037,8 @@ def _records_needing_metrics(
     required = [
         name
         for name in metric_names
-        if name in model.metric_registry and model.metric_registry[name].category != "saved"
+        if name in model.metric_registry
+        and model.metric_registry[name].category not in {"saved", "oracle", "oracle_diagnostic"}
     ]
     if not required:
         return []
@@ -1643,6 +2119,7 @@ def _score_profile_for_stage(
     raw_records: Sequence[RawMetricRecord],
     metric_registry: Mapping[str, MetricDescriptor],
     scoring_config: Mapping[str, float],
+    trio_oracle_records: Optional[Mapping[Tuple[str, str, str, Optional[str]], TrioOracleRecord]] = None,
 ) -> List[ProfileCandidateScore]:
     stage_rows = [
         row
@@ -1663,6 +2140,8 @@ def _score_profile_for_stage(
     )
     if not metric_weights:
         return []
+    uses_rankable_oracle = _profile_uses_rankable_oracle(profile, metric_registry)
+    trio_lookup = trio_oracle_records or {}
 
     dataset_metric_bounds: Dict[str, Dict[str, Tuple[float, float]]] = {
         dataset_id: {} for dataset_id in datasets
@@ -1675,6 +2154,9 @@ def _score_profile_for_stage(
             for row in stage_rows:
                 record = record_lookup.get((stage_name, row.row_id, dataset_id))
                 if record is None:
+                    continue
+                trio_record = _find_trio_record_for_raw_record(record, trio_lookup)
+                if uses_rankable_oracle and trio_record is not None and not trio_rankable(trio_record):
                     continue
                 numeric = record.metrics.get(metric_name)
                 if numeric is not None and math.isfinite(float(numeric)):
@@ -1707,6 +2189,10 @@ def _score_profile_for_stage(
         for dataset_id in datasets:
             record = record_lookup.get((stage_name, row.row_id, dataset_id))
             if record is None:
+                missing.append(dataset_id)
+                continue
+            trio_record = _find_trio_record_for_raw_record(record, trio_lookup)
+            if uses_rankable_oracle and trio_record is not None and not trio_rankable(trio_record):
                 missing.append(dataset_id)
                 continue
             normalized_values: Dict[str, float] = {}
@@ -1948,6 +2434,7 @@ def _ensure_profile_results(
         model.raw_records,
         model.metric_registry,
         model.scoring_config,
+        model.trio_oracle_records,
     )
     model.profile_results[(model.generation_scope, stage_name, profile.name)] = scored
     model.profile_results[(stage_name, profile.name)] = scored
@@ -2017,6 +2504,7 @@ def _prime_summary_backed_profiles(model: SweepMetricExplorerModel) -> None:
                 model.raw_records,
                 model.metric_registry,
                 model.scoring_config,
+                model.trio_oracle_records,
             )
             model.profile_results[(model.generation_scope, stage_name, profile.name)] = scored
             model.profile_results[(stage_name, profile.name)] = scored
@@ -2078,7 +2566,7 @@ def search_profile_combinations(
 ) -> List[SearchResult]:
     """Search a weight grid for a better profile."""
 
-    candidate_metrics = [name for name in metric_names if name in explorer_model.metric_registry]
+    candidate_metrics = _profile_search_metric_names(metric_names, explorer_model.metric_registry)
     if not candidate_metrics or len(candidate_metrics) > 6:
         return []
     _ensure_metrics_available(
@@ -2111,6 +2599,7 @@ def search_profile_combinations(
             explorer_model.raw_records,
             explorer_model.metric_registry,
             explorer_model.scoring_config,
+            explorer_model.trio_oracle_records,
         )
         summary = _evaluate_profile_for_stage(
             stage_name,
@@ -2139,6 +2628,7 @@ def load_sweep_metric_explorer_model(
     *,
     metrics_config_path: Optional[Path] = None,
     hydrate_mode: str = HYDRATE_MODE_EAGER,
+    trio_results_paths: Sequence[Path] = (),
 ) -> SweepMetricExplorerModel:
     """Load sweep artifacts and recompute focus metrics from raw workspace bundles."""
 
@@ -2148,12 +2638,20 @@ def load_sweep_metric_explorer_model(
     annotations_path = review_dir / "annotations.json"
     annotations = _load_annotations(annotations_path)
     metric_registry = build_metric_registry()
+    if trio_results_paths:
+        trio_import = import_trio_oracle_results(review_dir, trio_results_paths)
+        trio_warnings: List[str] = []
+    else:
+        trio_import, trio_warnings = load_trio_oracle_import(review_dir)
+    trio_has_records = trio_import is not None and bool(trio_import.records)
     config, config_warnings = _resolve_metric_config(
         review_dir,
         metric_registry,
         base_model.scoring_weights,
         metrics_config_path,
+        include_trio_oracle=trio_has_records,
     )
+    _ensure_trio_oracle_config(config, metric_registry, trio_import)
     enabled_registry = {
         name: metric_registry[name]
         for name in config.enabled_metrics
@@ -2164,6 +2662,7 @@ def load_sweep_metric_explorer_model(
         review_dir,
         enabled_registry,
     )
+    trio_lookup, trio_join_warnings, trio_join_summary = _apply_trio_oracle_import(raw_records, trio_import)
     scoring_config = _scoring_config(base_model)
 
     explorer_model = SweepMetricExplorerModel(
@@ -2180,8 +2679,15 @@ def load_sweep_metric_explorer_model(
         disagreements=[],
         annotations=annotations,
         search_results=[],
-        warnings=config_warnings + record_warnings,
+        warnings=config_warnings + record_warnings + trio_warnings + (trio_import.warnings if trio_import else []) + trio_join_warnings,
         scoring_config=scoring_config,
+        trio_oracle_path=trio_cache_path(review_dir) if trio_import is not None else None,
+        trio_oracle_records=trio_lookup,
+        trio_oracle_sources=list(trio_import.source_paths) if trio_import is not None else [],
+        trio_oracle_record_count=trio_join_summary.record_count,
+        trio_oracle_matched_count=trio_join_summary.matched_count,
+        trio_oracle_unmatched_count=trio_join_summary.unmatched_count,
+        trio_oracle_rankable_count=trio_join_summary.rankable_count,
         hydrate_mode=hydrate_mode,
     )
     _prime_summary_backed_profiles(explorer_model)
@@ -2192,7 +2698,7 @@ def load_sweep_metric_explorer_model(
 
 def _raw_metric_fieldnames(model: SweepMetricExplorerModel) -> List[str]:
     metric_names = sorted(model.metric_registry.keys())
-    return [
+    fieldnames = [
         "row_id",
         "generation_id",
         "stage",
@@ -2207,8 +2713,31 @@ def _raw_metric_fieldnames(model: SweepMetricExplorerModel) -> List[str]:
         "preview_path",
         "workspace_path",
         "warnings_json",
-        *metric_names,
     ]
+    if model.trio_oracle_records:
+        fieldnames.extend(TRIO_METADATA_EXPORT_FIELDS)
+    fieldnames.extend(metric_names)
+    return fieldnames
+
+
+def _trio_metadata_export_fields(
+    model: SweepMetricExplorerModel,
+    record: RawMetricRecord,
+) -> Dict[str, object]:
+    if not model.trio_oracle_records:
+        return {}
+    trio_record = _trio_record_for_raw_record(model, record)
+    if trio_record is None:
+        return {name: "" for name in TRIO_METADATA_EXPORT_FIELDS}
+    return {
+        "trio_validation_rank": trio_record.validation_rank if trio_record.validation_rank is not None else "",
+        "trio_validation_rankable": "true" if trio_rankable(trio_record) else "false",
+        "trio_ranking_exclusion_reason": trio_record.ranking_exclusion_reason or "",
+        "trio_report_path": trio_record.report_path or "",
+        "trio_overlay_path": trio_record.overlay_path or "",
+        "trio_diff_path": trio_record.diff_path or "",
+        "trio_source_path": trio_record.source_path or "",
+    }
 
 
 def _profile_result_rows(model: SweepMetricExplorerModel) -> List[Dict[str, object]]:
@@ -2308,6 +2837,7 @@ def export_metric_report(model: SweepMetricExplorerModel, output_dir: Path) -> P
     disagreements_path = export_dir / "disagreements.csv"
     report_json_path = export_dir / "report.json"
     html_path = export_dir / "index.html"
+    seeds_json_path, seeds_csv_path, seed_count = export_validation_refinement_seeds(model, export_dir)
 
     write_csv_atomic(
         candidate_metrics_path,
@@ -2330,6 +2860,7 @@ def export_metric_report(model: SweepMetricExplorerModel, output_dir: Path) -> P
                     "workspace_path": record.workspace_path,
                     "warnings_json": _compact_json(record.warnings),
                 },
+                **_trio_metadata_export_fields(model, record),
                 **{name: record.metrics.get(name) for name in sorted(model.metric_registry.keys())},
             }
             for record in model.raw_records
@@ -2414,6 +2945,15 @@ def export_metric_report(model: SweepMetricExplorerModel, output_dir: Path) -> P
             "source_path": model.config.source_path,
         },
         "scoring_config": model.scoring_config,
+        "trio_oracle": {
+            "record_count": model.trio_oracle_record_count,
+            "matched_count": model.trio_oracle_matched_count,
+            "unmatched_count": model.trio_oracle_unmatched_count,
+            "rankable_count": model.trio_oracle_rankable_count,
+            "cache_path": str(model.trio_oracle_path) if model.trio_oracle_path is not None else None,
+            "source_paths": list(model.trio_oracle_sources),
+            "seed_count": seed_count,
+        },
         "warnings": model.warnings,
         "evaluations": _evaluation_rows(model),
         "files": {
@@ -2421,6 +2961,8 @@ def export_metric_report(model: SweepMetricExplorerModel, output_dir: Path) -> P
             "profile_results_csv": profile_results_path.name,
             "search_results_csv": search_results_path.name,
             "disagreements_csv": disagreements_path.name,
+            "validation_refinement_seeds_json": seeds_json_path.name,
+            "validation_refinement_seeds_csv": seeds_csv_path.name,
             "index_html": html_path.name,
         },
     }
@@ -2572,6 +3114,20 @@ def _format_record_metric_lines(model: SweepMetricExplorerModel, record: RawMetr
         lines.append(
             f"{metric_label}: {'n/a' if value is None else f'{value:.6f}'}"
         )
+    trio_record = _trio_record_for_raw_record(model, record)
+    if trio_record is not None:
+        lines.extend(["", "trio oracle:"])
+        lines.append(
+            f"- validation rank: {'n/a' if trio_record.validation_rank is None else trio_record.validation_rank}"
+        )
+        for label_text, path in (
+            ("report", trio_record.report_path),
+            ("overlay", trio_record.overlay_path),
+            ("diff", trio_record.diff_path),
+            ("source csv", trio_record.source_path),
+        ):
+            if path:
+                lines.append(f"- {label_text}: {path}")
     if record.warnings:
         lines.extend(["", "warnings:"])
         lines.extend(f"- {item}" for item in record.warnings)
@@ -3298,7 +3854,13 @@ class _ComparisonImageInspector:
 class SweepMetricExplorerApp:
     """Tkinter GUI for loading, re-scoring, annotating, and exporting raw metrics."""
 
-    def __init__(self, root: Any, initial_path: Optional[Path] = None, metrics_config_path: Optional[Path] = None):
+    def __init__(
+        self,
+        root: Any,
+        initial_path: Optional[Path] = None,
+        metrics_config_path: Optional[Path] = None,
+        initial_trio_results_paths: Sequence[Path] = (),
+    ):
         import tkinter as tk
         from tkinter import ttk
 
@@ -3366,7 +3928,7 @@ class SweepMetricExplorerApp:
 
         self._build_ui()
         if initial_path is not None:
-            self.load_from_path(initial_path)
+            self.load_from_path(initial_path, trio_results_paths=initial_trio_results_paths)
 
     def _build_ui(self) -> None:
         top = self.ttk.Frame(self.root)
@@ -3379,6 +3941,8 @@ class SweepMetricExplorerApp:
         self.ttk.Button(top, text="Load", command=self._on_load).pack(side="left", padx=3)
         self.ttk.Button(top, text="Reload", command=self._on_reload).pack(side="left", padx=3)
         self.ttk.Button(top, text="Export...", command=self._on_export_dialog).pack(side="left", padx=3)
+        self.ttk.Button(top, text="Import Trio CSV...", command=self._on_import_trio_csv_dialog).pack(side="left", padx=3)
+        self.ttk.Button(top, text="Import Trio Folder...", command=self._on_import_trio_folder_dialog).pack(side="left", padx=3)
         self.ttk.Button(top, text="Open Folder", command=self._on_open_folder).pack(side="left", padx=3)
         self.ttk.Label(top, text="Generation").pack(side="left", padx=(10, 3))
         self.generation_scope_combo = self.ttk.Combobox(
@@ -3654,7 +4218,7 @@ class SweepMetricExplorerApp:
             textvariable=self.metric_category_filter_var,
             state="readonly",
             width=8,
-            values=["all", "old", "new", "saved"],
+            values=["all", "old", "new", "saved", "oracle", "oracle_diagnostic"],
         )
         self.metric_category_combo.pack(side="left", padx=4)
         self.metric_category_combo.bind("<<ComboboxSelected>>", lambda _evt: self._refresh_metric_listbox())
@@ -4291,21 +4855,58 @@ class SweepMetricExplorerApp:
             export_metric_report(self.model, Path(selection))
             self.status_var.set(f"Exported to {selection}")
 
-    def load_from_path(self, path: Path) -> None:
+    def _on_import_trio_csv_dialog(self) -> None:
+        raw_path = self.path_var.get().strip()
+        if not raw_path:
+            self.messagebox.showwarning("Import Trio", "Load a sweep first.")
+            return
+        selections = self.filedialog.askopenfilenames(
+            title="Import Trio Result CSVs",
+            filetypes=[
+                ("Trio result CSVs", "*.csv"),
+                ("CSV files", "*.csv"),
+                ("All files", "*.*"),
+            ],
+        )
+        self._import_trio_paths([Path(item) for item in selections])
+
+    def _on_import_trio_folder_dialog(self) -> None:
+        raw_path = self.path_var.get().strip()
+        if not raw_path:
+            self.messagebox.showwarning("Import Trio", "Load a sweep first.")
+            return
+        directory = self.filedialog.askdirectory(title="Import Trio Results Folder")
+        self._import_trio_paths([Path(directory)] if directory else [])
+
+    def _import_trio_paths(self, selected_paths: Sequence[Path]) -> None:
+        raw_path = self.path_var.get().strip()
+        if not raw_path or not selected_paths:
+            return
+        if self.load_from_path(Path(raw_path), trio_results_paths=selected_paths) and self.model is not None:
+            self.status_var.set(
+                "Imported trio: "
+                f"{self.model.trio_oracle_record_count} LF rows, "
+                f"{self.model.trio_oracle_matched_count} matched, "
+                f"{len(self.model.warnings)} warnings"
+            )
+
+    def load_from_path(self, path: Path, *, trio_results_paths: Sequence[Path] = ()) -> bool:
         try:
             model = load_sweep_metric_explorer_model(
                 path,
                 metrics_config_path=self.metrics_config_path,
                 hydrate_mode=HYDRATE_MODE_LAZY,
+                trio_results_paths=trio_results_paths,
             )
         except Exception as exc:  # noqa: BLE001
             self.status_var.set("Load failed")
             self.messagebox.showerror("Metric Explorer", str(exc))
-            return
+            return False
         self.model = model
         self.path_var.set(str(path))
         self.status_var.set(_loaded_status_text(model))
         self._populate_from_model(model)
+        return True
 
     def _on_generation_scope_changed(self) -> None:
         if self.model is None:
@@ -5040,6 +5641,21 @@ class SweepMetricExplorerApp:
         if not selected:
             self.messagebox.showwarning("Search", "Select one or more metrics first.")
             return
+        oracle_selected = [
+            name
+            for name in selected
+            if name in self.model.metric_registry
+            and self.model.metric_registry[name].category in {"oracle", "oracle_diagnostic"}
+        ]
+        selected = _profile_search_metric_names(selected, self.model.metric_registry)
+        if oracle_selected:
+            self.messagebox.showwarning(
+                "Search",
+                "Trio oracle metrics are excluded from profile search; using the remaining metrics.",
+            )
+        if not selected:
+            self.messagebox.showwarning("Search", "No searchable metrics remain after excluding trio oracle metrics.")
+            return
         try:
             max_metrics = int(self.search_max_metrics_var.get().strip() or "6")
         except ValueError:
@@ -5086,11 +5702,17 @@ def launch_sweep_metric_explorer(
     initial_path: Optional[Path] = None,
     *,
     metrics_config_path: Optional[Path] = None,
+    trio_results_paths: Sequence[Path] = (),
 ) -> None:
     import tkinter as tk
 
     root = tk.Tk()
-    SweepMetricExplorerApp(root, initial_path=initial_path, metrics_config_path=metrics_config_path)
+    SweepMetricExplorerApp(
+        root,
+        initial_path=initial_path,
+        metrics_config_path=metrics_config_path,
+        initial_trio_results_paths=trio_results_paths,
+    )
     root.mainloop()
 
 
@@ -5109,23 +5731,38 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--metrics-config",
         help="Optional JSON config for enabled metrics, profiles, and search defaults.",
     )
+    parser.add_argument(
+        "--trio-results",
+        action="append",
+        default=[],
+        help=(
+            "Optional trio_benchmark_results.csv, trio_batch_results.csv, or directory to import. "
+            "May be passed multiple times."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     metrics_config_path = Path(args.metrics_config) if args.metrics_config else None
+    trio_results_paths = [Path(item) for item in args.trio_results]
     if args.export_dir:
         if not args.sweep_dir:
             raise ValueError("--export-dir requires a sweep_dir argument.")
         model = load_sweep_metric_explorer_model(
             Path(args.sweep_dir),
             metrics_config_path=metrics_config_path,
+            trio_results_paths=trio_results_paths,
         )
         export_metric_report(model, Path(args.export_dir))
         return
     initial_path = Path(args.sweep_dir) if args.sweep_dir else None
-    launch_sweep_metric_explorer(initial_path=initial_path, metrics_config_path=metrics_config_path)
+    launch_sweep_metric_explorer(
+        initial_path=initial_path,
+        metrics_config_path=metrics_config_path,
+        trio_results_paths=trio_results_paths,
+    )
 
 
 if __name__ == "__main__":

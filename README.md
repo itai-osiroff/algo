@@ -104,7 +104,7 @@ python acquire_images_PG.py --mode stream --output-dir path/to/pg_snaps
 | `python -m moment_images.parameter_sweep --spec path/to/spec.json` | Recommended automated sweep workflow | Supports staged sweeps, resume, extend, merge, dry-run, scoring profiles, and optional metric experiments |
 | `python -m moment_images.parameter_sweep --gui` | GUI for building and running sweep specs | Useful when editing JSON by hand is inconvenient |
 | `python -m moment_images.sweep_visualization path/to/sweep_output` | Inspect sweep leaderboards and candidate comparisons | Also supports `--export-dir` for static reports |
-| `python -m moment_images.sweep_metric_explorer path/to/sweep_output` | Re-rank completed sweeps from raw `workspace.npz` artifacts | Supports annotations, custom metric profiles, and `--metrics-config` |
+| `python -m moment_images.sweep_metric_explorer path/to/sweep_output` | Re-rank completed sweeps from raw `workspace.npz` artifacts | Supports annotations, custom metric profiles, `--metrics-config`, and trio oracle import via `--trio-results` |
 | `python generate_reports.py path/to/sweep_output` | Rebuild analysis/alpha report artifacts from sweep outputs | Use `--rebuild-summaries --spec path/to/spec.json` when summary products need regeneration |
 | `python -m moment_images.validate_rectification` | Compare rectified output against Validation Camera and Thorcam images | GUI-only workflow |
 | `python -m moment_images.batch_process_validation_images` | Batch preprocess validation images with shared geometry/intensity/scale settings | GUI-only; it does not expose a normal argparse `--help` interface today |

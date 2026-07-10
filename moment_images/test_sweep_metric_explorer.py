@@ -225,6 +225,165 @@ def _write_annotations(output_dir: Path) -> None:
     )
 
 
+def _write_trio_results(path: Path, *, bad_rankable: bool = True, bad_primary_score: float = 0.40) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "source_kind",
+        "validation_rank",
+        "row_id",
+        "candidate_id",
+        "stage",
+        "dataset_id",
+        "generation_id",
+        "strategy",
+        "saved_rank",
+        "saved_score",
+        explorer.TRIO_PRIMARY_SCORE,
+        explorer.TRIO_ROW_LOCAL_SCORE,
+        explorer.TRIO_FULL_GRID_SCORE,
+        explorer.TRIO_VALID_FOV_FRACTION,
+        explorer.TRIO_ROI_FRACTION,
+        explorer.TRIO_ROI_PIXEL_COUNT,
+        explorer.TRIO_BEAD_COUNT,
+        explorer.TRIO_CANDIDATE_ROI_COVERAGE,
+        "registration_confidence",
+        "matched_bead_count",
+        "median_bead_error_px",
+        "common_fov_fraction",
+        "validation_rankable",
+        "ranking_exclusion_reason",
+        "workspace_path",
+        "preview_path",
+        "warnings",
+    ]
+    rows = [
+        {
+            "source_kind": explorer.TRIO_THORCAM_SOURCE_KIND,
+            "row_id": "thorcam:d1",
+            "candidate_id": "thorcam",
+            "stage": "baseline",
+            "dataset_id": "d1",
+            explorer.TRIO_PRIMARY_SCORE: 0.65,
+            explorer.TRIO_ROW_LOCAL_SCORE: 0.64,
+            explorer.TRIO_FULL_GRID_SCORE: 0.62,
+            "validation_rankable": "true",
+        },
+        {
+            "source_kind": explorer.TRIO_THORCAM_SOURCE_KIND,
+            "row_id": "thorcam:d2",
+            "candidate_id": "thorcam",
+            "stage": "baseline",
+            "dataset_id": "d2",
+            explorer.TRIO_PRIMARY_SCORE: 0.55,
+            explorer.TRIO_ROW_LOCAL_SCORE: 0.54,
+            explorer.TRIO_FULL_GRID_SCORE: 0.52,
+            "validation_rankable": "true",
+        },
+        {
+            "source_kind": explorer.TRIO_LF_SOURCE_KIND,
+            "validation_rank": 1,
+            "row_id": "c_good",
+            "candidate_id": "c_good",
+            "stage": "stage1",
+            "dataset_id": "d1",
+            "strategy": "combined",
+            "saved_rank": 2,
+            "saved_score": 0.51,
+            explorer.TRIO_PRIMARY_SCORE: 0.95,
+            explorer.TRIO_ROW_LOCAL_SCORE: 0.94,
+            explorer.TRIO_FULL_GRID_SCORE: 0.93,
+            explorer.TRIO_VALID_FOV_FRACTION: 0.98,
+            explorer.TRIO_ROI_FRACTION: 0.75,
+            explorer.TRIO_ROI_PIXEL_COUNT: 2400,
+            explorer.TRIO_BEAD_COUNT: 18,
+            explorer.TRIO_CANDIDATE_ROI_COVERAGE: 0.97,
+            "registration_confidence": 0.91,
+            "matched_bead_count": 17,
+            "median_bead_error_px": 1.2,
+            "common_fov_fraction": 0.88,
+            "validation_rankable": "true",
+        },
+        {
+            "source_kind": explorer.TRIO_LF_SOURCE_KIND,
+            "validation_rank": 2,
+            "row_id": "c_good",
+            "candidate_id": "c_good",
+            "stage": "stage1",
+            "dataset_id": "d2",
+            "strategy": "combined",
+            "saved_rank": 2,
+            "saved_score": 0.51,
+            explorer.TRIO_PRIMARY_SCORE: 0.90,
+            explorer.TRIO_ROW_LOCAL_SCORE: 0.89,
+            explorer.TRIO_FULL_GRID_SCORE: 0.87,
+            explorer.TRIO_VALID_FOV_FRACTION: 0.97,
+            explorer.TRIO_ROI_FRACTION: 0.74,
+            explorer.TRIO_ROI_PIXEL_COUNT: 2350,
+            explorer.TRIO_BEAD_COUNT: 17,
+            explorer.TRIO_CANDIDATE_ROI_COVERAGE: 0.96,
+            "registration_confidence": 0.89,
+            "matched_bead_count": 16,
+            "median_bead_error_px": 1.4,
+            "common_fov_fraction": 0.86,
+            "validation_rankable": "true",
+        },
+        {
+            "source_kind": explorer.TRIO_LF_SOURCE_KIND,
+            "validation_rank": 3,
+            "row_id": "c_bad",
+            "candidate_id": "c_bad",
+            "stage": "stage1",
+            "dataset_id": "d1",
+            "strategy": "combined",
+            "saved_rank": 1,
+            "saved_score": 0.92,
+            explorer.TRIO_PRIMARY_SCORE: bad_primary_score,
+            explorer.TRIO_ROW_LOCAL_SCORE: 0.39,
+            explorer.TRIO_FULL_GRID_SCORE: 0.37,
+            explorer.TRIO_VALID_FOV_FRACTION: 0.96,
+            explorer.TRIO_ROI_FRACTION: 0.73,
+            explorer.TRIO_ROI_PIXEL_COUNT: 2320,
+            explorer.TRIO_BEAD_COUNT: 18,
+            explorer.TRIO_CANDIDATE_ROI_COVERAGE: 0.95,
+            "registration_confidence": 0.82,
+            "matched_bead_count": 15,
+            "median_bead_error_px": 2.8,
+            "common_fov_fraction": 0.84,
+            "validation_rankable": "true" if bad_rankable else "false",
+            "ranking_exclusion_reason": "" if bad_rankable else "thorcam_fov_coverage_below_minimum",
+        },
+        {
+            "source_kind": explorer.TRIO_LF_SOURCE_KIND,
+            "validation_rank": 4,
+            "row_id": "c_bad",
+            "candidate_id": "c_bad",
+            "stage": "stage1",
+            "dataset_id": "d2",
+            "strategy": "combined",
+            "saved_rank": 1,
+            "saved_score": 0.92,
+            explorer.TRIO_PRIMARY_SCORE: bad_primary_score,
+            explorer.TRIO_ROW_LOCAL_SCORE: 0.29,
+            explorer.TRIO_FULL_GRID_SCORE: 0.28,
+            explorer.TRIO_VALID_FOV_FRACTION: 0.95,
+            explorer.TRIO_ROI_FRACTION: 0.72,
+            explorer.TRIO_ROI_PIXEL_COUNT: 2290,
+            explorer.TRIO_BEAD_COUNT: 17,
+            explorer.TRIO_CANDIDATE_ROI_COVERAGE: 0.94,
+            "registration_confidence": 0.80,
+            "matched_bead_count": 14,
+            "median_bead_error_px": 3.0,
+            "common_fov_fraction": 0.83,
+            "validation_rankable": "true" if bad_rankable else "false",
+            "ranking_exclusion_reason": "" if bad_rankable else "thorcam_fov_coverage_below_minimum",
+        },
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def _can_create_tk() -> bool:
     try:
         import tkinter as tk
@@ -462,6 +621,243 @@ def test_lazy_reload_reuses_metric_cache_without_reopening_workspaces(tmp_path, 
 
     assert calls == []
     assert ("stage1", "new_dct_sparse") in reloaded.profile_results
+
+
+def test_trio_results_import_join_oracle_profile_and_export_seeds(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    trio_csv = tmp_path / "trio" / "trio_benchmark_results.csv"
+    _write_trio_results(trio_csv)
+
+    model = load_sweep_metric_explorer_model(
+        output_dir,
+        hydrate_mode=HYDRATE_MODE_LAZY,
+        trio_results_paths=[trio_csv],
+    )
+
+    cache_path = output_dir / "metric_review" / explorer.TRIO_ORACLE_CACHE_FILENAME
+    assert cache_path.exists()
+    good_d1 = next(
+        record for record in model.raw_records if record.candidate_id == "c_good" and record.dataset_id == "d1"
+    )
+    assert good_d1.metrics[explorer.TRIO_PRIMARY_SCORE] == pytest.approx(0.95)
+    assert good_d1.metrics[explorer.TRIO_DELTA_VS_THORCAM] == pytest.approx(0.30)
+    assert any("trio_oracle:rank=1" in warning for warning in good_d1.warnings)
+    assert explorer.TRIO_ORACLE_PROFILE_NAME in {profile.name for profile in model.config.profiles}
+
+    results = _ensure_profile_results(
+        model,
+        stage_name="stage1",
+        profile_name=explorer.TRIO_ORACLE_PROFILE_NAME,
+        include_analysis=True,
+    )
+    assert [result.candidate_id for result in results[:2]] == ["c_good", "c_bad"]
+
+    export_dir = tmp_path / "trio_export"
+    export_metric_report(model, export_dir)
+    assert (export_dir / "validation_refinement_seeds.json").exists()
+    assert (export_dir / "validation_refinement_seeds.csv").exists()
+    seeds = json.loads((export_dir / "validation_refinement_seeds.json").read_text(encoding="utf-8"))
+    assert seeds["top_k"] == explorer.DEFAULT_TRIO_SEED_TOP_K
+    assert seeds["seeds"]
+    assert seeds["seeds"][0]["candidate_id"] == "c_good"
+    assert seeds["seeds"][0]["params"]["gauss_sigma"] == 3.0
+
+    reloaded = load_sweep_metric_explorer_model(output_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+    reloaded_good_d1 = next(
+        record for record in reloaded.raw_records if record.candidate_id == "c_good" and record.dataset_id == "d1"
+    )
+    assert reloaded_good_d1.metrics[explorer.TRIO_PRIMARY_SCORE] == pytest.approx(0.95)
+
+
+def test_trio_oracle_profile_hidden_without_import(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+
+    model = load_sweep_metric_explorer_model(output_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+
+    assert explorer.TRIO_ORACLE_PROFILE_NAME not in {profile.name for profile in model.config.profiles}
+
+    export_dir = tmp_path / "no_trio_export"
+    export_metric_report(model, export_dir)
+    with (export_dir / "profile_results.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert all(row["profile_name"] != explorer.TRIO_ORACLE_PROFILE_NAME for row in rows)
+    report = json.loads((export_dir / "report.json").read_text(encoding="utf-8"))
+    assert report["trio_oracle"]["record_count"] == 0
+    assert report["trio_oracle"]["matched_count"] == 0
+    assert report["trio_oracle"]["rankable_count"] == 0
+
+
+def test_trio_oracle_profile_respects_validation_rankability(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    trio_csv = tmp_path / "trio_rankability" / "trio_benchmark_results.csv"
+    _write_trio_results(trio_csv, bad_rankable=False, bad_primary_score=0.99)
+    model = load_sweep_metric_explorer_model(
+        output_dir,
+        hydrate_mode=explorer.HYDRATE_MODE_LAZY,
+        trio_results_paths=[trio_csv],
+    )
+
+    results = _ensure_profile_results(
+        model,
+        stage_name="stage1",
+        profile_name=explorer.TRIO_ORACLE_PROFILE_NAME,
+        include_analysis=True,
+    )
+
+    by_candidate = {result.candidate_id: result for result in results}
+    assert by_candidate["c_good"].rank == 1
+    assert by_candidate["c_bad"].score == float("-inf")
+    assert by_candidate["c_bad"].missing_datasets == ["d1", "d2"]
+
+    export_dir = tmp_path / "rankability_export"
+    export_metric_report(model, export_dir)
+    seeds = json.loads((export_dir / "validation_refinement_seeds.json").read_text(encoding="utf-8"))
+    assert {seed["candidate_id"] for seed in seeds["seeds"]} == {"c_good"}
+
+
+def test_trio_candidate_metrics_export_includes_metadata(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    trio_csv = tmp_path / "trio_metadata" / "trio_benchmark_results.csv"
+    _write_trio_results(trio_csv)
+    model = load_sweep_metric_explorer_model(
+        output_dir,
+        hydrate_mode=HYDRATE_MODE_LAZY,
+        trio_results_paths=[trio_csv],
+    )
+
+    export_dir = tmp_path / "metadata_export"
+    export_metric_report(model, export_dir)
+    with (export_dir / "candidate_metrics.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    expected_columns = {
+        "trio_validation_rank",
+        "trio_validation_rankable",
+        "trio_ranking_exclusion_reason",
+        "trio_report_path",
+        "trio_overlay_path",
+        "trio_diff_path",
+        "trio_source_path",
+    }
+    assert expected_columns.issubset(rows[0].keys())
+    good_d1 = next(row for row in rows if row["candidate_id"] == "c_good" and row["dataset_id"] == "d1")
+    assert good_d1["trio_validation_rank"] == "1"
+    assert good_d1["trio_validation_rankable"] == "true"
+    assert good_d1["trio_source_path"].endswith("trio_benchmark_results.csv")
+
+    report = json.loads((export_dir / "report.json").read_text(encoding="utf-8"))
+    assert report["trio_oracle"]["record_count"] == 4
+    assert report["trio_oracle"]["matched_count"] == 4
+    assert report["trio_oracle"]["unmatched_count"] == 0
+    assert report["trio_oracle"]["rankable_count"] == 4
+
+
+def test_trio_import_discovers_detailed_results_from_directory(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    batch_dir = tmp_path / "trio_batch"
+    _write_trio_results(batch_dir / "scene_one" / "trio_benchmark_results.csv")
+    _write_json(batch_dir / "trio_batch_results.csv", [])
+
+    model = load_sweep_metric_explorer_model(
+        output_dir,
+        hydrate_mode=HYDRATE_MODE_LAZY,
+        trio_results_paths=[batch_dir],
+    )
+
+    assert model.trio_oracle_sources
+    assert any(source.endswith("trio_benchmark_results.csv") for source in model.trio_oracle_sources)
+    assert any(explorer.TRIO_PRIMARY_SCORE in record.metrics for record in model.raw_records)
+
+
+def test_trio_batch_aggregate_imports_best_lf_row_without_detailed_results(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    batch_csv = tmp_path / "trio_batch_only" / "trio_batch_results.csv"
+    batch_csv.parent.mkdir(parents=True, exist_ok=True)
+    with batch_csv.open("w", newline="", encoding="utf-8") as handle:
+        fieldnames = [
+            "status",
+            "dataset_id",
+            "stage",
+            "best_lf_row_id",
+            "best_lf_candidate_id",
+            "best_validation_rank",
+            "best_validation_hybrid_thorcam_fov_v1",
+            "best_validation_hybrid_v1",
+            "best_validation_hybrid_full_grid_v1",
+            "best_validation_valid_fov_fraction",
+            "best_validation_metric_roi_fraction",
+            "best_validation_metric_bead_count",
+            "best_validation_metric_candidate_roi_coverage",
+            "thorcam_validation_hybrid_thorcam_fov_v1",
+            "thorcam_validation_hybrid_v1",
+            "thorcam_validation_hybrid_full_grid_v1",
+            "thorcam_validation_valid_fov_fraction",
+            "thorcam_validation_metric_roi_fraction",
+            "thorcam_validation_metric_bead_count",
+            "thorcam_validation_metric_candidate_roi_coverage",
+            "report_path",
+        ]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "status": "ok",
+                "dataset_id": "d1",
+                "stage": "stage1",
+                "best_lf_row_id": "c_good",
+                "best_lf_candidate_id": "c_good",
+                "best_validation_rank": 1,
+                "best_validation_hybrid_thorcam_fov_v1": 0.81,
+                "best_validation_hybrid_v1": 0.80,
+                "best_validation_hybrid_full_grid_v1": 0.79,
+                "best_validation_valid_fov_fraction": 0.97,
+                "best_validation_metric_roi_fraction": 0.73,
+                "best_validation_metric_bead_count": 19,
+                "best_validation_metric_candidate_roi_coverage": 0.96,
+                "thorcam_validation_hybrid_thorcam_fov_v1": 0.62,
+                "thorcam_validation_hybrid_v1": 0.61,
+                "thorcam_validation_hybrid_full_grid_v1": 0.60,
+                "thorcam_validation_valid_fov_fraction": 0.95,
+                "thorcam_validation_metric_roi_fraction": 0.70,
+                "thorcam_validation_metric_bead_count": 18,
+                "thorcam_validation_metric_candidate_roi_coverage": 0.93,
+                "report_path": "scene_report/index.html",
+            }
+        )
+
+    model = load_sweep_metric_explorer_model(
+        output_dir,
+        hydrate_mode=HYDRATE_MODE_LAZY,
+        trio_results_paths=[batch_csv],
+    )
+
+    good_d1 = next(
+        record for record in model.raw_records if record.candidate_id == "c_good" and record.dataset_id == "d1"
+    )
+    assert good_d1.metrics[explorer.TRIO_PRIMARY_SCORE] == pytest.approx(0.81)
+    assert good_d1.metrics[explorer.TRIO_DELTA_VS_THORCAM] == pytest.approx(0.19)
+
+
+def test_trio_oracle_metrics_are_excluded_from_profile_search(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    trio_csv = tmp_path / "trio" / "trio_benchmark_results.csv"
+    _write_trio_results(trio_csv)
+    model = load_sweep_metric_explorer_model(
+        output_dir,
+        hydrate_mode=explorer.HYDRATE_MODE_LAZY,
+        trio_results_paths=[trio_csv],
+    )
+
+    results = search_profile_combinations(
+        model,
+        stage_name="stage1",
+        metric_names=[explorer.TRIO_PRIMARY_SCORE, "saved_score"],
+        weight_step=0.5,
+    )
+
+    assert results
+    assert all(explorer.TRIO_PRIMARY_SCORE not in result.metric_weights for result in results)
+    assert all(set(result.metric_weights) == {"saved_score"} for result in results)
 
 
 def test_annotations_enable_evaluation_and_search(tmp_path):
@@ -767,6 +1163,8 @@ def test_export_metric_report_hydrates_lazy_model(tmp_path, monkeypatch):
 def test_export_metric_report_and_main(tmp_path):
     output_dir = _make_modern_fixture(tmp_path)
     _write_annotations(output_dir)
+    trio_csv = tmp_path / "trio_cli" / "trio_benchmark_results.csv"
+    _write_trio_results(trio_csv)
     model = load_sweep_metric_explorer_model(output_dir)
 
     export_dir = tmp_path / "export"
@@ -781,8 +1179,10 @@ def test_export_metric_report_and_main(tmp_path):
     assert (export_dir / "index.html").exists()
 
     cli_export = tmp_path / "cli_export"
-    main([str(output_dir), "--export-dir", str(cli_export)])
+    main([str(output_dir), "--trio-results", str(trio_csv), "--export-dir", str(cli_export)])
     assert (cli_export / "candidate_metrics.csv").exists()
+    assert (cli_export / "validation_refinement_seeds.json").exists()
+    assert (output_dir / "metric_review" / explorer.TRIO_ORACLE_CACHE_FILENAME).exists()
 
 
 def test_channel_comparison_figure_preserves_image_aspect_ratio(tmp_path):

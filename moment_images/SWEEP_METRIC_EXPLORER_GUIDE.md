@@ -70,6 +70,17 @@ Headless export:
 python -m moment_images.sweep_metric_explorer path/to/sweep_output --export-dir path/to/report_folder
 ```
 
+Import trio benchmark outputs while launching or exporting:
+
+```bash
+python -m moment_images.sweep_metric_explorer path/to/sweep_output --trio-results path/to/trio_benchmark_results.csv
+python -m moment_images.sweep_metric_explorer path/to/sweep_output --trio-results path/to/trio_batch_report --export-dir path/to/report_folder
+```
+
+`--trio-results` may be passed multiple times. Each value can be a
+`trio_benchmark_results.csv`, a `trio_batch_results.csv`, or a directory
+containing those files.
+
 ## What Gets Computed
 
 The explorer recomputes metrics from `average_rectified_image` inside each `workspace.npz`.
@@ -132,6 +143,8 @@ At the top of the window you also have:
 - `Load`
 - `Reload`
 - `Export...`
+- `Import Trio CSV...`
+- `Import Trio Folder...`
 - `Open Folder`
 
 ## Recommended Workflow
@@ -159,6 +172,11 @@ The built-in profiles are:
 - `old_recomputed`: old sweep metrics recomputed from `workspace.npz`
 - `new_dct_sparse`: equal-weight blend of the new DCT / sparsity / Vollath metrics
 - `hybrid_default`: equal-weight blend of old recomputed + new metrics
+
+After importing trio benchmark results, or after loading a sweep with a saved
+`metric_review/trio_oracle_metrics.json` cache, the explorer also exposes
+`trio_oracle_thorcam_fov`: imported validation-oracle ranking on the
+ThorCam-overlap FOV.
 
 Use these first before building anything custom.
 
@@ -422,6 +440,8 @@ Using `Export...` in the GUI or `--export-dir` on the CLI writes a report folder
 - `profile_results.csv`
 - `search_results.csv`
 - `disagreements.csv`
+- `validation_refinement_seeds.json`
+- `validation_refinement_seeds.csv`
 - `report.json`
 - `index.html`
 
@@ -431,8 +451,16 @@ What each file is for:
 - `profile_results.csv`: final ranked results for each stage/profile
 - `search_results.csv`: profile-search results from the current model
 - `disagreements.csv`: cases where the ranking disagreed with your labels
+- `validation_refinement_seeds.json` / `.csv`: top imported trio-oracle LF candidates per stage/dataset for follow-up refinement sweeps
 - `report.json`: machine-readable summary of config, warnings, and evaluations
 - `index.html`: lightweight static summary
+
+When trio data is loaded, `candidate_metrics.csv` also includes
+`trio_validation_rank`, `trio_validation_rankable`,
+`trio_ranking_exclusion_reason`, `trio_report_path`, `trio_overlay_path`,
+`trio_diff_path`, and `trio_source_path`. `report.json` includes trio oracle
+`record_count`, `matched_count`, `unmatched_count`, `rankable_count`,
+`cache_path`, `source_paths`, and `seed_count`.
 
 ### Trio benchmark outputs
 
@@ -443,9 +471,39 @@ available. It writes `trio_benchmark_results.csv`,
 under its own output directory.
 
 The trio benchmark records stable sweep identifiers and metric names, including
-the `validation_hybrid_v1` profile, so these outputs can be joined back to
-explorer data later. The metric explorer does not ingest the trio CSV/JSON
-directly yet.
+`validation_hybrid_thorcam_fov_v1`, `validation_hybrid_v1`, and
+`validation_hybrid_full_grid_v1`, so these outputs can be joined back to
+explorer data. Import them with either:
+
+- the GUI `Import Trio CSV...` button after loading a sweep
+- the GUI `Import Trio Folder...` button after loading a sweep
+- `--trio-results path/to/trio_benchmark_results.csv`
+- `--trio-results path/to/trio_batch_results.csv`
+- `--trio-results path/to/trio_batch_output_dir`
+
+The explorer normalizes imported rows into:
+
+```text
+metric_review/trio_oracle_metrics.json
+```
+
+Subsequent loads reuse that cache even if `--trio-results` is omitted.
+
+Imported LF rows are joined to sweep rows by
+`stage`, `candidate_id`, `dataset_id`, and `generation_id`, with a
+generationless fallback for batch aggregates or older trio outputs. The
+imported metrics are read-only, explorer-local oracle metrics. They are shown in
+the metric table and detail panel, but profile search excludes them so the
+search does not optimize directly against the validation oracle.
+
+Use the built-in `trio_oracle_thorcam_fov` profile to rank candidates by
+`validation_hybrid_thorcam_fov_v1`. This profile is available only after trio
+data is imported or loaded from cache. Rows marked
+`validation_rankable=false` by `trio_benchmark.py` keep their imported metrics
+for inspection, but oracle profiles treat those rows as missing for that
+dataset and exclude them from validation-refinement seeds. The explorer also
+derives `validation_hybrid_thorcam_fov_delta_vs_thorcam` for rankable LF rows
+when ThorCam baseline rows are present.
 
 For multi-scene registration and scoring calibration work,
 `moment_images/trio_benchmark_batch.py` runs a JSON manifest of trio scenes and

@@ -72,6 +72,17 @@ Re-rank a completed sweep from raw workspaces:
 python -m moment_images.sweep_metric_explorer path/to/sweep_output
 ```
 
+Import trio benchmark validation-oracle scores into the metric explorer:
+
+```bash
+python -m moment_images.sweep_metric_explorer path/to/sweep_output --trio-results path/to/trio_benchmark_results.csv --export-dir path/to/metric_report
+```
+
+The trio oracle profile appears after importing trio results or loading the
+saved `metric_review/trio_oracle_metrics.json` cache. Rows marked unrankable by
+the trio benchmark remain inspectable but are excluded from oracle ranking and
+validation-refinement seed export.
+
 Run validation against Validation Camera and Thorcam images:
 
 ```bash
