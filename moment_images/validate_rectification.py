@@ -1972,7 +1972,9 @@ class GuidedValidationEditor:
         self._schedule_preview()
 
     def _on_auto_align_toggle(self) -> None:
-        self._invalidate_alignment()
+        point_pairs = self._active_alignment_points()
+        if point_pairs is not None or self._clean_cached_non_point_alignment(point_pairs) is None:
+            self._invalidate_alignment()
         self._schedule_preview()
 
     def _current_options(self, auto_align_override: bool | None = None) -> ValidationOptions:
@@ -2029,6 +2031,16 @@ class GuidedValidationEditor:
         self.alignment_result = None
         self._alignment_dirty = True
 
+    def _clean_cached_non_point_alignment(
+        self,
+        point_pairs: AlignmentPointSet | None,
+    ) -> AlignmentResult | None:
+        if self._alignment_dirty or self.alignment_result is None or point_pairs is not None:
+            return None
+        if self.alignment_result.alignment_model != ALIGNMENT_MODEL_TRANSLATION_ECC:
+            return None
+        return self.alignment_result
+
     def _run_alignment(self) -> None:
         if not self._apply_scale_entries(commit=True):
             return
@@ -2064,7 +2076,7 @@ class GuidedValidationEditor:
 
         point_pairs = self._active_alignment_points()
         alignment_requested = options.auto_align or point_pairs is not None
-        alignment_for_preview: AlignmentResult | None = None
+        alignment_for_preview = self._clean_cached_non_point_alignment(point_pairs)
         if alignment_requested and not self._alignment_dirty and self.alignment_result is not None:
             alignment_for_preview = self.alignment_result
 
@@ -2107,7 +2119,14 @@ class GuidedValidationEditor:
                 else:
                     status_parts.append(f"Alignment={alignment_for_preview.status}")
             else:
-                status_parts.append("Alignment=disabled")
+                if alignment_for_preview is None:
+                    status_parts.append("Alignment=disabled")
+                else:
+                    status_parts.append(f"Alignment={alignment_for_preview.status}")
+                    if alignment_for_preview.match_score is not None:
+                        status_parts.append(f"Template={alignment_for_preview.match_score:.3f}")
+                    if alignment_for_preview.ecc_score is not None:
+                        status_parts.append(f"ECC={alignment_for_preview.ecc_score:.3f}")
         if self.alignment_points.pair_count > 0 or self.point_pick_var.get() or self.use_points_var.get():
             status_parts.append(self._format_points_status())
         status_parts.append(f"Compare={comp_data.status}")
@@ -2436,8 +2455,11 @@ class GuidedValidationEditor:
         processed = self._build_processed_image()
         alignment_result: AlignmentResult | None = None
         point_pairs = self._active_alignment_points()
+        cached_alignment = self._clean_cached_non_point_alignment(point_pairs)
         alignment_requested = options.auto_align or point_pairs is not None
-        if alignment_requested:
+        if cached_alignment is not None:
+            alignment_result = cached_alignment
+        elif alignment_requested:
             if self._alignment_dirty or self.alignment_result is None:
                 alignment_result = auto_align_images(
                     self.reference_image,

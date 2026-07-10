@@ -26,12 +26,109 @@ from moment_images.validate_rectification import (
 )
 
 
+class _FakeVar:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value) -> None:
+        self.value = value
+
+
+class _FakeTop:
+    def __init__(self):
+        self.destroyed = False
+        self.after_calls = 0
+
+    def after(self, _delay_ms, _callback):
+        self.after_calls += 1
+        return f"after-{self.after_calls}"
+
+    def after_cancel(self, _job) -> None:
+        pass
+
+    def destroy(self) -> None:
+        self.destroyed = True
+
+
 def _synthetic_reference() -> np.ndarray:
     ref = np.zeros((120, 140), dtype=np.float32)
     cv.circle(ref, (35, 30), 10, 180, -1)
     cv.rectangle(ref, (80, 70), (120, 110), 220, -1)
     cv.line(ref, (0, 119), (139, 0), 90, 2)
     return cv.GaussianBlur(ref, (5, 5), 0)
+
+
+def _make_headless_editor(reference: np.ndarray, source: np.ndarray):
+    editor = validate_rectification.GuidedValidationEditor.__new__(
+        validate_rectification.GuidedValidationEditor
+    )
+    editor.top = _FakeTop()
+    editor.reference_image = np.asarray(reference, dtype=np.float32).copy()
+    editor.base_image = np.asarray(source, dtype=np.float32).copy()
+    editor.rotation_deg = 0
+    editor.flip_h = False
+    editor.flip_v = False
+    editor.crop_box = None
+    editor.scale_x_value = 1.0
+    editor.scale_y_value = 1.0
+    editor.preblur_before_resize = True
+    editor.preserve_flux_sum = True
+    editor.intensity_min_value = 0.0
+    editor.intensity_max_value = 255.0
+    editor.alignment_result = None
+    editor.alignment_points = AlignmentPointSet()
+    editor._pending_reference_point = None
+    editor._alignment_dirty = True
+    editor._preview_job = None
+    editor._result = None
+    editor.mode_var = _FakeVar(VALIDATION_MODE_PRESERVE)
+    editor.auto_align_var = _FakeVar(False)
+    editor.use_points_var = _FakeVar(False)
+    editor.point_pick_var = _FakeVar(False)
+    editor.scale_x_var = _FakeVar("1.0000")
+    editor.scale_y_var = _FakeVar("1.0000")
+    editor.scale_status_var = _FakeVar("")
+    editor.points_status_var = _FakeVar("")
+    editor.status_var = _FakeVar("")
+    return editor
+
+
+def _plain_validation_result(image: np.ndarray) -> ValidationImageResult:
+    return ValidationImageResult(
+        processed_image=np.asarray(image, dtype=np.float32),
+        options=ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=False),
+        alignment_result=None,
+        scale_x=1.0,
+        scale_y=1.0,
+        preblur_before_resize=True,
+        preserve_flux_sum=True,
+        intensity_min=0.0,
+        intensity_max=255.0,
+        crop_box=None,
+        rotation_deg=0,
+        flip_h=False,
+        flip_v=False,
+    )
+
+
+def _write_workspace_for_editor_result(tmp_path, rectified: np.ndarray, thor_result: ValidationImageResult):
+    val_path = tmp_path / "val.png"
+    thor_path = tmp_path / "thor.png"
+    save_path = tmp_path / "validation_workspace.npz"
+    assert cv.imwrite(str(val_path), np.full(rectified.shape, 80, dtype=np.uint8))
+    assert cv.imwrite(str(thor_path), np.full(thor_result.processed_image.shape, 140, dtype=np.uint8))
+    _save_workspace_data(
+        save_path=str(save_path),
+        rectified_img=rectified,
+        val_path=str(val_path),
+        thor_path=str(thor_path),
+        val_result=_plain_validation_result(rectified),
+        thor_result=thor_result,
+    )
+    return save_path
 
 
 def test_load_rectified_reference_from_npy_stack(tmp_path):
@@ -575,6 +672,85 @@ def test_apply_intensity_window_clips_without_rescaling():
 
     np.testing.assert_allclose(actual, expected)
     assert float(np.max(actual)) == 10.0
+
+
+def _translation_alignment_for_grid(image: np.ndarray) -> AlignmentResult:
+    h, w = image.shape[:2]
+    return AlignmentResult(
+        aligned_image=np.asarray(image, dtype=np.float32).copy(),
+        status="aligned_preserve_same_shape",
+        mode=VALIDATION_MODE_PRESERVE,
+        match_found=True,
+        ecc_score=0.987,
+        warp_matrix=np.array([[1.0, 0.0, 0.25], [0.0, 1.0, -0.5]], dtype=np.float32),
+        roi_reference=(0, 0, w, h),
+        roi_input=(0, 0, w, h),
+        alignment_model=validate_rectification.ALIGNMENT_MODEL_TRANSLATION_ECC,
+    )
+
+
+def test_finish_persists_clean_manual_alignment_when_auto_align_unchecked(monkeypatch, tmp_path):
+    rectified = _synthetic_reference()
+    editor = _make_headless_editor(rectified, rectified.copy())
+    alignment = _translation_alignment_for_grid(rectified)
+    calls = []
+
+    def fake_auto_align(ref_img, target_img, options=None, **kwargs):
+        calls.append((ref_img, target_img, options, kwargs))
+        assert options.auto_align is True
+        assert kwargs["point_pairs"] is None
+        assert kwargs["run_ecc_after_points"] is False
+        return alignment
+
+    monkeypatch.setattr(validate_rectification, "auto_align_images", fake_auto_align)
+
+    editor._run_alignment()
+    editor.auto_align_var.set(True)
+    editor._on_auto_align_toggle()
+    editor.auto_align_var.set(False)
+    editor._on_auto_align_toggle()
+    editor._finish()
+
+    assert len(calls) == 1
+    assert editor._result is not None
+    assert editor._result.alignment_result is alignment
+    assert editor._result.options.auto_align is False
+    save_path = _write_workspace_for_editor_result(tmp_path, rectified, editor._result)
+
+    with np.load(save_path) as workspace:
+        assert str(workspace["thorcam_alignment_status"].item()).startswith("aligned_")
+        np.testing.assert_array_equal(
+            workspace["thorcam_alignment_output_shape"],
+            np.array(rectified.shape, dtype=np.int32),
+        )
+        assert np.all(np.isfinite(workspace["thorcam_alignment_final_warp_matrix"]))
+
+
+def test_finish_discards_stale_manual_alignment_when_auto_align_unchecked(monkeypatch, tmp_path):
+    rectified = _synthetic_reference()
+    editor = _make_headless_editor(rectified, rectified.copy())
+    alignment = _translation_alignment_for_grid(rectified)
+    calls = []
+
+    def fake_auto_align(ref_img, target_img, options=None, **kwargs):
+        calls.append((ref_img, target_img, options, kwargs))
+        return alignment
+
+    monkeypatch.setattr(validate_rectification, "auto_align_images", fake_auto_align)
+
+    editor._run_alignment()
+    editor._invalidate_alignment()
+    editor._finish()
+
+    assert len(calls) == 1
+    assert editor._result is not None
+    assert editor._result.alignment_result is None
+    save_path = _write_workspace_for_editor_result(tmp_path, rectified, editor._result)
+
+    with np.load(save_path) as workspace:
+        assert workspace["thorcam_alignment_status"].item() == "not_run"
+        assert not str(workspace["thorcam_alignment_status"].item()).startswith("aligned_")
+        assert np.all(np.isfinite(workspace["thorcam_alignment_final_warp_matrix"]))
 
 
 def test_save_workspace_data_persists_resize_processing_flags(tmp_path):
