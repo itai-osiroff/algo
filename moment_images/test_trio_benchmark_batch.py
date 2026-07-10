@@ -230,6 +230,64 @@ def test_batch_manifest_forwards_validation_workspace_transform_flag(tmp_path):
     assert scene_summary["config"]["registration_profile"] == "validate_workspace_transform_v1"
 
 
+def test_batch_workspace_transform_invalid_thorcam_keeps_scene_successful(tmp_path):
+    sweep_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        include_workspace=True,
+        stage_mode="single_stage",
+    )
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    reference = np.full((4, 4), 1.25, dtype=np.float32)
+    identity = np.eye(2, 3, dtype=np.float32)
+    np.savez_compressed(
+        validation_workspace,
+        rectified_image=reference,
+        validation_processed=reference,
+        thorcam_processed=np.full((2, 3), 1.25, dtype=np.float32),
+        validation_alignment_final_warp_matrix=identity,
+        thorcam_alignment_final_warp_matrix=identity,
+    )
+    manifest_path = tmp_path / "trio_manifest.json"
+    output_dir = tmp_path / "batch_output"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "defaults": {
+                    "stage": "stage1",
+                    "top_k": 1,
+                    "use_validation_workspace_transforms": True,
+                },
+                "scenes": [
+                    {
+                        "scene_id": "scene_one",
+                        "sweep_dir": str(sweep_dir),
+                        "dataset_id": "d1",
+                        "validation_workspace": str(validation_workspace),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = run_batch_from_manifest(manifest_path, output_dir)
+
+    assert summary["num_successful"] == 1
+    scene = summary["scenes"][0]
+    assert scene["status"] == "ok"
+    assert scene["best_lf_candidate_id"]
+    assert scene["thorcam_validation_hybrid_v1"] is None
+    assert scene["best_lf_minus_thorcam_validation_hybrid_v1"] is None
+    scene_summary = json.loads(
+        (output_dir / "scene_one" / "trio_benchmark_summary.json").read_text(encoding="utf-8")
+    )
+    thor_registration = scene_summary["thorcam_baseline"]["registration"]
+    assert thor_registration["status"] == "failed"
+    assert thor_registration["validation_rankable"] is False
+    assert thor_registration["ranking_exclusion_reason"] == "workspace_transform_identity_shape_mismatch"
+
+
 def test_batch_main_emits_scene_progress_to_stderr(tmp_path, capsys):
     sweep_dir = _create_modern_fixture(
         tmp_path,

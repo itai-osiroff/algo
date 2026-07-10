@@ -965,13 +965,50 @@ def _workspace_grid_identity_registration(
     return result
 
 
-def _workspace_transform_source_for(references: ReferenceImages, source_kind: str) -> str:
+def _failed_workspace_transform_registration(
+    reference: np.ndarray,
+    *,
+    initializer: str,
+    transform_source: str,
+    invalid_reason: str,
+) -> SimilarityRegistrationResult:
+    ref = _as_float_2d(reference)
+    matrix = np.eye(2, 3, dtype=np.float64)
+    return SimilarityRegistrationResult(
+        status="failed",
+        aligned_image=np.zeros_like(ref, dtype=np.float32),
+        forward_matrix=matrix,
+        scale=1.0,
+        rotation_deg=0.0,
+        translation_x=0.0,
+        translation_y=0.0,
+        ecc_score=None,
+        ecc_warp_matrix=np.eye(2, 3, dtype=np.float32),
+        registration_profile=REGISTRATION_PROFILE_VALIDATE_WORKSPACE,
+        registration_confidence=0.0,
+        registration_suspect=True,
+        registration_suspect_reasons=[invalid_reason],
+        registration_constraint_level="failed",
+        registration_underconstrained=False,
+        registration_initializer=initializer,
+        registration_transform_source=transform_source,
+        validation_rankable=False,
+        ranking_exclusion_reason=invalid_reason,
+        warnings=[f"workspace_transform_invalid:{invalid_reason}"],
+    )
+
+
+def _workspace_transform_info_for(references: ReferenceImages, source_kind: str) -> Mapping[str, Any]:
     sources = references.workspace_transform_info.get("sources", {})
-    source_info: Mapping[str, Any] = {}
     if isinstance(sources, Mapping):
         raw = sources.get(source_kind, {})
         if isinstance(raw, Mapping):
-            source_info = raw
+            return raw
+    return {}
+
+
+def _workspace_transform_source_for(references: ReferenceImages, source_kind: str) -> str:
+    source_info = _workspace_transform_info_for(references, source_kind)
     return str(source_info.get("transform_source") or f"{source_kind}_alignment_final_warp_matrix")
 
 
@@ -2051,6 +2088,22 @@ def compute_validation_metrics(
     )
 
 
+def _empty_validation_metric_result() -> ValidationMetricResult:
+    return ValidationMetricResult(
+        metrics={
+            PROFILE_NAME: None,
+            "validation_signal": None,
+            "validation_structure": None,
+            "validation_bead": None,
+            "validation_sharpness": None,
+            "validation_signal_structure_score": None,
+        },
+        weights_used={},
+        bead_count=0,
+        warnings=[],
+    )
+
+
 def _prepare_validation_metric_reference(validation_image: np.ndarray) -> ValidationMetricReference:
     return _prepare_validation_metric_reference_from_unit(_robust_unit(_as_float_2d(validation_image)))
 
@@ -2184,14 +2237,23 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     if cfg.use_validation_workspace_transforms:
         thor_source = _workspace_transform_source_for(references, "thorcam")
-        thor_registration = _workspace_grid_identity_registration(
-            validation,
-            thorcam,
-            config=cfg,
-            initializer="validation_workspace_transform",
-            transform_source=thor_source,
-            quality_reference_cache=metric_reference_cache,
-        )
+        thor_info = _workspace_transform_info_for(references, "thorcam")
+        if thor_info.get("valid_for_scoring") is False:
+            thor_registration = _failed_workspace_transform_registration(
+                validation,
+                initializer="validation_workspace_transform",
+                transform_source=thor_source,
+                invalid_reason=str(thor_info.get("invalid_reason") or "workspace_transform_invalid"),
+            )
+        else:
+            thor_registration = _workspace_grid_identity_registration(
+                validation,
+                thorcam,
+                config=cfg,
+                initializer="validation_workspace_transform",
+                transform_source=thor_source,
+                quality_reference_cache=metric_reference_cache,
+            )
     elif cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
         thor_registration = _estimate_manual_similarity_registration(
             validation,
@@ -2221,7 +2283,11 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             geometric_reference_cache=geometric_reference_cache,
             quality_reference_cache=metric_reference_cache,
         )
-    thor_metrics = compute_validation_metrics(validation, thor_registration.aligned_image, reference_cache=metric_reference_cache)
+    thor_metrics = (
+        compute_validation_metrics(validation, thor_registration.aligned_image, reference_cache=metric_reference_cache)
+        if thor_registration.status == "aligned" and thor_registration.validation_rankable
+        else _empty_validation_metric_result()
+    )
     thor_row = BenchmarkResultRow(
         source_kind="thorcam_baseline",
         row_id="thorcam_baseline",
@@ -2422,12 +2488,14 @@ def _load_reference_images_from_workspace_transforms(
         workspace_path,
         prefix="validation",
         rectified_shape=rectified.shape,
+        required=True,
     )
     thorcam, thorcam_info = _warp_workspace_processed_to_rectified_grid(
         workspace,
         workspace_path,
         prefix="thorcam",
         rectified_shape=rectified.shape,
+        required=False,
     )
     warnings.extend(validation_info["warnings"])
     warnings.extend(thorcam_info["warnings"])
@@ -2455,24 +2523,57 @@ def _warp_workspace_processed_to_rectified_grid(
     *,
     prefix: str,
     rectified_shape: Tuple[int, int],
+    required: bool,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     image_key = f"{prefix}_processed"
     matrix_key = f"{prefix}_alignment_final_warp_matrix"
     if image_key not in workspace:
         raise ValueError(f"{workspace_path} does not contain {image_key!r}")
     source = _as_float_2d(np.asarray(workspace[image_key]))
+    source_shape = tuple(int(value) for value in source.shape[:2])
+    output_shape = tuple(int(value) for value in rectified_shape)
+    source_shape_matches_rectified = source_shape == output_shape
     matrix = _workspace_affine_matrix(workspace.get(matrix_key))
     warnings: List[str] = []
     transform_source = matrix_key
+    invalid_reason: Optional[str] = None
     if matrix is None:
-        if tuple(source.shape[:2]) != tuple(rectified_shape):
+        if not source_shape_matches_rectified:
+            invalid_reason = "workspace_transform_missing_matrix_shape_mismatch"
+        else:
+            matrix = np.eye(2, 3, dtype=np.float32)
+            transform_source = "identity_workspace_same_shape"
+            warnings.append(f"{prefix}:{transform_source}:{matrix_key}")
+    matrix_is_identity = bool(matrix is not None and _is_identity_affine_matrix(matrix))
+    if matrix is not None and matrix_is_identity and not source_shape_matches_rectified:
+        invalid_reason = "workspace_transform_identity_shape_mismatch"
+
+    if invalid_reason is not None:
+        warnings.append(f"{prefix}:{invalid_reason}:{matrix_key}")
+        info = _workspace_transform_source_info(
+            image_key=image_key,
+            matrix_key=matrix_key,
+            transform_source=transform_source,
+            source_shape=source_shape,
+            output_shape=output_shape,
+            matrix=matrix,
+            matrix_is_identity=matrix_is_identity,
+            source_shape_matches_rectified=source_shape_matches_rectified,
+            valid_for_scoring=False,
+            invalid_reason=invalid_reason,
+            alignment_status=_workspace_text(workspace.get(f"{prefix}_alignment_status")),
+            warnings=warnings,
+        )
+        if required:
             raise ValueError(
-                f"{workspace_path} has no usable {matrix_key!r} and {image_key!r} shape "
-                f"{tuple(source.shape[:2])} differs from rectified grid {tuple(rectified_shape)}"
+                f"{workspace_path} has invalid {matrix_key!r}: {invalid_reason}; "
+                f"{image_key!r} shape {source_shape} differs from rectified grid {output_shape}"
             )
-        matrix = np.eye(2, 3, dtype=np.float32)
-        transform_source = "identity_workspace_same_shape"
-        warnings.append(f"{prefix}:{transform_source}:{matrix_key}")
+        return np.zeros(output_shape, dtype=np.float32), info
+
+    if matrix is None:
+        raise ValueError(f"{workspace_path} has no usable {matrix_key!r}")
+
     warped = cv.warpAffine(
         source,
         np.asarray(matrix, dtype=np.float32),
@@ -2481,16 +2582,53 @@ def _warp_workspace_processed_to_rectified_grid(
         borderMode=cv.BORDER_CONSTANT,
         borderValue=0.0,
     )
+    info = _workspace_transform_source_info(
+        image_key=image_key,
+        matrix_key=matrix_key,
+        transform_source=transform_source,
+        source_shape=source_shape,
+        output_shape=output_shape,
+        matrix=matrix,
+        matrix_is_identity=matrix_is_identity,
+        source_shape_matches_rectified=source_shape_matches_rectified,
+        valid_for_scoring=True,
+        invalid_reason=None,
+        alignment_status=_workspace_text(workspace.get(f"{prefix}_alignment_status")),
+        warnings=warnings,
+    )
+    return warped.astype(np.float32), info
+
+
+def _workspace_transform_source_info(
+    *,
+    image_key: str,
+    matrix_key: str,
+    transform_source: str,
+    source_shape: Tuple[int, int],
+    output_shape: Tuple[int, int],
+    matrix: Optional[np.ndarray],
+    matrix_is_identity: bool,
+    source_shape_matches_rectified: bool,
+    valid_for_scoring: bool,
+    invalid_reason: Optional[str],
+    alignment_status: Optional[str],
+    warnings: Sequence[str],
+) -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "image_key": image_key,
         "matrix_key": matrix_key,
         "transform_source": transform_source,
-        "source_shape": [int(source.shape[0]), int(source.shape[1])],
-        "output_shape": [int(rectified_shape[0]), int(rectified_shape[1])],
-        "matrix": np.asarray(matrix, dtype=float).tolist(),
-        "warnings": warnings,
+        "source_shape": [int(source_shape[0]), int(source_shape[1])],
+        "output_shape": [int(output_shape[0]), int(output_shape[1])],
+        "matrix": None if matrix is None else np.asarray(matrix, dtype=float).tolist(),
+        "matrix_is_identity": bool(matrix_is_identity),
+        "source_shape_matches_rectified": bool(source_shape_matches_rectified),
+        "valid_for_scoring": bool(valid_for_scoring),
+        "invalid_reason": invalid_reason,
+        "alignment_status": alignment_status,
+        "warnings": list(warnings),
     }
-    return warped.astype(np.float32), info
+    return info
 
 
 def _workspace_affine_matrix(value: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -2500,6 +2638,10 @@ def _workspace_affine_matrix(value: Optional[np.ndarray]) -> Optional[np.ndarray
     if arr.shape != (2, 3) or not np.all(np.isfinite(arr)):
         return None
     return arr
+
+
+def _is_identity_affine_matrix(matrix: np.ndarray) -> bool:
+    return bool(np.allclose(np.asarray(matrix, dtype=np.float32), np.eye(2, 3, dtype=np.float32), atol=1e-6))
 
 
 def _validation_workspace_alignment_warnings(
@@ -3803,17 +3945,29 @@ def _with_registration_quality(
     bead_error_score = 0.0 if median_error is None else max(0.0, 1.0 - float(median_error) / 8.0)
     bead_quality = bead_coverage * bead_error_score
     confidence = _clip01(0.45 * bead_quality + 0.40 * structure + 0.15 * common_fov)
+    external_transform_profile = result.registration_profile in {
+        REGISTRATION_PROFILE_VALIDATE_WORKSPACE,
+        REGISTRATION_PROFILE_MANUAL_SIMILARITY,
+    }
+    underconstrained_warning: Optional[str] = None
+    if external_transform_profile and result.status == "aligned":
+        evidence_level, evidence_underconstrained = _external_transform_constraint_level(matched_count)
+        result.registration_constraint_level = evidence_level
+        result.registration_underconstrained = bool(result.registration_underconstrained or evidence_underconstrained)
+        if evidence_underconstrained:
+            underconstrained_warning = f"registration_underconstrained:{evidence_level}_evidence"
 
     reasons: List[str] = []
     if result.residual_translation_norm > max(0.0, float(residual_suspect_px)):
         reasons.append(
             f"residual_translation_norm>{float(residual_suspect_px):.3f}"
         )
-    required_matches = min(max(0, int(min_matched_beads)), len(reference_centers))
-    if len(reference_centers) == 0 and max(0, int(min_matched_beads)) > 0:
-        reasons.append("validation_bead_count=0")
-    elif matched_count < required_matches:
-        reasons.append(f"matched_bead_count<{required_matches}")
+    if not external_transform_profile:
+        required_matches = min(max(0, int(min_matched_beads)), len(reference_centers))
+        if len(reference_centers) == 0 and max(0, int(min_matched_beads)) > 0:
+            reasons.append("validation_bead_count=0")
+        elif matched_count < required_matches:
+            reasons.append(f"matched_bead_count<{required_matches}")
     if structure < float(min_structure_score):
         reasons.append(f"structure_score<{float(min_structure_score):.3f}")
     if _scale_at_search_boundary(result.scale, scale_values):
@@ -3829,7 +3983,19 @@ def _with_registration_quality(
         result.warnings = _unique_strings(result.warnings + [f"registration_suspect:{'|'.join(reasons)}"])
     else:
         result.warnings = _unique_strings(result.warnings)
+    if underconstrained_warning is not None:
+        result.warnings = _unique_strings(result.warnings + [underconstrained_warning])
     return result
+
+
+def _external_transform_constraint_level(matched_count: int) -> Tuple[str, bool]:
+    if matched_count >= 3:
+        return "full", False
+    if matched_count == 2:
+        return "partial", False
+    if matched_count == 1:
+        return "single_bead", True
+    return "image_only", True
 
 
 def _match_bead_centers(
