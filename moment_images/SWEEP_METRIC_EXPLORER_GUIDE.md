@@ -434,6 +434,23 @@ What each file is for:
 - `report.json`: machine-readable summary of config, warnings, and evaluations
 - `index.html`: lightweight static summary
 
+### Trio benchmark outputs
+
+`moment_images/trio_benchmark.py` is a separate headless post-processing tool
+for completed sweeps when processed Validation Camera and ThorCam images are
+available. It writes `trio_benchmark_results.csv`,
+`trio_benchmark_summary.json`, `trio_benchmark_report.html`, and `figures/`
+under its own output directory.
+
+The trio benchmark records stable sweep identifiers and metric names, including
+the `validation_hybrid_v1` profile, so these outputs can be joined back to
+explorer data later. The metric explorer does not ingest the trio CSV/JSON
+directly yet.
+
+For multi-scene registration and scoring calibration work,
+`moment_images/trio_benchmark_batch.py` runs a JSON manifest of trio scenes and
+writes aggregate CSV/JSON/HTML outputs alongside the per-scene trio reports.
+
 ## Metrics Config File
 
 You can optionally provide a config file with:

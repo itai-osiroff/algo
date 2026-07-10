@@ -293,3 +293,51 @@ flux-sum preservation.
 Current limitation: this helper does not expose a normal argparse command line
 or `--help` reference. Run it from a desktop session and configure it through
 the GUI.
+
+## Headless Trio Benchmark
+
+`moment_images/trio_benchmark.py` ranks completed LF sweep candidates against a
+processed Validation Camera image and scores a ThorCam image as a baseline
+comparator. The sweep algorithm stays blind to those reference images; this
+tool only post-processes completed sweep artifacts.
+
+```bash
+python -m moment_images.trio_benchmark --sweep-dir path/to/sweep_output --dataset-id scene_id --validation-image path/to/validation_processed.tif --thorcam-image path/to/thorcam_processed.tif --output-dir path/to/trio_report
+```
+
+The same command can read the processed references directly from a saved
+`validate_rectification.py` workspace:
+
+```bash
+python -m moment_images.trio_benchmark --sweep-dir path/to/sweep_output --dataset-id scene_id --validation-workspace path/to/validation_workspace.npz --output-dir path/to/trio_report
+```
+
+The benchmark writes `trio_benchmark_results.csv`,
+`trio_benchmark_summary.json`, `trio_benchmark_report.html`, and a `figures/`
+folder. Results use the stable `validation_hybrid_v1` metric profile and
+preserve sweep row identity (`row_id`, `stage`, `candidate_id`, `dataset_id`,
+and `generation_id`) so later utilities can join the records back to sweep
+artifacts.
+
+The default registration profile is `bead_geometric_v2`. It keeps the primary
+registration shear-free, generates bead-geometry hypotheses, refines them
+locally, and labels one-bead scenes as underconstrained rather than failed when
+the single bead is aligned. It writes `registration_confidence`,
+`registration_suspect`, `registration_suspect_reasons`,
+`registration_constraint_level`, `registration_initializer`, matched bead
+counts, median bead error, common-FOV fraction, and residual translation norm
+into the CSV/JSON/HTML outputs. Use `--registration-profile
+bead_similarity_v1` or `--registration-profile centered_ecc_legacy` when you
+need to compare against older initializers.
+
+For repeated evaluation across multiple scenes, use a manifest and the batch
+runner:
+
+```bash
+python -m moment_images.trio_benchmark_batch --manifest path/to/trio_manifest.json --output-dir path/to/trio_batch_report
+```
+
+`moment_images/trio_benchmark_manifest_example.json` shows the expected schema.
+Each scene writes its normal trio report under a scene-specific subfolder, while
+the batch output folder also receives `trio_batch_results.csv`,
+`trio_batch_summary.json`, and `trio_batch_report.html`.

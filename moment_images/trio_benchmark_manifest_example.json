@@ -1,0 +1,32 @@
+{
+  "defaults": {
+    "stage": "stage2",
+    "generation_scope": "All",
+    "anchor_row_id": "auto",
+    "top_k": 12,
+    "residual_translation_max_px": 5.0,
+    "registration_profile": "bead_geometric_v2",
+    "registration_rotation_search": "-45:45:19",
+    "registration_top_hypotheses": 24,
+    "registration_diagnostics_top_n": 12,
+    "registration_suspect_residual_px": 15.0,
+    "registration_min_matched_beads": 3,
+    "registration_min_structure_score": 0.10,
+    "enable_nonrigid_diagnostic": false
+  },
+  "scenes": [
+    {
+      "scene_id": "scene_001",
+      "sweep_dir": "C:/path/to/completed_sweep",
+      "dataset_id": "dataset_or_scene_id",
+      "validation_workspace": "C:/path/to/validation_workspace.npz"
+    },
+    {
+      "scene_id": "scene_002_with_exported_images",
+      "sweep_dir": "C:/path/to/completed_sweep",
+      "dataset_id": "dataset_or_scene_id",
+      "validation_image": "C:/path/to/validation_processed.tif",
+      "thorcam_image": "C:/path/to/thorcam_processed.tif"
+    }
+  ]
+}

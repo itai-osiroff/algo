@@ -905,7 +905,75 @@ def test_save_workspace_data_persists_point_alignment_metadata(tmp_path):
         np.testing.assert_allclose(workspace["validation_alignment_point_transform_matrix"], point_matrix)
         np.testing.assert_allclose(workspace["validation_alignment_residual_warp_matrix"], residual_matrix)
         np.testing.assert_allclose(workspace["validation_alignment_final_warp_matrix"], final_matrix)
+        np.testing.assert_array_equal(workspace["validation_alignment_output_shape"], np.array([8, 8], dtype=np.int32))
         assert workspace["validation_alignment_model"].item() == "point_similarity+translation_ecc"
         assert float(workspace["validation_alignment_point_rmse"]) == pytest.approx(0.125)
         assert bool(workspace["validation_point_alignment_enabled"]) is True
         assert bool(workspace["validation_point_alignment_residual_ecc"]) is True
+
+
+def test_save_workspace_data_persists_successful_thorcam_alignment_replay_contract(tmp_path):
+    rectified = np.zeros((8, 8), dtype=np.float32)
+    val_path = tmp_path / "val.png"
+    thor_path = tmp_path / "thor.png"
+    save_path = tmp_path / "validation_workspace.npz"
+
+    assert cv.imwrite(str(val_path), np.full((8, 8), 80, dtype=np.uint8))
+    assert cv.imwrite(str(thor_path), np.full((8, 8), 140, dtype=np.uint8))
+
+    final_matrix = np.array([[1.0, 0.0, 0.75], [0.0, 1.0, -0.25]], dtype=np.float32)
+    val_result = ValidationImageResult(
+        processed_image=rectified.copy(),
+        options=ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=False),
+        alignment_result=None,
+        scale_x=1.0,
+        scale_y=1.0,
+        preblur_before_resize=True,
+        preserve_flux_sum=True,
+        intensity_min=0.0,
+        intensity_max=255.0,
+        crop_box=None,
+        rotation_deg=0,
+        flip_h=False,
+        flip_v=False,
+    )
+    thor_result = ValidationImageResult(
+        processed_image=rectified.copy(),
+        options=ValidationOptions(mode=VALIDATION_MODE_PRESERVE, auto_align=True),
+        alignment_result=AlignmentResult(
+            aligned_image=rectified.copy(),
+            status="aligned_preserve_same_shape",
+            mode=VALIDATION_MODE_PRESERVE,
+            match_found=True,
+            warp_matrix=final_matrix,
+            roi_reference=(0, 0, 8, 8),
+            roi_input=(0, 0, 8, 8),
+            alignment_model="translation_ecc",
+            ecc_score=0.95,
+        ),
+        scale_x=1.0,
+        scale_y=1.0,
+        preblur_before_resize=True,
+        preserve_flux_sum=True,
+        intensity_min=0.0,
+        intensity_max=255.0,
+        crop_box=None,
+        rotation_deg=0,
+        flip_h=False,
+        flip_v=False,
+    )
+
+    _save_workspace_data(
+        save_path=str(save_path),
+        rectified_img=rectified,
+        val_path=str(val_path),
+        thor_path=str(thor_path),
+        val_result=val_result,
+        thor_result=thor_result,
+    )
+
+    with np.load(save_path) as workspace:
+        np.testing.assert_allclose(workspace["thorcam_alignment_final_warp_matrix"], final_matrix)
+        np.testing.assert_array_equal(workspace["thorcam_alignment_output_shape"], np.array([8, 8], dtype=np.int32))
+        assert workspace["thorcam_alignment_status"].item() == "aligned_preserve_same_shape"
+        assert workspace["thorcam_alignment_model"].item() == "translation_ecc"
