@@ -115,6 +115,43 @@ def test_state_to_spec_roundtrip_with_metric_experiments(tmp_path):
     assert roundtrip.metric_experiment_rows[1].family == "blurred_composite_corr"
 
 
+def test_state_to_spec_roundtrip_with_validation_oracle_sweep(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.validation_oracle_enabled = True
+    state.validation_oracle_top_k = "4"
+    state.validation_oracle_budget_per_dataset = "6"
+    state.validation_oracle_defaults_json = json.dumps(
+        {
+            "registration_profile": "rigid_b",
+            "residual_translation_max_px": 3.0,
+        }
+    )
+    state.validation_oracle_scenes_json = json.dumps(
+        [
+            {
+                "dataset_id": "dataset_a",
+                "scene_id": "scene_a",
+                "validation_image": str(tmp_path / "validation.tif"),
+                "thorcam_image": str(tmp_path / "thorcam.tif"),
+            }
+        ]
+    )
+
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    oracle = payload["validation_oracle_sweep"]
+    assert oracle["enabled"] is True
+    assert oracle["top_k"] == 4
+    assert oracle["budget_per_dataset"] == 6
+    assert oracle["defaults"]["registration_profile"] == "rigid_b"
+    assert oracle["scenes"][0]["dataset_id"] == "dataset_a"
+    assert roundtrip.validation_oracle_enabled is True
+    assert roundtrip.validation_oracle_top_k == "4"
+    assert roundtrip.validation_oracle_budget_per_dataset == "6"
+    assert json.loads(roundtrip.validation_oracle_scenes_json)[0]["scene_id"] == "scene_a"
+
+
 def test_new_metric_experiment_gui_state_defaults_to_independent_intensity(tmp_path):
     state = _build_valid_state(tmp_path)
     state.metric_experiments_enabled = True

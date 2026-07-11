@@ -39,7 +39,8 @@ DEFAULT_FALLBACK_METRICS = (
     "maximum_intensity",
     "average_intensity",
 )
-STAGE_ORDER = ("legacy", "stage1", "stage2", "metric_phase")
+VALIDATION_ORACLE_STAGE_NAME = "validation_phase"
+STAGE_ORDER = ("legacy", "stage1", "stage2", "metric_phase", VALIDATION_ORACLE_STAGE_NAME)
 SUCCESS_STATUSES = {"ok", "skipped_valid", "recomputed"}
 DEFAULT_REPORT_TOP_K = 6
 GENERATION_SCOPE_ALL = "All"
@@ -347,6 +348,16 @@ def _read_json_optional(
         return None, None
 
 
+def _select_primary_stage(stage_summaries: Dict[str, "StageVisualizationSummary"], stage_order: Sequence[str]) -> str:
+    for preferred in ("metric_phase", "stage2", "stage1", "legacy"):
+        if preferred in stage_summaries:
+            return preferred
+    for stage_name in stage_order:
+        if stage_name in stage_summaries:
+            return stage_name
+    return stage_order[-1] if stage_order else VALIDATION_ORACLE_STAGE_NAME
+
+
 def _coerce_float(value: object) -> Optional[float]:
     try:
         numeric = float(value)
@@ -426,7 +437,14 @@ def _resolve_visualization_scope(path: Path) -> Tuple[Path, Path, Optional[Path]
     selected_path = Path(path)
     selected_name = selected_path.name.lower()
     metric_markers = ("metric_phase_summary.json", "alpha_report.json", "summary.json", "leaderboard.json")
-    root_markers = ("experiment_manifest.json", "run_state.json", "stage1_summary.json", "stage2_summary.json", "leaderboard.json")
+    root_markers = (
+        "experiment_manifest.json",
+        "run_state.json",
+        "stage1_summary.json",
+        "stage2_summary.json",
+        "validation_phase_summary.json",
+        "leaderboard.json",
+    )
 
     if selected_name == "metric_experiments":
         experiment_root = selected_path.parent
@@ -643,6 +661,11 @@ def _load_generation_product_candidates(
         ("stage1", products_dir / "stage1_summary.json", products_dir),
         ("stage2", products_dir / "stage2_summary.json", products_dir),
         (
+            VALIDATION_ORACLE_STAGE_NAME,
+            products_dir / "validation_phase_summary.json",
+            products_dir,
+        ),
+        (
             "metric_phase",
             products_dir / "metric_experiments" / "metric_phase_summary.json",
             products_dir / "metric_experiments",
@@ -732,6 +755,11 @@ def _load_generation_product_run_records(
     candidate_lookup = _candidate_lookup_by_generation_rows(candidate_rows)
     locations: List[Tuple[Optional[str], Path, Path]] = [
         (None, products_dir / "summary.json", products_dir),
+        (
+            VALIDATION_ORACLE_STAGE_NAME,
+            products_dir / "validation_summary.json",
+            products_dir,
+        ),
         (
             "metric_phase",
             products_dir / "metric_experiments" / "summary.json",
@@ -1007,7 +1035,7 @@ def _infer_run_identity(
 
     stage_name = stage_hint or "summary"
     remainder = run_name
-    stage_match = re.match(r"^(legacy|stage1|stage2|metric_phase)_(.+)$", run_name)
+    stage_match = re.match(r"^(legacy|stage1|stage2|metric_phase|validation_phase)_(.+)$", run_name)
     if stage_match is not None:
         stage_name = stage_match.group(1)
         remainder = stage_match.group(2)
@@ -1634,7 +1662,13 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
 
     modern_artifacts_present = path_scope in {"experiment_root", "metric_phase_dir"} or any(
         _candidate_path_exists(experiment_root / filename)
-        for filename in ("stage1_summary.json", "stage2_summary.json", "leaderboard.json", "run_state.json")
+        for filename in (
+            "stage1_summary.json",
+            "stage2_summary.json",
+            "validation_phase_summary.json",
+            "leaderboard.json",
+            "run_state.json",
+        )
     )
 
     scoring_weights: Dict[str, float] = {}
@@ -1722,6 +1756,7 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         summary_locations: Dict[str, Path] = {
             "stage1": experiment_root / "stage1_summary.json",
             "stage2": experiment_root / "stage2_summary.json",
+            VALIDATION_ORACLE_STAGE_NAME: experiment_root / "validation_phase_summary.json",
         }
         if metric_phase_dir is not None:
             summary_locations["metric_phase"] = metric_phase_dir / "metric_phase_summary.json"
@@ -1754,7 +1789,16 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         )
 
         metric_summary_payload: Optional[List[Dict[str, object]]] = None
+        validation_summary_payload: Optional[List[Dict[str, object]]] = None
         metric_alpha_report_path: Optional[Path] = None
+        validation_summary_raw, validation_summary_path = _read_json_optional(
+            experiment_root / "validation_summary.json",
+            validator=lambda obj: isinstance(obj, list),
+            warnings=warnings,
+        )
+        if validation_summary_path is not None:
+            used_files.append(str(validation_summary_path))
+        validation_summary_payload = cast(Optional[List[Dict[str, object]]], validation_summary_raw)
         if metric_phase_dir is not None:
             metric_summary_raw, metric_summary_path = _read_json_optional(
                 metric_phase_dir / "summary.json",
@@ -1786,7 +1830,7 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         if root_alpha_report_path is not None:
             used_files.append(str(root_alpha_report_path))
 
-        for stage_name in ("stage1", "stage2", "metric_phase"):
+        for stage_name in ("stage1", "stage2", "metric_phase", VALIDATION_ORACLE_STAGE_NAME):
             summary_payload = summary_payloads.get(stage_name)
             if summary_payload is None and not (
                 isinstance(run_state, dict)
@@ -1862,6 +1906,18 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
                     primary_metric=primary_metric,
                     stage_hint="metric_phase",
                     base_dir=metric_phase_dir if metric_phase_dir is not None else experiment_root,
+                    run_lookup=run_lookup,
+                    candidate_lookup=candidate_lookup,
+                ),
+            )
+        for record in validation_summary_payload or []:
+            _register_run_metric_record(
+                run_metric_records_by_id,
+                _build_run_metric_record(
+                    metric_record=record,
+                    primary_metric=primary_metric,
+                    stage_hint=VALIDATION_ORACLE_STAGE_NAME,
+                    base_dir=experiment_root,
                     run_lookup=run_lookup,
                     candidate_lookup=candidate_lookup,
                 ),
@@ -2038,7 +2094,7 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
     stage_order = [stage_name for stage_name in STAGE_ORDER if stage_name in stage_summaries]
     if not stage_order:
         stage_order = [candidate_rows[0].stage] if candidate_rows else []
-    primary_stage_name = "metric_phase" if "metric_phase" in stage_summaries else stage_order[-1]
+    primary_stage_name = _select_primary_stage(stage_summaries, stage_order)
 
     ordered_candidate_rows: List[CandidateVisualizationRow] = []
     for stage_name in stage_order:
@@ -2243,7 +2299,13 @@ def load_sweep_visualization_model(path: Path) -> SweepVisualizationModel:
 
     modern_artifacts_present = any(
         _candidate_path_exists(output_dir / filename)
-        for filename in ("stage1_summary.json", "stage2_summary.json", "leaderboard.json", "run_state.json")
+        for filename in (
+            "stage1_summary.json",
+            "stage2_summary.json",
+            "validation_phase_summary.json",
+            "leaderboard.json",
+            "run_state.json",
+        )
     )
 
     scoring_weights: Dict[str, float] = {}
@@ -2305,6 +2367,7 @@ def load_sweep_visualization_model(path: Path) -> SweepVisualizationModel:
         summary_locations = {
             "stage1": output_dir / "stage1_summary.json",
             "stage2": output_dir / "stage2_summary.json",
+            VALIDATION_ORACLE_STAGE_NAME: output_dir / "validation_phase_summary.json",
             "metric_phase": metric_output_dir / "metric_phase_summary.json",
         }
         summary_payloads: Dict[str, Optional[Dict[str, object]]] = {}
@@ -2348,7 +2411,15 @@ def load_sweep_visualization_model(path: Path) -> SweepVisualizationModel:
             )
         )
 
-        for stage_name in ("stage1", "stage2", "metric_phase"):
+        validation_summary_payload, validation_summary_path = _read_json_optional(
+            output_dir / "validation_summary.json",
+            validator=lambda obj: isinstance(obj, list),
+            warnings=warnings,
+        )
+        if validation_summary_path is not None:
+            used_files.append(str(validation_summary_path))
+
+        for stage_name in ("stage1", "stage2", "metric_phase", VALIDATION_ORACLE_STAGE_NAME):
             base_dir = metric_output_dir if stage_name == "metric_phase" else output_dir
             summary_payload = summary_payloads.get(stage_name)
             if summary_payload is None and not (
@@ -2456,7 +2527,7 @@ def load_sweep_visualization_model(path: Path) -> SweepVisualizationModel:
     stage_order = [stage_name for stage_name in STAGE_ORDER if stage_name in stage_summaries]
     if not stage_order:
         stage_order = [candidate_rows[0].stage] if candidate_rows else []
-    primary_stage_name = "metric_phase" if "metric_phase" in stage_summaries else stage_order[-1]
+    primary_stage_name = _select_primary_stage(stage_summaries, stage_order)
 
     ordered_candidate_rows: List[CandidateVisualizationRow] = []
     for stage_name in stage_order:

@@ -24,7 +24,7 @@ import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
@@ -79,6 +79,14 @@ from moment_images.sweep_analysis import (
     generate_alpha_report,
     save_analysis,
 )
+from moment_images.trio_benchmark import BenchmarkConfig, run_benchmark
+from moment_images.trio_oracle_metrics import (
+    TRIO_LF_SOURCE_KIND,
+    TRIO_PRIMARY_SCORE,
+    find_trio_record_for_identity,
+    import_trio_oracle_results,
+    trio_rankable,
+)
 
 
 MEMORY_SAFETY_FRACTION = 0.70
@@ -98,6 +106,14 @@ METRIC_CANDIDATE_SOURCES = {
 }
 METRIC_SEARCH_STAGE1_NAME = "metric_stage1"
 METRIC_PHASE_STAGE_NAME = "metric_phase"
+VALIDATION_ORACLE_STAGE_NAME = "validation_phase"
+VALIDATION_ORACLE_DIR_NAME = "validation_oracle"
+VALIDATION_ORACLE_PATH_KEYS = (
+    "validation_image",
+    "thorcam_image",
+    "validation_workspace",
+    "registration_annotations",
+)
 
 
 class LiveMetricsPlotter:
@@ -625,6 +641,65 @@ class ExperimentalMetricSweepSpec:
 
 
 @dataclass
+class ValidationOracleSweepSpec:
+    """Optional validation-guided sweep that scores LF outputs against trio references."""
+
+    enabled: bool = False
+    top_k: int = 8
+    budget_per_dataset: Optional[int] = None
+    scenes: List[Dict[str, object]] = field(default_factory=list)
+    defaults: Dict[str, object] = field(default_factory=dict)
+    strict: bool = True
+
+    def __post_init__(self) -> None:
+        self.top_k = int(self.top_k)
+        if self.top_k < 1:
+            raise ValueError("validation_oracle_sweep.top_k must be >= 1.")
+        if self.budget_per_dataset is not None:
+            self.budget_per_dataset = int(self.budget_per_dataset)
+            if self.budget_per_dataset < 1:
+                raise ValueError(
+                    "validation_oracle_sweep.budget_per_dataset must be >= 1 when provided."
+                )
+        if not isinstance(self.defaults, dict):
+            raise ValueError("validation_oracle_sweep.defaults must be an object.")
+        self.defaults = dict(self.defaults)
+        if not isinstance(self.scenes, list):
+            raise ValueError("validation_oracle_sweep.scenes must be a list.")
+        normalized_scenes: List[Dict[str, object]] = []
+        for idx, scene in enumerate(self.scenes, start=1):
+            if not isinstance(scene, dict):
+                raise ValueError(f"validation_oracle_sweep.scenes[{idx}] must be an object.")
+            normalized_scenes.append(dict(scene))
+        self.scenes = normalized_scenes
+        self.strict = bool(self.strict)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Optional[Dict[str, object]],
+        *,
+        default_top_k: int,
+    ) -> "ValidationOracleSweepSpec":
+        if payload is None:
+            return cls(enabled=False, top_k=default_top_k)
+        if not isinstance(payload, dict):
+            raise ValueError("validation_oracle_sweep must be an object.")
+        return cls(
+            enabled=bool(payload.get("enabled", False)),
+            top_k=int(payload.get("top_k", default_top_k)),
+            budget_per_dataset=(
+                None
+                if payload.get("budget_per_dataset") is None
+                else int(cast(object, payload.get("budget_per_dataset")))
+            ),
+            scenes=cast(List[Dict[str, object]], payload.get("scenes", [])),
+            defaults=cast(Dict[str, object], payload.get("defaults", {})),
+            strict=bool(payload.get("strict", True)),
+        )
+
+
+@dataclass
 class SweepExperimentSpec:
     """Top-level experiment definition loaded from ``--spec`` JSON."""
 
@@ -634,6 +709,7 @@ class SweepExperimentSpec:
     stages: SweepStageSpec = field(default_factory=SweepStageSpec)
     scoring: SweepScoringSpec = field(default_factory=SweepScoringSpec)
     experimental_metric_sweep: Optional[ExperimentalMetricSweepSpec] = None
+    validation_oracle_sweep: Optional[ValidationOracleSweepSpec] = None
     metric_formulations: Optional[List[MetricFormulationSpec]] = None
     reporting: SweepReportingSpec = field(default_factory=SweepReportingSpec)
     output_dir: Optional[str] = None
@@ -702,6 +778,26 @@ class SweepExperimentSpec:
             _clone_metric_formulation(item)
             for item in self.experimental_metric_sweep.formulations
         ]
+        validation = self.validation_oracle_sweep
+        if validation is None:
+            validation = ValidationOracleSweepSpec(enabled=False, top_k=stage_top_k)
+        elif not isinstance(validation, ValidationOracleSweepSpec):
+            validation = ValidationOracleSweepSpec.from_dict(
+                cast(Dict[str, object], validation),
+                default_top_k=stage_top_k,
+            )
+        if validation.enabled and self.stages.mode != "two_stage":
+            raise ValueError(
+                "validation_oracle_sweep requires stages.mode='two_stage' in this version."
+            )
+        self.validation_oracle_sweep = ValidationOracleSweepSpec(
+            enabled=bool(validation.enabled),
+            top_k=int(validation.top_k),
+            budget_per_dataset=validation.budget_per_dataset,
+            scenes=[dict(scene) for scene in validation.scenes],
+            defaults=dict(validation.defaults),
+            strict=bool(validation.strict),
+        )
 
     @classmethod
     def from_dict(cls, payload: Dict[str, object]) -> "SweepExperimentSpec":
@@ -807,6 +903,11 @@ class SweepExperimentSpec:
                 formulations=[],
             )
 
+        validation_oracle_sweep = ValidationOracleSweepSpec.from_dict(
+            cast(Optional[Dict[str, object]], payload.get("validation_oracle_sweep")),
+            default_top_k=stages.top_k,
+        )
+
         reporting_raw = cast(Dict[str, object], payload.get("reporting", {}))
         reporting = SweepReportingSpec(
             primary_metric=str(reporting_raw.get("primary_metric", "laplacian_variance")),
@@ -821,6 +922,7 @@ class SweepExperimentSpec:
             stages=stages,
             scoring=scoring,
             experimental_metric_sweep=experimental_metric_sweep,
+            validation_oracle_sweep=validation_oracle_sweep,
             metric_formulations=legacy_formulations,
             reporting=reporting,
             output_dir=cast(Optional[str], payload.get("output_dir")),
@@ -968,11 +1070,43 @@ def _apply_relocation_to_spec_payload(
             for key in ("views", "views_path", "source_image", "source_image_dir"):
                 apply_field(dataset_entry, key, f"datasets[{dataset_id}].{key}")
 
+    validation_oracle = relocated.get("validation_oracle_sweep")
+    if isinstance(validation_oracle, dict):
+        oracle_entry = cast(Dict[str, object], validation_oracle)
+        defaults = oracle_entry.get("defaults")
+        if isinstance(defaults, dict):
+            defaults_entry = cast(Dict[str, object], defaults)
+            for key in VALIDATION_ORACLE_PATH_KEYS:
+                apply_field(defaults_entry, key, f"validation_oracle_sweep.defaults.{key}")
+        scenes = oracle_entry.get("scenes")
+        if isinstance(scenes, list):
+            for idx, scene in enumerate(scenes):
+                if not isinstance(scene, dict):
+                    continue
+                scene_id = str(
+                    scene.get("scene_id")
+                    or scene.get("dataset_id")
+                    or idx
+                )
+                scene_entry = cast(Dict[str, object], scene)
+                for key in VALIDATION_ORACLE_PATH_KEYS:
+                    apply_field(scene_entry, key, f"validation_oracle_sweep.scenes[{scene_id}].{key}")
+
     report: Dict[str, object] = {
         "rules": _relocation_rules_to_payload(rules),
         "applied": applied,
     }
     return relocated, report
+
+
+def _resolve_relative_path_fields(container: Dict[str, object], keys: Sequence[str], spec_path: Path) -> None:
+    for key in keys:
+        value = container.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        path = Path(value)
+        if not path.is_absolute():
+            container[key] = str((spec_path.parent / path).resolve())
 
 
 def _resolve_spec_relative_paths_payload(
@@ -987,6 +1121,25 @@ def _resolve_spec_relative_paths_payload(
             profile_config_path = Path(profile_config_path_raw)
             if not profile_config_path.is_absolute():
                 scoring["profile_config_path"] = str((spec_path.parent / profile_config_path).resolve())
+    validation_oracle = resolved.get("validation_oracle_sweep")
+    if isinstance(validation_oracle, dict):
+        oracle_entry = cast(Dict[str, object], validation_oracle)
+        defaults = oracle_entry.get("defaults")
+        if isinstance(defaults, dict):
+            _resolve_relative_path_fields(
+                cast(Dict[str, object], defaults),
+                VALIDATION_ORACLE_PATH_KEYS,
+                spec_path,
+            )
+        scenes = oracle_entry.get("scenes")
+        if isinstance(scenes, list):
+            for scene in scenes:
+                if isinstance(scene, dict):
+                    _resolve_relative_path_fields(
+                        cast(Dict[str, object], scene),
+                        VALIDATION_ORACLE_PATH_KEYS,
+                        spec_path,
+                    )
     return resolved
 
 
@@ -5125,6 +5278,13 @@ def _build_count_only_sweep_run_preview(
             baseline_candidate_lookup=baseline_candidate_lookup,
             dataset_count=dataset_count,
         )
+    validation_spec = _validation_oracle_spec(spec)
+    validation_phase_budget = _validation_oracle_phase_budget(validation_spec, stage2_budget)
+    validation_payload = _validation_oracle_dry_run_payload(
+        validation_spec=validation_spec,
+        dataset_ids=[dataset.dataset_id for dataset in spec.datasets],
+        validation_phase_budget=validation_phase_budget,
+    )
 
     stage_planned = sum(
         int(cast(Mapping[str, object], payload).get("planned_run_count", 0) or 0)
@@ -5154,9 +5314,18 @@ def _build_count_only_sweep_run_preview(
         },
         "stages": stages_payload,
         "metric_experiments": metric_payload,
+        "validation_oracle_sweep": validation_payload,
         "totals": {
-            "planned_run_count": int(stage_planned + _metric_planned_count(metric_payload)),
-            "pending_run_count": int(stage_pending + _metric_pending_count(metric_payload)),
+            "planned_run_count": int(
+                stage_planned
+                + _metric_planned_count(metric_payload)
+                + _validation_oracle_planned_count(validation_payload)
+            ),
+            "pending_run_count": int(
+                stage_pending
+                + _metric_pending_count(metric_payload)
+                + _validation_oracle_planned_count(validation_payload)
+            ),
             "skipped_valid_count": int(stage_skipped + _metric_skipped_valid_count(metric_payload)),
             "exact": False,
         },
@@ -5216,6 +5385,15 @@ def build_sweep_run_preview(
         allow_dataset_generation=allow_dataset_generation,
     )
     dataset_ids = [dataset.dataset_id for dataset in prepared_datasets]
+    validation_spec = _validation_oracle_spec(spec)
+    validation_phase_budget = _validation_oracle_phase_budget(
+        validation_spec,
+        _stage_budgets(spec.stages)[1],
+    )
+    _validate_validation_oracle_scene_lookup(
+        validation_spec,
+        dataset_ids,
+    )
     fingerprint_payload = _build_experiment_fingerprint_payload(
         spec=spec,
         prepared_datasets=prepared_datasets,
@@ -5370,6 +5548,11 @@ def build_sweep_run_preview(
                 merge_log=merge_log,
             )
 
+    validation_payload = _validation_oracle_dry_run_payload(
+        validation_spec=validation_spec,
+        dataset_ids=dataset_ids,
+        validation_phase_budget=validation_phase_budget,
+    )
     stage_planned = sum(
         int(cast(Mapping[str, object], payload).get("planned_run_count", 0) or 0)
         for payload in stages_payload.values()
@@ -5386,8 +5569,16 @@ def build_sweep_run_preview(
         if isinstance(payload, dict)
     )
     totals = {
-        "planned_run_count": int(stage_planned + _metric_planned_count(metric_payload)),
-        "pending_run_count": int(stage_pending + _metric_pending_count(metric_payload)),
+        "planned_run_count": int(
+            stage_planned
+            + _metric_planned_count(metric_payload)
+            + _validation_oracle_planned_count(validation_payload)
+        ),
+        "pending_run_count": int(
+            stage_pending
+            + _metric_pending_count(metric_payload)
+            + _validation_oracle_planned_count(validation_payload)
+        ),
         "skipped_valid_count": int(stage_skipped + _metric_skipped_valid_count(metric_payload)),
         "exact": bool(
             all(
@@ -5396,6 +5587,7 @@ def build_sweep_run_preview(
                 if isinstance(payload, dict)
             )
             and bool(metric_payload.get("exact", False))
+            and bool(validation_payload.get("exact", False))
         ),
     }
     return {
@@ -5411,6 +5603,7 @@ def build_sweep_run_preview(
         },
         "stages": stages_payload,
         "metric_experiments": metric_payload,
+        "validation_oracle_sweep": validation_payload,
         "totals": totals,
         "merge_log": merge_log,
     }
@@ -5472,6 +5665,395 @@ def _write_phase_summary_artifacts(
             primary_metric=reporting.primary_metric,
             tolerate_partial_outputs=reporting.tolerate_partial_outputs,
         )
+
+
+def _validation_oracle_spec(spec: SweepExperimentSpec) -> ValidationOracleSweepSpec:
+    return spec.validation_oracle_sweep or ValidationOracleSweepSpec(
+        enabled=False,
+        top_k=spec.stages.top_k,
+    )
+
+
+def _validate_validation_oracle_scene_lookup(
+    validation_spec: ValidationOracleSweepSpec,
+    dataset_ids: Sequence[str],
+) -> Dict[str, Dict[str, object]]:
+    if not validation_spec.enabled:
+        return {}
+
+    scenes_by_dataset: Dict[str, Dict[str, object]] = {}
+    duplicates: List[str] = []
+    for scene in validation_spec.scenes:
+        dataset_id = str(scene.get("dataset_id") or scene.get("id") or "").strip()
+        if not dataset_id:
+            raise ValueError("validation_oracle_sweep.scenes entries must include dataset_id.")
+        if dataset_id in scenes_by_dataset:
+            duplicates.append(dataset_id)
+        scenes_by_dataset[dataset_id] = dict(scene)
+    if duplicates:
+        raise ValueError(
+            "validation_oracle_sweep has duplicate scene entries for dataset(s): "
+            + ", ".join(sorted(set(duplicates)))
+        )
+
+    missing = [dataset_id for dataset_id in dataset_ids if dataset_id not in scenes_by_dataset]
+    if missing:
+        raise ValueError(
+            "validation_oracle_sweep requires one scene for every dataset; missing: "
+            + ", ".join(missing)
+        )
+
+    for dataset_id in dataset_ids:
+        merged = dict(validation_spec.defaults)
+        merged.update(scenes_by_dataset[dataset_id])
+        validation_image = str(merged.get("validation_image") or "").strip()
+        thorcam_image = str(merged.get("thorcam_image") or "").strip()
+        if not validation_image or not thorcam_image:
+            raise ValueError(
+                "validation_oracle_sweep scene for dataset "
+                f"{dataset_id!r} must provide validation_image and thorcam_image."
+            )
+        missing_paths = []
+        for key in VALIDATION_ORACLE_PATH_KEYS:
+            value = merged.get(key)
+            if value is None or not str(value).strip():
+                continue
+            if not Path(str(value)).exists():
+                missing_paths.append(f"{key}={value}")
+        if missing_paths:
+            raise ValueError(
+                "validation_oracle_sweep scene for dataset "
+                f"{dataset_id!r} references missing file(s): "
+                + ", ".join(missing_paths)
+            )
+        scenes_by_dataset[dataset_id] = merged
+    return scenes_by_dataset
+
+
+def _validation_oracle_phase_budget(
+    validation_spec: ValidationOracleSweepSpec,
+    fallback_budget: int,
+) -> int:
+    if validation_spec.budget_per_dataset is not None:
+        return max(1, int(validation_spec.budget_per_dataset))
+    return max(1, int(fallback_budget))
+
+
+def _validation_oracle_dry_run_payload(
+    *,
+    validation_spec: ValidationOracleSweepSpec,
+    dataset_ids: Sequence[str],
+    validation_phase_budget: int,
+) -> Dict[str, object]:
+    if not validation_spec.enabled:
+        return {
+            "enabled": False,
+            "output_dir": None,
+            "status": "disabled",
+        }
+    _validate_validation_oracle_scene_lookup(validation_spec, dataset_ids)
+    return {
+        "enabled": True,
+        "status": "planned_after_stage1_oracle_ranking",
+        "strict": bool(validation_spec.strict),
+        "stage": VALIDATION_ORACLE_STAGE_NAME,
+        "score_metric": TRIO_PRIMARY_SCORE,
+        "top_k": int(validation_spec.top_k),
+        "budget_per_dataset": int(validation_phase_budget),
+        "num_scenes": len(dataset_ids),
+        "num_stage1_benchmarks": len(dataset_ids),
+        "estimated_validation_phase_runs": int(validation_phase_budget * len(dataset_ids)),
+        "estimated_validation_phase_benchmarks": len(dataset_ids),
+        "exact": False,
+    }
+
+
+def _validation_oracle_planned_count(payload: Mapping[str, object]) -> int:
+    if not bool(payload.get("enabled", False)):
+        return 0
+    return int(payload.get("estimated_validation_phase_runs", 0) or 0)
+
+
+def _benchmark_config_from_validation_scene(
+    *,
+    validation_spec: ValidationOracleSweepSpec,
+    scene: Mapping[str, object],
+    sweep_dir: Path,
+    dataset_id: str,
+    stage_name: str,
+    output_dir: Path,
+) -> BenchmarkConfig:
+    benchmark_payload: Dict[str, object] = dict(validation_spec.defaults)
+    benchmark_payload.update(dict(scene))
+    benchmark_payload.pop("id", None)
+    field_names = {item.name for item in fields(BenchmarkConfig)}
+    unsupported = sorted(set(benchmark_payload) - field_names)
+    if unsupported:
+        raise ValueError(
+            "Unsupported validation_oracle_sweep scene/default field(s): "
+            + ", ".join(unsupported)
+        )
+    benchmark_payload.update(
+        {
+            "sweep_dir": sweep_dir,
+            "dataset_id": dataset_id,
+            "stage": stage_name,
+            "output_dir": output_dir,
+            "top_k": int(validation_spec.top_k),
+        }
+    )
+    for key in VALIDATION_ORACLE_PATH_KEYS + ("sweep_dir", "output_dir"):
+        value = benchmark_payload.get(key)
+        if value is None or isinstance(value, Path):
+            continue
+        if isinstance(value, str) and not value.strip():
+            benchmark_payload[key] = None
+        else:
+            benchmark_payload[key] = Path(str(value))
+    return BenchmarkConfig(**benchmark_payload)
+
+
+def _run_validation_oracle_benchmarks(
+    *,
+    validation_spec: ValidationOracleSweepSpec,
+    scene_lookup: Mapping[str, Mapping[str, object]],
+    sweep_dir: Path,
+    dataset_ids: Sequence[str],
+    stage_name: str,
+) -> Tuple[object, Dict[str, object]]:
+    oracle_root = sweep_dir / VALIDATION_ORACLE_DIR_NAME
+    stage_root = oracle_root / stage_name
+    csv_paths: List[Path] = []
+    scene_results: List[Dict[str, object]] = []
+    for dataset_id in dataset_ids:
+        benchmark_dir = stage_root / dataset_id
+        config = _benchmark_config_from_validation_scene(
+            validation_spec=validation_spec,
+            scene=scene_lookup[dataset_id],
+            sweep_dir=sweep_dir,
+            dataset_id=dataset_id,
+            stage_name=stage_name,
+            output_dir=benchmark_dir,
+        )
+        result = run_benchmark(config)
+        csv_path = benchmark_dir / "trio_benchmark_results.csv"
+        if not csv_path.exists():
+            raise ValueError(
+                "validation_oracle_sweep benchmark did not write expected trio CSV: "
+                f"{csv_path}"
+            )
+        csv_paths.append(csv_path)
+        scene_results.append(
+            {
+                "dataset_id": dataset_id,
+                "stage": stage_name,
+                "scene_id": config.scene_id,
+                "output_dir": str(benchmark_dir.resolve()),
+                "result_csv": str(csv_path.resolve()),
+                "best_lf_row_id": getattr(result, "best_lf_row_id", None),
+            }
+        )
+
+    import_data = import_trio_oracle_results(sweep_dir / "metric_review", [oracle_root])
+    manifest = {
+        "stage": stage_name,
+        "score_metric": TRIO_PRIMARY_SCORE,
+        "csv_paths": [str(path.resolve()) for path in csv_paths],
+        "scenes": scene_results,
+        "num_records": len(import_data.records),
+        "warnings": list(import_data.warnings),
+    }
+    write_json_atomic(
+        oracle_root / f"{stage_name}_trio_import.json",
+        manifest,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+    return import_data, manifest
+
+
+def _rank_stage_with_validation_oracle(
+    *,
+    stage_name: str,
+    stage_results: Sequence[Dict[str, object]],
+    validation_import: object,
+    dataset_ids: Sequence[str],
+    scoring: SweepScoringSpec,
+) -> List[Dict[str, object]]:
+    records = cast(Any, validation_import).records
+    trio_lookup = {
+        (
+            str(record.stage),
+            str(record.candidate_id),
+            str(record.dataset_id),
+            record.generation_id,
+        ): record
+        for record in records
+        if str(record.source_kind) == TRIO_LF_SOURCE_KIND
+    }
+    rankable_count_by_dataset = {dataset_id: 0 for dataset_id in dataset_ids}
+    grouped: Dict[str, Dict[str, object]] = {}
+
+    for record in stage_results:
+        if record.get("status") != "ok":
+            continue
+        candidate_id = str(record.get("candidate_id", ""))
+        dataset_id = str(record.get("dataset_id", ""))
+        if not candidate_id or dataset_id not in rankable_count_by_dataset:
+            continue
+        trio_record = find_trio_record_for_identity(
+            trio_lookup,
+            stage=stage_name,
+            candidate_id=candidate_id,
+            dataset_id=dataset_id,
+            generation_id=cast(Optional[str], record.get("generation_id")),
+        )
+        if trio_record is None or not trio_rankable(trio_record):
+            continue
+        score = trio_record.metrics.get(TRIO_PRIMARY_SCORE)
+        if score is None or not math.isfinite(float(score)):
+            continue
+        rankable_count_by_dataset[dataset_id] += 1
+        slot = grouped.setdefault(
+            candidate_id,
+            {
+                "candidate_id": candidate_id,
+                "strategy": record["strategy"],
+                "config": record["config"],
+                "params": record["params"],
+                "candidate_signature": record.get("candidate_signature"),
+                "generation_id": record.get("generation_id"),
+                "dataset_scores": {},
+                "dataset_metrics": {},
+                "dataset_trio_diagnostics": {},
+                "runtime_seconds": {},
+                "run_signatures": {},
+                "run_dirs": {},
+                "artifact_paths": {},
+            },
+        )
+        cast(Dict[str, float], slot["dataset_scores"])[dataset_id] = float(score)
+        cast(Dict[str, Dict[str, float]], slot["dataset_metrics"])[dataset_id] = dict(
+            trio_record.metrics
+        )
+        cast(Dict[str, Dict[str, object]], slot["dataset_trio_diagnostics"])[dataset_id] = {
+            "validation_rank": trio_record.validation_rank,
+            "validation_rankable": trio_record.validation_rankable,
+            "ranking_exclusion_reason": trio_record.ranking_exclusion_reason,
+            "row_id": trio_record.row_id,
+            "source_path": trio_record.source_path,
+            **dict(trio_record.diagnostics),
+        }
+        cast(Dict[str, float], slot["runtime_seconds"])[dataset_id] = float(
+            record.get("runtime_seconds", 0.0)
+        )
+        cast(Dict[str, object], slot["run_signatures"])[dataset_id] = record.get(
+            "run_signature"
+        )
+        cast(Dict[str, object], slot["run_dirs"])[dataset_id] = record.get("run_dir")
+        cast(Dict[str, object], slot["artifact_paths"])[dataset_id] = record.get(
+            "artifact_paths"
+        )
+
+    missing_rankable = [
+        dataset_id for dataset_id, count in rankable_count_by_dataset.items() if count <= 0
+    ]
+    if missing_rankable:
+        raise ValueError(
+            f"validation_oracle_sweep produced no rankable {TRIO_PRIMARY_SCORE} LF rows "
+            "for dataset(s): "
+            + ", ".join(missing_rankable)
+        )
+
+    rankings: List[Dict[str, object]] = []
+    for slot in grouped.values():
+        dataset_scores_map = cast(Dict[str, float], slot["dataset_scores"])
+        present_scores = [
+            dataset_scores_map[dataset_id]
+            for dataset_id in dataset_ids
+            if dataset_id in dataset_scores_map
+        ]
+        missing = [
+            dataset_id for dataset_id in dataset_ids if dataset_id not in dataset_scores_map
+        ]
+        mean_score = float(np.mean(present_scores)) if present_scores else -float("inf")
+        std_score = float(np.std(present_scores)) if present_scores else 0.0
+        robust = mean_score - float(scoring.robustness_lambda) * std_score
+        robust -= float(scoring.missing_dataset_penalty) * len(missing)
+        rankings.append(
+            {
+                "candidate_id": slot["candidate_id"],
+                "strategy": slot["strategy"],
+                "config": slot["config"],
+                "params": slot["params"],
+                "candidate_signature": slot.get("candidate_signature"),
+                "generation_id": slot.get("generation_id"),
+                "score": float(robust),
+                "mean_dataset_score": float(mean_score),
+                "std_dataset_score": float(std_score),
+                "missing_datasets": missing,
+                "dataset_scores": slot["dataset_scores"],
+                "dataset_metrics": slot["dataset_metrics"],
+                "dataset_trio_diagnostics": slot["dataset_trio_diagnostics"],
+                "runtime_seconds": slot["runtime_seconds"],
+                "run_signatures": slot["run_signatures"],
+                "run_dirs": slot["run_dirs"],
+                "artifact_paths": slot["artifact_paths"],
+                "score_metric": TRIO_PRIMARY_SCORE,
+            }
+        )
+    if not rankings:
+        raise ValueError("validation_oracle_sweep produced no rankable validation rankings.")
+    rankings.sort(key=lambda item: float(item["score"]), reverse=True)
+    for idx, item in enumerate(rankings, start=1):
+        item["rank"] = idx
+    return rankings
+
+
+def _write_validation_phase_artifacts(
+    *,
+    output_dir: Path,
+    stage_results: Sequence[Dict[str, object]],
+    rankings: Sequence[Dict[str, object]],
+    execution: Optional[Dict[str, object]],
+    generation_id: Optional[str],
+) -> None:
+    _write_stage_outputs(
+        VALIDATION_ORACLE_STAGE_NAME,
+        stage_results,
+        rankings,
+        output_dir,
+        execution=execution,
+        generation_id=generation_id,
+    )
+    write_json_atomic(
+        output_dir / "validation_leaderboard.json",
+        list(rankings),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+    _write_leaderboard_csv(rankings, output_dir / "validation_leaderboard.csv")
+    write_json_atomic(
+        output_dir / "validation_best_configs.json",
+        _best_configs_payload(rankings),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+    metric_records = [
+        cast(Dict[str, object], stage_result["metric_record"])
+        for stage_result in stage_results
+        if stage_result.get("status") == "ok" and "metric_record" in stage_result
+    ]
+    write_json_atomic(
+        output_dir / "validation_summary.json",
+        metric_records,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
 
 
 def _run_independent_metric_search_phase(
@@ -5624,6 +6206,11 @@ def _snapshot_generation_products(output_dir: Path, generation_id: str) -> Path:
     for filename in (
         "stage1_summary.json",
         "stage2_summary.json",
+        "validation_phase_summary.json",
+        "validation_leaderboard.json",
+        "validation_leaderboard.csv",
+        "validation_best_configs.json",
+        "validation_summary.json",
         "leaderboard.json",
         "leaderboard.csv",
         "best_configs.json",
@@ -5654,6 +6241,14 @@ def _snapshot_generation_products(output_dir: Path, generation_id: str) -> Path:
         ):
             _copy_product_if_exists(metric_dir / filename, metric_products_dir / filename)
         _snapshot_run_display_artifacts(metric_dir / "runs", metric_products_dir / "runs")
+    validation_dir = output_dir / VALIDATION_ORACLE_DIR_NAME
+    if validation_dir.exists():
+        validation_products_dir = products_dir / VALIDATION_ORACLE_DIR_NAME
+        for source_path in sorted(validation_dir.rglob("*")):
+            if source_path.is_file():
+                destination = validation_products_dir / source_path.relative_to(validation_dir)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, destination)
     return products_dir
 
 
@@ -5688,6 +6283,15 @@ def run_sweep_experiment(
         dataset_identities=dataset_identities,
     )
     dataset_ids = [dataset.dataset_id for dataset in prepared_datasets]
+    validation_spec = _validation_oracle_spec(spec)
+    validation_phase_budget = _validation_oracle_phase_budget(
+        validation_spec,
+        _stage_budgets(spec.stages)[1],
+    )
+    validation_scene_lookup = _validate_validation_oracle_scene_lookup(
+        validation_spec,
+        dataset_ids,
+    )
     fingerprint_payload = _build_experiment_fingerprint_payload(
         spec=spec,
         prepared_datasets=prepared_datasets,
@@ -5765,6 +6369,131 @@ def run_sweep_experiment(
             resolved_output_dir,
             execution=stage1_eval.execution,
             generation_id=generation_id,
+        )
+
+    validation_phase_results: List[Dict[str, object]] = []
+    validation_phase_rankings: List[Dict[str, object]] = []
+    validation_oracle_manifest: Dict[str, object] = {
+        "enabled": bool(validation_spec.enabled),
+        "output_dir": None,
+        "status": "disabled",
+    }
+    if validation_spec.enabled and not dry_run:
+        validation_oracle_dir = resolved_output_dir / VALIDATION_ORACLE_DIR_NAME
+        validation_oracle_dir.mkdir(parents=True, exist_ok=True)
+        stage1_trio_import, stage1_trio_manifest = _run_validation_oracle_benchmarks(
+            validation_spec=validation_spec,
+            scene_lookup=validation_scene_lookup,
+            sweep_dir=resolved_output_dir,
+            dataset_ids=dataset_ids,
+            stage_name="stage1",
+        )
+        oracle_stage1_rankings = _rank_stage_with_validation_oracle(
+            stage_name="stage1",
+            stage_results=stage1_results,
+            validation_import=stage1_trio_import,
+            dataset_ids=dataset_ids,
+            scoring=spec.scoring,
+        )
+        write_json_atomic(
+            validation_oracle_dir / "stage1_rankings.json",
+            oracle_stage1_rankings,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
+        )
+        validation_candidates = generate_refined_candidates(
+            ranked_candidates=oracle_stage1_rankings,
+            candidate_lookup=coarse_lookup,
+            search_spaces=spec.search_spaces,
+            top_k=validation_spec.top_k,
+            budget=validation_phase_budget,
+            refinement=spec.stages.refinement,
+        )
+        if not validation_candidates and oracle_stage1_rankings:
+            best_id = str(oracle_stage1_rankings[0]["candidate_id"])
+            validation_candidates = [coarse_lookup[best_id]]
+        validation_candidates = _assign_candidate_ids(
+            _dedupe_candidates(validation_candidates),
+            "v1c",
+        )
+        validation_eval = _evaluate_stage(
+            stage_name=VALIDATION_ORACLE_STAGE_NAME,
+            candidates=validation_candidates,
+            datasets=prepared_datasets,
+            output_dir=resolved_output_dir,
+            save_figures_flag=spec.save_figures,
+            requested_workers=requested_workers,
+            scoring=spec.scoring,
+            run_state=run_state,
+            run_state_path=run_state_path,
+            generation_id=generation_id,
+            merge_sources=merge_sources,
+            merge_log=merge_log,
+            dry_run=False,
+        )
+        validation_phase_results = validation_eval.stage_results
+        validation_image_rankings = score_and_rank_runs(
+            validation_phase_results,
+            spec.scoring,
+            dataset_ids=dataset_ids,
+        )
+        _write_stage_outputs(
+            VALIDATION_ORACLE_STAGE_NAME,
+            validation_phase_results,
+            validation_image_rankings,
+            resolved_output_dir,
+            execution=validation_eval.execution,
+            generation_id=generation_id,
+        )
+        validation_trio_import, validation_trio_manifest = _run_validation_oracle_benchmarks(
+            validation_spec=validation_spec,
+            scene_lookup=validation_scene_lookup,
+            sweep_dir=resolved_output_dir,
+            dataset_ids=dataset_ids,
+            stage_name=VALIDATION_ORACLE_STAGE_NAME,
+        )
+        validation_phase_rankings = _rank_stage_with_validation_oracle(
+            stage_name=VALIDATION_ORACLE_STAGE_NAME,
+            stage_results=validation_phase_results,
+            validation_import=validation_trio_import,
+            dataset_ids=dataset_ids,
+            scoring=spec.scoring,
+        )
+        _write_validation_phase_artifacts(
+            output_dir=resolved_output_dir,
+            stage_results=validation_phase_results,
+            rankings=validation_phase_rankings,
+            execution=validation_eval.execution,
+            generation_id=generation_id,
+        )
+        write_json_atomic(
+            validation_oracle_dir / "validation_phase_rankings.json",
+            validation_phase_rankings,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
+        )
+        validation_oracle_manifest = {
+            "enabled": True,
+            "status": "completed",
+            "output_dir": str(validation_oracle_dir.resolve()),
+            "stage": VALIDATION_ORACLE_STAGE_NAME,
+            "score_metric": TRIO_PRIMARY_SCORE,
+            "top_k": int(validation_spec.top_k),
+            "budget_per_dataset": int(validation_phase_budget),
+            "num_candidates": len(validation_candidates),
+            "num_runs": len(validation_phase_results),
+            "num_ranked": len(validation_phase_rankings),
+            "stage1": stage1_trio_manifest,
+            "validation_phase": validation_trio_manifest,
+        }
+        write_json_atomic(
+            validation_oracle_dir / "validation_oracle_manifest.json",
+            validation_oracle_manifest,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
         )
 
     refined_lookup: Dict[str, SweepCandidate] = {}
@@ -5861,6 +6590,11 @@ def run_sweep_experiment(
                     merge_sources=merge_sources,
                     merge_log=merge_log,
                 )
+        validation_dry_run_payload = _validation_oracle_dry_run_payload(
+            validation_spec=validation_spec,
+            dataset_ids=dataset_ids,
+            validation_phase_budget=validation_phase_budget,
+        )
         stages_payload: Dict[str, object] = {
             "stage1": _stage_preview_payload(stage1_eval.execution),
             **(
@@ -5897,9 +6631,18 @@ def run_sweep_experiment(
             },
             "stages": stages_payload,
             "metric_experiments": metric_dry_run_payload,
+            "validation_oracle_sweep": validation_dry_run_payload,
             "totals": {
-                "planned_run_count": int(stage_planned + _metric_planned_count(metric_dry_run_payload)),
-                "pending_run_count": int(stage_pending + _metric_pending_count(metric_dry_run_payload)),
+                "planned_run_count": int(
+                    stage_planned
+                    + _metric_planned_count(metric_dry_run_payload)
+                    + _validation_oracle_planned_count(validation_dry_run_payload)
+                ),
+                "pending_run_count": int(
+                    stage_pending
+                    + _metric_pending_count(metric_dry_run_payload)
+                    + _validation_oracle_planned_count(validation_dry_run_payload)
+                ),
                 "skipped_valid_count": int(stage_skipped + _metric_skipped_valid_count(metric_dry_run_payload)),
                 "exact": bool(
                     all(
@@ -5908,6 +6651,7 @@ def run_sweep_experiment(
                         if isinstance(payload, dict)
                     )
                     and bool(metric_dry_run_payload.get("exact", False))
+                    and bool(validation_dry_run_payload.get("exact", False))
                 ),
             },
             "merge_log": merge_log,
@@ -6059,6 +6803,7 @@ def run_sweep_experiment(
                 else asdict(spec.experimental_metric_sweep)
             ),
             "metric_experiments": metric_phase_manifest,
+            "validation_oracle_sweep": validation_oracle_manifest,
             "datasets": [_dataset_identity_payload(dataset) for dataset in prepared_datasets],
             "stages": asdict(spec.stages),
             "scoring": asdict(spec.scoring),
@@ -6730,6 +7475,11 @@ class SpecGuiState:
     metric_experiment_rows: List[SpecGuiMetricExperimentRowState] = field(
         default_factory=lambda: [SpecGuiMetricExperimentRowState()]
     )
+    validation_oracle_enabled: bool = False
+    validation_oracle_top_k: str = "8"
+    validation_oracle_budget_per_dataset: str = ""
+    validation_oracle_defaults_json: str = "{}"
+    validation_oracle_scenes_json: str = "[]"
     datasets: List[SpecGuiDatasetState] = field(
         default_factory=lambda: [SpecGuiDatasetState(dataset_id="dataset_a")]
     )
@@ -7141,6 +7891,28 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
                 },
             }
         payload["experimental_metric_sweep"] = experimental_payload
+    if state.validation_oracle_enabled:
+        defaults_text = state.validation_oracle_defaults_json.strip() or "{}"
+        scenes_text = state.validation_oracle_scenes_json.strip() or "[]"
+        defaults_payload = json.loads(defaults_text)
+        scenes_payload = json.loads(scenes_text)
+        if not isinstance(defaults_payload, dict):
+            raise ValueError("Validation oracle defaults JSON must be an object.")
+        if not isinstance(scenes_payload, list) or not all(
+            isinstance(item, dict) for item in scenes_payload
+        ):
+            raise ValueError("Validation oracle scenes JSON must be a list of objects.")
+        oracle_payload: Dict[str, object] = {
+            "enabled": True,
+            "top_k": int(state.validation_oracle_top_k.strip()),
+            "defaults": defaults_payload,
+            "scenes": scenes_payload,
+        }
+        if state.validation_oracle_budget_per_dataset.strip():
+            oracle_payload["budget_per_dataset"] = int(
+                state.validation_oracle_budget_per_dataset.strip()
+            )
+        payload["validation_oracle_sweep"] = oracle_payload
     relocation_rules = _state_relocation_rules(state)
     if relocation_rules or state.adopt_relocated:
         payload["relocation"] = {
@@ -7338,6 +8110,32 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         ]
     else:
         state.metric_experiment_rows = [SpecGuiMetricExperimentRowState()]
+
+    validation_payload = cast(
+        Optional[Dict[str, object]], payload.get("validation_oracle_sweep")
+    )
+    if validation_payload is not None:
+        state.validation_oracle_enabled = bool(validation_payload.get("enabled", False))
+        state.validation_oracle_top_k = str(
+            validation_payload.get("top_k", state.validation_oracle_top_k)
+        )
+        state.validation_oracle_budget_per_dataset = (
+            ""
+            if validation_payload.get("budget_per_dataset") is None
+            else str(validation_payload.get("budget_per_dataset"))
+        )
+        defaults_payload = validation_payload.get("defaults", {})
+        scenes_payload = validation_payload.get("scenes", [])
+        state.validation_oracle_defaults_json = json.dumps(
+            defaults_payload if isinstance(defaults_payload, dict) else {},
+            indent=2,
+        )
+        state.validation_oracle_scenes_json = json.dumps(
+            scenes_payload if isinstance(scenes_payload, list) else [],
+            indent=2,
+        )
+    else:
+        state.validation_oracle_enabled = False
 
     datasets_payload = cast(List[Dict[str, object]], payload.get("datasets", []))
     datasets: List[SpecGuiDatasetState] = []
@@ -7662,6 +8460,41 @@ def validate_state(state: SpecGuiState) -> List[str]:
 
         if len(formulation_ids) != len(set(formulation_ids)):
             issues.append("Metric experiment formulation IDs must be unique.")
+
+    if state.validation_oracle_enabled:
+        if stage_mode != "two_stage":
+            issues.append("Validation oracle sweep requires two_stage execution mode.")
+        try:
+            if int(state.validation_oracle_top_k.strip()) < 1:
+                issues.append("Validation oracle top-k must be >= 1.")
+        except Exception:
+            issues.append("Validation oracle top-k must be an integer.")
+        if state.validation_oracle_budget_per_dataset.strip():
+            try:
+                if int(state.validation_oracle_budget_per_dataset.strip()) < 1:
+                    issues.append("Validation oracle budget per dataset must be >= 1.")
+            except Exception:
+                issues.append("Validation oracle budget per dataset must be an integer.")
+        try:
+            defaults_payload = json.loads(
+                state.validation_oracle_defaults_json.strip() or "{}"
+            )
+            if not isinstance(defaults_payload, dict):
+                issues.append("Validation oracle defaults JSON must be an object.")
+        except Exception as exc:
+            issues.append(f"Validation oracle defaults JSON is invalid: {exc}")
+        try:
+            scenes_payload = json.loads(
+                state.validation_oracle_scenes_json.strip() or "[]"
+            )
+            if not isinstance(scenes_payload, list) or not all(
+                isinstance(item, dict) for item in scenes_payload
+            ):
+                issues.append("Validation oracle scenes JSON must be a list of objects.")
+            elif not scenes_payload:
+                issues.append("Validation oracle scenes JSON must include at least one scene.")
+        except Exception as exc:
+            issues.append(f"Validation oracle scenes JSON is invalid: {exc}")
 
     return issues
 
@@ -8171,6 +9004,49 @@ class SpecGuiApp:
         self.metric_experiment_rows_frame.pack(fill="x", padx=4, pady=2)
         self._toggle_metric_experiment_controls()
 
+        validation_container = self.ttk.LabelFrame(
+            self.advanced_frame, text="Validation Oracle Sweep (Optional)"
+        )
+        validation_container.pack(fill="x", padx=4, pady=6)
+        validation_controls = self.ttk.Frame(validation_container)
+        validation_controls.pack(fill="x", padx=4, pady=2)
+        self.validation_oracle_enabled_var = self.tk.BooleanVar(value=False)
+        validation_enabled_chk = self.ttk.Checkbutton(
+            validation_controls,
+            text="Enable validation-guided sweep",
+            variable=self.validation_oracle_enabled_var,
+        )
+        validation_enabled_chk.pack(side="left", padx=4)
+        self._register_editable(validation_enabled_chk)
+        self.ttk.Label(validation_controls, text="Top-k").pack(side="left", padx=(12, 2))
+        self.validation_oracle_top_k_entry = self.ttk.Entry(validation_controls, width=8)
+        self.validation_oracle_top_k_entry.insert(0, "8")
+        self.validation_oracle_top_k_entry.pack(side="left", padx=2)
+        self._register_editable(self.validation_oracle_top_k_entry)
+        self.ttk.Label(validation_controls, text="Budget").pack(side="left", padx=(12, 2))
+        self.validation_oracle_budget_entry = self.ttk.Entry(validation_controls, width=8)
+        self.validation_oracle_budget_entry.pack(side="left", padx=2)
+        self._register_editable(self.validation_oracle_budget_entry)
+
+        self.ttk.Label(validation_container, text="Defaults JSON").pack(anchor="w", padx=8)
+        self.validation_oracle_defaults_text = self.tk.Text(
+            validation_container,
+            height=4,
+            wrap="none",
+        )
+        self.validation_oracle_defaults_text.insert(self.tk.END, "{}")
+        self.validation_oracle_defaults_text.pack(fill="x", padx=8, pady=(0, 4))
+        self._register_editable(self.validation_oracle_defaults_text)
+        self.ttk.Label(validation_container, text="Scenes JSON").pack(anchor="w", padx=8)
+        self.validation_oracle_scenes_text = self.tk.Text(
+            validation_container,
+            height=5,
+            wrap="none",
+        )
+        self.validation_oracle_scenes_text.insert(self.tk.END, "[]")
+        self.validation_oracle_scenes_text.pack(fill="x", padx=8, pady=(0, 6))
+        self._register_editable(self.validation_oracle_scenes_text)
+
         json_frame = self.ttk.LabelFrame(self.content_frame, text="JSON Preview / Editor (Optional)")
         json_frame.pack(fill="both", expand=True, pady=6)
         self.json_text = self.tk.Text(json_frame, height=12, wrap="none")
@@ -8632,6 +9508,17 @@ class SpecGuiApp:
             metric_experiments_candidate_source=self.metric_candidate_source_var.get().strip(),
             metric_experiments_shortlist_top_k=self.metric_shortlist_entry.get().strip(),
             metric_experiment_rows=metric_rows,
+            validation_oracle_enabled=bool(self.validation_oracle_enabled_var.get()),
+            validation_oracle_top_k=self.validation_oracle_top_k_entry.get().strip(),
+            validation_oracle_budget_per_dataset=self.validation_oracle_budget_entry.get().strip(),
+            validation_oracle_defaults_json=self.validation_oracle_defaults_text.get(
+                "1.0",
+                self.tk.END,
+            ).strip(),
+            validation_oracle_scenes_json=self.validation_oracle_scenes_text.get(
+                "1.0",
+                self.tk.END,
+            ).strip(),
             datasets=datasets,
             json_preview=self.json_text.get("1.0", self.tk.END).strip(),
         )
@@ -8666,6 +9553,21 @@ class SpecGuiApp:
         )
         self.metric_shortlist_entry.delete(0, self.tk.END)
         self.metric_shortlist_entry.insert(0, state.metric_experiments_shortlist_top_k)
+        self.validation_oracle_enabled_var.set(state.validation_oracle_enabled)
+        self.validation_oracle_top_k_entry.delete(0, self.tk.END)
+        self.validation_oracle_top_k_entry.insert(0, state.validation_oracle_top_k)
+        self.validation_oracle_budget_entry.delete(0, self.tk.END)
+        self.validation_oracle_budget_entry.insert(0, state.validation_oracle_budget_per_dataset)
+        self.validation_oracle_defaults_text.delete("1.0", self.tk.END)
+        self.validation_oracle_defaults_text.insert(
+            self.tk.END,
+            state.validation_oracle_defaults_json or "{}",
+        )
+        self.validation_oracle_scenes_text.delete("1.0", self.tk.END)
+        self.validation_oracle_scenes_text.insert(
+            self.tk.END,
+            state.validation_oracle_scenes_json or "[]",
+        )
 
         field_mapping = [
             (self.pixel_window_entry, state.pixel_similarity_window_sizes),
