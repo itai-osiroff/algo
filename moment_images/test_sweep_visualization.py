@@ -678,6 +678,34 @@ def test_load_sweep_visualization_model_supports_validation_phase_as_non_primary
     assert any(record.stage == "validation_phase" for record in model.run_metric_records)
 
 
+def test_load_sweep_visualization_model_ignores_failed_validation_oracle_without_summary(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_validation_phase=False,
+    )
+    manifest_path = output_dir / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["validation_oracle_sweep"] = {
+        "enabled": True,
+        "status": "failed",
+        "failed_stage": "validation_phase_benchmark",
+        "error_type": "RuntimeError",
+        "error": "validation benchmark exploded",
+    }
+    _write_json(manifest_path, manifest)
+    _write_json(
+        output_dir / "validation_oracle" / "validation_oracle_manifest.json",
+        manifest["validation_oracle_sweep"],
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.primary_stage_name == "stage2"
+    assert "validation_phase" not in model.stage_order
+    assert not [row for row in model.candidates if row.stage == "validation_phase"]
+
+
 def test_load_sweep_visualization_model_normalizes_stale_internal_metric_run_names(tmp_path):
     output_dir = _create_modern_fixture(
         tmp_path,

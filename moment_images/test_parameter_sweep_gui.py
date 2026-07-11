@@ -120,6 +120,8 @@ def test_state_to_spec_roundtrip_with_validation_oracle_sweep(tmp_path):
     state.validation_oracle_enabled = True
     state.validation_oracle_top_k = "4"
     state.validation_oracle_budget_per_dataset = "6"
+    state.datasets[0].validation_image_path = str(tmp_path / "validation_from_row.tif")
+    state.datasets[0].thorcam_image_path = str(tmp_path / "thorcam_from_row.tif")
     state.validation_oracle_defaults_json = json.dumps(
         {
             "registration_profile": "rigid_b",
@@ -131,8 +133,9 @@ def test_state_to_spec_roundtrip_with_validation_oracle_sweep(tmp_path):
             {
                 "dataset_id": "dataset_a",
                 "scene_id": "scene_a",
-                "validation_image": str(tmp_path / "validation.tif"),
-                "thorcam_image": str(tmp_path / "thorcam.tif"),
+                "validation_image": str(tmp_path / "validation_from_json.tif"),
+                "thorcam_image": str(tmp_path / "thorcam_from_json.tif"),
+                "anchor_row_id": "auto",
             }
         ]
     )
@@ -146,10 +149,31 @@ def test_state_to_spec_roundtrip_with_validation_oracle_sweep(tmp_path):
     assert oracle["budget_per_dataset"] == 6
     assert oracle["defaults"]["registration_profile"] == "rigid_b"
     assert oracle["scenes"][0]["dataset_id"] == "dataset_a"
+    assert oracle["scenes"][0]["validation_image"] == str(tmp_path / "validation_from_row.tif")
+    assert oracle["scenes"][0]["thorcam_image"] == str(tmp_path / "thorcam_from_row.tif")
+    assert oracle["scenes"][0]["anchor_row_id"] == "auto"
     assert roundtrip.validation_oracle_enabled is True
     assert roundtrip.validation_oracle_top_k == "4"
     assert roundtrip.validation_oracle_budget_per_dataset == "6"
-    assert json.loads(roundtrip.validation_oracle_scenes_json)[0]["scene_id"] == "scene_a"
+    assert roundtrip.datasets[0].validation_image_path == str(tmp_path / "validation_from_row.tif")
+    assert roundtrip.datasets[0].thorcam_image_path == str(tmp_path / "thorcam_from_row.tif")
+    scene_overrides = json.loads(roundtrip.validation_oracle_scenes_json)
+    assert scene_overrides[0]["scene_id"] == "scene_a"
+    assert scene_overrides[0]["anchor_row_id"] == "auto"
+    assert "validation_image" not in scene_overrides[0]
+    assert "thorcam_image" not in scene_overrides[0]
+
+
+def test_validate_state_requires_validation_oracle_dataset_paths(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.validation_oracle_enabled = True
+    state.validation_oracle_defaults_json = "{}"
+    state.validation_oracle_scenes_json = "[]"
+
+    issues = validate_state(state)
+
+    assert any("validation image" in issue.lower() for issue in issues)
+    assert any("thorcam image" in issue.lower() for issue in issues)
 
 
 def test_new_metric_experiment_gui_state_defaults_to_independent_intensity(tmp_path):

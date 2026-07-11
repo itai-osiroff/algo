@@ -114,6 +114,13 @@ VALIDATION_ORACLE_PATH_KEYS = (
     "validation_workspace",
     "registration_annotations",
 )
+VALIDATION_ORACLE_GENERATED_ROOT_ARTIFACTS = (
+    f"{VALIDATION_ORACLE_STAGE_NAME}_summary.json",
+    "validation_leaderboard.json",
+    "validation_leaderboard.csv",
+    "validation_best_configs.json",
+    "validation_summary.json",
+)
 
 
 class LiveMetricsPlotter:
@@ -649,7 +656,6 @@ class ValidationOracleSweepSpec:
     budget_per_dataset: Optional[int] = None
     scenes: List[Dict[str, object]] = field(default_factory=list)
     defaults: Dict[str, object] = field(default_factory=dict)
-    strict: bool = True
 
     def __post_init__(self) -> None:
         self.top_k = int(self.top_k)
@@ -672,7 +678,6 @@ class ValidationOracleSweepSpec:
                 raise ValueError(f"validation_oracle_sweep.scenes[{idx}] must be an object.")
             normalized_scenes.append(dict(scene))
         self.scenes = normalized_scenes
-        self.strict = bool(self.strict)
 
     @classmethod
     def from_dict(
@@ -695,7 +700,6 @@ class ValidationOracleSweepSpec:
             ),
             scenes=cast(List[Dict[str, object]], payload.get("scenes", [])),
             defaults=cast(Dict[str, object], payload.get("defaults", {})),
-            strict=bool(payload.get("strict", True)),
         )
 
 
@@ -796,7 +800,6 @@ class SweepExperimentSpec:
             budget_per_dataset=validation.budget_per_dataset,
             scenes=[dict(scene) for scene in validation.scenes],
             defaults=dict(validation.defaults),
-            strict=bool(validation.strict),
         )
 
     @classmethod
@@ -2536,7 +2539,7 @@ def _normalize_fingerprint_payload_for_resume_compat(
     """
     Remove machine-specific path details and volatile cache mtimes.
 
-    This keeps the strict fingerprint for normal operation, while allowing a
+    This keeps the precise fingerprint for normal operation, while allowing a
     copied run directory to be adopted on another machine if the semantic spec
     and prepared dataset identities are otherwise unchanged.
     """
@@ -2590,13 +2593,43 @@ def _normalize_fingerprint_payload_for_resume_compat(
     return normalized
 
 
+def _normalize_validation_oracle_fingerprint_defaults(
+    spec_snapshot: Dict[str, object],
+) -> Dict[str, object]:
+    normalized_spec = dict(spec_snapshot)
+    oracle_raw = normalized_spec.get("validation_oracle_sweep")
+    if not isinstance(oracle_raw, dict):
+        return normalized_spec
+
+    oracle = dict(oracle_raw)
+    oracle.pop("strict", None)
+    defaults_raw = oracle.get("defaults")
+    if isinstance(defaults_raw, dict):
+        defaults = dict(defaults_raw)
+        defaults.pop("strict", None)
+        oracle["defaults"] = defaults
+    scenes_raw = oracle.get("scenes")
+    if isinstance(scenes_raw, list):
+        scenes: List[object] = []
+        for scene_raw in scenes_raw:
+            if isinstance(scene_raw, dict):
+                scene = dict(scene_raw)
+                scene.pop("strict", None)
+                scenes.append(scene)
+            else:
+                scenes.append(scene_raw)
+        oracle["scenes"] = scenes
+    normalized_spec["validation_oracle_sweep"] = oracle
+    return normalized_spec
+
+
 def _normalize_metric_sweep_fingerprint_defaults(
     spec_snapshot: Dict[str, object],
 ) -> Dict[str, object]:
     normalized_spec = dict(spec_snapshot)
     experimental_raw = normalized_spec.get("experimental_metric_sweep")
     if not isinstance(experimental_raw, dict):
-        return normalized_spec
+        return _normalize_validation_oracle_fingerprint_defaults(normalized_spec)
 
     experimental = dict(experimental_raw)
     source = str(
@@ -2610,7 +2643,7 @@ def _normalize_metric_sweep_fingerprint_defaults(
         experimental["candidate_source"] = METRIC_CANDIDATE_SOURCE_BASELINE_SHORTLIST
         experimental["search_stages"] = None
     normalized_spec["experimental_metric_sweep"] = experimental
-    return normalized_spec
+    return _normalize_validation_oracle_fingerprint_defaults(normalized_spec)
 
 
 def _fingerprint_payloads_resume_compatible(
@@ -4521,6 +4554,7 @@ def _write_stage_outputs(
     output_dir: Path,
     execution: Optional[Dict[str, object]] = None,
     generation_id: Optional[str] = None,
+    create_backup: bool = True,
 ) -> None:
     successful = [record for record in stage_results if record.get("status") == "ok"]
     failed = [record for record in stage_results if record.get("status") != "ok"]
@@ -4536,7 +4570,13 @@ def _write_stage_outputs(
         "execution": dict(execution or {}),
     }
     summary_path = output_dir / f"{stage_name}_summary.json"
-    write_json_atomic(summary_path, payload, indent=2, sort_keys=False, create_backup=True)
+    write_json_atomic(
+        summary_path,
+        payload,
+        indent=2,
+        sort_keys=False,
+        create_backup=create_backup,
+    )
 
 
 def _best_configs_payload(rankings: Sequence[Dict[str, object]]) -> Dict[str, object]:
@@ -5755,7 +5795,6 @@ def _validation_oracle_dry_run_payload(
     return {
         "enabled": True,
         "status": "planned_after_stage1_oracle_ranking",
-        "strict": bool(validation_spec.strict),
         "stage": VALIDATION_ORACLE_STAGE_NAME,
         "score_metric": TRIO_PRIMARY_SCORE,
         "top_k": int(validation_spec.top_k),
@@ -5785,7 +5824,9 @@ def _benchmark_config_from_validation_scene(
 ) -> BenchmarkConfig:
     benchmark_payload: Dict[str, object] = dict(validation_spec.defaults)
     benchmark_payload.update(dict(scene))
+    benchmark_payload.pop("strict", None)
     benchmark_payload.pop("id", None)
+    benchmark_payload.setdefault("generation_scope", "Active")
     field_names = {item.name for item in fields(BenchmarkConfig)}
     unsupported = sorted(set(benchmark_payload) - field_names)
     if unsupported:
@@ -6056,6 +6097,236 @@ def _write_validation_phase_artifacts(
     )
 
 
+def _remove_path_and_backup(path: Path) -> None:
+    for candidate in (path, Path(f"{path}.bak")):
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            continue
+
+
+def _clear_validation_oracle_root_artifacts(output_dir: Path) -> None:
+    for filename in VALIDATION_ORACLE_GENERATED_ROOT_ARTIFACTS:
+        _remove_path_and_backup(output_dir / filename)
+
+
+def _validation_oracle_manifest_base(
+    *,
+    validation_oracle_dir: Path,
+    validation_spec: ValidationOracleSweepSpec,
+    validation_phase_budget: int,
+) -> Dict[str, object]:
+    return {
+        "enabled": True,
+        "output_dir": str(validation_oracle_dir.resolve()),
+        "stage": VALIDATION_ORACLE_STAGE_NAME,
+        "score_metric": TRIO_PRIMARY_SCORE,
+        "top_k": int(validation_spec.top_k),
+        "budget_per_dataset": int(validation_phase_budget),
+    }
+
+
+def _write_validation_oracle_manifest(
+    validation_oracle_dir: Path,
+    manifest: Mapping[str, object],
+) -> None:
+    write_json_atomic(
+        validation_oracle_dir / "validation_oracle_manifest.json",
+        dict(manifest),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+
+
+def _validation_oracle_failed_manifest(
+    *,
+    validation_oracle_dir: Path,
+    validation_spec: ValidationOracleSweepSpec,
+    validation_phase_budget: int,
+    failed_stage: str,
+    error: BaseException,
+) -> Dict[str, object]:
+    manifest = _validation_oracle_manifest_base(
+        validation_oracle_dir=validation_oracle_dir,
+        validation_spec=validation_spec,
+        validation_phase_budget=validation_phase_budget,
+    )
+    manifest.update(
+        {
+            "status": "failed",
+            "failed_stage": failed_stage,
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+    )
+    return manifest
+
+
+def _run_validation_oracle_workflow(
+    *,
+    spec: SweepExperimentSpec,
+    validation_spec: ValidationOracleSweepSpec,
+    validation_phase_budget: int,
+    stage1_results: Sequence[Dict[str, object]],
+    coarse_lookup: Mapping[str, SweepCandidate],
+    prepared_datasets: Sequence[PreparedDataset],
+    dataset_ids: Sequence[str],
+    output_dir: Path,
+    requested_workers: int,
+    run_state: Dict[str, object],
+    run_state_path: Path,
+    generation_id: Optional[str],
+    merge_sources: Sequence[Path],
+    merge_log: Dict[str, object],
+) -> Dict[str, object]:
+    validation_oracle_dir = output_dir / VALIDATION_ORACLE_DIR_NAME
+    validation_oracle_dir.mkdir(parents=True, exist_ok=True)
+    _clear_validation_oracle_root_artifacts(output_dir)
+
+    failed_stage = "scene_validation"
+    try:
+        validation_scene_lookup = _validate_validation_oracle_scene_lookup(
+            validation_spec,
+            dataset_ids,
+        )
+
+        failed_stage = "stage1_benchmark"
+        stage1_trio_import, stage1_trio_manifest = _run_validation_oracle_benchmarks(
+            validation_spec=validation_spec,
+            scene_lookup=validation_scene_lookup,
+            sweep_dir=output_dir,
+            dataset_ids=dataset_ids,
+            stage_name="stage1",
+        )
+
+        failed_stage = "stage1_ranking"
+        oracle_stage1_rankings = _rank_stage_with_validation_oracle(
+            stage_name="stage1",
+            stage_results=stage1_results,
+            validation_import=stage1_trio_import,
+            dataset_ids=dataset_ids,
+            scoring=spec.scoring,
+        )
+        write_json_atomic(
+            validation_oracle_dir / "stage1_rankings.json",
+            oracle_stage1_rankings,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
+        )
+
+        failed_stage = "validation_phase_candidates"
+        validation_candidates = generate_refined_candidates(
+            ranked_candidates=oracle_stage1_rankings,
+            candidate_lookup=dict(coarse_lookup),
+            search_spaces=spec.search_spaces,
+            top_k=validation_spec.top_k,
+            budget=validation_phase_budget,
+            refinement=spec.stages.refinement,
+        )
+        if not validation_candidates and oracle_stage1_rankings:
+            best_id = str(oracle_stage1_rankings[0]["candidate_id"])
+            validation_candidates = [coarse_lookup[best_id]]
+        validation_candidates = _assign_candidate_ids(
+            _dedupe_candidates(validation_candidates),
+            "v1c",
+        )
+
+        failed_stage = "validation_phase_eval"
+        validation_eval = _evaluate_stage(
+            stage_name=VALIDATION_ORACLE_STAGE_NAME,
+            candidates=validation_candidates,
+            datasets=prepared_datasets,
+            output_dir=output_dir,
+            save_figures_flag=spec.save_figures,
+            requested_workers=requested_workers,
+            scoring=spec.scoring,
+            run_state=run_state,
+            run_state_path=run_state_path,
+            generation_id=generation_id,
+            merge_sources=merge_sources,
+            merge_log=merge_log,
+            dry_run=False,
+        )
+        validation_phase_results = validation_eval.stage_results
+
+        failed_stage = "validation_phase_image_ranking"
+        validation_image_rankings = score_and_rank_runs(
+            validation_phase_results,
+            spec.scoring,
+            dataset_ids=dataset_ids,
+        )
+        _write_stage_outputs(
+            VALIDATION_ORACLE_STAGE_NAME,
+            validation_phase_results,
+            validation_image_rankings,
+            output_dir,
+            execution=validation_eval.execution,
+            generation_id=generation_id,
+            create_backup=False,
+        )
+
+        failed_stage = "validation_phase_benchmark"
+        validation_trio_import, validation_trio_manifest = _run_validation_oracle_benchmarks(
+            validation_spec=validation_spec,
+            scene_lookup=validation_scene_lookup,
+            sweep_dir=output_dir,
+            dataset_ids=dataset_ids,
+            stage_name=VALIDATION_ORACLE_STAGE_NAME,
+        )
+
+        failed_stage = "validation_phase_ranking"
+        validation_phase_rankings = _rank_stage_with_validation_oracle(
+            stage_name=VALIDATION_ORACLE_STAGE_NAME,
+            stage_results=validation_phase_results,
+            validation_import=validation_trio_import,
+            dataset_ids=dataset_ids,
+            scoring=spec.scoring,
+        )
+        _write_validation_phase_artifacts(
+            output_dir=output_dir,
+            stage_results=validation_phase_results,
+            rankings=validation_phase_rankings,
+            execution=validation_eval.execution,
+            generation_id=generation_id,
+        )
+        write_json_atomic(
+            validation_oracle_dir / "validation_phase_rankings.json",
+            validation_phase_rankings,
+            indent=2,
+            sort_keys=False,
+            create_backup=True,
+        )
+        validation_oracle_manifest = _validation_oracle_manifest_base(
+            validation_oracle_dir=validation_oracle_dir,
+            validation_spec=validation_spec,
+            validation_phase_budget=validation_phase_budget,
+        )
+        validation_oracle_manifest.update(
+            {
+                "status": "completed",
+                "num_candidates": len(validation_candidates),
+                "num_runs": len(validation_phase_results),
+                "num_ranked": len(validation_phase_rankings),
+                "stage1": stage1_trio_manifest,
+                "validation_phase": validation_trio_manifest,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - validation oracle is advisory.
+        _clear_validation_oracle_root_artifacts(output_dir)
+        validation_oracle_manifest = _validation_oracle_failed_manifest(
+            validation_oracle_dir=validation_oracle_dir,
+            validation_spec=validation_spec,
+            validation_phase_budget=validation_phase_budget,
+            failed_stage=failed_stage,
+            error=exc,
+        )
+
+    _write_validation_oracle_manifest(validation_oracle_dir, validation_oracle_manifest)
+    return validation_oracle_manifest
+
+
 def _run_independent_metric_search_phase(
     *,
     spec: SweepExperimentSpec,
@@ -6288,10 +6559,6 @@ def run_sweep_experiment(
         validation_spec,
         _stage_budgets(spec.stages)[1],
     )
-    validation_scene_lookup = _validate_validation_oracle_scene_lookup(
-        validation_spec,
-        dataset_ids,
-    )
     fingerprint_payload = _build_experiment_fingerprint_payload(
         spec=spec,
         prepared_datasets=prepared_datasets,
@@ -6371,130 +6638,11 @@ def run_sweep_experiment(
             generation_id=generation_id,
         )
 
-    validation_phase_results: List[Dict[str, object]] = []
-    validation_phase_rankings: List[Dict[str, object]] = []
     validation_oracle_manifest: Dict[str, object] = {
         "enabled": bool(validation_spec.enabled),
         "output_dir": None,
         "status": "disabled",
     }
-    if validation_spec.enabled and not dry_run:
-        validation_oracle_dir = resolved_output_dir / VALIDATION_ORACLE_DIR_NAME
-        validation_oracle_dir.mkdir(parents=True, exist_ok=True)
-        stage1_trio_import, stage1_trio_manifest = _run_validation_oracle_benchmarks(
-            validation_spec=validation_spec,
-            scene_lookup=validation_scene_lookup,
-            sweep_dir=resolved_output_dir,
-            dataset_ids=dataset_ids,
-            stage_name="stage1",
-        )
-        oracle_stage1_rankings = _rank_stage_with_validation_oracle(
-            stage_name="stage1",
-            stage_results=stage1_results,
-            validation_import=stage1_trio_import,
-            dataset_ids=dataset_ids,
-            scoring=spec.scoring,
-        )
-        write_json_atomic(
-            validation_oracle_dir / "stage1_rankings.json",
-            oracle_stage1_rankings,
-            indent=2,
-            sort_keys=False,
-            create_backup=True,
-        )
-        validation_candidates = generate_refined_candidates(
-            ranked_candidates=oracle_stage1_rankings,
-            candidate_lookup=coarse_lookup,
-            search_spaces=spec.search_spaces,
-            top_k=validation_spec.top_k,
-            budget=validation_phase_budget,
-            refinement=spec.stages.refinement,
-        )
-        if not validation_candidates and oracle_stage1_rankings:
-            best_id = str(oracle_stage1_rankings[0]["candidate_id"])
-            validation_candidates = [coarse_lookup[best_id]]
-        validation_candidates = _assign_candidate_ids(
-            _dedupe_candidates(validation_candidates),
-            "v1c",
-        )
-        validation_eval = _evaluate_stage(
-            stage_name=VALIDATION_ORACLE_STAGE_NAME,
-            candidates=validation_candidates,
-            datasets=prepared_datasets,
-            output_dir=resolved_output_dir,
-            save_figures_flag=spec.save_figures,
-            requested_workers=requested_workers,
-            scoring=spec.scoring,
-            run_state=run_state,
-            run_state_path=run_state_path,
-            generation_id=generation_id,
-            merge_sources=merge_sources,
-            merge_log=merge_log,
-            dry_run=False,
-        )
-        validation_phase_results = validation_eval.stage_results
-        validation_image_rankings = score_and_rank_runs(
-            validation_phase_results,
-            spec.scoring,
-            dataset_ids=dataset_ids,
-        )
-        _write_stage_outputs(
-            VALIDATION_ORACLE_STAGE_NAME,
-            validation_phase_results,
-            validation_image_rankings,
-            resolved_output_dir,
-            execution=validation_eval.execution,
-            generation_id=generation_id,
-        )
-        validation_trio_import, validation_trio_manifest = _run_validation_oracle_benchmarks(
-            validation_spec=validation_spec,
-            scene_lookup=validation_scene_lookup,
-            sweep_dir=resolved_output_dir,
-            dataset_ids=dataset_ids,
-            stage_name=VALIDATION_ORACLE_STAGE_NAME,
-        )
-        validation_phase_rankings = _rank_stage_with_validation_oracle(
-            stage_name=VALIDATION_ORACLE_STAGE_NAME,
-            stage_results=validation_phase_results,
-            validation_import=validation_trio_import,
-            dataset_ids=dataset_ids,
-            scoring=spec.scoring,
-        )
-        _write_validation_phase_artifacts(
-            output_dir=resolved_output_dir,
-            stage_results=validation_phase_results,
-            rankings=validation_phase_rankings,
-            execution=validation_eval.execution,
-            generation_id=generation_id,
-        )
-        write_json_atomic(
-            validation_oracle_dir / "validation_phase_rankings.json",
-            validation_phase_rankings,
-            indent=2,
-            sort_keys=False,
-            create_backup=True,
-        )
-        validation_oracle_manifest = {
-            "enabled": True,
-            "status": "completed",
-            "output_dir": str(validation_oracle_dir.resolve()),
-            "stage": VALIDATION_ORACLE_STAGE_NAME,
-            "score_metric": TRIO_PRIMARY_SCORE,
-            "top_k": int(validation_spec.top_k),
-            "budget_per_dataset": int(validation_phase_budget),
-            "num_candidates": len(validation_candidates),
-            "num_runs": len(validation_phase_results),
-            "num_ranked": len(validation_phase_rankings),
-            "stage1": stage1_trio_manifest,
-            "validation_phase": validation_trio_manifest,
-        }
-        write_json_atomic(
-            validation_oracle_dir / "validation_oracle_manifest.json",
-            validation_oracle_manifest,
-            indent=2,
-            sort_keys=False,
-            create_backup=True,
-        )
 
     refined_lookup: Dict[str, SweepCandidate] = {}
     stage2_results: List[Dict[str, object]] = []
@@ -6784,6 +6932,24 @@ def run_sweep_experiment(
                 num_ranked=len(metric_rankings),
                 num_results=len(metric_results),
             )
+
+    if validation_spec.enabled:
+        validation_oracle_manifest = _run_validation_oracle_workflow(
+            spec=spec,
+            validation_spec=validation_spec,
+            validation_phase_budget=validation_phase_budget,
+            stage1_results=stage1_results,
+            coarse_lookup=coarse_lookup,
+            prepared_datasets=prepared_datasets,
+            dataset_ids=dataset_ids,
+            output_dir=resolved_output_dir,
+            requested_workers=requested_workers,
+            run_state=run_state,
+            run_state_path=run_state_path,
+            generation_id=generation_id,
+            merge_sources=merge_sources,
+            merge_log=merge_log,
+        )
 
     write_json_atomic(
         resolved_output_dir / "experiment_manifest.json",
@@ -7386,6 +7552,8 @@ class SpecGuiDatasetState:
     dataset_id: str = ""
     source_type: str = "views"
     source_path: str = ""
+    validation_image_path: str = ""
+    thorcam_image_path: str = ""
     center_x: str = ""
     center_y: str = ""
     view_radius: str = ""
@@ -7901,12 +8069,61 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
         if not isinstance(scenes_payload, list) or not all(
             isinstance(item, dict) for item in scenes_payload
         ):
-            raise ValueError("Validation oracle scenes JSON must be a list of objects.")
+            raise ValueError(
+                "Validation oracle scene overrides JSON must be a list of objects."
+            )
+        defaults_payload = dict(defaults_payload)
+        defaults_payload.pop("strict", None)
+        scene_overrides_by_dataset: Dict[str, Dict[str, object]] = {}
+        for idx, scene_payload_raw in enumerate(scenes_payload, start=1):
+            scene_payload = dict(scene_payload_raw)
+            dataset_id = str(scene_payload.get("dataset_id") or "").strip()
+            if not dataset_id:
+                raise ValueError(
+                    "Validation oracle scene override "
+                    f"{idx} must include dataset_id."
+                )
+            if dataset_id in scene_overrides_by_dataset:
+                raise ValueError(
+                    "Validation oracle scene overrides must have unique dataset_id values."
+                )
+            scene_payload.pop("strict", None)
+            scene_payload.pop("validation_image", None)
+            scene_payload.pop("thorcam_image", None)
+            scene_overrides_by_dataset[dataset_id] = scene_payload
+
+        scene_entries: List[Dict[str, object]] = []
+        dataset_ids = {row.dataset_id.strip() for row in state.datasets}
+        unknown_overrides = sorted(set(scene_overrides_by_dataset) - dataset_ids)
+        if unknown_overrides:
+            raise ValueError(
+                "Validation oracle scene override dataset_id not found in datasets: "
+                + ", ".join(unknown_overrides)
+            )
+        for row in state.datasets:
+            dataset_id = row.dataset_id.strip()
+            validation_image = row.validation_image_path.strip()
+            thorcam_image = row.thorcam_image_path.strip()
+            if not validation_image:
+                raise ValueError(
+                    f"Dataset '{dataset_id}' validation image path is required "
+                    "when validation oracle is enabled."
+                )
+            if not thorcam_image:
+                raise ValueError(
+                    f"Dataset '{dataset_id}' ThorCam image path is required "
+                    "when validation oracle is enabled."
+                )
+            scene_entry = dict(scene_overrides_by_dataset.get(dataset_id, {}))
+            scene_entry["dataset_id"] = dataset_id
+            scene_entry["validation_image"] = validation_image
+            scene_entry["thorcam_image"] = thorcam_image
+            scene_entries.append(scene_entry)
         oracle_payload: Dict[str, object] = {
             "enabled": True,
             "top_k": int(state.validation_oracle_top_k.strip()),
             "defaults": defaults_payload,
-            "scenes": scenes_payload,
+            "scenes": scene_entries,
         }
         if state.validation_oracle_budget_per_dataset.strip():
             oracle_payload["budget_per_dataset"] = int(
@@ -8111,6 +8328,7 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
     else:
         state.metric_experiment_rows = [SpecGuiMetricExperimentRowState()]
 
+    validation_row_paths_by_dataset: Dict[str, Dict[str, str]] = {}
     validation_payload = cast(
         Optional[Dict[str, object]], payload.get("validation_oracle_sweep")
     )
@@ -8130,8 +8348,25 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
             defaults_payload if isinstance(defaults_payload, dict) else {},
             indent=2,
         )
+        advanced_scenes: List[Dict[str, object]] = []
+        if isinstance(scenes_payload, list):
+            for scene_payload_raw in scenes_payload:
+                if not isinstance(scene_payload_raw, dict):
+                    continue
+                scene_payload = dict(scene_payload_raw)
+                dataset_id = str(scene_payload.get("dataset_id") or "").strip()
+                if dataset_id:
+                    validation_row_paths_by_dataset[dataset_id] = {
+                        "validation_image_path": str(scene_payload.get("validation_image") or ""),
+                        "thorcam_image_path": str(scene_payload.get("thorcam_image") or ""),
+                    }
+                scene_payload.pop("validation_image", None)
+                scene_payload.pop("thorcam_image", None)
+                scene_payload.pop("strict", None)
+                if scene_payload:
+                    advanced_scenes.append(scene_payload)
         state.validation_oracle_scenes_json = json.dumps(
-            scenes_payload if isinstance(scenes_payload, list) else [],
+            advanced_scenes,
             indent=2,
         )
     else:
@@ -8154,6 +8389,14 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
             dataset_id=str(entry.get("id") or entry.get("dataset_id") or ""),
             source_type=source_type,
             source_path=source_path,
+            validation_image_path=validation_row_paths_by_dataset.get(
+                str(entry.get("id") or entry.get("dataset_id") or ""),
+                {},
+            ).get("validation_image_path", ""),
+            thorcam_image_path=validation_row_paths_by_dataset.get(
+                str(entry.get("id") or entry.get("dataset_id") or ""),
+                {},
+            ).get("thorcam_image_path", ""),
             center_x="" if entry.get("center_x") is None else str(entry.get("center_x")),
             center_y="" if entry.get("center_y") is None else str(entry.get("center_y")),
             view_radius=""
@@ -8464,6 +8707,18 @@ def validate_state(state: SpecGuiState) -> List[str]:
     if state.validation_oracle_enabled:
         if stage_mode != "two_stage":
             issues.append("Validation oracle sweep requires two_stage execution mode.")
+        for idx, row in enumerate(state.datasets, start=1):
+            prefix = f"Dataset row {idx}"
+            if not row.validation_image_path.strip():
+                issues.append(
+                    f"{prefix}: validation image path is required when "
+                    "validation oracle is enabled."
+                )
+            if not row.thorcam_image_path.strip():
+                issues.append(
+                    f"{prefix}: ThorCam image path is required when "
+                    "validation oracle is enabled."
+                )
         try:
             if int(state.validation_oracle_top_k.strip()) < 1:
                 issues.append("Validation oracle top-k must be >= 1.")
@@ -8490,11 +8745,11 @@ def validate_state(state: SpecGuiState) -> List[str]:
             if not isinstance(scenes_payload, list) or not all(
                 isinstance(item, dict) for item in scenes_payload
             ):
-                issues.append("Validation oracle scenes JSON must be a list of objects.")
-            elif not scenes_payload:
-                issues.append("Validation oracle scenes JSON must include at least one scene.")
+                issues.append(
+                    "Validation oracle scene overrides JSON must be a list of objects."
+                )
         except Exception as exc:
-            issues.append(f"Validation oracle scenes JSON is invalid: {exc}")
+            issues.append(f"Validation oracle scene overrides JSON is invalid: {exc}")
 
     return issues
 
@@ -9196,6 +9451,8 @@ class SpecGuiApp:
         id_var = self.tk.StringVar(value=initial_state.dataset_id)
         source_type_var = self.tk.StringVar(value=initial_state.source_type)
         source_path_var = self.tk.StringVar(value=initial_state.source_path)
+        validation_image_var = self.tk.StringVar(value=initial_state.validation_image_path)
+        thorcam_image_var = self.tk.StringVar(value=initial_state.thorcam_image_path)
         center_x_var = self.tk.StringVar(value=initial_state.center_x)
         center_y_var = self.tk.StringVar(value=initial_state.center_y)
         radius_var = self.tk.StringVar(value=initial_state.view_radius)
@@ -9226,6 +9483,22 @@ class SpecGuiApp:
         browse_btn.pack(side="left", padx=2)
         self._register_editable(browse_btn)
 
+        for label, var in [
+            ("Validation", validation_image_var),
+            ("ThorCam", thorcam_image_var),
+        ]:
+            self.ttk.Label(row_frame, text=label).pack(side="left")
+            image_entry = self.ttk.Entry(row_frame, textvariable=var, width=24)
+            image_entry.pack(side="left", padx=2)
+            self._register_editable(image_entry)
+            image_browse_btn = self.ttk.Button(
+                row_frame,
+                text="Browse",
+                command=lambda sp=var: self._browse_image_path(sp),
+            )
+            image_browse_btn.pack(side="left", padx=2)
+            self._register_editable(image_browse_btn)
+
         for label, var, width in [("cx", center_x_var, 4), ("cy", center_y_var, 4), ("r", radius_var, 4), ("grid", grid_var, 4), ("dist", dist_var, 4)]:
             self.ttk.Label(row_frame, text=label).pack(side="left")
             entry = self.ttk.Entry(row_frame, textvariable=var, width=width)
@@ -9254,6 +9527,8 @@ class SpecGuiApp:
                 "id_var": id_var,
                 "source_type_var": source_type_var,
                 "source_path_var": source_path_var,
+                "validation_image_var": validation_image_var,
+                "thorcam_image_var": thorcam_image_var,
                 "center_x_var": center_x_var,
                 "center_y_var": center_y_var,
                 "radius_var": radius_var,
@@ -9408,6 +9683,13 @@ class SpecGuiApp:
         if selected:
             path_var.set(selected)
 
+    def _browse_image_path(self, path_var: Any) -> None:
+        selected = self.filedialog.askopenfilename(
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tiff *.tif")]
+        )
+        if selected:
+            path_var.set(selected)
+
     def _on_browse_output_dir(self) -> None:
         selected = self.filedialog.askdirectory()
         if selected:
@@ -9422,6 +9704,8 @@ class SpecGuiApp:
                     dataset_id=row["id_var"].get().strip(),
                     source_type=row["source_type_var"].get().strip(),
                     source_path=row["source_path_var"].get().strip(),
+                    validation_image_path=row["validation_image_var"].get().strip(),
+                    thorcam_image_path=row["thorcam_image_var"].get().strip(),
                     center_x=row["center_x_var"].get().strip(),
                     center_y=row["center_y_var"].get().strip(),
                     view_radius=row["radius_var"].get().strip(),
