@@ -1659,10 +1659,12 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
 
     assert result.best_lf_row_id == "stage2:candidate_a"
     assert (output_dir / "trio_benchmark_results.csv").exists()
+    assert (output_dir / "bead_quality_metrics.csv").exists()
     assert (output_dir / "trio_benchmark_summary.json").exists()
     assert (output_dir / "trio_benchmark_report.html").exists()
     assert (output_dir / "figures" / "rank_001_stage2_candidate_a_overlay.png").exists()
     assert (output_dir / "figures" / "rank_001_stage2_candidate_a_affine_diagnostic_overlay.png").exists()
+    assert (output_dir / "figures" / "rank_001_stage2_candidate_a_bead_crops.png").exists()
 
     with (output_dir / "trio_benchmark_results.csv").open(newline="", encoding="utf-8") as fp:
         csv_rows = list(csv.DictReader(fp))
@@ -1684,6 +1686,13 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
     assert "registration_initializer" in csv_rows[0]
     assert "registration_refined_score" in csv_rows[0]
     assert "registration_runtime_seconds" in csv_rows[0]
+
+    with (output_dir / "bead_quality_metrics.csv").open(newline="", encoding="utf-8") as fp:
+        bead_rows = list(csv.DictReader(fp))
+    lf_bead_rows = [row for row in bead_rows if row["source_kind"] == "lf_candidate"]
+    assert [row["candidate_id"] for row in lf_bead_rows[:2]] == ["candidate_a", "candidate_b"]
+    assert float(lf_bead_rows[0]["compactness_score"]) > float(lf_bead_rows[1]["compactness_score"])
+    assert lf_bead_rows[0]["bead_crop_path"].endswith("rank_001_stage2_candidate_a_bead_crops.png")
     assert "hypotheses_generated" in csv_rows[0]
     assert "hypotheses_prefiltered" in csv_rows[0]
     assert "hypotheses_dense_scored" in csv_rows[0]

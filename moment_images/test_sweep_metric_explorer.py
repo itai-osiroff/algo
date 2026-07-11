@@ -11,6 +11,7 @@ from PIL import Image
 matplotlib.use("Agg")
 
 from moment_images import sweep_metric_explorer as explorer
+from moment_images.bead_ranking_diagnostics import main as bead_diagnostics_main
 from moment_images.sweep_metric_explorer import (
     HYDRATE_MODE_LAZY,
     _ensure_profile_results,
@@ -376,6 +377,79 @@ def _write_trio_results(path: Path, *, bad_rankable: bool = True, bad_primary_sc
             "common_fov_fraction": 0.83,
             "validation_rankable": "true" if bad_rankable else "false",
             "ranking_exclusion_reason": "" if bad_rankable else "thorcam_fov_coverage_below_minimum",
+        },
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_bead_quality_results(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "source_kind",
+        "stage",
+        "dataset_id",
+        "candidate_id",
+        "row_id",
+        "generation_id",
+        "validation_rank",
+        "validation_rankable",
+        "validation_bead_count",
+        "evaluated_bead_count",
+        "candidate_width_mean_px",
+        "validation_width_mean_px",
+        "width_excess_mean_px",
+        "compactness_score",
+        "support_area_ratio_mean",
+        "support_compactness_score",
+        "peak_contrast_mean",
+        "ringing_penalty_mean",
+        "bead_crop_path",
+    ]
+    rows = [
+        {
+            "source_kind": explorer.TRIO_LF_SOURCE_KIND,
+            "stage": "stage1",
+            "dataset_id": "d1",
+            "candidate_id": "c_good",
+            "row_id": "c_good",
+            "generation_id": "",
+            "validation_rank": 1,
+            "validation_rankable": "true",
+            "validation_bead_count": 8,
+            "evaluated_bead_count": 8,
+            "candidate_width_mean_px": 5.8,
+            "validation_width_mean_px": 4.2,
+            "width_excess_mean_px": 1.6,
+            "compactness_score": 0.58,
+            "support_area_ratio_mean": 1.5,
+            "support_compactness_score": 0.52,
+            "peak_contrast_mean": 0.56,
+            "ringing_penalty_mean": 0.05,
+            "bead_crop_path": "figures/c_good_bead_crops.png",
+        },
+        {
+            "source_kind": explorer.TRIO_LF_SOURCE_KIND,
+            "stage": "stage1",
+            "dataset_id": "d1",
+            "candidate_id": "c_bad",
+            "row_id": "c_bad",
+            "generation_id": "",
+            "validation_rank": 3,
+            "validation_rankable": "true",
+            "validation_bead_count": 8,
+            "evaluated_bead_count": 8,
+            "candidate_width_mean_px": 4.4,
+            "validation_width_mean_px": 4.2,
+            "width_excess_mean_px": 0.2,
+            "compactness_score": 0.94,
+            "support_area_ratio_mean": 1.1,
+            "support_compactness_score": 0.90,
+            "peak_contrast_mean": 0.78,
+            "ringing_penalty_mean": 0.04,
+            "bead_crop_path": "figures/c_bad_bead_crops.png",
         },
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -1183,6 +1257,41 @@ def test_export_metric_report_and_main(tmp_path):
     assert (cli_export / "candidate_metrics.csv").exists()
     assert (cli_export / "validation_refinement_seeds.json").exists()
     assert (output_dir / "metric_review" / explorer.TRIO_ORACLE_CACHE_FILENAME).exists()
+
+
+def test_bead_ranking_diagnostics_exports_proxy_oracle_disagreements(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    trio_dir = tmp_path / "trio_bead_diagnostics"
+    trio_csv = trio_dir / "trio_benchmark_results.csv"
+    _write_trio_results(trio_csv)
+    _write_bead_quality_results(trio_dir / "bead_quality_metrics.csv")
+
+    diagnostics_dir = tmp_path / "bead_report"
+    bead_diagnostics_main(
+        [
+            str(output_dir),
+            "--trio-results",
+            str(trio_csv),
+            "--proxy-profile",
+            "saved_original",
+            "--output-dir",
+            str(diagnostics_dir),
+        ]
+    )
+
+    disagreements_path = diagnostics_dir / "bead_disagreements.csv"
+    assert disagreements_path.exists()
+    with disagreements_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows
+    first = rows[0]
+    assert first["dataset_id"] == "d1"
+    assert first["oracle_candidate_id"] == "c_good"
+    assert first["proxy_candidate_id"] == "c_bad"
+    assert first["classification"] == "proxy_sharper_and_compacter"
+    assert float(first["proxy_compactness_score"]) > float(first["oracle_compactness_score"])
+    assert (diagnostics_dir / "bead_diagnostic_summary.json").exists()
+    assert (diagnostics_dir / "index.html").exists()
 
 
 def test_channel_comparison_figure_preserves_image_aspect_ratio(tmp_path):

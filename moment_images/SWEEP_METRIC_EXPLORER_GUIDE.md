@@ -467,8 +467,8 @@ When trio data is loaded, `candidate_metrics.csv` also includes
 `moment_images/trio_benchmark.py` is a separate headless post-processing tool
 for completed sweeps when processed Validation Camera and ThorCam images are
 available. It writes `trio_benchmark_results.csv`,
-`trio_benchmark_summary.json`, `trio_benchmark_report.html`, and `figures/`
-under its own output directory.
+`bead_quality_metrics.csv`, `trio_benchmark_summary.json`,
+`trio_benchmark_report.html`, and `figures/` under its own output directory.
 
 The trio benchmark records stable sweep identifiers and metric names, including
 `validation_hybrid_thorcam_fov_v1`, `validation_hybrid_v1`, and
@@ -504,6 +504,25 @@ for inspection, but oracle profiles treat those rows as missing for that
 dataset and exclude them from validation-refinement seeds. The explorer also
 derives `validation_hybrid_thorcam_fov_delta_vs_thorcam` for rankable LF rows
 when ThorCam baseline rows are present.
+
+### Bead-ranking diagnostics
+
+When a blind/image-only profile appears to beat the validation oracle by
+producing sharper, more compact bead centers, run the bead diagnostic helper
+against the same sweep and trio output:
+
+```bash
+python -m moment_images.bead_ranking_diagnostics path/to/sweep_output \
+  --trio-results path/to/trio_benchmark_results.csv \
+  --proxy-profile saved_original \
+  --output-dir path/to/bead_diagnostic_report
+```
+
+Replace `saved_original` with the image-only profile you want to audit. The
+helper compares it against `trio_oracle_thorcam_fov` by default, joins
+`bead_quality_metrics.csv`, and writes `bead_disagreements.csv`,
+`bead_diagnostic_summary.json`, and `index.html`. The report is diagnostic
+only; it does not change sweep rankings or validation scoring weights.
 
 For multi-scene registration and scoring calibration work,
 `moment_images/trio_benchmark_batch.py` runs a JSON manifest of trio scenes and
