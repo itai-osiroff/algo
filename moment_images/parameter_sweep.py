@@ -114,6 +114,14 @@ VALIDATION_ORACLE_PATH_KEYS = (
     "validation_workspace",
     "registration_annotations",
 )
+VALIDATION_ORACLE_REFERENCE_KEYS = (
+    "validation_workspace",
+    "validation_image",
+    "thorcam_image",
+)
+VALIDATION_ORACLE_GUI_OWNED_SCENE_KEYS = VALIDATION_ORACLE_REFERENCE_KEYS + (
+    "use_validation_workspace_transforms",
+)
 VALIDATION_ORACLE_GENERATED_ROOT_ARTIFACTS = (
     f"{VALIDATION_ORACLE_STAGE_NAME}_summary.json",
     "validation_leaderboard.json",
@@ -5714,6 +5722,32 @@ def _validation_oracle_spec(spec: SweepExperimentSpec) -> ValidationOracleSweepS
     )
 
 
+def _validation_oracle_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _validation_oracle_scene_has_workspace(scene: Mapping[str, object]) -> bool:
+    return bool(_validation_oracle_text(scene.get("validation_workspace")))
+
+
+def _validation_oracle_scene_has_image_pair(scene: Mapping[str, object]) -> bool:
+    return bool(_validation_oracle_text(scene.get("validation_image"))) and bool(
+        _validation_oracle_text(scene.get("thorcam_image"))
+    )
+
+
+def _strip_validation_oracle_gui_owned_scene_fields(
+    scene_payload: Mapping[str, object],
+) -> Dict[str, object]:
+    scene_entry = dict(scene_payload)
+    scene_entry.pop("strict", None)
+    for key in VALIDATION_ORACLE_GUI_OWNED_SCENE_KEYS:
+        scene_entry.pop(key, None)
+    return scene_entry
+
+
 def _validate_validation_oracle_scene_lookup(
     validation_spec: ValidationOracleSweepSpec,
     dataset_ids: Sequence[str],
@@ -5746,12 +5780,14 @@ def _validate_validation_oracle_scene_lookup(
     for dataset_id in dataset_ids:
         merged = dict(validation_spec.defaults)
         merged.update(scenes_by_dataset[dataset_id])
-        validation_image = str(merged.get("validation_image") or "").strip()
-        thorcam_image = str(merged.get("thorcam_image") or "").strip()
-        if not validation_image or not thorcam_image:
+        if not (
+            _validation_oracle_scene_has_workspace(merged)
+            or _validation_oracle_scene_has_image_pair(merged)
+        ):
             raise ValueError(
                 "validation_oracle_sweep scene for dataset "
-                f"{dataset_id!r} must provide validation_image and thorcam_image."
+                f"{dataset_id!r} must provide validation_workspace or both "
+                "validation_image and thorcam_image."
             )
         missing_paths = []
         for key in VALIDATION_ORACLE_PATH_KEYS:
@@ -5827,6 +5863,11 @@ def _benchmark_config_from_validation_scene(
     benchmark_payload.pop("strict", None)
     benchmark_payload.pop("id", None)
     benchmark_payload.setdefault("generation_scope", "Active")
+    if (
+        _validation_oracle_scene_has_workspace(benchmark_payload)
+        and "use_validation_workspace_transforms" not in benchmark_payload
+    ):
+        benchmark_payload["use_validation_workspace_transforms"] = True
     field_names = {item.name for item in fields(BenchmarkConfig)}
     unsupported = sorted(set(benchmark_payload) - field_names)
     if unsupported:
@@ -7552,6 +7593,7 @@ class SpecGuiDatasetState:
     dataset_id: str = ""
     source_type: str = "views"
     source_path: str = ""
+    validation_workspace_path: str = ""
     validation_image_path: str = ""
     thorcam_image_path: str = ""
     center_x: str = ""
@@ -8076,7 +8118,9 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
         defaults_payload.pop("strict", None)
         scene_overrides_by_dataset: Dict[str, Dict[str, object]] = {}
         for idx, scene_payload_raw in enumerate(scenes_payload, start=1):
-            scene_payload = dict(scene_payload_raw)
+            scene_payload = _strip_validation_oracle_gui_owned_scene_fields(
+                scene_payload_raw
+            )
             dataset_id = str(scene_payload.get("dataset_id") or "").strip()
             if not dataset_id:
                 raise ValueError(
@@ -8087,9 +8131,6 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
                 raise ValueError(
                     "Validation oracle scene overrides must have unique dataset_id values."
                 )
-            scene_payload.pop("strict", None)
-            scene_payload.pop("validation_image", None)
-            scene_payload.pop("thorcam_image", None)
             scene_overrides_by_dataset[dataset_id] = scene_payload
 
         scene_entries: List[Dict[str, object]] = []
@@ -8102,22 +8143,30 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             )
         for row in state.datasets:
             dataset_id = row.dataset_id.strip()
+            validation_workspace = row.validation_workspace_path.strip()
             validation_image = row.validation_image_path.strip()
             thorcam_image = row.thorcam_image_path.strip()
-            if not validation_image:
+            has_image_pair = bool(validation_image and thorcam_image)
+            has_partial_image_pair = bool(validation_image or thorcam_image) and not has_image_pair
+            if not validation_workspace and not has_image_pair:
                 raise ValueError(
-                    f"Dataset '{dataset_id}' validation image path is required "
+                    f"Dataset '{dataset_id}' validation workspace or "
+                    "validation/ThorCam image pair is required "
                     "when validation oracle is enabled."
                 )
-            if not thorcam_image:
+            if has_partial_image_pair and not validation_workspace:
                 raise ValueError(
-                    f"Dataset '{dataset_id}' ThorCam image path is required "
-                    "when validation oracle is enabled."
+                    f"Dataset '{dataset_id}' must provide both validation and "
+                    "ThorCam image paths when no validation workspace is set."
                 )
             scene_entry = dict(scene_overrides_by_dataset.get(dataset_id, {}))
             scene_entry["dataset_id"] = dataset_id
-            scene_entry["validation_image"] = validation_image
-            scene_entry["thorcam_image"] = thorcam_image
+            if validation_workspace:
+                scene_entry["validation_workspace"] = validation_workspace
+                scene_entry["use_validation_workspace_transforms"] = True
+            else:
+                scene_entry["validation_image"] = validation_image
+                scene_entry["thorcam_image"] = thorcam_image
             scene_entries.append(scene_entry)
         oracle_payload: Dict[str, object] = {
             "enabled": True,
@@ -8356,13 +8405,21 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
                 scene_payload = dict(scene_payload_raw)
                 dataset_id = str(scene_payload.get("dataset_id") or "").strip()
                 if dataset_id:
+                    validation_workspace = _validation_oracle_text(
+                        scene_payload.get("validation_workspace")
+                    )
                     validation_row_paths_by_dataset[dataset_id] = {
-                        "validation_image_path": str(scene_payload.get("validation_image") or ""),
-                        "thorcam_image_path": str(scene_payload.get("thorcam_image") or ""),
+                        "validation_workspace_path": validation_workspace,
+                        "validation_image_path": ""
+                        if validation_workspace
+                        else str(scene_payload.get("validation_image") or ""),
+                        "thorcam_image_path": ""
+                        if validation_workspace
+                        else str(scene_payload.get("thorcam_image") or ""),
                     }
-                scene_payload.pop("validation_image", None)
-                scene_payload.pop("thorcam_image", None)
-                scene_payload.pop("strict", None)
+                scene_payload = _strip_validation_oracle_gui_owned_scene_fields(
+                    scene_payload
+                )
                 if scene_payload:
                     advanced_scenes.append(scene_payload)
         state.validation_oracle_scenes_json = json.dumps(
@@ -8389,6 +8446,10 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
             dataset_id=str(entry.get("id") or entry.get("dataset_id") or ""),
             source_type=source_type,
             source_path=source_path,
+            validation_workspace_path=validation_row_paths_by_dataset.get(
+                str(entry.get("id") or entry.get("dataset_id") or ""),
+                {},
+            ).get("validation_workspace_path", ""),
             validation_image_path=validation_row_paths_by_dataset.get(
                 str(entry.get("id") or entry.get("dataset_id") or ""),
                 {},
@@ -8709,15 +8770,20 @@ def validate_state(state: SpecGuiState) -> List[str]:
             issues.append("Validation oracle sweep requires two_stage execution mode.")
         for idx, row in enumerate(state.datasets, start=1):
             prefix = f"Dataset row {idx}"
-            if not row.validation_image_path.strip():
+            validation_workspace = row.validation_workspace_path.strip()
+            validation_image = row.validation_image_path.strip()
+            thorcam_image = row.thorcam_image_path.strip()
+            has_image_pair = bool(validation_image and thorcam_image)
+            has_partial_image_pair = bool(validation_image or thorcam_image) and not has_image_pair
+            if not validation_workspace and not has_image_pair:
                 issues.append(
-                    f"{prefix}: validation image path is required when "
-                    "validation oracle is enabled."
+                    f"{prefix}: workspace or validation/ThorCam image pair "
+                    "is required when validation oracle is enabled."
                 )
-            if not row.thorcam_image_path.strip():
+            if has_partial_image_pair and not validation_workspace:
                 issues.append(
-                    f"{prefix}: ThorCam image path is required when "
-                    "validation oracle is enabled."
+                    f"{prefix}: both validation and ThorCam image paths are "
+                    "required when no validation workspace is set."
                 )
         try:
             if int(state.validation_oracle_top_k.strip()) < 1:
@@ -9451,6 +9517,7 @@ class SpecGuiApp:
         id_var = self.tk.StringVar(value=initial_state.dataset_id)
         source_type_var = self.tk.StringVar(value=initial_state.source_type)
         source_path_var = self.tk.StringVar(value=initial_state.source_path)
+        validation_workspace_var = self.tk.StringVar(value=initial_state.validation_workspace_path)
         validation_image_var = self.tk.StringVar(value=initial_state.validation_image_path)
         thorcam_image_var = self.tk.StringVar(value=initial_state.thorcam_image_path)
         center_x_var = self.tk.StringVar(value=initial_state.center_x)
@@ -9482,6 +9549,18 @@ class SpecGuiApp:
         )
         browse_btn.pack(side="left", padx=2)
         self._register_editable(browse_btn)
+
+        self.ttk.Label(row_frame, text="Workspace").pack(side="left")
+        workspace_entry = self.ttk.Entry(row_frame, textvariable=validation_workspace_var, width=24)
+        workspace_entry.pack(side="left", padx=2)
+        self._register_editable(workspace_entry)
+        workspace_browse_btn = self.ttk.Button(
+            row_frame,
+            text="Browse",
+            command=lambda sp=validation_workspace_var: self._browse_workspace_path(sp),
+        )
+        workspace_browse_btn.pack(side="left", padx=2)
+        self._register_editable(workspace_browse_btn)
 
         for label, var in [
             ("Validation", validation_image_var),
@@ -9527,6 +9606,7 @@ class SpecGuiApp:
                 "id_var": id_var,
                 "source_type_var": source_type_var,
                 "source_path_var": source_path_var,
+                "validation_workspace_var": validation_workspace_var,
                 "validation_image_var": validation_image_var,
                 "thorcam_image_var": thorcam_image_var,
                 "center_x_var": center_x_var,
@@ -9690,6 +9770,13 @@ class SpecGuiApp:
         if selected:
             path_var.set(selected)
 
+    def _browse_workspace_path(self, path_var: Any) -> None:
+        selected = self.filedialog.askopenfilename(
+            filetypes=[("Validation Workspace", "*.npz"), ("NPZ files", "*.npz")]
+        )
+        if selected:
+            path_var.set(selected)
+
     def _on_browse_output_dir(self) -> None:
         selected = self.filedialog.askdirectory()
         if selected:
@@ -9704,6 +9791,7 @@ class SpecGuiApp:
                     dataset_id=row["id_var"].get().strip(),
                     source_type=row["source_type_var"].get().strip(),
                     source_path=row["source_path_var"].get().strip(),
+                    validation_workspace_path=row["validation_workspace_var"].get().strip(),
                     validation_image_path=row["validation_image_var"].get().strip(),
                     thorcam_image_path=row["thorcam_image_var"].get().strip(),
                     center_x=row["center_x_var"].get().strip(),

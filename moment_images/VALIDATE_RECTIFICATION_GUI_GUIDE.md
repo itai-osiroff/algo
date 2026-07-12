@@ -312,6 +312,11 @@ The same command can read the processed references directly from a saved
 python -m moment_images.trio_benchmark --sweep-dir path/to/sweep_output --dataset-id scene_id --validation-workspace path/to/validation_workspace.npz --output-dir path/to/trio_report
 ```
 
+For validation-guided parameter sweeps, use the same saved workspace in the
+dataset row `Workspace` field of `python -m moment_images.parameter_sweep
+--gui`. The sweep spec will replay the saved validation/ThorCam transforms by
+default, avoiding a separate processed-image export step.
+
 The benchmark writes `trio_benchmark_results.csv`,
 `trio_benchmark_summary.json`, `trio_benchmark_report.html`, and a `figures/`
 folder. Results use the stable `validation_hybrid_v1` metric profile and

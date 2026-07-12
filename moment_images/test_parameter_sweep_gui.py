@@ -164,6 +164,62 @@ def test_state_to_spec_roundtrip_with_validation_oracle_sweep(tmp_path):
     assert "thorcam_image" not in scene_overrides[0]
 
 
+def test_state_to_spec_roundtrip_with_validation_oracle_workspace(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.validation_oracle_enabled = True
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    state.datasets[0].validation_workspace_path = str(validation_workspace)
+    state.datasets[0].validation_image_path = str(tmp_path / "validation_ignored.tif")
+    state.datasets[0].thorcam_image_path = str(tmp_path / "thorcam_ignored.tif")
+    state.validation_oracle_scenes_json = json.dumps(
+        [
+            {
+                "dataset_id": "dataset_a",
+                "scene_id": "scene_a",
+                "validation_workspace": str(tmp_path / "workspace_from_json.npz"),
+                "validation_image": str(tmp_path / "validation_from_json.tif"),
+                "thorcam_image": str(tmp_path / "thorcam_from_json.tif"),
+                "use_validation_workspace_transforms": False,
+                "anchor_row_id": "auto",
+            }
+        ]
+    )
+
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    scene = payload["validation_oracle_sweep"]["scenes"][0]
+    assert scene["dataset_id"] == "dataset_a"
+    assert scene["scene_id"] == "scene_a"
+    assert scene["validation_workspace"] == str(validation_workspace)
+    assert scene["use_validation_workspace_transforms"] is True
+    assert "validation_image" not in scene
+    assert "thorcam_image" not in scene
+    assert roundtrip.datasets[0].validation_workspace_path == str(validation_workspace)
+    assert roundtrip.datasets[0].validation_image_path == ""
+    assert roundtrip.datasets[0].thorcam_image_path == ""
+    scene_overrides = json.loads(roundtrip.validation_oracle_scenes_json)
+    assert scene_overrides[0]["scene_id"] == "scene_a"
+    assert scene_overrides[0]["anchor_row_id"] == "auto"
+    assert "validation_workspace" not in scene_overrides[0]
+    assert "validation_image" not in scene_overrides[0]
+    assert "thorcam_image" not in scene_overrides[0]
+    assert "use_validation_workspace_transforms" not in scene_overrides[0]
+
+
+def test_validate_state_accepts_validation_oracle_workspace_path(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.validation_oracle_enabled = True
+    state.datasets[0].validation_workspace_path = str(tmp_path / "validation_workspace.npz")
+    state.validation_oracle_defaults_json = "{}"
+    state.validation_oracle_scenes_json = "[]"
+
+    issues = validate_state(state)
+
+    assert not any("validation image" in issue.lower() for issue in issues)
+    assert not any("thorcam image" in issue.lower() for issue in issues)
+
+
 def test_validate_state_requires_validation_oracle_dataset_paths(tmp_path):
     state = _build_valid_state(tmp_path)
     state.validation_oracle_enabled = True
@@ -172,8 +228,7 @@ def test_validate_state_requires_validation_oracle_dataset_paths(tmp_path):
 
     issues = validate_state(state)
 
-    assert any("validation image" in issue.lower() for issue in issues)
-    assert any("thorcam image" in issue.lower() for issue in issues)
+    assert any("workspace or validation/ThorCam image pair" in issue for issue in issues)
 
 
 def test_new_metric_experiment_gui_state_defaults_to_independent_intensity(tmp_path):

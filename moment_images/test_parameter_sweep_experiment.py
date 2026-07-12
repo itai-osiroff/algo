@@ -2461,6 +2461,24 @@ def _install_fake_trio_runner(monkeypatch, *, rankable: bool = True):
                 "output_dir": str(config.output_dir),
                 "rankable": rankable,
                 "generation_scope": str(config.generation_scope),
+                "validation_workspace": (
+                    None
+                    if getattr(config, "validation_workspace", None) is None
+                    else str(config.validation_workspace)
+                ),
+                "validation_image": (
+                    None
+                    if getattr(config, "validation_image", None) is None
+                    else str(config.validation_image)
+                ),
+                "thorcam_image": (
+                    None
+                    if getattr(config, "thorcam_image", None) is None
+                    else str(config.thorcam_image)
+                ),
+                "use_validation_workspace_transforms": bool(
+                    getattr(config, "use_validation_workspace_transforms", False)
+                ),
             }
         )
         return SimpleNamespace(best_lf_row_id=None, rows=[], summary={})
@@ -2544,6 +2562,76 @@ def test_validation_oracle_sweep_records_missing_scene_failure(monkeypatch, tmp_
     assert manifest["validation_oracle_sweep"]["status"] == "failed"
     assert manifest["validation_oracle_sweep"]["failed_stage"] == "scene_validation"
     assert "d1" in manifest["validation_oracle_sweep"]["error"]
+
+
+def test_validation_oracle_sweep_accepts_workspace_only_scene(monkeypatch, tmp_path):
+    _install_window_score_artifact_runner(monkeypatch)
+    trio_calls = _install_fake_trio_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+    validation_workspace = tmp_path / "validation_workspace.npz"
+    validation_workspace.write_bytes(b"workspace")
+
+    spec = _validation_oracle_spec(
+        tmp_path,
+        views_path,
+        output_name="validation_workspace_only",
+    )
+    spec.validation_oracle_sweep.scenes = [
+        {
+            "dataset_id": "d1",
+            "scene_id": "scene_d1",
+            "validation_workspace": str(validation_workspace),
+        }
+    ]
+
+    out_dir = run_sweep_experiment(spec)
+
+    manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["validation_oracle_sweep"]["status"] == "completed"
+    assert [call["validation_workspace"] for call in trio_calls] == [
+        str(validation_workspace),
+        str(validation_workspace),
+    ]
+    assert {call["validation_image"] for call in trio_calls} == {None}
+    assert {call["thorcam_image"] for call in trio_calls} == {None}
+    assert {call["use_validation_workspace_transforms"] for call in trio_calls} == {True}
+
+
+def test_validation_oracle_sweep_reports_missing_workspace_file(monkeypatch, tmp_path):
+    _install_window_score_artifact_runner(monkeypatch)
+    monkeypatch.setattr(
+        parameter_sweep,
+        "run_benchmark",
+        lambda config: pytest.fail("invalid workspace scene must fail before benchmarking"),
+    )
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+    missing_workspace = tmp_path / "missing_validation_workspace.npz"
+
+    spec = _validation_oracle_spec(
+        tmp_path,
+        views_path,
+        output_name="validation_missing_workspace",
+    )
+    spec.validation_oracle_sweep.scenes = [
+        {
+            "dataset_id": "d1",
+            "validation_workspace": str(missing_workspace),
+            "use_validation_workspace_transforms": True,
+        }
+    ]
+
+    out_dir = run_sweep_experiment(spec)
+
+    manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
+    oracle_manifest = manifest["validation_oracle_sweep"]
+    assert oracle_manifest["status"] == "failed"
+    assert oracle_manifest["failed_stage"] == "scene_validation"
+    assert "d1" in oracle_manifest["error"]
+    assert str(missing_workspace) in oracle_manifest["error"]
 
 
 def test_validation_oracle_sweep_dry_run_reports_plan_without_artifacts(monkeypatch, tmp_path):
