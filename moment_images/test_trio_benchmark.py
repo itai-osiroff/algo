@@ -412,6 +412,49 @@ def test_validation_metrics_penalize_blur_and_center_errors():
     assert sharp_metrics.metrics["validation_bead"] > shifted_metrics.metrics["validation_bead"]
 
 
+def test_validation_bead_local_ncc_allows_tiny_residual_shift_only():
+    validation = _synthetic_beads()
+    aligned = validation.copy()
+    shifted_one_px = cv.warpAffine(
+        validation,
+        np.array([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        validation.shape[::-1],
+        flags=cv.INTER_LINEAR,
+    )
+    shifted_five_px = cv.warpAffine(
+        validation,
+        np.array([[1.0, 0.0, 5.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        validation.shape[::-1],
+        flags=cv.INTER_LINEAR,
+    )
+
+    aligned_metrics = compute_validation_metrics(validation, aligned)
+    shifted_one_metrics = compute_validation_metrics(validation, shifted_one_px)
+    shifted_five_metrics = compute_validation_metrics(validation, shifted_five_px)
+
+    assert aligned_metrics.metrics["validation_bead"] == pytest.approx(1.0, abs=1e-6)
+    assert shifted_one_metrics.metrics["validation_bead"] > 0.98
+    assert (
+        shifted_five_metrics.metrics["validation_bead"]
+        < shifted_one_metrics.metrics["validation_bead"] - 0.20
+    )
+
+
+def test_validation_bead_score_does_not_depend_on_candidate_bead_detection(monkeypatch):
+    validation = _synthetic_beads()
+    candidate = validation.copy()
+    reference_cache = trio_benchmark._prepare_validation_metric_reference(validation)
+
+    def fail_candidate_detection(_image):
+        raise AssertionError("candidate bead detection should not be used for validation_bead")
+
+    monkeypatch.setattr(trio_benchmark, "_detect_bead_centers", fail_candidate_detection)
+
+    metrics = compute_validation_metrics(validation, candidate, reference_cache=reference_cache)
+
+    assert metrics.metrics["validation_bead"] == pytest.approx(1.0, abs=1e-6)
+
+
 def test_validation_metrics_rank_on_common_fov_not_zero_filled_borders():
     validation = _synthetic_beads()
     validation[120:150, 120:150] = 1.0
