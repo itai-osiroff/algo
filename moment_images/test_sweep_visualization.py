@@ -678,6 +678,52 @@ def test_load_sweep_visualization_model_supports_validation_phase_as_non_primary
     assert any(record.stage == "validation_phase" for record in model.run_metric_records)
 
 
+def test_load_sweep_visualization_model_prefers_validation_phase_for_skip_mode(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        include_validation_phase=True,
+    )
+    manifest_path = output_dir / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["validation_oracle_sweep"] = {
+        "enabled": True,
+        "status": "completed",
+        "skip_image_metric_stage": True,
+    }
+    _write_json(manifest_path, manifest)
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.mode == "spec_validation_guided"
+    assert model.primary_stage_name == "validation_phase"
+    assert model.stage_order == ["stage1", "validation_phase"]
+
+
+def test_load_sweep_visualization_model_ignores_stale_stage2_for_skip_mode(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_validation_phase=True,
+    )
+    manifest_path = output_dir / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["validation_oracle_sweep"] = {
+        "enabled": True,
+        "status": "completed",
+        "skip_image_metric_stage": True,
+    }
+    _write_json(manifest_path, manifest)
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.mode == "spec_validation_guided"
+    assert model.primary_stage_name == "validation_phase"
+    assert model.stage_order == ["stage1", "validation_phase"]
+    assert "stage2" not in model.stages
+    assert any("Ignored stale stage2 artifacts" in warning for warning in model.warnings)
+
+
 def test_load_sweep_visualization_model_ignores_failed_validation_oracle_without_summary(tmp_path):
     output_dir = _create_modern_fixture(
         tmp_path,

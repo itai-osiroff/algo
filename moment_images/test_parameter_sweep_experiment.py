@@ -2704,6 +2704,149 @@ def test_validation_oracle_sweep_uses_oracle_rankings_for_validation_phase(monke
     assert {call["generation_scope"] for call in trio_calls} == {"Active"}
 
 
+def test_validation_oracle_skip_image_metric_stage_promotes_validation_rankings(monkeypatch, tmp_path):
+    runner_calls = _install_window_score_artifact_runner(monkeypatch)
+    trio_calls = _install_fake_trio_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = _validation_oracle_spec(
+        tmp_path,
+        views_path,
+        output_name="validation_skip_image_stage",
+    )
+    spec.validation_oracle_sweep.skip_image_metric_stage = True
+
+    out_dir = run_sweep_experiment(spec)
+
+    assert not (out_dir / "stage2_summary.json").exists()
+    assert not (out_dir / "runs" / "stage2").exists()
+    assert {call["stage"] for call in runner_calls} == {"stage1"}
+    assert [call["stage"] for call in trio_calls] == ["stage1", "validation_phase"]
+
+    validation_summary = json.loads(
+        (out_dir / "validation_phase_summary.json").read_text(encoding="utf-8")
+    )
+    root_leaderboard = json.loads((out_dir / "leaderboard.json").read_text(encoding="utf-8"))
+    root_best = json.loads((out_dir / "best_configs.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
+
+    assert validation_summary["stage"] == "validation_phase"
+    assert root_leaderboard == validation_summary["rankings"]
+    assert int(root_leaderboard[0]["params"]["similarity_window_size"]) == 1
+    assert int(root_best["overall_best"]["params"]["similarity_window_size"]) == 1
+    assert manifest["validation_oracle_sweep"]["status"] == "completed"
+    assert manifest["validation_oracle_sweep"]["skip_image_metric_stage"] is True
+
+
+def test_validation_oracle_skip_image_metric_stage_archives_stale_stage2(monkeypatch, tmp_path):
+    _install_window_score_artifact_runner(monkeypatch)
+    _install_fake_trio_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = _validation_oracle_spec(
+        tmp_path,
+        views_path,
+        output_name="validation_skip_image_stage_stale",
+    )
+    spec.validation_oracle_sweep.skip_image_metric_stage = True
+    out_dir = Path(spec.output_dir)
+    stale_run_dir = out_dir / "runs" / "stage2" / "s2c9999" / "d1"
+    stale_run_dir.mkdir(parents=True)
+    (stale_run_dir / "metric_record.json").write_text("{}", encoding="utf-8")
+    (out_dir / "stage2_summary.json").parent.mkdir(parents=True, exist_ok=True)
+    (out_dir / "stage2_summary.json").write_text(
+        json.dumps({"stage": "stage2", "rankings": []}),
+        encoding="utf-8",
+    )
+
+    run_sweep_experiment(spec)
+
+    assert not (out_dir / "stage2_summary.json").exists()
+    assert not (out_dir / "runs" / "stage2").exists()
+    inactive_root = next((out_dir / "generations").glob("*/inactive_artifacts/stage2"))
+    manifest = json.loads((inactive_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["reason"] == "validation_oracle_skip_image_metric_stage"
+    assert (inactive_root / "stage2_summary.json").exists()
+    assert (inactive_root / "runs" / "stage2" / "s2c9999" / "d1" / "metric_record.json").exists()
+    products_dir = next((out_dir / "generations").glob("*/products"))
+    assert not (products_dir / "stage2_summary.json").exists()
+    assert not (products_dir / "runs" / "stage2").exists()
+
+
+def test_validation_oracle_skip_image_metric_stage_dry_run_preserves_stale_stage2(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: pytest.fail("dry run must not execute tasks"),
+    )
+    monkeypatch.setattr(
+        parameter_sweep,
+        "run_benchmark",
+        lambda config: pytest.fail("dry run must not run trio benchmarks"),
+    )
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = _validation_oracle_spec(
+        tmp_path,
+        views_path,
+        output_name="validation_skip_image_stage_dry_run_stale",
+    )
+    spec.validation_oracle_sweep.skip_image_metric_stage = True
+    out_dir = Path(spec.output_dir)
+    stale_run_dir = out_dir / "runs" / "stage2" / "s2c9999" / "d1"
+    stale_run_dir.mkdir(parents=True)
+    (stale_run_dir / "metric_record.json").write_text("{}", encoding="utf-8")
+    (out_dir / "stage2_summary.json").parent.mkdir(parents=True, exist_ok=True)
+    (out_dir / "stage2_summary.json").write_text(
+        json.dumps({"stage": "stage2", "rankings": []}),
+        encoding="utf-8",
+    )
+
+    run_sweep_experiment(spec, dry_run=True)
+
+    assert (out_dir / "stage2_summary.json").exists()
+    assert (out_dir / "runs" / "stage2" / "s2c9999" / "d1" / "metric_record.json").exists()
+    assert not list((out_dir / "generations").glob("*/inactive_artifacts/stage2"))
+
+
+def test_validation_oracle_skip_image_metric_stage_dry_run_omits_stage2(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: pytest.fail("dry run must not execute tasks"),
+    )
+    monkeypatch.setattr(
+        parameter_sweep,
+        "run_benchmark",
+        lambda config: pytest.fail("dry run must not run trio benchmarks"),
+    )
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = _validation_oracle_spec(
+        tmp_path,
+        views_path,
+        output_name="validation_skip_image_stage_dry_run",
+    )
+    spec.validation_oracle_sweep.skip_image_metric_stage = True
+    out_dir = run_sweep_experiment(spec, dry_run=True)
+
+    dry_run_path = next((out_dir / "generations").glob("*/dry_run.json"))
+    dry_run_payload = json.loads(dry_run_path.read_text(encoding="utf-8"))
+
+    assert set(dry_run_payload["stages"]) == {"stage1"}
+    assert dry_run_payload["validation_oracle_sweep"]["skip_image_metric_stage"] is True
+    assert dry_run_payload["validation_oracle_sweep"]["estimated_validation_phase_runs"] == 2
+    assert dry_run_payload["totals"]["planned_run_count"] == 5
+
+
 def test_validation_oracle_sweep_honors_explicit_generation_scope(monkeypatch, tmp_path):
     _install_window_score_artifact_runner(monkeypatch)
     trio_calls = _install_fake_trio_runner(monkeypatch)

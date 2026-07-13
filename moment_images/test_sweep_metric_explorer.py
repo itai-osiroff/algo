@@ -540,6 +540,62 @@ def test_load_sweep_metric_explorer_model_recomputes_metrics_and_profiles(tmp_pa
     assert good_d1.metrics["tamura_gradient_avg"] > bad_d2.metrics["tamura_gradient_avg"]
 
 
+def test_load_sweep_metric_explorer_model_defaults_to_validation_phase_for_skip_mode(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    manifest_path = output_dir / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["stages"] = {"mode": "two_stage", "top_k": 2}
+    manifest["validation_oracle_sweep"] = {
+        "enabled": True,
+        "status": "completed",
+        "skip_image_metric_stage": True,
+    }
+    _write_json(manifest_path, manifest)
+    validation_ranking = {
+        "candidate_id": "v_good",
+        "strategy": "combined",
+        "config": {
+            "strategy": "combined",
+            "displacement_metric_family": "intensity",
+            "displacement_alpha": 1.0,
+            "metric_formulation_id": "intensity_default",
+            "max_displacement": 4,
+            "gauss_sigma": 3.0,
+        },
+        "params": {"max_displacement": 4, "gauss_sigma": 3.0},
+        "score": 0.97,
+        "mean_dataset_score": 0.97,
+        "std_dataset_score": 0.0,
+        "missing_datasets": [],
+        "dataset_scores": {"d1": 0.97, "d2": 0.96},
+        "runtime_seconds": {"d1": 1.0, "d2": 1.0},
+        "dataset_metrics": {
+            "d1": {"laplacian_variance": 97.0},
+            "d2": {"laplacian_variance": 96.0},
+        },
+        "rank": 1,
+        "stage": "validation_phase",
+    }
+    _write_json(
+        output_dir / "validation_phase_summary.json",
+        {
+            "stage": "validation_phase",
+            "num_runs": 1,
+            "num_successful": 1,
+            "num_failed": 0,
+            "rankings": [validation_ranking],
+            "failed_runs": [],
+            "runs": [],
+            "execution": {"selected_workers": 1, "requested_workers": 1},
+        },
+    )
+
+    model = load_sweep_metric_explorer_model(output_dir)
+
+    assert model.base_model.mode == "spec_validation_guided"
+    assert model.base_model.primary_stage_name == "validation_phase"
+
+
 def test_metric_explorer_model_keeps_reused_metric_stage_records_public(tmp_path):
     output_dir = _make_modern_fixture(tmp_path)
     metric_dir = output_dir / "metric_experiments"

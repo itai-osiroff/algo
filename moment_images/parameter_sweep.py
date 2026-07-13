@@ -106,6 +106,12 @@ METRIC_CANDIDATE_SOURCES = {
 }
 METRIC_SEARCH_STAGE1_NAME = "metric_stage1"
 METRIC_PHASE_STAGE_NAME = "metric_phase"
+VALIDATION_ORACLE_WORKFLOW_NORMAL = "normal_validation"
+VALIDATION_ORACLE_WORKFLOW_SKIP_IMAGE_STAGE = "validation_guided_refinement"
+VALIDATION_ORACLE_WORKFLOW_MODES = {
+    VALIDATION_ORACLE_WORKFLOW_NORMAL,
+    VALIDATION_ORACLE_WORKFLOW_SKIP_IMAGE_STAGE,
+}
 VALIDATION_ORACLE_STAGE_NAME = "validation_phase"
 VALIDATION_ORACLE_DIR_NAME = "validation_oracle"
 VALIDATION_ORACLE_PATH_KEYS = (
@@ -662,6 +668,7 @@ class ValidationOracleSweepSpec:
     enabled: bool = False
     top_k: int = 8
     budget_per_dataset: Optional[int] = None
+    skip_image_metric_stage: bool = False
     scenes: List[Dict[str, object]] = field(default_factory=list)
     defaults: Dict[str, object] = field(default_factory=dict)
 
@@ -706,6 +713,7 @@ class ValidationOracleSweepSpec:
                 if payload.get("budget_per_dataset") is None
                 else int(cast(object, payload.get("budget_per_dataset")))
             ),
+            skip_image_metric_stage=bool(payload.get("skip_image_metric_stage", False)),
             scenes=cast(List[Dict[str, object]], payload.get("scenes", [])),
             defaults=cast(Dict[str, object], payload.get("defaults", {})),
         )
@@ -798,14 +806,20 @@ class SweepExperimentSpec:
                 cast(Dict[str, object], validation),
                 default_top_k=stage_top_k,
             )
-        if validation.enabled and self.stages.mode != "two_stage":
+        if (
+            validation.enabled
+            and self.stages.mode != "two_stage"
+            and not validation.skip_image_metric_stage
+        ):
             raise ValueError(
-                "validation_oracle_sweep requires stages.mode='two_stage' in this version."
+                "validation_oracle_sweep requires stages.mode='two_stage' unless "
+                "validation_oracle_sweep.skip_image_metric_stage is enabled."
             )
         self.validation_oracle_sweep = ValidationOracleSweepSpec(
             enabled=bool(validation.enabled),
             top_k=int(validation.top_k),
             budget_per_dataset=validation.budget_per_dataset,
+            skip_image_metric_stage=bool(validation.skip_image_metric_stage),
             scenes=[dict(scene) for scene in validation.scenes],
             defaults=dict(validation.defaults),
         )
@@ -2611,6 +2625,7 @@ def _normalize_validation_oracle_fingerprint_defaults(
 
     oracle = dict(oracle_raw)
     oracle.pop("strict", None)
+    oracle.setdefault("skip_image_metric_stage", False)
     defaults_raw = oracle.get("defaults")
     if isinstance(defaults_raw, dict):
         defaults = dict(defaults_raw)
@@ -5278,6 +5293,8 @@ def _build_count_only_sweep_run_preview(
     dataset_count = len(spec.datasets)
     stage_mode = spec.stages.mode
     stage1_budget, stage2_budget = _stage_budgets(spec.stages)
+    validation_spec = _validation_oracle_spec(spec)
+    skip_image_metric_stage = _skip_image_metric_stage_for_validation(validation_spec)
     baseline_budget = (
         stage1_budget
         if stage_mode == "two_stage"
@@ -5295,7 +5312,7 @@ def _build_count_only_sweep_run_preview(
         "stage1": _count_only_stage_payload(len(coarse_candidates) * dataset_count)
     }
     refined_lookup: Dict[str, SweepCandidate] = {}
-    if stage_mode == "two_stage":
+    if stage_mode == "two_stage" and not skip_image_metric_stage:
         stages_payload["stage2"] = _count_only_stage_payload(
             max(1, int(stage2_budget)) * dataset_count,
             status="estimated_requires_stage1_rankings",
@@ -5326,7 +5343,6 @@ def _build_count_only_sweep_run_preview(
             baseline_candidate_lookup=baseline_candidate_lookup,
             dataset_count=dataset_count,
         )
-    validation_spec = _validation_oracle_spec(spec)
     validation_phase_budget = _validation_oracle_phase_budget(validation_spec, stage2_budget)
     validation_payload = _validation_oracle_dry_run_payload(
         validation_spec=validation_spec,
@@ -5473,6 +5489,7 @@ def build_sweep_run_preview(
 
     stage_mode = spec.stages.mode
     stage1_budget, stage2_budget = _stage_budgets(spec.stages)
+    skip_image_metric_stage = _skip_image_metric_stage_for_validation(validation_spec)
     baseline_budget = (
         stage1_budget
         if stage_mode == "two_stage"
@@ -5515,7 +5532,7 @@ def build_sweep_run_preview(
 
     refined_lookup: Dict[str, SweepCandidate] = {}
     stage2_rankings: List[Dict[str, object]] = []
-    if stage_mode == "two_stage":
+    if stage_mode == "two_stage" and not skip_image_metric_stage:
         refined_candidates = generate_refined_candidates(
             ranked_candidates=stage1_rankings,
             candidate_lookup=coarse_lookup,
@@ -5722,6 +5739,10 @@ def _validation_oracle_spec(spec: SweepExperimentSpec) -> ValidationOracleSweepS
     )
 
 
+def _skip_image_metric_stage_for_validation(validation_spec: ValidationOracleSweepSpec) -> bool:
+    return bool(validation_spec.enabled and validation_spec.skip_image_metric_stage)
+
+
 def _validation_oracle_text(value: object) -> str:
     if value is None:
         return ""
@@ -5835,6 +5856,7 @@ def _validation_oracle_dry_run_payload(
         "score_metric": TRIO_PRIMARY_SCORE,
         "top_k": int(validation_spec.top_k),
         "budget_per_dataset": int(validation_phase_budget),
+        "skip_image_metric_stage": bool(validation_spec.skip_image_metric_stage),
         "num_scenes": len(dataset_ids),
         "num_stage1_benchmarks": len(dataset_ids),
         "estimated_validation_phase_runs": int(validation_phase_budget * len(dataset_ids)),
@@ -6138,6 +6160,53 @@ def _write_validation_phase_artifacts(
     )
 
 
+def _metric_records_from_stage_results(
+    stage_results: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    return [
+        cast(Dict[str, object], stage_result["metric_record"])
+        for stage_result in stage_results
+        if stage_result.get("status") == "ok" and "metric_record" in stage_result
+    ]
+
+
+def _write_root_ranked_outputs(
+    *,
+    output_dir: Path,
+    rankings: Sequence[Dict[str, object]],
+    metric_records: Sequence[Dict[str, object]],
+    analyze: bool,
+) -> None:
+    write_json_atomic(
+        output_dir / "leaderboard.json",
+        list(rankings),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+    _write_leaderboard_csv(rankings, output_dir / "leaderboard.csv")
+
+    write_json_atomic(
+        output_dir / "best_configs.json",
+        _best_configs_payload(rankings),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+
+    write_json_atomic(
+        output_dir / "summary.json",
+        list(metric_records),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+
+    if analyze and metric_records:
+        analysis = analyze_summary_data(metric_records)
+        save_analysis(analysis, output_dir / "analysis.json")
+
+
 def _remove_path_and_backup(path: Path) -> None:
     for candidate in (path, Path(f"{path}.bak")):
         try:
@@ -6164,6 +6233,7 @@ def _validation_oracle_manifest_base(
         "score_metric": TRIO_PRIMARY_SCORE,
         "top_k": int(validation_spec.top_k),
         "budget_per_dataset": int(validation_phase_budget),
+        "skip_image_metric_stage": bool(validation_spec.skip_image_metric_stage),
     }
 
 
@@ -6352,6 +6422,9 @@ def _run_validation_oracle_workflow(
                 "num_ranked": len(validation_phase_rankings),
                 "stage1": stage1_trio_manifest,
                 "validation_phase": validation_trio_manifest,
+                "validation_phase_results": list(validation_phase_results),
+                "validation_phase_rankings": list(validation_phase_rankings),
+                "validation_phase_execution": validation_eval.execution,
             }
         )
     except Exception as exc:  # noqa: BLE001 - validation oracle is advisory.
@@ -6564,6 +6637,47 @@ def _snapshot_generation_products(output_dir: Path, generation_id: str) -> Path:
     return products_dir
 
 
+def _archive_validation_skip_stage2_artifacts(output_dir: Path, generation_id: str) -> None:
+    archive_root = _generation_dir(output_dir, generation_id) / "inactive_artifacts" / "stage2"
+    moved: List[Dict[str, str]] = []
+
+    def move_if_exists(source: Path, relative_destination: Path) -> None:
+        if not source.exists():
+            return
+        destination = archive_root / relative_destination
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            destination = destination.with_name(
+                f"{destination.name}.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+            )
+        shutil.move(str(source), str(destination))
+        moved.append(
+            {
+                "source": str(source),
+                "destination": str(destination),
+            }
+        )
+
+    move_if_exists(output_dir / "stage2_summary.json", Path("stage2_summary.json"))
+    move_if_exists(output_dir / "stage2_summary.json.bak", Path("stage2_summary.json.bak"))
+    move_if_exists(output_dir / "runs" / "stage2", Path("runs") / "stage2")
+
+    if not moved:
+        return
+    write_json_atomic(
+        archive_root / "manifest.json",
+        {
+            "generated_at": _utc_now_iso(),
+            "reason": "validation_oracle_skip_image_metric_stage",
+            "generation_id": generation_id,
+            "moved": moved,
+        },
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+
+
 def run_sweep_experiment(
     spec: SweepExperimentSpec,
     output_dir: Optional[Path] = None,
@@ -6634,6 +6748,9 @@ def run_sweep_experiment(
 
     stage_mode = spec.stages.mode
     stage1_budget, stage2_budget = _stage_budgets(spec.stages)
+    skip_image_metric_stage = _skip_image_metric_stage_for_validation(validation_spec)
+    if skip_image_metric_stage and not dry_run:
+        _archive_validation_skip_stage2_artifacts(resolved_output_dir, generation_id)
     baseline_budget = (
         stage1_budget
         if stage_mode == "two_stage"
@@ -6688,7 +6805,7 @@ def run_sweep_experiment(
     refined_lookup: Dict[str, SweepCandidate] = {}
     stage2_results: List[Dict[str, object]] = []
     stage2_rankings: List[Dict[str, object]] = []
-    if stage_mode == "two_stage":
+    if stage_mode == "two_stage" and not skip_image_metric_stage:
         refined_candidates = generate_refined_candidates(
             ranked_candidates=stage1_rankings,
             candidate_lookup=coarse_lookup,
@@ -6856,39 +6973,15 @@ def run_sweep_experiment(
         return resolved_output_dir
 
     final_rankings = stage2_rankings if stage2_rankings else stage1_rankings
-
-    write_json_atomic(
-        resolved_output_dir / "leaderboard.json",
-        final_rankings,
-        indent=2,
-        sort_keys=False,
-        create_backup=True,
+    all_metric_records: List[Dict[str, object]] = _metric_records_from_stage_results(
+        stage1_results + stage2_results
     )
-    _write_leaderboard_csv(final_rankings, resolved_output_dir / "leaderboard.csv")
-
-    write_json_atomic(
-        resolved_output_dir / "best_configs.json",
-        _best_configs_payload(final_rankings),
-        indent=2,
-        sort_keys=False,
-        create_backup=True,
+    _write_root_ranked_outputs(
+        output_dir=resolved_output_dir,
+        rankings=final_rankings,
+        metric_records=all_metric_records,
+        analyze=spec.analyze,
     )
-
-    all_metric_records: List[Dict[str, object]] = []
-    for stage_result in (stage1_results + stage2_results):
-        if stage_result.get("status") == "ok":
-            all_metric_records.append(cast(Dict[str, object], stage_result["metric_record"]))
-    write_json_atomic(
-        resolved_output_dir / "summary.json",
-        all_metric_records,
-        indent=2,
-        sort_keys=False,
-        create_backup=True,
-    )
-
-    if spec.analyze and all_metric_records:
-        analysis = analyze_summary_data(all_metric_records)
-        save_analysis(analysis, resolved_output_dir / "analysis.json")
 
     metric_phase_manifest: Dict[str, object] = {
         "enabled": bool(spec.experimental_metric_sweep and spec.experimental_metric_sweep.enabled),
@@ -6991,6 +7084,33 @@ def run_sweep_experiment(
             merge_sources=merge_sources,
             merge_log=merge_log,
         )
+        if (
+            skip_image_metric_stage
+            and validation_oracle_manifest.get("status") == "completed"
+        ):
+            validation_rankings = [
+                cast(Dict[str, object], item)
+                for item in cast(
+                    Sequence[object],
+                    validation_oracle_manifest.get("validation_phase_rankings", []),
+                )
+                if isinstance(item, dict)
+            ]
+            validation_results = [
+                cast(Dict[str, object], item)
+                for item in cast(
+                    Sequence[object],
+                    validation_oracle_manifest.get("validation_phase_results", []),
+                )
+                if isinstance(item, dict)
+            ]
+            validation_metric_records = _metric_records_from_stage_results(validation_results)
+            _write_root_ranked_outputs(
+                output_dir=resolved_output_dir,
+                rankings=validation_rankings,
+                metric_records=validation_metric_records,
+                analyze=spec.analyze,
+            )
 
     write_json_atomic(
         resolved_output_dir / "experiment_manifest.json",
@@ -7688,6 +7808,8 @@ class SpecGuiState:
     validation_oracle_enabled: bool = False
     validation_oracle_top_k: str = "8"
     validation_oracle_budget_per_dataset: str = ""
+    validation_oracle_skip_image_metric_stage: bool = False
+    validation_oracle_workflow_mode: str = VALIDATION_ORACLE_WORKFLOW_NORMAL
     validation_oracle_defaults_json: str = "{}"
     validation_oracle_scenes_json: str = "[]"
     datasets: List[SpecGuiDatasetState] = field(
@@ -7884,6 +8006,23 @@ def _state_relocation_rules(state: SpecGuiState) -> List[PathRelocationRule]:
             )
         raw_rules.append(f"{old_root}={new_root}")
     return _parse_path_relocation_rules(raw_rules)
+
+
+def _validation_oracle_workflow_mode_for_skip(skip_image_metric_stage: bool) -> str:
+    return (
+        VALIDATION_ORACLE_WORKFLOW_SKIP_IMAGE_STAGE
+        if skip_image_metric_stage
+        else VALIDATION_ORACLE_WORKFLOW_NORMAL
+    )
+
+
+def _validation_oracle_skip_image_stage_from_state(state: SpecGuiState) -> bool:
+    workflow_mode = str(state.validation_oracle_workflow_mode or "").strip()
+    if workflow_mode == VALIDATION_ORACLE_WORKFLOW_SKIP_IMAGE_STAGE:
+        return True
+    if workflow_mode == VALIDATION_ORACLE_WORKFLOW_NORMAL:
+        return bool(state.validation_oracle_skip_image_metric_stage)
+    return bool(state.validation_oracle_skip_image_metric_stage)
 
 
 def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
@@ -8171,6 +8310,7 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
         oracle_payload: Dict[str, object] = {
             "enabled": True,
             "top_k": int(state.validation_oracle_top_k.strip()),
+            "skip_image_metric_stage": _validation_oracle_skip_image_stage_from_state(state),
             "defaults": defaults_payload,
             "scenes": scene_entries,
         }
@@ -8391,6 +8531,12 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
             if validation_payload.get("budget_per_dataset") is None
             else str(validation_payload.get("budget_per_dataset"))
         )
+        state.validation_oracle_skip_image_metric_stage = bool(
+            validation_payload.get("skip_image_metric_stage", False)
+        )
+        state.validation_oracle_workflow_mode = _validation_oracle_workflow_mode_for_skip(
+            state.validation_oracle_skip_image_metric_stage
+        )
         defaults_payload = validation_payload.get("defaults", {})
         scenes_payload = validation_payload.get("scenes", [])
         state.validation_oracle_defaults_json = json.dumps(
@@ -8428,6 +8574,8 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         )
     else:
         state.validation_oracle_enabled = False
+        state.validation_oracle_skip_image_metric_stage = False
+        state.validation_oracle_workflow_mode = VALIDATION_ORACLE_WORKFLOW_NORMAL
 
     datasets_payload = cast(List[Dict[str, object]], payload.get("datasets", []))
     datasets: List[SpecGuiDatasetState] = []
@@ -8766,8 +8914,14 @@ def validate_state(state: SpecGuiState) -> List[str]:
             issues.append("Metric experiment formulation IDs must be unique.")
 
     if state.validation_oracle_enabled:
-        if stage_mode != "two_stage":
-            issues.append("Validation oracle sweep requires two_stage execution mode.")
+        if (
+            stage_mode != "two_stage"
+            and not _validation_oracle_skip_image_stage_from_state(state)
+        ):
+            issues.append(
+                "Validation oracle sweep requires two_stage execution mode unless "
+                "skip image-metric stage2 is enabled."
+            )
         for idx, row in enumerate(state.datasets, start=1):
             prefix = f"Dataset row {idx}"
             validation_workspace = row.validation_workspace_path.strip()
@@ -9349,6 +9503,28 @@ class SpecGuiApp:
         self.validation_oracle_budget_entry.pack(side="left", padx=2)
         self._register_editable(self.validation_oracle_budget_entry)
 
+        validation_workflow_frame = self.ttk.Frame(validation_container)
+        validation_workflow_frame.pack(fill="x", padx=8, pady=(2, 4))
+        self.validation_oracle_workflow_var = self.tk.StringVar(
+            value=VALIDATION_ORACLE_WORKFLOW_NORMAL
+        )
+        normal_workflow_radio = self.ttk.Radiobutton(
+            validation_workflow_frame,
+            text="Normal validation: run image-metric stage2, then validate",
+            variable=self.validation_oracle_workflow_var,
+            value=VALIDATION_ORACLE_WORKFLOW_NORMAL,
+        )
+        normal_workflow_radio.pack(anchor="w", pady=1)
+        self._register_editable(normal_workflow_radio)
+        skip_workflow_radio = self.ttk.Radiobutton(
+            validation_workflow_frame,
+            text="Validation-guided refinement: skip image-metric stage2",
+            variable=self.validation_oracle_workflow_var,
+            value=VALIDATION_ORACLE_WORKFLOW_SKIP_IMAGE_STAGE,
+        )
+        skip_workflow_radio.pack(anchor="w", pady=1)
+        self._register_editable(skip_workflow_radio)
+
         self.ttk.Label(validation_container, text="Defaults JSON").pack(anchor="w", padx=8)
         self.validation_oracle_defaults_text = self.tk.Text(
             validation_container,
@@ -9883,6 +10059,15 @@ class SpecGuiApp:
             validation_oracle_enabled=bool(self.validation_oracle_enabled_var.get()),
             validation_oracle_top_k=self.validation_oracle_top_k_entry.get().strip(),
             validation_oracle_budget_per_dataset=self.validation_oracle_budget_entry.get().strip(),
+            validation_oracle_skip_image_metric_stage=(
+                self.validation_oracle_workflow_var.get()
+                == VALIDATION_ORACLE_WORKFLOW_SKIP_IMAGE_STAGE
+            ),
+            validation_oracle_workflow_mode=(
+                self.validation_oracle_workflow_var.get()
+                if self.validation_oracle_workflow_var.get() in VALIDATION_ORACLE_WORKFLOW_MODES
+                else VALIDATION_ORACLE_WORKFLOW_NORMAL
+            ),
             validation_oracle_defaults_json=self.validation_oracle_defaults_text.get(
                 "1.0",
                 self.tk.END,
@@ -9930,6 +10115,12 @@ class SpecGuiApp:
         self.validation_oracle_top_k_entry.insert(0, state.validation_oracle_top_k)
         self.validation_oracle_budget_entry.delete(0, self.tk.END)
         self.validation_oracle_budget_entry.insert(0, state.validation_oracle_budget_per_dataset)
+        workflow_mode = state.validation_oracle_workflow_mode
+        if workflow_mode not in VALIDATION_ORACLE_WORKFLOW_MODES:
+            workflow_mode = _validation_oracle_workflow_mode_for_skip(
+                state.validation_oracle_skip_image_metric_stage
+            )
+        self.validation_oracle_workflow_var.set(workflow_mode)
         self.validation_oracle_defaults_text.delete("1.0", self.tk.END)
         self.validation_oracle_defaults_text.insert(
             self.tk.END,

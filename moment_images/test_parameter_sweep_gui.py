@@ -207,6 +207,41 @@ def test_state_to_spec_roundtrip_with_validation_oracle_workspace(tmp_path):
     assert "use_validation_workspace_transforms" not in scene_overrides[0]
 
 
+def test_state_to_spec_roundtrip_with_validation_oracle_skip_image_stage(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.validation_oracle_enabled = True
+    state.validation_oracle_skip_image_metric_stage = True
+    state.datasets[0].validation_workspace_path = str(tmp_path / "validation_workspace.npz")
+
+    issues = validate_state(state)
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    assert not any("two_stage" in issue for issue in issues)
+    assert payload["validation_oracle_sweep"]["skip_image_metric_stage"] is True
+    assert roundtrip.validation_oracle_enabled is True
+    assert roundtrip.validation_oracle_skip_image_metric_stage is True
+    assert roundtrip.validation_oracle_workflow_mode == "validation_guided_refinement"
+
+
+def test_state_to_spec_maps_validation_oracle_workflow_mode(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.validation_oracle_enabled = True
+    state.validation_oracle_workflow_mode = "validation_guided_refinement"
+    state.datasets[0].validation_workspace_path = str(tmp_path / "validation_workspace.npz")
+
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    assert payload["validation_oracle_sweep"]["skip_image_metric_stage"] is True
+    assert roundtrip.validation_oracle_workflow_mode == "validation_guided_refinement"
+
+    state.validation_oracle_workflow_mode = "normal_validation"
+    payload = state_to_spec_dict(state)
+
+    assert payload["validation_oracle_sweep"]["skip_image_metric_stage"] is False
+
+
 def test_validate_state_accepts_validation_oracle_workspace_path(tmp_path):
     state = _build_valid_state(tmp_path)
     state.validation_oracle_enabled = True

@@ -165,12 +165,20 @@ this as the dataset row `Workspace` field. Workspace rows are emitted with
 `use_validation_workspace_transforms: true`, so trio benchmarking replays the
 saved validation/ThorCam alignment on the rectified grid.
 
+Set `skip_image_metric_stage: true` to skip the normal image-metric `stage2`.
+That mode runs `stage1`, ranks it with the validation oracle, runs
+`validation_phase` from that oracle ranking, and promotes the validation-ranked
+results to the root `leaderboard.json`, `best_configs.json`, and
+`summary.json` outputs. In the GUI this is exposed as
+`Validation-guided refinement: skip image-metric stage2`.
+
 ```json
 {
   "validation_oracle_sweep": {
     "enabled": true,
     "top_k": 8,
     "budget_per_dataset": 4,
+    "skip_image_metric_stage": true,
     "defaults": {
       "registration_profile": "bead_geometric_v2"
     },
@@ -247,6 +255,10 @@ Modern sweep roots commonly contain:
 - `experiment_manifest.json`
 - `validation_oracle/`, `validation_leaderboard.json`, and
   `validation_phase_summary.json` when validation oracle sweep completes
+- no `stage2_summary.json` when validation oracle runs with
+  `skip_image_metric_stage: true`
+- stale `stage2` products from a reused output directory are moved under
+  `generations/<generation_id>/inactive_artifacts/stage2/`
 - `runs/<stage>/<candidate>/<dataset>/...`
 - `generations/<generation_id>/products/...`
 

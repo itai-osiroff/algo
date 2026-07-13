@@ -348,7 +348,14 @@ def _read_json_optional(
         return None, None
 
 
-def _select_primary_stage(stage_summaries: Dict[str, "StageVisualizationSummary"], stage_order: Sequence[str]) -> str:
+def _select_primary_stage(
+    stage_summaries: Dict[str, "StageVisualizationSummary"],
+    stage_order: Sequence[str],
+    *,
+    prefer_validation_phase: bool = False,
+) -> str:
+    if prefer_validation_phase and VALIDATION_ORACLE_STAGE_NAME in stage_summaries:
+        return VALIDATION_ORACLE_STAGE_NAME
     for preferred in ("metric_phase", "stage2", "stage1", "legacy"):
         if preferred in stage_summaries:
             return preferred
@@ -507,6 +514,28 @@ def _resolve_configured_stage_mode(
         if mode in valid_modes:
             return mode
     return "two_stage"
+
+
+def _validation_skip_mode_enabled(
+    experiment_manifest: Optional[Dict[str, object]],
+    run_state: Optional[Dict[str, object]],
+) -> bool:
+    def payload_enabled(payload: object) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        oracle = cast(Dict[str, object], payload.get("validation_oracle_sweep", {}))
+        return bool(
+            isinstance(oracle, dict)
+            and oracle.get("enabled", False)
+            and oracle.get("skip_image_metric_stage", False)
+        )
+
+    if payload_enabled(experiment_manifest):
+        return True
+    if isinstance(run_state, dict):
+        fingerprint_payload = cast(Dict[str, object], run_state.get("fingerprint_payload", {}))
+        return payload_enabled(fingerprint_payload.get("spec", {}))
+    return False
 
 
 def _normalize_alpha_summary_rows(
@@ -1741,6 +1770,10 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         cast(Optional[Dict[str, object]], experiment_manifest),
         cast(Optional[Dict[str, object]], run_state),
     )
+    validation_skip_mode = _validation_skip_mode_enabled(
+        cast(Optional[Dict[str, object]], experiment_manifest),
+        cast(Optional[Dict[str, object]], run_state),
+    )
     stage_summaries: Dict[str, StageVisualizationSummary] = {}
     stage_candidate_ids: Dict[str, List[str]] = {}
     candidate_rows: List[CandidateVisualizationRow] = []
@@ -1877,6 +1910,25 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
                 f"No readable stage summaries found under {source_dir}; cannot build visualization model."
             )
 
+        validation_guided_mode = (
+            validation_skip_mode
+            and path_scope != "metric_phase_dir"
+            and VALIDATION_ORACLE_STAGE_NAME in stage_summaries
+        )
+        if validation_guided_mode:
+            stale_stage2_present = (
+                "stage2" in stage_summaries
+                or summary_payloads.get("stage2") is not None
+                or (experiment_root / "runs" / "stage2").exists()
+            )
+            stage_summaries.pop("stage2", None)
+            stage_candidate_ids.pop("stage2", None)
+            candidate_rows = [row for row in candidate_rows if row.stage != "stage2"]
+            if stale_stage2_present:
+                warnings.append(
+                    "Ignored stale stage2 artifacts because validation_oracle_sweep.skip_image_metric_stage is enabled."
+                )
+
         candidate_lookup = _candidate_lookup(candidate_rows)
         run_lookup = {
             str(key): cast(Dict[str, object], value)
@@ -1950,9 +2002,21 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
                 ),
             )
 
-        stage2_present = bool(summary_payloads.get("stage2"))
+        if validation_guided_mode:
+            run_metric_records_by_id = {
+                key: value
+                for key, value in run_metric_records_by_id.items()
+                if value.stage != "stage2"
+            }
+            alpha_rows_from_records = [
+                row for row in alpha_rows_from_records if row.stage != "stage2"
+            ]
+
+        stage2_present = bool(summary_payloads.get("stage2")) and not validation_guided_mode
         if path_scope == "metric_phase_dir":
             mode = "metric_phase_dir"
+        elif validation_guided_mode:
+            mode = "spec_validation_guided"
         elif configured_stage_mode == "single_stage" and "stage1" in stage_summaries and "stage2" not in stage_summaries:
             mode = "spec_single_stage"
         else:
@@ -2094,7 +2158,11 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
     stage_order = [stage_name for stage_name in STAGE_ORDER if stage_name in stage_summaries]
     if not stage_order:
         stage_order = [candidate_rows[0].stage] if candidate_rows else []
-    primary_stage_name = _select_primary_stage(stage_summaries, stage_order)
+    primary_stage_name = _select_primary_stage(
+        stage_summaries,
+        stage_order,
+        prefer_validation_phase=(mode == "spec_validation_guided"),
+    )
 
     ordered_candidate_rows: List[CandidateVisualizationRow] = []
     for stage_name in stage_order:
