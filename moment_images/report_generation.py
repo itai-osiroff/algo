@@ -1070,6 +1070,11 @@ def _validation_skip_enabled(spec: SweepExperimentSpec) -> bool:
     )
 
 
+def _validation_oracle_enabled(spec: SweepExperimentSpec) -> bool:
+    validation_spec = spec.validation_oracle_sweep
+    return bool(validation_spec is not None and validation_spec.enabled)
+
+
 def _load_validation_rankings_for_rebuild(output_dir: Path) -> List[Dict[str, object]]:
     candidates = (
         output_dir / VALIDATION_ORACLE_DIR_NAME / "validation_phase_rankings.json",
@@ -1163,17 +1168,34 @@ def _rebuild_summaries(
         return len(stage1_results), len(validation_results), active_generation
 
     stage2_discovery = _discover_stage_results(output_dir, "stage2", dataset_ids, run_state_scope)
-    _append_discovery_context(context, [stage1_discovery, stage2_discovery], active_generation)
+    validation_discovery: Optional[StageDiscovery] = None
+    discoveries = [stage1_discovery, stage2_discovery]
+    if _validation_oracle_enabled(spec):
+        validation_discovery = _discover_stage_results(
+            output_dir,
+            VALIDATION_ORACLE_STAGE_NAME,
+            dataset_ids,
+            run_state_scope,
+        )
+        discoveries.append(validation_discovery)
+    _append_discovery_context(context, discoveries, active_generation)
 
     stage1_results = stage1_discovery.results
     stage2_results = stage2_discovery.results
     _validate_rebuild_dataset_ids("stage1", stage1_results, dataset_ids)
     _validate_rebuild_dataset_ids("stage2", stage2_results, dataset_ids)
+    validation_results: List[Dict[str, object]] = []
+    if validation_discovery is not None:
+        validation_results = validation_discovery.results
+        _validate_rebuild_dataset_ids(VALIDATION_ORACLE_STAGE_NAME, validation_results, dataset_ids)
 
     stage1_rankings = score_and_rank_runs(stage1_results, spec.scoring, dataset_ids=dataset_ids)
     stage2_rankings: List[Dict[str, object]] = []
     if stage2_results:
         stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
+    validation_rankings: List[Dict[str, object]] = []
+    if validation_results:
+        validation_rankings = _load_validation_rankings_for_rebuild(output_dir)
 
     _mark_artifact_writes_started(context)
     _write_stage_outputs(
@@ -1196,6 +1218,15 @@ def _rebuild_summaries(
             generation_id=_stage_generation_id(run_state, stage2_results),
         )
         final_rankings = stage2_rankings
+
+    if validation_discovery is not None and validation_results:
+        _write_validation_phase_artifacts(
+            output_dir=output_dir,
+            stage_results=validation_results,
+            rankings=validation_rankings,
+            execution=_stage_execution_payload(validation_discovery),
+            generation_id=_stage_generation_id(run_state, validation_results),
+        )
 
     all_metric_records = [
         cast(Dict[str, object], row["metric_record"]) for row in (stage1_results + stage2_results)
