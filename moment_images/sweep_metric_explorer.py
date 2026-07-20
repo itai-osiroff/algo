@@ -28,6 +28,19 @@ from moment_images.reliable_io import (
     write_json_atomic,
 )
 from moment_images.metric_profiles import compute_extended_image_metrics, validate_profile_for_sweep
+from moment_images.human_bead_oracle import (
+    HUMAN_BEAD_CENTER_SHIFT_P95,
+    HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN,
+    HUMAN_BEAD_ELONGATION_MEAN,
+    HUMAN_BEAD_EVALUATED_BEAD_COUNT,
+    HUMAN_BEAD_FWHM_RADIUS_MEAN,
+    HUMAN_BEAD_HALO_TO_CORE_RATIO_MEAN,
+    HUMAN_BEAD_ORACLE_PROFILE_NAME,
+    HUMAN_BEAD_ORACLE_SCORE,
+    HUMAN_BEAD_RESIDUAL_GRADIENT_MAX,
+    HUMAN_BEAD_RESIDUAL_GRADIENT_P95,
+    HUMAN_BEAD_SUPPORT_RADIUS_MEAN,
+)
 from moment_images.sweep_visualization import (
     CandidateVisualizationRow,
     SweepVisualizationModel,
@@ -883,6 +896,66 @@ def build_metric_registry() -> Dict[str, MetricDescriptor]:
             "oracle_diagnostic",
             "min",
         ),
+        HUMAN_BEAD_ORACLE_SCORE: (
+            "Human Bead Oracle Score",
+            "Manual bead-center oracle score imported from human_bead_oracle.",
+            "oracle",
+            "max",
+        ),
+        HUMAN_BEAD_EVALUATED_BEAD_COUNT: (
+            "Human Bead Evaluated Count",
+            "Number of human-tagged beads evaluated for the candidate.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        HUMAN_BEAD_FWHM_RADIUS_MEAN: (
+            "Human Bead FWHM Radius",
+            "Mean equivalent FWHM radius measured at human bead centers.",
+            "oracle_diagnostic",
+            "min",
+        ),
+        HUMAN_BEAD_SUPPORT_RADIUS_MEAN: (
+            "Human Bead Support Radius",
+            "Mean equivalent outer-support radius measured at human bead centers.",
+            "oracle_diagnostic",
+            "min",
+        ),
+        HUMAN_BEAD_HALO_TO_CORE_RATIO_MEAN: (
+            "Human Bead Halo/Core Ratio",
+            "Mean annulus halo signal relative to core signal.",
+            "oracle_diagnostic",
+            "min",
+        ),
+        HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN: (
+            "Human Bead Core Energy Fraction",
+            "Mean fraction of bead support energy inside the core radius.",
+            "oracle_diagnostic",
+            "max",
+        ),
+        HUMAN_BEAD_ELONGATION_MEAN: (
+            "Human Bead Elongation",
+            "Mean intensity-weighted bead elongation.",
+            "oracle_diagnostic",
+            "min",
+        ),
+        HUMAN_BEAD_CENTER_SHIFT_P95: (
+            "Human Bead Center Shift P95",
+            "P95 shift from manual center to local refined peak.",
+            "oracle_diagnostic",
+            "min",
+        ),
+        HUMAN_BEAD_RESIDUAL_GRADIENT_P95: (
+            "Human Bead Residual Gradient P95",
+            "P95 residual gradient magnitude for sigma-blend score fields when available.",
+            "oracle_diagnostic",
+            "min",
+        ),
+        HUMAN_BEAD_RESIDUAL_GRADIENT_MAX: (
+            "Human Bead Residual Gradient Max",
+            "Maximum residual gradient magnitude for sigma-blend score fields when available.",
+            "oracle_diagnostic",
+            "min",
+        ),
     }
     for name, (label, description, category, direction) in oracle_metrics.items():
         registry[name] = MetricDescriptor(
@@ -1729,6 +1802,20 @@ def _ensure_trio_oracle_config(
                 label="Trio Oracle (ThorCam FOV)",
                 metric_weights={TRIO_PRIMARY_SCORE: 1.0},
                 description="External validation-oracle ranking imported from trio_benchmark.",
+                built_in=True,
+            )
+        )
+    has_human_bead = any(
+        HUMAN_BEAD_ORACLE_SCORE in record.metrics
+        for record in import_data.records
+    )
+    if has_human_bead and HUMAN_BEAD_ORACLE_PROFILE_NAME not in {profile.name for profile in config.profiles}:
+        config.profiles.append(
+            RankingProfileSpec(
+                name=HUMAN_BEAD_ORACLE_PROFILE_NAME,
+                label="Human Bead Oracle",
+                metric_weights={HUMAN_BEAD_ORACLE_SCORE: 1.0},
+                description="Manual bead-center oracle ranking imported from human_bead_oracle.",
                 built_in=True,
             )
         )

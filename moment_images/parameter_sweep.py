@@ -73,6 +73,13 @@ from moment_images.metric_profiles import (
     resolve_metric_config,
     resolve_profile_weights_for_sweep,
 )
+from moment_images.human_bead_oracle import (
+    HUMAN_BEAD_ORACLE_MODE,
+    HUMAN_BEAD_ORACLE_SCORE,
+    build_human_bead_oracle_import,
+    load_human_bead_annotations,
+    write_human_bead_oracle_import,
+)
 from moment_images.sweep_analysis import (
     analyze_summary_data,
     build_metric_record,
@@ -112,6 +119,12 @@ VALIDATION_ORACLE_WORKFLOW_MODES = {
     VALIDATION_ORACLE_WORKFLOW_NORMAL,
     VALIDATION_ORACLE_WORKFLOW_SKIP_IMAGE_STAGE,
 }
+VALIDATION_ORACLE_MODE_TRIO = "trio_validation"
+VALIDATION_ORACLE_MODE_HUMAN_BEAD = HUMAN_BEAD_ORACLE_MODE
+VALIDATION_ORACLE_MODES = {
+    VALIDATION_ORACLE_MODE_TRIO,
+    VALIDATION_ORACLE_MODE_HUMAN_BEAD,
+}
 VALIDATION_ORACLE_STAGE_NAME = "validation_phase"
 VALIDATION_ORACLE_DIR_NAME = "validation_oracle"
 VALIDATION_ORACLE_PATH_KEYS = (
@@ -119,6 +132,7 @@ VALIDATION_ORACLE_PATH_KEYS = (
     "thorcam_image",
     "validation_workspace",
     "registration_annotations",
+    "human_bead_annotations",
 )
 VALIDATION_ORACLE_REFERENCE_KEYS = (
     "validation_workspace",
@@ -127,6 +141,9 @@ VALIDATION_ORACLE_REFERENCE_KEYS = (
 )
 VALIDATION_ORACLE_GUI_OWNED_SCENE_KEYS = VALIDATION_ORACLE_REFERENCE_KEYS + (
     "use_validation_workspace_transforms",
+)
+VALIDATION_ORACLE_GUI_OWNED_DEFAULT_KEYS = (
+    "human_bead_annotations",
 )
 VALIDATION_ORACLE_GENERATED_ROOT_ARTIFACTS = (
     f"{VALIDATION_ORACLE_STAGE_NAME}_summary.json",
@@ -666,6 +683,7 @@ class ValidationOracleSweepSpec:
     """Optional validation-guided sweep that scores LF outputs against trio references."""
 
     enabled: bool = False
+    oracle_mode: str = VALIDATION_ORACLE_MODE_TRIO
     top_k: int = 8
     budget_per_dataset: Optional[int] = None
     skip_image_metric_stage: bool = False
@@ -673,6 +691,12 @@ class ValidationOracleSweepSpec:
     defaults: Dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.oracle_mode = str(self.oracle_mode or VALIDATION_ORACLE_MODE_TRIO).strip()
+        if self.oracle_mode not in VALIDATION_ORACLE_MODES:
+            raise ValueError(
+                "validation_oracle_sweep.oracle_mode must be one of: "
+                + ", ".join(sorted(VALIDATION_ORACLE_MODES))
+            )
         self.top_k = int(self.top_k)
         if self.top_k < 1:
             raise ValueError("validation_oracle_sweep.top_k must be >= 1.")
@@ -707,6 +731,7 @@ class ValidationOracleSweepSpec:
             raise ValueError("validation_oracle_sweep must be an object.")
         return cls(
             enabled=bool(payload.get("enabled", False)),
+            oracle_mode=str(payload.get("oracle_mode", VALIDATION_ORACLE_MODE_TRIO)),
             top_k=int(payload.get("top_k", default_top_k)),
             budget_per_dataset=(
                 None
@@ -817,6 +842,7 @@ class SweepExperimentSpec:
             )
         self.validation_oracle_sweep = ValidationOracleSweepSpec(
             enabled=bool(validation.enabled),
+            oracle_mode=validation.oracle_mode,
             top_k=int(validation.top_k),
             budget_per_dataset=validation.budget_per_dataset,
             skip_image_metric_stage=bool(validation.skip_image_metric_stage),
@@ -2625,6 +2651,7 @@ def _normalize_validation_oracle_fingerprint_defaults(
 
     oracle = dict(oracle_raw)
     oracle.pop("strict", None)
+    oracle.setdefault("oracle_mode", VALIDATION_ORACLE_MODE_TRIO)
     oracle.setdefault("skip_image_metric_stage", False)
     defaults_raw = oracle.get("defaults")
     if isinstance(defaults_raw, dict):
@@ -5759,6 +5786,18 @@ def _validation_oracle_scene_has_image_pair(scene: Mapping[str, object]) -> bool
     )
 
 
+def _validation_oracle_scene_human_bead_annotations(scene: Mapping[str, object]) -> str:
+    return _validation_oracle_text(scene.get("human_bead_annotations"))
+
+
+def _validation_oracle_score_metric(validation_spec: ValidationOracleSweepSpec) -> str:
+    return (
+        HUMAN_BEAD_ORACLE_SCORE
+        if validation_spec.oracle_mode == VALIDATION_ORACLE_MODE_HUMAN_BEAD
+        else TRIO_PRIMARY_SCORE
+    )
+
+
 def _strip_validation_oracle_gui_owned_scene_fields(
     scene_payload: Mapping[str, object],
 ) -> Dict[str, object]:
@@ -5801,15 +5840,6 @@ def _validate_validation_oracle_scene_lookup(
     for dataset_id in dataset_ids:
         merged = dict(validation_spec.defaults)
         merged.update(scenes_by_dataset[dataset_id])
-        if not (
-            _validation_oracle_scene_has_workspace(merged)
-            or _validation_oracle_scene_has_image_pair(merged)
-        ):
-            raise ValueError(
-                "validation_oracle_sweep scene for dataset "
-                f"{dataset_id!r} must provide validation_workspace or both "
-                "validation_image and thorcam_image."
-            )
         missing_paths = []
         for key in VALIDATION_ORACLE_PATH_KEYS:
             value = merged.get(key)
@@ -5822,6 +5852,30 @@ def _validate_validation_oracle_scene_lookup(
                 "validation_oracle_sweep scene for dataset "
                 f"{dataset_id!r} references missing file(s): "
                 + ", ".join(missing_paths)
+            )
+        if validation_spec.oracle_mode == VALIDATION_ORACLE_MODE_HUMAN_BEAD:
+            annotations_path = _validation_oracle_scene_human_bead_annotations(merged)
+            if not annotations_path:
+                raise ValueError(
+                    "validation_oracle_sweep human_bead scene for dataset "
+                    f"{dataset_id!r} must provide human_bead_annotations."
+                )
+            annotations = load_human_bead_annotations(Path(annotations_path))
+            if dataset_id not in annotations:
+                raise ValueError(
+                    "validation_oracle_sweep human_bead annotations "
+                    f"{annotations_path!r} do not contain dataset {dataset_id!r}."
+                )
+            scenes_by_dataset[dataset_id] = merged
+            continue
+        if not (
+            _validation_oracle_scene_has_workspace(merged)
+            or _validation_oracle_scene_has_image_pair(merged)
+        ):
+            raise ValueError(
+                "validation_oracle_sweep scene for dataset "
+                f"{dataset_id!r} must provide validation_workspace or both "
+                "validation_image and thorcam_image."
             )
         scenes_by_dataset[dataset_id] = merged
     return scenes_by_dataset
@@ -5853,14 +5907,23 @@ def _validation_oracle_dry_run_payload(
         "enabled": True,
         "status": "planned_after_stage1_oracle_ranking",
         "stage": VALIDATION_ORACLE_STAGE_NAME,
-        "score_metric": TRIO_PRIMARY_SCORE,
+        "oracle_mode": validation_spec.oracle_mode,
+        "score_metric": _validation_oracle_score_metric(validation_spec),
         "top_k": int(validation_spec.top_k),
         "budget_per_dataset": int(validation_phase_budget),
         "skip_image_metric_stage": bool(validation_spec.skip_image_metric_stage),
         "num_scenes": len(dataset_ids),
-        "num_stage1_benchmarks": len(dataset_ids),
+        "num_stage1_benchmarks": (
+            0
+            if validation_spec.oracle_mode == VALIDATION_ORACLE_MODE_HUMAN_BEAD
+            else len(dataset_ids)
+        ),
         "estimated_validation_phase_runs": int(validation_phase_budget * len(dataset_ids)),
-        "estimated_validation_phase_benchmarks": len(dataset_ids),
+        "estimated_validation_phase_benchmarks": (
+            0
+            if validation_spec.oracle_mode == VALIDATION_ORACLE_MODE_HUMAN_BEAD
+            else len(dataset_ids)
+        ),
         "exact": False,
     }
 
@@ -5977,6 +6040,80 @@ def _run_validation_oracle_benchmarks(
     return import_data, manifest
 
 
+def _human_bead_annotations_for_scenes(
+    scene_lookup: Mapping[str, Mapping[str, object]],
+    dataset_ids: Sequence[str],
+) -> Tuple[Dict[str, object], List[Path]]:
+    annotations_by_dataset: Dict[str, object] = {}
+    loaded_by_path: Dict[Path, Dict[str, object]] = {}
+    source_paths: List[Path] = []
+    for dataset_id in dataset_ids:
+        annotation_path_text = _validation_oracle_scene_human_bead_annotations(
+            scene_lookup[dataset_id]
+        )
+        if not annotation_path_text:
+            raise ValueError(
+                "validation_oracle_sweep human_bead scene for dataset "
+                f"{dataset_id!r} must provide human_bead_annotations."
+            )
+        annotation_path = Path(annotation_path_text)
+        source_paths.append(annotation_path)
+        if annotation_path not in loaded_by_path:
+            loaded_by_path[annotation_path] = cast(
+                Dict[str, object],
+                load_human_bead_annotations(annotation_path),
+            )
+        annotations = loaded_by_path[annotation_path]
+        if dataset_id not in annotations:
+            raise ValueError(
+                "validation_oracle_sweep human_bead annotations "
+                f"{annotation_path!s} do not contain dataset {dataset_id!r}."
+            )
+        annotations_by_dataset[dataset_id] = annotations[dataset_id]
+    return annotations_by_dataset, list(dict.fromkeys(path.resolve() for path in source_paths))
+
+
+def _run_human_bead_oracle_stage(
+    *,
+    scene_lookup: Mapping[str, Mapping[str, object]],
+    sweep_dir: Path,
+    dataset_ids: Sequence[str],
+    stage_name: str,
+    stage_results: Sequence[Dict[str, object]],
+) -> Tuple[object, Dict[str, object]]:
+    oracle_root = sweep_dir / VALIDATION_ORACLE_DIR_NAME
+    stage_root = oracle_root / stage_name
+    stage_root.mkdir(parents=True, exist_ok=True)
+    annotations_by_dataset, source_paths = _human_bead_annotations_for_scenes(
+        scene_lookup,
+        dataset_ids,
+    )
+    stage_import = build_human_bead_oracle_import(
+        stage_name=stage_name,
+        stage_results=stage_results,
+        annotations=annotations_by_dataset,
+        source_paths=source_paths,
+    )
+    import_data = write_human_bead_oracle_import(sweep_dir / "metric_review", stage_import)
+    manifest = {
+        "stage": stage_name,
+        "oracle_mode": VALIDATION_ORACLE_MODE_HUMAN_BEAD,
+        "score_metric": HUMAN_BEAD_ORACLE_SCORE,
+        "source_paths": [str(path.resolve()) for path in source_paths],
+        "num_records": len(stage_import.records),
+        "num_rankable": sum(1 for record in stage_import.records if record.validation_rankable),
+        "warnings": list(stage_import.warnings),
+    }
+    write_json_atomic(
+        stage_root / "human_bead_oracle_import.json",
+        manifest,
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+    return import_data, manifest
+
+
 def _rank_stage_with_validation_oracle(
     *,
     stage_name: str,
@@ -5984,6 +6121,7 @@ def _rank_stage_with_validation_oracle(
     validation_import: object,
     dataset_ids: Sequence[str],
     scoring: SweepScoringSpec,
+    score_metric: str = TRIO_PRIMARY_SCORE,
 ) -> List[Dict[str, object]]:
     records = cast(Any, validation_import).records
     trio_lookup = {
@@ -6015,7 +6153,7 @@ def _rank_stage_with_validation_oracle(
         )
         if trio_record is None or not trio_rankable(trio_record):
             continue
-        score = trio_record.metrics.get(TRIO_PRIMARY_SCORE)
+        score = trio_record.metrics.get(score_metric)
         if score is None or not math.isfinite(float(score)):
             continue
         rankable_count_by_dataset[dataset_id] += 1
@@ -6065,7 +6203,7 @@ def _rank_stage_with_validation_oracle(
     ]
     if missing_rankable:
         raise ValueError(
-            f"validation_oracle_sweep produced no rankable {TRIO_PRIMARY_SCORE} LF rows "
+            f"validation_oracle_sweep produced no rankable {score_metric} LF rows "
             "for dataset(s): "
             + ", ".join(missing_rankable)
         )
@@ -6104,7 +6242,7 @@ def _rank_stage_with_validation_oracle(
                 "run_signatures": slot["run_signatures"],
                 "run_dirs": slot["run_dirs"],
                 "artifact_paths": slot["artifact_paths"],
-                "score_metric": TRIO_PRIMARY_SCORE,
+                "score_metric": score_metric,
             }
         )
     if not rankings:
@@ -6230,7 +6368,8 @@ def _validation_oracle_manifest_base(
         "enabled": True,
         "output_dir": str(validation_oracle_dir.resolve()),
         "stage": VALIDATION_ORACLE_STAGE_NAME,
-        "score_metric": TRIO_PRIMARY_SCORE,
+        "oracle_mode": validation_spec.oracle_mode,
+        "score_metric": _validation_oracle_score_metric(validation_spec),
         "top_k": int(validation_spec.top_k),
         "budget_per_dataset": int(validation_phase_budget),
         "skip_image_metric_stage": bool(validation_spec.skip_image_metric_stage),
@@ -6303,13 +6442,22 @@ def _run_validation_oracle_workflow(
         )
 
         failed_stage = "stage1_benchmark"
-        stage1_trio_import, stage1_trio_manifest = _run_validation_oracle_benchmarks(
-            validation_spec=validation_spec,
-            scene_lookup=validation_scene_lookup,
-            sweep_dir=output_dir,
-            dataset_ids=dataset_ids,
-            stage_name="stage1",
-        )
+        if validation_spec.oracle_mode == VALIDATION_ORACLE_MODE_HUMAN_BEAD:
+            stage1_trio_import, stage1_trio_manifest = _run_human_bead_oracle_stage(
+                scene_lookup=validation_scene_lookup,
+                sweep_dir=output_dir,
+                dataset_ids=dataset_ids,
+                stage_name="stage1",
+                stage_results=stage1_results,
+            )
+        else:
+            stage1_trio_import, stage1_trio_manifest = _run_validation_oracle_benchmarks(
+                validation_spec=validation_spec,
+                scene_lookup=validation_scene_lookup,
+                sweep_dir=output_dir,
+                dataset_ids=dataset_ids,
+                stage_name="stage1",
+            )
 
         failed_stage = "stage1_ranking"
         oracle_stage1_rankings = _rank_stage_with_validation_oracle(
@@ -6318,6 +6466,7 @@ def _run_validation_oracle_workflow(
             validation_import=stage1_trio_import,
             dataset_ids=dataset_ids,
             scoring=spec.scoring,
+            score_metric=_validation_oracle_score_metric(validation_spec),
         )
         write_json_atomic(
             validation_oracle_dir / "stage1_rankings.json",
@@ -6379,13 +6528,22 @@ def _run_validation_oracle_workflow(
         )
 
         failed_stage = "validation_phase_benchmark"
-        validation_trio_import, validation_trio_manifest = _run_validation_oracle_benchmarks(
-            validation_spec=validation_spec,
-            scene_lookup=validation_scene_lookup,
-            sweep_dir=output_dir,
-            dataset_ids=dataset_ids,
-            stage_name=VALIDATION_ORACLE_STAGE_NAME,
-        )
+        if validation_spec.oracle_mode == VALIDATION_ORACLE_MODE_HUMAN_BEAD:
+            validation_trio_import, validation_trio_manifest = _run_human_bead_oracle_stage(
+                scene_lookup=validation_scene_lookup,
+                sweep_dir=output_dir,
+                dataset_ids=dataset_ids,
+                stage_name=VALIDATION_ORACLE_STAGE_NAME,
+                stage_results=validation_phase_results,
+            )
+        else:
+            validation_trio_import, validation_trio_manifest = _run_validation_oracle_benchmarks(
+                validation_spec=validation_spec,
+                scene_lookup=validation_scene_lookup,
+                sweep_dir=output_dir,
+                dataset_ids=dataset_ids,
+                stage_name=VALIDATION_ORACLE_STAGE_NAME,
+            )
 
         failed_stage = "validation_phase_ranking"
         validation_phase_rankings = _rank_stage_with_validation_oracle(
@@ -6394,6 +6552,7 @@ def _run_validation_oracle_workflow(
             validation_import=validation_trio_import,
             dataset_ids=dataset_ids,
             scoring=spec.scoring,
+            score_metric=_validation_oracle_score_metric(validation_spec),
         )
         _write_validation_phase_artifacts(
             output_dir=output_dir,
@@ -7806,10 +7965,12 @@ class SpecGuiState:
         default_factory=lambda: [SpecGuiMetricExperimentRowState()]
     )
     validation_oracle_enabled: bool = False
+    validation_oracle_mode: str = VALIDATION_ORACLE_MODE_TRIO
     validation_oracle_top_k: str = "8"
     validation_oracle_budget_per_dataset: str = ""
     validation_oracle_skip_image_metric_stage: bool = False
     validation_oracle_workflow_mode: str = VALIDATION_ORACLE_WORKFLOW_NORMAL
+    validation_oracle_human_bead_annotations: str = ""
     validation_oracle_defaults_json: str = "{}"
     validation_oracle_scenes_json: str = "[]"
     datasets: List[SpecGuiDatasetState] = field(
@@ -8023,6 +8184,10 @@ def _validation_oracle_skip_image_stage_from_state(state: SpecGuiState) -> bool:
     if workflow_mode == VALIDATION_ORACLE_WORKFLOW_NORMAL:
         return bool(state.validation_oracle_skip_image_metric_stage)
     return bool(state.validation_oracle_skip_image_metric_stage)
+
+
+def _validation_oracle_mode_from_state(state: SpecGuiState) -> str:
+    return str(state.validation_oracle_mode or VALIDATION_ORACLE_MODE_TRIO).strip()
 
 
 def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
@@ -8241,6 +8406,12 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             }
         payload["experimental_metric_sweep"] = experimental_payload
     if state.validation_oracle_enabled:
+        oracle_mode = _validation_oracle_mode_from_state(state)
+        if oracle_mode not in VALIDATION_ORACLE_MODES:
+            raise ValueError(
+                "Validation oracle mode must be one of: "
+                + ", ".join(sorted(VALIDATION_ORACLE_MODES))
+            )
         defaults_text = state.validation_oracle_defaults_json.strip() or "{}"
         scenes_text = state.validation_oracle_scenes_json.strip() or "[]"
         defaults_payload = json.loads(defaults_text)
@@ -8255,6 +8426,10 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             )
         defaults_payload = dict(defaults_payload)
         defaults_payload.pop("strict", None)
+        if oracle_mode == VALIDATION_ORACLE_MODE_HUMAN_BEAD:
+            annotation_path = state.validation_oracle_human_bead_annotations.strip()
+            if annotation_path:
+                defaults_payload["human_bead_annotations"] = annotation_path
         scene_overrides_by_dataset: Dict[str, Dict[str, object]] = {}
         for idx, scene_payload_raw in enumerate(scenes_payload, start=1):
             scene_payload = _strip_validation_oracle_gui_owned_scene_fields(
@@ -8287,28 +8462,30 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             thorcam_image = row.thorcam_image_path.strip()
             has_image_pair = bool(validation_image and thorcam_image)
             has_partial_image_pair = bool(validation_image or thorcam_image) and not has_image_pair
-            if not validation_workspace and not has_image_pair:
-                raise ValueError(
-                    f"Dataset '{dataset_id}' validation workspace or "
-                    "validation/ThorCam image pair is required "
-                    "when validation oracle is enabled."
-                )
-            if has_partial_image_pair and not validation_workspace:
-                raise ValueError(
-                    f"Dataset '{dataset_id}' must provide both validation and "
-                    "ThorCam image paths when no validation workspace is set."
-                )
             scene_entry = dict(scene_overrides_by_dataset.get(dataset_id, {}))
             scene_entry["dataset_id"] = dataset_id
-            if validation_workspace:
-                scene_entry["validation_workspace"] = validation_workspace
-                scene_entry["use_validation_workspace_transforms"] = True
-            else:
-                scene_entry["validation_image"] = validation_image
-                scene_entry["thorcam_image"] = thorcam_image
+            if oracle_mode != VALIDATION_ORACLE_MODE_HUMAN_BEAD:
+                if not validation_workspace and not has_image_pair:
+                    raise ValueError(
+                        f"Dataset '{dataset_id}' validation workspace or "
+                        "validation/ThorCam image pair is required "
+                        "when validation oracle is enabled."
+                    )
+                if has_partial_image_pair and not validation_workspace:
+                    raise ValueError(
+                        f"Dataset '{dataset_id}' must provide both validation and "
+                        "ThorCam image paths when no validation workspace is set."
+                    )
+                if validation_workspace:
+                    scene_entry["validation_workspace"] = validation_workspace
+                    scene_entry["use_validation_workspace_transforms"] = True
+                else:
+                    scene_entry["validation_image"] = validation_image
+                    scene_entry["thorcam_image"] = thorcam_image
             scene_entries.append(scene_entry)
         oracle_payload: Dict[str, object] = {
             "enabled": True,
+            "oracle_mode": oracle_mode,
             "top_k": int(state.validation_oracle_top_k.strip()),
             "skip_image_metric_stage": _validation_oracle_skip_image_stage_from_state(state),
             "defaults": defaults_payload,
@@ -8523,6 +8700,11 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
     )
     if validation_payload is not None:
         state.validation_oracle_enabled = bool(validation_payload.get("enabled", False))
+        state.validation_oracle_mode = str(
+            validation_payload.get("oracle_mode", VALIDATION_ORACLE_MODE_TRIO)
+        )
+        if state.validation_oracle_mode not in VALIDATION_ORACLE_MODES:
+            state.validation_oracle_mode = VALIDATION_ORACLE_MODE_TRIO
         state.validation_oracle_top_k = str(
             validation_payload.get("top_k", state.validation_oracle_top_k)
         )
@@ -8539,8 +8721,16 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         )
         defaults_payload = validation_payload.get("defaults", {})
         scenes_payload = validation_payload.get("scenes", [])
+        defaults_payload_for_gui = (
+            dict(defaults_payload) if isinstance(defaults_payload, dict) else {}
+        )
+        state.validation_oracle_human_bead_annotations = _validation_oracle_text(
+            defaults_payload_for_gui.get("human_bead_annotations")
+        )
+        for key in VALIDATION_ORACLE_GUI_OWNED_DEFAULT_KEYS:
+            defaults_payload_for_gui.pop(key, None)
         state.validation_oracle_defaults_json = json.dumps(
-            defaults_payload if isinstance(defaults_payload, dict) else {},
+            defaults_payload_for_gui,
             indent=2,
         )
         advanced_scenes: List[Dict[str, object]] = []
@@ -8574,6 +8764,8 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         )
     else:
         state.validation_oracle_enabled = False
+        state.validation_oracle_mode = VALIDATION_ORACLE_MODE_TRIO
+        state.validation_oracle_human_bead_annotations = ""
         state.validation_oracle_skip_image_metric_stage = False
         state.validation_oracle_workflow_mode = VALIDATION_ORACLE_WORKFLOW_NORMAL
 
@@ -8914,6 +9106,15 @@ def validate_state(state: SpecGuiState) -> List[str]:
             issues.append("Metric experiment formulation IDs must be unique.")
 
     if state.validation_oracle_enabled:
+        oracle_mode = _validation_oracle_mode_from_state(state)
+        if oracle_mode not in VALIDATION_ORACLE_MODES:
+            issues.append(
+                "Validation oracle mode must be one of: "
+                + ", ".join(sorted(VALIDATION_ORACLE_MODES))
+            )
+        is_human_bead_mode = oracle_mode == VALIDATION_ORACLE_MODE_HUMAN_BEAD
+        defaults_payload_for_validation: Dict[str, object] = {}
+        scenes_payload_for_validation: List[Dict[str, object]] = []
         if (
             stage_mode != "two_stage"
             and not _validation_oracle_skip_image_stage_from_state(state)
@@ -8922,23 +9123,73 @@ def validate_state(state: SpecGuiState) -> List[str]:
                 "Validation oracle sweep requires two_stage execution mode unless "
                 "skip image-metric stage2 is enabled."
             )
-        for idx, row in enumerate(state.datasets, start=1):
-            prefix = f"Dataset row {idx}"
-            validation_workspace = row.validation_workspace_path.strip()
-            validation_image = row.validation_image_path.strip()
-            thorcam_image = row.thorcam_image_path.strip()
-            has_image_pair = bool(validation_image and thorcam_image)
-            has_partial_image_pair = bool(validation_image or thorcam_image) and not has_image_pair
-            if not validation_workspace and not has_image_pair:
+        try:
+            defaults_payload_raw = json.loads(
+                state.validation_oracle_defaults_json.strip() or "{}"
+            )
+            if isinstance(defaults_payload_raw, dict):
+                defaults_payload_for_validation = dict(defaults_payload_raw)
+            else:
+                issues.append("Validation oracle defaults JSON must be an object.")
+        except Exception as exc:
+            issues.append(f"Validation oracle defaults JSON is invalid: {exc}")
+        try:
+            scenes_payload_raw = json.loads(
+                state.validation_oracle_scenes_json.strip() or "[]"
+            )
+            if isinstance(scenes_payload_raw, list) and all(
+                isinstance(item, dict) for item in scenes_payload_raw
+            ):
+                scenes_payload_for_validation = [
+                    dict(item) for item in scenes_payload_raw
+                ]
+            else:
                 issues.append(
-                    f"{prefix}: workspace or validation/ThorCam image pair "
-                    "is required when validation oracle is enabled."
+                    "Validation oracle scene overrides JSON must be a list of objects."
                 )
-            if has_partial_image_pair and not validation_workspace:
+        except Exception as exc:
+            issues.append(f"Validation oracle scene overrides JSON is invalid: {exc}")
+
+        if is_human_bead_mode:
+            has_default_annotations = bool(
+                state.validation_oracle_human_bead_annotations.strip()
+                or _validation_oracle_text(
+                    defaults_payload_for_validation.get("human_bead_annotations")
+                )
+            )
+            dataset_ids = {row.dataset_id.strip() for row in state.datasets}
+            annotated_scene_ids = {
+                str(scene.get("dataset_id") or "").strip()
+                for scene in scenes_payload_for_validation
+                if _validation_oracle_text(scene.get("human_bead_annotations"))
+            }
+            if not has_default_annotations and not dataset_ids.issubset(
+                annotated_scene_ids
+            ):
                 issues.append(
-                    f"{prefix}: both validation and ThorCam image paths are "
-                    "required when no validation workspace is set."
+                    "Validation oracle human bead annotations path is required "
+                    "in the annotations field, defaults JSON, or every scene override."
                 )
+        else:
+            for idx, row in enumerate(state.datasets, start=1):
+                prefix = f"Dataset row {idx}"
+                validation_workspace = row.validation_workspace_path.strip()
+                validation_image = row.validation_image_path.strip()
+                thorcam_image = row.thorcam_image_path.strip()
+                has_image_pair = bool(validation_image and thorcam_image)
+                has_partial_image_pair = (
+                    bool(validation_image or thorcam_image) and not has_image_pair
+                )
+                if not validation_workspace and not has_image_pair:
+                    issues.append(
+                        f"{prefix}: workspace or validation/ThorCam image pair "
+                        "is required when validation oracle is enabled."
+                    )
+                if has_partial_image_pair and not validation_workspace:
+                    issues.append(
+                        f"{prefix}: both validation and ThorCam image paths are "
+                        "required when no validation workspace is set."
+                    )
         try:
             if int(state.validation_oracle_top_k.strip()) < 1:
                 issues.append("Validation oracle top-k must be >= 1.")
@@ -8950,26 +9201,6 @@ def validate_state(state: SpecGuiState) -> List[str]:
                     issues.append("Validation oracle budget per dataset must be >= 1.")
             except Exception:
                 issues.append("Validation oracle budget per dataset must be an integer.")
-        try:
-            defaults_payload = json.loads(
-                state.validation_oracle_defaults_json.strip() or "{}"
-            )
-            if not isinstance(defaults_payload, dict):
-                issues.append("Validation oracle defaults JSON must be an object.")
-        except Exception as exc:
-            issues.append(f"Validation oracle defaults JSON is invalid: {exc}")
-        try:
-            scenes_payload = json.loads(
-                state.validation_oracle_scenes_json.strip() or "[]"
-            )
-            if not isinstance(scenes_payload, list) or not all(
-                isinstance(item, dict) for item in scenes_payload
-            ):
-                issues.append(
-                    "Validation oracle scene overrides JSON must be a list of objects."
-                )
-        except Exception as exc:
-            issues.append(f"Validation oracle scene overrides JSON is invalid: {exc}")
 
     return issues
 
@@ -9493,6 +9724,17 @@ class SpecGuiApp:
         )
         validation_enabled_chk.pack(side="left", padx=4)
         self._register_editable(validation_enabled_chk)
+        self.ttk.Label(validation_controls, text="Mode").pack(side="left", padx=(12, 2))
+        self.validation_oracle_mode_var = self.tk.StringVar(value=VALIDATION_ORACLE_MODE_TRIO)
+        validation_mode_menu = self.ttk.OptionMenu(
+            validation_controls,
+            self.validation_oracle_mode_var,
+            VALIDATION_ORACLE_MODE_TRIO,
+            VALIDATION_ORACLE_MODE_TRIO,
+            VALIDATION_ORACLE_MODE_HUMAN_BEAD,
+        )
+        validation_mode_menu.pack(side="left", padx=2)
+        self._register_editable(validation_mode_menu)
         self.ttk.Label(validation_controls, text="Top-k").pack(side="left", padx=(12, 2))
         self.validation_oracle_top_k_entry = self.ttk.Entry(validation_controls, width=8)
         self.validation_oracle_top_k_entry.insert(0, "8")
@@ -9524,6 +9766,27 @@ class SpecGuiApp:
         )
         skip_workflow_radio.pack(anchor="w", pady=1)
         self._register_editable(skip_workflow_radio)
+
+        bead_annotations_frame = self.ttk.Frame(validation_container)
+        bead_annotations_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self.ttk.Label(bead_annotations_frame, text="Bead annotations").pack(side="left")
+        self.validation_oracle_human_bead_annotations_var = self.tk.StringVar(value="")
+        bead_annotations_entry = self.ttk.Entry(
+            bead_annotations_frame,
+            textvariable=self.validation_oracle_human_bead_annotations_var,
+            width=72,
+        )
+        bead_annotations_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self._register_editable(bead_annotations_entry)
+        bead_annotations_browse_btn = self.ttk.Button(
+            bead_annotations_frame,
+            text="Browse",
+            command=lambda: self._browse_json_path(
+                self.validation_oracle_human_bead_annotations_var
+            ),
+        )
+        bead_annotations_browse_btn.pack(side="left", padx=2)
+        self._register_editable(bead_annotations_browse_btn)
 
         self.ttk.Label(validation_container, text="Defaults JSON").pack(anchor="w", padx=8)
         self.validation_oracle_defaults_text = self.tk.Text(
@@ -9953,6 +10216,13 @@ class SpecGuiApp:
         if selected:
             path_var.set(selected)
 
+    def _browse_json_path(self, path_var: Any) -> None:
+        selected = self.filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if selected:
+            path_var.set(selected)
+
     def _on_browse_output_dir(self) -> None:
         selected = self.filedialog.askdirectory()
         if selected:
@@ -10057,6 +10327,7 @@ class SpecGuiApp:
             metric_experiments_shortlist_top_k=self.metric_shortlist_entry.get().strip(),
             metric_experiment_rows=metric_rows,
             validation_oracle_enabled=bool(self.validation_oracle_enabled_var.get()),
+            validation_oracle_mode=self.validation_oracle_mode_var.get().strip(),
             validation_oracle_top_k=self.validation_oracle_top_k_entry.get().strip(),
             validation_oracle_budget_per_dataset=self.validation_oracle_budget_entry.get().strip(),
             validation_oracle_skip_image_metric_stage=(
@@ -10067,6 +10338,9 @@ class SpecGuiApp:
                 self.validation_oracle_workflow_var.get()
                 if self.validation_oracle_workflow_var.get() in VALIDATION_ORACLE_WORKFLOW_MODES
                 else VALIDATION_ORACLE_WORKFLOW_NORMAL
+            ),
+            validation_oracle_human_bead_annotations=(
+                self.validation_oracle_human_bead_annotations_var.get().strip()
             ),
             validation_oracle_defaults_json=self.validation_oracle_defaults_text.get(
                 "1.0",
@@ -10111,6 +10385,10 @@ class SpecGuiApp:
         self.metric_shortlist_entry.delete(0, self.tk.END)
         self.metric_shortlist_entry.insert(0, state.metric_experiments_shortlist_top_k)
         self.validation_oracle_enabled_var.set(state.validation_oracle_enabled)
+        validation_oracle_mode = state.validation_oracle_mode
+        if validation_oracle_mode not in VALIDATION_ORACLE_MODES:
+            validation_oracle_mode = VALIDATION_ORACLE_MODE_TRIO
+        self.validation_oracle_mode_var.set(validation_oracle_mode)
         self.validation_oracle_top_k_entry.delete(0, self.tk.END)
         self.validation_oracle_top_k_entry.insert(0, state.validation_oracle_top_k)
         self.validation_oracle_budget_entry.delete(0, self.tk.END)
@@ -10121,6 +10399,9 @@ class SpecGuiApp:
                 state.validation_oracle_skip_image_metric_stage
             )
         self.validation_oracle_workflow_var.set(workflow_mode)
+        self.validation_oracle_human_bead_annotations_var.set(
+            state.validation_oracle_human_bead_annotations
+        )
         self.validation_oracle_defaults_text.delete("1.0", self.tk.END)
         self.validation_oracle_defaults_text.insert(
             self.tk.END,

@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 import moment_images.parameter_sweep as parameter_sweep
+from moment_images.human_bead_oracle import HUMAN_BEAD_ORACLE_SCORE
 from moment_images.im_process import RectificationResult, RectificationRunConfig, rectify_views_from_config
 from moment_images.parameter_sweep import (
     ExperimentalMetricSweepSpec,
@@ -211,6 +212,110 @@ def _install_window_score_artifact_runner(monkeypatch):
 
     monkeypatch.setattr(parameter_sweep, "_run_task_isolated", fake_run)
     return calls
+
+
+def _install_bead_score_artifact_runner(monkeypatch):
+    calls: list[dict] = []
+
+    def bead_image(window: int, shape: tuple[int, int] = (64, 64)) -> np.ndarray:
+        yy, xx = np.indices(shape, dtype=np.float32)
+        sigma = {1: 1.6, 5: 3.2, 9: 5.0}.get(int(window), 4.0)
+        image = np.zeros(shape, dtype=np.float32)
+        for cx, cy in [(20.0, 20.0), (44.0, 20.0), (32.0, 44.0)]:
+            image += np.exp(
+                -0.5
+                * (
+                    np.square((xx - cx) / sigma)
+                    + np.square((yy - cy) / sigma)
+                )
+            ).astype(np.float32)
+        return image
+
+    def fake_run(task: dict) -> tuple[dict, bool]:
+        config = RectificationRunConfig(**task["config"])
+        calls.append(
+            {
+                "run_uid": str(task["run_uid"]),
+                "stage": str(task["stage"]),
+                "window": int(config.similarity_window_size),
+            }
+        )
+        avg = bead_image(int(config.similarity_window_size))
+        rectified = np.broadcast_to(avg, (2, 2, *avg.shape)).astype(np.float32)
+        result = RectificationResult(
+            avg_image=avg,
+            rectified_views=rectified,
+            similarity_data=None,
+            config=config,
+            ref_view_index=(0, 0),
+        )
+        run_dir = Path(task["run_dir"])
+        artifact_paths = parameter_sweep._artifact_paths_payload(run_dir)
+        metric_record = parameter_sweep.build_metric_record(str(task["run_uid"]), config, result)
+        metric_record["global_and_local_metrics"]["laplacian_variance"] = float(config.similarity_window_size)
+        metric_record.update(
+            {
+                "candidate_signature": task.get("candidate_signature"),
+                "dataset_signature": task.get("dataset_signature"),
+                "run_signature": task.get("run_signature"),
+                "generation_id": task.get("generation_id"),
+                "artifact_paths": artifact_paths,
+            }
+        )
+        parameter_sweep._save_run_artifacts(
+            Path(task["run_parent_dir"]),
+            str(task["run_name"]),
+            result,
+            metric_record=metric_record,
+        )
+        return (
+            {
+                "status": "ok",
+                "stage": task["stage"],
+                "candidate_id": task["candidate_id"],
+                "dataset_id": task["dataset_id"],
+                "strategy": task["strategy"],
+                "run_uid": task["run_uid"],
+                "run_dir": str(run_dir),
+                "runtime_seconds": 0.01,
+                "config": task["config"],
+                "params": task["params"],
+                "task_index": task["task_index"],
+                "metric_record": metric_record,
+                "candidate_signature": task.get("candidate_signature"),
+                "dataset_signature": task.get("dataset_signature"),
+                "run_signature": task.get("run_signature"),
+                "generation_id": task.get("generation_id"),
+                "artifact_paths": artifact_paths,
+            },
+            False,
+        )
+
+    monkeypatch.setattr(parameter_sweep, "_run_task_isolated", fake_run)
+    return calls
+
+
+def _write_human_bead_annotations(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "datasets": [
+                    {
+                        "dataset_id": "d1",
+                        "image_shape": [64, 64],
+                        "default_radius_px": 4.0,
+                        "beads": [
+                            {"id": "b001", "x": 20.0, "y": 20.0, "radius_px": 4.0},
+                            {"id": "b002", "x": 44.0, "y": 20.0, "radius_px": 4.0},
+                            {"id": "b003", "x": 32.0, "y": 44.0, "radius_px": 4.0},
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _structured_avg_image(window_size: int) -> np.ndarray:
@@ -2702,6 +2807,94 @@ def test_validation_oracle_sweep_uses_oracle_rankings_for_validation_phase(monke
     assert manifest["validation_oracle_sweep"]["num_ranked"] == 2
     assert [call["stage"] for call in trio_calls] == ["stage1", "validation_phase"]
     assert {call["generation_scope"] for call in trio_calls} == {"Active"}
+
+
+def test_human_bead_oracle_sweep_skips_trio_and_ranks_validation_phase(monkeypatch, tmp_path):
+    runner_calls = _install_bead_score_artifact_runner(monkeypatch)
+    monkeypatch.setattr(
+        parameter_sweep,
+        "run_benchmark",
+        lambda config: pytest.fail("human bead oracle must not run trio benchmarking"),
+    )
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+    annotations_path = tmp_path / "human_beads.json"
+    _write_human_bead_annotations(annotations_path)
+
+    spec = _validation_oracle_spec(tmp_path, views_path, output_name="human_bead_validation")
+    spec.validation_oracle_sweep.oracle_mode = "human_bead"
+    spec.validation_oracle_sweep.defaults = {"human_bead_annotations": str(annotations_path)}
+    spec.validation_oracle_sweep.scenes = [{"dataset_id": "d1"}]
+
+    out_dir = run_sweep_experiment(spec)
+
+    validation_summary = json.loads(
+        (out_dir / "validation_phase_summary.json").read_text(encoding="utf-8")
+    )
+    cache = json.loads(
+        (out_dir / "metric_review" / "trio_oracle_metrics.json").read_text(encoding="utf-8")
+    )
+    manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
+
+    assert {call["stage"] for call in runner_calls}
+    assert validation_summary["rankings"][0]["score_metric"] == HUMAN_BEAD_ORACLE_SCORE
+    assert int(validation_summary["rankings"][0]["params"]["similarity_window_size"]) == 1
+    assert {record["stage"] for record in cache["records"]} == {"stage1", "validation_phase"}
+    assert all(HUMAN_BEAD_ORACLE_SCORE in record["metrics"] for record in cache["records"])
+    assert manifest["validation_oracle_sweep"]["status"] == "completed"
+    assert manifest["validation_oracle_sweep"]["oracle_mode"] == "human_bead"
+
+
+def test_human_bead_oracle_skip_image_metric_stage_promotes_validation_rankings(monkeypatch, tmp_path):
+    _install_bead_score_artifact_runner(monkeypatch)
+    monkeypatch.setattr(
+        parameter_sweep,
+        "run_benchmark",
+        lambda config: pytest.fail("human bead oracle must not run trio benchmarking"),
+    )
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+    annotations_path = tmp_path / "human_beads.json"
+    _write_human_bead_annotations(annotations_path)
+
+    spec = _validation_oracle_spec(tmp_path, views_path, output_name="human_bead_skip")
+    spec.validation_oracle_sweep.oracle_mode = "human_bead"
+    spec.validation_oracle_sweep.skip_image_metric_stage = True
+    spec.validation_oracle_sweep.defaults = {"human_bead_annotations": str(annotations_path)}
+    spec.validation_oracle_sweep.scenes = [{"dataset_id": "d1"}]
+
+    out_dir = run_sweep_experiment(spec)
+
+    assert not (out_dir / "stage2_summary.json").exists()
+    root_leaderboard = json.loads((out_dir / "leaderboard.json").read_text(encoding="utf-8"))
+    validation_summary = json.loads(
+        (out_dir / "validation_phase_summary.json").read_text(encoding="utf-8")
+    )
+    assert root_leaderboard == validation_summary["rankings"]
+    assert root_leaderboard[0]["score_metric"] == HUMAN_BEAD_ORACLE_SCORE
+
+
+def test_human_bead_oracle_missing_annotations_fails_advisory_path(monkeypatch, tmp_path):
+    _install_bead_score_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    spec = _validation_oracle_spec(tmp_path, views_path, output_name="human_bead_missing")
+    spec.validation_oracle_sweep.oracle_mode = "human_bead"
+    spec.validation_oracle_sweep.defaults = {"human_bead_annotations": str(tmp_path / "missing.json")}
+    spec.validation_oracle_sweep.scenes = [{"dataset_id": "d1"}]
+
+    out_dir = run_sweep_experiment(spec)
+
+    assert (out_dir / "stage2_summary.json").exists()
+    assert not (out_dir / "validation_phase_summary.json").exists()
+    manifest = json.loads((out_dir / "experiment_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["validation_oracle_sweep"]["status"] == "failed"
+    assert manifest["validation_oracle_sweep"]["failed_stage"] == "scene_validation"
+    assert "missing.json" in manifest["validation_oracle_sweep"]["error"]
 
 
 def test_validation_oracle_skip_image_metric_stage_promotes_validation_rankings(monkeypatch, tmp_path):

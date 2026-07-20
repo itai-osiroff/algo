@@ -601,6 +601,17 @@ def load_trio_oracle_import(review_dir: Path) -> Tuple[Optional[TrioOracleImport
         return None, [f"Failed to load trio oracle cache {path}: {type(exc).__name__}: {exc}"]
 
 
+def write_trio_oracle_import(review_dir: Path, import_data: TrioOracleImport) -> None:
+    review_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(
+        trio_cache_path(review_dir),
+        _trio_import_to_payload(import_data),
+        indent=2,
+        sort_keys=False,
+        create_backup=True,
+    )
+
+
 def import_trio_oracle_results(review_dir: Path, paths: Sequence[Path]) -> TrioOracleImport:
     detailed_paths, aggregate_paths, warnings = _discover_trio_result_files(paths)
     records: List[TrioOracleRecord] = []
@@ -628,12 +639,5 @@ def import_trio_oracle_results(review_dir: Path, paths: Sequence[Path]) -> TrioO
         source_paths=_stable_unique_strings(source_paths),
         warnings=_stable_unique_strings(warnings),
     )
-    review_dir.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(
-        trio_cache_path(review_dir),
-        _trio_import_to_payload(import_data),
-        indent=2,
-        sort_keys=False,
-        create_backup=True,
-    )
+    write_trio_oracle_import(review_dir, import_data)
     return import_data
