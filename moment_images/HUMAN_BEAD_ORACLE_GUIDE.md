@@ -74,7 +74,11 @@ python -m moment_images.human_bead_oracle annotate-gui \
 The command opens the Tkinter annotation workbench. `--dataset-folder` imports
 `.png`, `.jpg`, `.jpeg`, `.tif`, and `.tiff` files and maps filename stems to
 dataset ids. You can also launch the workbench with only `--output` and add
-images or folders from the window.
+images or folders from the window. Images added from the window are
+auto-disambiguated when common preview filenames repeat. For sweep artifacts
+such as `runs/<stage>/<candidate>/<dataset>/avg_rectified.png`, the workbench
+uses the dataset folder as the generated id and appends path context when the
+same dataset id appears more than once.
 
 Controls:
 
