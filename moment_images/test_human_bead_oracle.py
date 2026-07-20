@@ -23,6 +23,10 @@ from moment_images.human_bead_oracle import (
     scaled_beads_for_image,
     write_human_bead_annotations,
 )
+from moment_images.human_bead_workbench import (
+    HumanBeadWorkbenchState,
+    collect_dataset_images_from_folder,
+)
 
 
 def _gaussian_bead(
@@ -124,6 +128,98 @@ def test_annotation_session_preserves_existing_datasets_not_in_current_run(tmp_p
     assert sorted(loaded) == ["d1", "d2"]
     assert loaded["d2"].beads[0].bead_id == "b002"
     assert loaded["d2"].beads[0].x == pytest.approx(20.0)
+
+
+def test_workbench_state_edits_beads_and_undo_redo(tmp_path: Path):
+    state = HumanBeadWorkbenchState(
+        {"d1": tmp_path / "d1.png"},
+        tmp_path / "beads.json",
+        image_shapes={"d1": (32, 32)},
+        default_radius_px=4.0,
+    )
+
+    bead_index = state.add_bead(10.0, 12.0)
+    state.move_selected_bead(11.5, 13.5)
+    state.adjust_selected_radius(-10.0)
+
+    bead = state.current_annotation.beads[bead_index]
+    assert bead.bead_id == "b001"
+    assert bead.x == pytest.approx(11.5)
+    assert bead.y == pytest.approx(13.5)
+    assert bead.radius_px == pytest.approx(0.5)
+
+    state.delete_selected_bead()
+    assert state.current_annotation.beads == []
+
+    assert state.undo() is True
+    assert len(state.current_annotation.beads) == 1
+    assert state.current_annotation.beads[0].x == pytest.approx(11.5)
+
+    assert state.redo() is True
+    assert state.current_annotation.beads == []
+
+
+def test_workbench_state_undo_after_add_clears_stale_selection(tmp_path: Path):
+    state = HumanBeadWorkbenchState(
+        {"d1": tmp_path / "d1.png"},
+        tmp_path / "beads.json",
+        image_shapes={"d1": (32, 32)},
+    )
+
+    state.add_bead(10.0, 12.0)
+
+    assert state.undo() is True
+    assert state.current_annotation.beads == []
+    assert state.selected_index is None
+
+
+def test_workbench_state_save_preserves_unopened_existing_datasets(tmp_path: Path):
+    annotations_path = tmp_path / "beads.json"
+    write_human_bead_annotations(
+        annotations_path,
+        {
+            "d1": HumanBeadDatasetAnnotations(
+                dataset_id="d1",
+                image_path="d1.png",
+                image_shape=(32, 32),
+                default_radius_px=4.0,
+                beads=[],
+            ),
+            "d2": HumanBeadDatasetAnnotations(
+                dataset_id="d2",
+                image_path="d2.png",
+                image_shape=(64, 64),
+                default_radius_px=5.0,
+                beads=[HumanBead(bead_id="b001", x=20.0, y=21.0, radius_px=5.0)],
+            ),
+        },
+    )
+    existing = load_human_bead_annotations(annotations_path)
+    state = HumanBeadWorkbenchState(
+        {"d1": tmp_path / "d1.png"},
+        annotations_path,
+        existing=existing,
+        image_shapes={"d1": (32, 32)},
+        default_radius_px=4.0,
+    )
+
+    state.add_bead(8.0, 9.0)
+    state.save()
+    loaded = load_human_bead_annotations(annotations_path)
+
+    assert sorted(loaded) == ["d1", "d2"]
+    assert loaded["d1"].beads[0].x == pytest.approx(8.0)
+    assert loaded["d2"].beads[0].x == pytest.approx(20.0)
+
+
+def test_collect_dataset_images_from_folder_maps_supported_file_stems(tmp_path: Path):
+    for name in ("scene_b.tif", "scene_a.PNG", "ignore.txt", "scene_c.jpeg"):
+        (tmp_path / name).write_bytes(b"x")
+
+    dataset_images = collect_dataset_images_from_folder(tmp_path)
+
+    assert list(dataset_images) == ["scene_a", "scene_b", "scene_c"]
+    assert dataset_images["scene_a"] == tmp_path / "scene_a.PNG"
 
 
 def test_annotation_loading_rejects_invalid_radius(tmp_path: Path):
@@ -243,6 +339,68 @@ def test_cli_annotate_help_smoke(capsys):
 
     assert exc_info.value.code == 0
     assert "dataset-image" in capsys.readouterr().out
+
+
+def test_cli_annotate_gui_help_smoke(capsys):
+    parser = build_arg_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["annotate-gui", "--help"])
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "dataset-image" in help_text
+    assert "dataset-folder" in help_text
+    assert "default-radius-px" in help_text
+
+
+def test_cli_annotate_gui_dispatches_to_workbench(monkeypatch, tmp_path: Path):
+    image_path = tmp_path / "manual.png"
+    image_path.write_bytes(b"x")
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    (folder / "scene_a.png").write_bytes(b"x")
+    output_path = tmp_path / "beads.json"
+    calls = []
+
+    def fake_launch(*, dataset_images, output_path, default_radius_px, parent=None):
+        calls.append(
+            {
+                "dataset_images": dict(dataset_images),
+                "output_path": output_path,
+                "default_radius_px": default_radius_px,
+                "parent": parent,
+            }
+        )
+        return output_path
+
+    monkeypatch.setattr(
+        "moment_images.human_bead_oracle.launch_human_bead_workbench",
+        fake_launch,
+    )
+
+    main(
+        [
+            "annotate-gui",
+            "--dataset-image",
+            f"manual={image_path}",
+            "--dataset-folder",
+            str(folder),
+            "--output",
+            str(output_path),
+            "--default-radius-px",
+            "6",
+        ]
+    )
+
+    assert calls == [
+        {
+            "dataset_images": {"manual": image_path, "scene_a": folder / "scene_a.png"},
+            "output_path": output_path,
+            "default_radius_px": 6.0,
+            "parent": None,
+        }
+    ]
 
 
 def test_cli_preview_and_score_workspace_smoke(tmp_path: Path):

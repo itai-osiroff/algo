@@ -8191,6 +8191,46 @@ def _validation_oracle_mode_from_state(state: SpecGuiState) -> str:
     return str(state.validation_oracle_mode or VALIDATION_ORACLE_MODE_TRIO).strip()
 
 
+HUMAN_BEAD_WORKBENCH_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+
+
+def _launch_human_bead_workbench_for_sweep(
+    *,
+    annotation_path_text: str,
+    output_dir_text: str,
+    dataset_images: Mapping[str, Path],
+    choose_output_path: Optional[Callable[[Path], Optional[Path]]] = None,
+    launcher: Optional[Callable[..., Path]] = None,
+    parent: Any = None,
+    default_radius_px: float = 4.0,
+) -> str:
+    cleaned_path = str(annotation_path_text or "").strip()
+    if cleaned_path:
+        output_path = Path(cleaned_path)
+    else:
+        output_dir = Path(str(output_dir_text or "").strip() or ".")
+        default_path = output_dir / "human_beads.json"
+        selected_path = (
+            choose_output_path(default_path)
+            if choose_output_path is not None
+            else default_path
+        )
+        if selected_path is None:
+            return ""
+        output_path = Path(selected_path)
+
+    if launcher is None:
+        from moment_images.human_bead_oracle import launch_human_bead_workbench as launcher
+
+    saved_path = launcher(
+        dataset_images={dataset_id: Path(path) for dataset_id, path in dataset_images.items()},
+        output_path=output_path,
+        default_radius_px=float(default_radius_px),
+        parent=parent,
+    )
+    return str(saved_path or output_path)
+
+
 def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
     """Convert GUI state into canonical JSON payload for SweepExperimentSpec."""
     strategies: List[str] = []
@@ -9788,6 +9828,13 @@ class SpecGuiApp:
         )
         bead_annotations_browse_btn.pack(side="left", padx=2)
         self._register_editable(bead_annotations_browse_btn)
+        bead_annotations_annotate_btn = self.ttk.Button(
+            bead_annotations_frame,
+            text="Annotate",
+            command=self._open_human_bead_workbench,
+        )
+        bead_annotations_annotate_btn.pack(side="left", padx=2)
+        self._register_editable(bead_annotations_annotate_btn)
 
         self.ttk.Label(validation_container, text="Defaults JSON").pack(anchor="w", padx=8)
         self.validation_oracle_defaults_text = self.tk.Text(
@@ -10223,6 +10270,43 @@ class SpecGuiApp:
         )
         if selected:
             path_var.set(selected)
+
+    def _human_bead_dataset_images_from_rows(self) -> Dict[str, Path]:
+        dataset_images: Dict[str, Path] = {}
+        for row in self.dataset_rows:
+            dataset_id = str(row["id_var"].get()).strip()
+            source_type = str(row["source_type_var"].get()).strip()
+            source_path = str(row["source_path_var"].get()).strip()
+            if not dataset_id or source_type != "source_image" or not source_path:
+                continue
+            path = Path(source_path)
+            if path.suffix.lower() in HUMAN_BEAD_WORKBENCH_IMAGE_EXTENSIONS and path.exists():
+                dataset_images[dataset_id] = path
+        return dataset_images
+
+    def _open_human_bead_workbench(self) -> None:
+        def choose_output_path(default_path: Path) -> Optional[Path]:
+            selected = self.filedialog.asksaveasfilename(
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+                initialdir=str(default_path.parent),
+                initialfile=default_path.name,
+            )
+            return None if not selected else Path(selected)
+
+        try:
+            saved_path = _launch_human_bead_workbench_for_sweep(
+                annotation_path_text=self.validation_oracle_human_bead_annotations_var.get(),
+                output_dir_text=self.output_dir_entry.get(),
+                dataset_images=self._human_bead_dataset_images_from_rows(),
+                choose_output_path=choose_output_path,
+                parent=self.root,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.messagebox.showerror("Human Bead Annotations", str(exc))
+            return
+        if saved_path:
+            self.validation_oracle_human_bead_annotations_var.set(saved_path)
 
     def _on_browse_output_dir(self) -> None:
         selected = self.filedialog.askdirectory()

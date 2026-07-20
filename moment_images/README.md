@@ -85,10 +85,10 @@ saved `metric_review/trio_oracle_metrics.json` cache. Rows marked unrankable by
 the trio benchmark remain inspectable but are excluded from oracle ranking and
 validation-refinement seed export.
 
-Create human bead-center annotations:
+Create human bead-center annotations with the batch workbench:
 
 ```bash
-python -m moment_images.human_bead_oracle annotate --dataset-image scene_id=path/to/preview.png --output path/to/human_beads.json
+python -m moment_images.human_bead_oracle annotate-gui --dataset-image scene_id=path/to/preview.png --output path/to/human_beads.json
 ```
 
 Preview and score human bead annotations:
@@ -203,6 +203,7 @@ Several tools are GUI-first and require a desktop session:
 - `parameter_sweep.py --gui`
 - `sweep_visualization.py` without `--export-dir`
 - `sweep_metric_explorer.py` without `--export-dir`
+- `human_bead_oracle.py annotate-gui`
 - `human_bead_oracle.py annotate`
 - `validate_rectification.py`
 - `batch_process_validation_images.py`

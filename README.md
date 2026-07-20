@@ -23,7 +23,7 @@ Spinnaker camera environment.
 | Sweep GUI/report export | [Sweep Reporting Guide](moment_images/SWEEP_REPORTING_GUIDE.md) | `python -m moment_images.sweep_visualization path/to/sweep_output` |
 | Raw metric re-ranking | [Sweep Metric Explorer Guide](moment_images/SWEEP_METRIC_EXPLORER_GUIDE.md) | `python -m moment_images.sweep_metric_explorer path/to/sweep_output` |
 | Validation against other cameras | [Validation GUI Guide](moment_images/VALIDATE_RECTIFICATION_GUI_GUIDE.md) | `python -m moment_images.validate_rectification` |
-| Human bead oracle annotations | [Human Bead Oracle Guide](moment_images/HUMAN_BEAD_ORACLE_GUIDE.md) | `python -m moment_images.human_bead_oracle annotate --dataset-image dataset_id=path/to/image --output path/to/human_beads.json` |
+| Human bead oracle annotations | [Human Bead Oracle Guide](moment_images/HUMAN_BEAD_ORACLE_GUIDE.md) | `python -m moment_images.human_bead_oracle annotate-gui --dataset-image dataset_id=path/to/image --output path/to/human_beads.json` |
 | Gain calibration | [Gain Calibration Guide](moment_images/GAIN_CALIBRATION_GUIDE.md) | `python -m moment_images.main_thor_gain --gui` |
 | Point Grey / FLIR acquisition | [Point Grey Acquisition Guide](POINT_GREY_ACQUISITION_GUIDE.md) | `python acquire_images_PG.py --mode stream --output-dir path/to/pg_snaps` |
 
@@ -106,7 +106,8 @@ python acquire_images_PG.py --mode stream --output-dir path/to/pg_snaps
 | `python -m moment_images.parameter_sweep --gui` | GUI for building and running sweep specs | Useful when editing JSON by hand is inconvenient |
 | `python -m moment_images.sweep_visualization path/to/sweep_output` | Inspect sweep leaderboards and candidate comparisons | Also supports `--export-dir` for static reports |
 | `python -m moment_images.sweep_metric_explorer path/to/sweep_output` | Re-rank completed sweeps from raw `workspace.npz` artifacts | Supports annotations, custom metric profiles, `--metrics-config`, and trio oracle import via `--trio-results` |
-| `python -m moment_images.human_bead_oracle annotate` | Interactively click bead centers/radii and write human-bead annotation JSON | Requires `--dataset-image dataset_id=path` and `--output`; opens a matplotlib window |
+| `python -m moment_images.human_bead_oracle annotate-gui` | Batch GUI for bead center/radius annotation JSON | Supports `--dataset-image`, `--dataset-folder`, and `--output`; opens a Tkinter workbench |
+| `python -m moment_images.human_bead_oracle annotate` | Lightweight bead center/radius annotation JSON editor | Requires `--dataset-image dataset_id=path` and `--output`; opens a Matplotlib window |
 | `python -m moment_images.human_bead_oracle preview` | Render preview sheets for a human-bead annotation JSON | Requires `--annotations` and `--output-dir` |
 | `python -m moment_images.human_bead_oracle score-workspace` | Score one `workspace.npz` against one dataset's human-bead annotations | Requires `--annotations`, `--dataset-id`, `--workspace`, and `--output` |
 | `python generate_reports.py path/to/sweep_output` | Rebuild analysis/alpha report artifacts from sweep outputs | Use `--rebuild-summaries --spec path/to/spec.json` when summary products need regeneration |

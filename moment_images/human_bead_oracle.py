@@ -956,6 +956,38 @@ def _cmd_score_workspace(args: argparse.Namespace) -> None:
     )
 
 
+def launch_human_bead_workbench(
+    *,
+    dataset_images: Mapping[str, Path],
+    output_path: Path,
+    default_radius_px: float = 4.0,
+    parent: Any = None,
+) -> Path:
+    from moment_images.human_bead_workbench import launch_human_bead_workbench as _launch_workbench
+
+    return _launch_workbench(
+        dataset_images=dataset_images,
+        output_path=Path(output_path),
+        default_radius_px=float(default_radius_px),
+        parent=parent,
+    )
+
+
+def _cmd_annotate_gui(args: argparse.Namespace) -> None:
+    from moment_images.human_bead_workbench import collect_dataset_images
+
+    dataset_images = collect_dataset_images(
+        args.dataset_image or [],
+        args.dataset_folder or [],
+    )
+    launch_human_bead_workbench(
+        dataset_images=dataset_images,
+        output_path=Path(args.output),
+        default_radius_px=float(args.default_radius_px),
+        parent=None,
+    )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Annotate and score manual bead-center oracle metrics.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -965,6 +997,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     annotate.add_argument("--output", required=True, type=Path)
     annotate.add_argument("--default-radius-px", type=float, default=4.0)
     annotate.set_defaults(func=_cmd_annotate)
+
+    annotate_gui = subparsers.add_parser("annotate-gui", help="Open the batch bead annotation workbench.")
+    annotate_gui.add_argument("--dataset-image", action="append", default=[], help="dataset_id=path/to/image")
+    annotate_gui.add_argument(
+        "--dataset-folder",
+        action="append",
+        default=[],
+        type=Path,
+        help="Folder of image files keyed by filename stem",
+    )
+    annotate_gui.add_argument("--output", required=True, type=Path)
+    annotate_gui.add_argument("--default-radius-px", type=float, default=4.0)
+    annotate_gui.set_defaults(func=_cmd_annotate_gui)
 
     preview = subparsers.add_parser("preview", help="Render bead annotation preview sheets.")
     preview.add_argument("--annotations", required=True, type=Path)

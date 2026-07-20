@@ -63,29 +63,45 @@ rejected because they would distort bead geometry.
 Run from the project root:
 
 ```bash
-python -m moment_images.human_bead_oracle annotate \
+python -m moment_images.human_bead_oracle annotate-gui \
   --dataset-image scene_a=path/to/scene_a_preview.png \
   --dataset-image scene_b=path/to/scene_b_preview.png \
+  --dataset-folder path/to/more_preview_images \
   --output path/to/human_beads.json \
   --default-radius-px 4
 ```
 
-The command opens a Matplotlib window.
+The command opens the Tkinter annotation workbench. `--dataset-folder` imports
+`.png`, `.jpg`, `.jpeg`, `.tif`, and `.tiff` files and maps filename stems to
+dataset ids. You can also launch the workbench with only `--output` and add
+images or folders from the window.
 
 Controls:
 
 - left click empty space: add a bead
-- left click near a bead: move that bead
-- mouse wheel, `+`, or `=`: increase selected bead radius
-- mouse wheel down, `-`, or `_`: decrease selected bead radius
+- left click near a bead: select and move that bead
+- toolbar pan/zoom: inspect dense images before clicking
+- bead table / inspector: select, edit id/x/y/radius, and apply changes
+- `+` or keypad plus: increase selected bead radius
+- `-` or keypad minus: decrease selected bead radius
 - `delete` or `backspace`: remove selected bead
 - `n` or right arrow: next dataset
 - `p` or left arrow: previous dataset
-- `s`: save
+- `Ctrl+S`: save
+- `Ctrl+Z` / `Ctrl+Y`: undo / redo
 
-Closing the window saves any unsaved changes. Re-running `annotate` against an
-existing JSON updates only the datasets passed with `--dataset-image`; other
-datasets in the JSON are preserved.
+The workbench autosaves when switching datasets and asks whether to save on
+close. Re-running `annotate-gui` against an existing JSON preserves datasets
+that are not opened in the session.
+
+The older lightweight Matplotlib annotator remains available:
+
+```bash
+python -m moment_images.human_bead_oracle annotate \
+  --dataset-image scene_a=path/to/scene_a_preview.png \
+  --output path/to/human_beads.json \
+  --default-radius-px 4
+```
 
 ## Preview Annotations
 
@@ -205,7 +221,9 @@ In `python -m moment_images.parameter_sweep --gui`:
    - normal validation: run image-metric stage 2, then validate
    - validation-guided refinement: skip image-metric stage 2
 4. Use `Bead annotations` and `Browse` for one shared annotation JSON.
-5. For per-dataset annotation files, enter scene overrides in `Scenes JSON`
+5. Use `Annotate` beside `Bead annotations` to open the workbench from the
+   sweep GUI. If the path is empty, choose where to save `human_beads.json`.
+6. For per-dataset annotation files, enter scene overrides in `Scenes JSON`
    using `human_bead_annotations`.
 
 The dataset row validation workspace / validation image / ThorCam fields are
@@ -268,4 +286,3 @@ Relative `image_path` values are resolved relative to the annotation JSON file.
 
 Confirm the validation oracle `Mode` is `human_bead`. Trio validation mode still
 requires a validation workspace or a validation/ThorCam image pair.
-
