@@ -10,6 +10,18 @@ from typing import Dict, Iterable, List, Mapping, Optional, Tuple, cast
 import cv2 as cv
 import numpy as np
 
+from moment_images.human_bead_oracle import (
+    HUMAN_BEAD_CENTER_SHIFT_P95,
+    HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN,
+    HUMAN_BEAD_ELONGATION_MEAN,
+    HUMAN_BEAD_EVALUATED_BEAD_COUNT,
+    HUMAN_BEAD_FWHM_RADIUS_MEAN,
+    HUMAN_BEAD_HALO_TO_CORE_RATIO_MEAN,
+    HUMAN_BEAD_ORACLE_SCORE,
+    HUMAN_BEAD_RESIDUAL_GRADIENT_MAX,
+    HUMAN_BEAD_RESIDUAL_GRADIENT_P95,
+    HUMAN_BEAD_SUPPORT_RADIUS_MEAN,
+)
 from moment_images.im_process import min_max_normalize
 from moment_images.reliable_io import read_json_first_valid, write_json_atomic
 
@@ -374,6 +386,28 @@ def build_metric_registry(*, include_saved: bool = True) -> Dict[str, MetricDesc
             category="tamura",
             representation=representation,
             description="Tamura coefficient focus metric recomputed from the workspace artifact.",
+        )
+    human_bead_metrics = {
+        HUMAN_BEAD_ORACLE_SCORE: ("Human Bead Oracle Score", "oracle", "max"),
+        HUMAN_BEAD_EVALUATED_BEAD_COUNT: ("Human Bead Evaluated Count", "oracle_diagnostic", "max"),
+        HUMAN_BEAD_FWHM_RADIUS_MEAN: ("Human Bead FWHM Radius", "oracle_diagnostic", "min"),
+        HUMAN_BEAD_SUPPORT_RADIUS_MEAN: ("Human Bead Support Radius", "oracle_diagnostic", "min"),
+        HUMAN_BEAD_HALO_TO_CORE_RATIO_MEAN: ("Human Bead Halo/Core Ratio", "oracle_diagnostic", "min"),
+        HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN: ("Human Bead Core Energy Fraction", "oracle_diagnostic", "max"),
+        HUMAN_BEAD_ELONGATION_MEAN: ("Human Bead Elongation", "oracle_diagnostic", "min"),
+        HUMAN_BEAD_CENTER_SHIFT_P95: ("Human Bead Center Shift P95", "oracle_diagnostic", "min"),
+        HUMAN_BEAD_RESIDUAL_GRADIENT_P95: ("Human Bead Residual Gradient P95", "oracle_diagnostic", "min"),
+        HUMAN_BEAD_RESIDUAL_GRADIENT_MAX: ("Human Bead Residual Gradient Max", "oracle_diagnostic", "min"),
+    }
+    for name, (label, category, direction) in human_bead_metrics.items():
+        registry[name] = MetricDescriptor(
+            name=name,
+            label=label,
+            direction=direction,
+            category=category,
+            representation="external_oracle",
+            description="Manual bead-center oracle metric imported from human_bead_oracle.",
+            read_only=True,
         )
     return registry
 

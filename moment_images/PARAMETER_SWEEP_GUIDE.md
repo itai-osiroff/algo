@@ -197,6 +197,12 @@ Legacy exported references still work by providing both `validation_image` and
 `thorcam_image` for a scene. Use the advanced scene JSON for non-reference
 fields such as `scene_id`, `anchor_row_id`, and registration tuning.
 
+To rank validation phases from manually clicked bead centers instead of trio
+benchmark references, set `oracle_mode: "human_bead"` and provide
+`human_bead_annotations`. See
+[HUMAN_BEAD_ORACLE_GUIDE.md](HUMAN_BEAD_ORACLE_GUIDE.md) for the annotation
+workflow, JSON schema, GUI setup, and output interpretation.
+
 ## Resume, Extend, Merge, Dry Run
 
 Spec-mode sweeps write durable state to `run_state.json`.

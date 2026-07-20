@@ -799,6 +799,94 @@ def test_trio_results_import_join_oracle_profile_and_export_seeds(tmp_path):
     assert reloaded_good_d1.metrics[explorer.TRIO_PRIMARY_SCORE] == pytest.approx(0.95)
 
 
+def test_human_bead_oracle_cache_adds_profile_and_exports_metrics(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    cache_dir = output_dir / "metric_review"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / explorer.TRIO_ORACLE_CACHE_FILENAME
+    cache_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "imported_at": "2026-07-20T00:00:00+00:00",
+                "source_paths": ["human_beads.json"],
+                "warnings": [],
+                "baselines": {},
+                "records": [
+                    {
+                        "source_kind": "lf_candidate",
+                        "stage": "stage1",
+                        "candidate_id": "c_good",
+                        "dataset_id": "d1",
+                        "generation_id": None,
+                        "row_id": "stage1:c_good",
+                        "validation_rank": 1,
+                        "metrics": {
+                            explorer.HUMAN_BEAD_ORACLE_SCORE: 0.92,
+                            explorer.HUMAN_BEAD_EVALUATED_BEAD_COUNT: 3,
+                        },
+                        "diagnostics": {
+                            "validation_rankable": True,
+                            "oracle_mode": "human_bead",
+                            explorer.HUMAN_BEAD_PER_BEAD_METRICS: [
+                                {
+                                    "bead_id": "b001",
+                                    "rankable": True,
+                                    "x": 16.0,
+                                    "y": 16.0,
+                                    "radius_px": 4.0,
+                                    "metrics": {explorer.HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN: 0.82},
+                                }
+                            ],
+                        },
+                        "validation_rankable": True,
+                        "ranking_exclusion_reason": None,
+                        "report_path": None,
+                        "overlay_path": None,
+                        "diff_path": None,
+                        "source_path": "human_beads.json",
+                        "warnings": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    model = load_sweep_metric_explorer_model(output_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+
+    profile_names = {profile.name for profile in model.config.profiles}
+    assert explorer.HUMAN_BEAD_ORACLE_PROFILE_NAME in profile_names
+    assert explorer.TRIO_ORACLE_PROFILE_NAME not in profile_names
+    good_d1 = next(
+        record for record in model.raw_records if record.candidate_id == "c_good" and record.dataset_id == "d1"
+    )
+    assert good_d1.metrics[explorer.HUMAN_BEAD_ORACLE_SCORE] == pytest.approx(0.92)
+
+    results = _ensure_profile_results(
+        model,
+        stage_name="stage1",
+        profile_name=explorer.HUMAN_BEAD_ORACLE_PROFILE_NAME,
+        include_analysis=True,
+    )
+    assert results[0].candidate_id == "c_good"
+
+    export_dir = tmp_path / "human_bead_export"
+    export_metric_report(model, export_dir)
+    with (export_dir / "candidate_metrics.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    good_row = next(row for row in rows if row["candidate_id"] == "c_good" and row["dataset_id"] == "d1")
+    assert good_row[explorer.HUMAN_BEAD_ORACLE_SCORE] == "0.92"
+    diagnostics = json.loads(good_row["oracle_diagnostics_json"])
+    assert diagnostics[explorer.HUMAN_BEAD_PER_BEAD_METRICS][0]["bead_id"] == "b001"
+    seeds = json.loads((export_dir / "validation_refinement_seeds.json").read_text(encoding="utf-8"))
+    assert seeds["source"] == "oracle_metrics"
+    assert seeds["score_metric"] == explorer.HUMAN_BEAD_ORACLE_SCORE
+    assert seeds["oracle_mode"] == "human_bead"
+    assert seeds["seeds"][0]["candidate_id"] == "c_good"
+    assert seeds["seeds"][0]["oracle_score"] == pytest.approx(0.92)
+
+
 def test_trio_oracle_profile_hidden_without_import(tmp_path):
     output_dir = _make_modern_fixture(tmp_path)
 

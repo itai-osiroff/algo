@@ -9,6 +9,7 @@ from moment_images.parameter_sweep import (
     SpecGuiMetricExperimentRowState,
     SpecGuiRelocationRuleState,
     SpecGuiState,
+    _launch_human_bead_workbench_for_sweep,
     _load_spec_payload,
     _save_spec_payload,
     spec_dict_to_state,
@@ -240,6 +241,79 @@ def test_state_to_spec_maps_validation_oracle_workflow_mode(tmp_path):
     payload = state_to_spec_dict(state)
 
     assert payload["validation_oracle_sweep"]["skip_image_metric_stage"] is False
+
+
+def test_state_to_spec_roundtrip_with_human_bead_oracle_shortcut(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.validation_oracle_enabled = True
+    state.validation_oracle_mode = "human_bead"
+    state.validation_oracle_human_bead_annotations = str(tmp_path / "beads.json")
+    state.validation_oracle_scenes_json = json.dumps(
+        [{"dataset_id": "dataset_a", "scene_id": "scene_a"}]
+    )
+
+    issues = validate_state(state)
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    assert not any("workspace or validation/ThorCam image pair" in issue for issue in issues)
+    oracle = payload["validation_oracle_sweep"]
+    assert oracle["oracle_mode"] == "human_bead"
+    assert oracle["defaults"]["human_bead_annotations"] == str(tmp_path / "beads.json")
+    assert oracle["scenes"][0]["dataset_id"] == "dataset_a"
+    assert oracle["scenes"][0]["scene_id"] == "scene_a"
+    assert "validation_workspace" not in oracle["scenes"][0]
+    assert "validation_image" not in oracle["scenes"][0]
+    assert "thorcam_image" not in oracle["scenes"][0]
+    assert roundtrip.validation_oracle_mode == "human_bead"
+    assert roundtrip.validation_oracle_human_bead_annotations == str(tmp_path / "beads.json")
+    assert json.loads(roundtrip.validation_oracle_defaults_json) == {}
+
+
+def test_human_bead_workbench_sweep_helper_uses_default_output_and_dataset_images(tmp_path):
+    preview_path = tmp_path / "preview.png"
+    preview_path.write_bytes(b"x")
+    calls = []
+
+    def fake_launcher(*, dataset_images, output_path, default_radius_px, parent=None):
+        calls.append(
+            {
+                "dataset_images": dict(dataset_images),
+                "output_path": output_path,
+                "default_radius_px": default_radius_px,
+                "parent": parent,
+            }
+        )
+        return output_path
+
+    resolved = _launch_human_bead_workbench_for_sweep(
+        annotation_path_text="",
+        output_dir_text=str(tmp_path / "sweep_out"),
+        dataset_images={"dataset_a": preview_path},
+        choose_output_path=lambda default_path: default_path,
+        launcher=fake_launcher,
+        parent="root",
+    )
+
+    assert resolved == str(tmp_path / "sweep_out" / "human_beads.json")
+    assert calls == [
+        {
+            "dataset_images": {"dataset_a": preview_path},
+            "output_path": tmp_path / "sweep_out" / "human_beads.json",
+            "default_radius_px": 4.0,
+            "parent": "root",
+        }
+    ]
+
+
+def test_validate_state_requires_human_bead_annotations_in_human_mode(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.validation_oracle_enabled = True
+    state.validation_oracle_mode = "human_bead"
+
+    issues = validate_state(state)
+
+    assert any("human bead annotations" in issue.lower() for issue in issues)
 
 
 def test_validate_state_accepts_validation_oracle_workspace_path(tmp_path):
