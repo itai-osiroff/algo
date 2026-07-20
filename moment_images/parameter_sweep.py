@@ -6043,10 +6043,10 @@ def _run_validation_oracle_benchmarks(
 def _human_bead_annotations_for_scenes(
     scene_lookup: Mapping[str, Mapping[str, object]],
     dataset_ids: Sequence[str],
-) -> Tuple[Dict[str, object], List[Path]]:
+) -> Tuple[Dict[str, object], Dict[str, Path]]:
     annotations_by_dataset: Dict[str, object] = {}
     loaded_by_path: Dict[Path, Dict[str, object]] = {}
-    source_paths: List[Path] = []
+    source_paths_by_dataset: Dict[str, Path] = {}
     for dataset_id in dataset_ids:
         annotation_path_text = _validation_oracle_scene_human_bead_annotations(
             scene_lookup[dataset_id]
@@ -6057,7 +6057,7 @@ def _human_bead_annotations_for_scenes(
                 f"{dataset_id!r} must provide human_bead_annotations."
             )
         annotation_path = Path(annotation_path_text)
-        source_paths.append(annotation_path)
+        source_paths_by_dataset[dataset_id] = annotation_path.resolve()
         if annotation_path not in loaded_by_path:
             loaded_by_path[annotation_path] = cast(
                 Dict[str, object],
@@ -6070,7 +6070,7 @@ def _human_bead_annotations_for_scenes(
                 f"{annotation_path!s} do not contain dataset {dataset_id!r}."
             )
         annotations_by_dataset[dataset_id] = annotations[dataset_id]
-    return annotations_by_dataset, list(dict.fromkeys(path.resolve() for path in source_paths))
+    return annotations_by_dataset, source_paths_by_dataset
 
 
 def _run_human_bead_oracle_stage(
@@ -6084,7 +6084,7 @@ def _run_human_bead_oracle_stage(
     oracle_root = sweep_dir / VALIDATION_ORACLE_DIR_NAME
     stage_root = oracle_root / stage_name
     stage_root.mkdir(parents=True, exist_ok=True)
-    annotations_by_dataset, source_paths = _human_bead_annotations_for_scenes(
+    annotations_by_dataset, source_paths_by_dataset = _human_bead_annotations_for_scenes(
         scene_lookup,
         dataset_ids,
     )
@@ -6092,9 +6092,10 @@ def _run_human_bead_oracle_stage(
         stage_name=stage_name,
         stage_results=stage_results,
         annotations=annotations_by_dataset,
-        source_paths=source_paths,
+        annotation_source_paths_by_dataset=source_paths_by_dataset,
     )
     import_data = write_human_bead_oracle_import(sweep_dir / "metric_review", stage_import)
+    source_paths = list(dict.fromkeys(source_paths_by_dataset.values()))
     manifest = {
         "stage": stage_name,
         "oracle_mode": VALIDATION_ORACLE_MODE_HUMAN_BEAD,

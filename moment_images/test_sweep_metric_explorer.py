@@ -828,6 +828,16 @@ def test_human_bead_oracle_cache_adds_profile_and_exports_metrics(tmp_path):
                         "diagnostics": {
                             "validation_rankable": True,
                             "oracle_mode": "human_bead",
+                            explorer.HUMAN_BEAD_PER_BEAD_METRICS: [
+                                {
+                                    "bead_id": "b001",
+                                    "rankable": True,
+                                    "x": 16.0,
+                                    "y": 16.0,
+                                    "radius_px": 4.0,
+                                    "metrics": {explorer.HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN: 0.82},
+                                }
+                            ],
                         },
                         "validation_rankable": True,
                         "ranking_exclusion_reason": None,
@@ -845,7 +855,9 @@ def test_human_bead_oracle_cache_adds_profile_and_exports_metrics(tmp_path):
 
     model = load_sweep_metric_explorer_model(output_dir, hydrate_mode=HYDRATE_MODE_LAZY)
 
-    assert explorer.HUMAN_BEAD_ORACLE_PROFILE_NAME in {profile.name for profile in model.config.profiles}
+    profile_names = {profile.name for profile in model.config.profiles}
+    assert explorer.HUMAN_BEAD_ORACLE_PROFILE_NAME in profile_names
+    assert explorer.TRIO_ORACLE_PROFILE_NAME not in profile_names
     good_d1 = next(
         record for record in model.raw_records if record.candidate_id == "c_good" and record.dataset_id == "d1"
     )
@@ -865,6 +877,14 @@ def test_human_bead_oracle_cache_adds_profile_and_exports_metrics(tmp_path):
         rows = list(csv.DictReader(handle))
     good_row = next(row for row in rows if row["candidate_id"] == "c_good" and row["dataset_id"] == "d1")
     assert good_row[explorer.HUMAN_BEAD_ORACLE_SCORE] == "0.92"
+    diagnostics = json.loads(good_row["oracle_diagnostics_json"])
+    assert diagnostics[explorer.HUMAN_BEAD_PER_BEAD_METRICS][0]["bead_id"] == "b001"
+    seeds = json.loads((export_dir / "validation_refinement_seeds.json").read_text(encoding="utf-8"))
+    assert seeds["source"] == "oracle_metrics"
+    assert seeds["score_metric"] == explorer.HUMAN_BEAD_ORACLE_SCORE
+    assert seeds["oracle_mode"] == "human_bead"
+    assert seeds["seeds"][0]["candidate_id"] == "c_good"
+    assert seeds["seeds"][0]["oracle_score"] == pytest.approx(0.92)
 
 
 def test_trio_oracle_profile_hidden_without_import(tmp_path):

@@ -26,6 +26,7 @@ HUMAN_BEAD_ORACLE_MODE = "human_bead"
 HUMAN_BEAD_ORACLE_PROFILE_NAME = "human_bead_oracle"
 HUMAN_BEAD_ORACLE_SCORE = "human_bead_oracle_score_v1"
 HUMAN_BEAD_EVALUATED_BEAD_COUNT = "human_bead_evaluated_bead_count"
+HUMAN_BEAD_PER_BEAD_METRICS = "human_bead_per_bead_metrics"
 HUMAN_BEAD_FWHM_RADIUS_MEAN = "human_bead_fwhm_radius_px_mean"
 HUMAN_BEAD_SUPPORT_RADIUS_MEAN = "human_bead_support_radius_px_mean"
 HUMAN_BEAD_HALO_TO_CORE_RATIO_MEAN = "human_bead_halo_to_core_ratio_mean"
@@ -464,8 +465,19 @@ def compute_human_bead_oracle_metrics(
             warnings=[str(exc)],
         )
 
-    per_bead = [_compute_one_bead(arr, bead) for bead in beads]
-    evaluated = [item for item in per_bead if item is not None]
+    per_bead = [(bead, _compute_one_bead(arr, bead)) for bead in beads]
+    evaluated = [item for _bead, item in per_bead if item is not None]
+    per_bead_diagnostics = [
+        {
+            "bead_id": bead.bead_id,
+            "rankable": item is not None,
+            "x": float(bead.x),
+            "y": float(bead.y),
+            "radius_px": float(bead.radius_px),
+            "metrics": {} if item is None else {name: float(value) for name, value in item.items()},
+        }
+        for bead, item in per_bead
+    ]
     required_count = min(3, len(beads))
     metrics: Dict[str, float] = {
         HUMAN_BEAD_EVALUATED_BEAD_COUNT: float(len(evaluated)),
@@ -492,6 +504,7 @@ def compute_human_bead_oracle_metrics(
         "validation_rankable": bool(rankable),
         "oracle_mode": HUMAN_BEAD_ORACLE_MODE,
         "human_bead_annotation_count": len(beads),
+        HUMAN_BEAD_PER_BEAD_METRICS: per_bead_diagnostics,
     }
     if exclusion_reason:
         diagnostics["ranking_exclusion_reason"] = exclusion_reason
@@ -530,8 +543,11 @@ def build_human_bead_oracle_import(
     stage_name: str,
     stage_results: Sequence[Mapping[str, object]],
     annotations: Mapping[str, HumanBeadDatasetAnnotations],
-    source_paths: Sequence[Path],
+    annotation_source_paths_by_dataset: Mapping[str, Path],
 ) -> TrioOracleImport:
+    source_paths = _stable_unique_strings(
+        str(path) for path in annotation_source_paths_by_dataset.values()
+    )
     pending_records: List[TrioOracleRecord] = []
     for stage_result in stage_results:
         if stage_result.get("status") != "ok":
@@ -581,7 +597,11 @@ def build_human_bead_oracle_import(
                 diagnostics=diagnostics,
                 validation_rankable=rankable,
                 ranking_exclusion_reason=exclusion_reason,
-                source_path=str(source_paths[0]) if source_paths else None,
+                source_path=(
+                    None
+                    if dataset_id not in annotation_source_paths_by_dataset
+                    else str(annotation_source_paths_by_dataset[dataset_id])
+                ),
                 warnings=_stable_unique_strings(warnings),
             )
         )
@@ -624,7 +644,7 @@ def build_human_bead_oracle_import(
     return TrioOracleImport(
         records=final_records,
         baselines={},
-        source_paths=_stable_unique_strings(str(path) for path in source_paths),
+        source_paths=source_paths,
         warnings=[],
     )
 
@@ -713,17 +733,18 @@ class _AnnotationSession:
         self.dataset_images = dict(dataset_images)
         self.output_path = Path(output_path)
         self.images = {dataset_id: _load_image(path) for dataset_id, path in dataset_images.items()}
-        self.annotations: Dict[str, HumanBeadDatasetAnnotations] = {}
+        self.annotations: Dict[str, HumanBeadDatasetAnnotations] = dict(existing or {})
         for dataset_id in self.dataset_ids:
             image = self.images[dataset_id]
             existing_item = None if existing is None else existing.get(dataset_id)
-            self.annotations[dataset_id] = existing_item or HumanBeadDatasetAnnotations(
-                dataset_id=dataset_id,
-                image_path=str(self.dataset_images[dataset_id]),
-                image_shape=tuple(int(dim) for dim in image.shape[:2]),
-                default_radius_px=float(default_radius_px),
-                beads=[],
-            )
+            if existing_item is None:
+                self.annotations[dataset_id] = HumanBeadDatasetAnnotations(
+                    dataset_id=dataset_id,
+                    image_path=str(self.dataset_images[dataset_id]),
+                    image_shape=tuple(int(dim) for dim in image.shape[:2]),
+                    default_radius_px=float(default_radius_px),
+                    beads=[],
+                )
         self.index = 0
         self.selected_index: Optional[int] = None
         self.dirty = False

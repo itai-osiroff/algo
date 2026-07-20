@@ -27,6 +27,7 @@ For Point Grey / FLIR camera preview and acquisition, see
 | Raw metric exploration and profile search | `sweep_metric_explorer.py` | [Sweep Metric Explorer Guide](SWEEP_METRIC_EXPLORER_GUIDE.md) |
 | Summary/alpha report regeneration | `../generate_reports.py` | [Sweep Reporting Guide](SWEEP_REPORTING_GUIDE.md) |
 | Rectification validation against external cameras | `validate_rectification.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
+| Human bead oracle annotation and scoring | `human_bead_oracle.py` | This package map |
 | Batch validation image preprocessing | `batch_process_validation_images.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
 | Trio benchmark against validation/ThorCam | `trio_benchmark.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
 | Batch trio benchmark evaluation | `trio_benchmark_batch.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
@@ -82,6 +83,25 @@ The trio oracle profile appears after importing trio results or loading the
 saved `metric_review/trio_oracle_metrics.json` cache. Rows marked unrankable by
 the trio benchmark remain inspectable but are excluded from oracle ranking and
 validation-refinement seed export.
+
+Create human bead-center annotations:
+
+```bash
+python -m moment_images.human_bead_oracle annotate --dataset-image scene_id=path/to/preview.png --output path/to/human_beads.json
+```
+
+Preview and score human bead annotations:
+
+```bash
+python -m moment_images.human_bead_oracle preview --annotations path/to/human_beads.json --output-dir path/to/previews
+python -m moment_images.human_bead_oracle score-workspace --annotations path/to/human_beads.json --dataset-id scene_id --workspace path/to/workspace.npz --output path/to/score.json
+```
+
+When `parameter_sweep.py --gui` uses
+`validation_oracle_sweep.oracle_mode = "human_bead"`, the Bead annotations field
+is the convenient path for one shared annotation JSON. Per-dataset annotation
+files are supported through advanced Scenes JSON overrides with
+`human_bead_annotations`.
 
 Run validation against Validation Camera and Thorcam images:
 
@@ -182,6 +202,7 @@ Several tools are GUI-first and require a desktop session:
 - `parameter_sweep.py --gui`
 - `sweep_visualization.py` without `--export-dir`
 - `sweep_metric_explorer.py` without `--export-dir`
+- `human_bead_oracle.py annotate`
 - `validate_rectification.py`
 - `batch_process_validation_images.py`
 - `main_thor_gain.py --gui`

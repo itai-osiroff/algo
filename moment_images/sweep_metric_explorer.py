@@ -37,6 +37,7 @@ from moment_images.human_bead_oracle import (
     HUMAN_BEAD_HALO_TO_CORE_RATIO_MEAN,
     HUMAN_BEAD_ORACLE_PROFILE_NAME,
     HUMAN_BEAD_ORACLE_SCORE,
+    HUMAN_BEAD_PER_BEAD_METRICS,
     HUMAN_BEAD_RESIDUAL_GRADIENT_MAX,
     HUMAN_BEAD_RESIDUAL_GRADIENT_P95,
     HUMAN_BEAD_SUPPORT_RADIUS_MEAN,
@@ -1129,6 +1130,7 @@ def _resolve_metric_config(
     scoring_weights: Mapping[str, float],
     config_path: Optional[Path],
     *,
+    include_oracle_metrics: bool = False,
     include_trio_oracle: bool = False,
 ) -> Tuple[MetricExplorerConfig, List[str]]:
     warnings: List[str] = []
@@ -1145,7 +1147,7 @@ def _resolve_metric_config(
     enabled_metrics = [
         name
         for name, descriptor in metric_registry.items()
-        if include_trio_oracle or descriptor.category not in {"oracle", "oracle_diagnostic"}
+        if include_oracle_metrics or descriptor.category not in {"oracle", "oracle_diagnostic"}
     ]
     profiles = list(default_profiles)
     search_defaults = SearchDefaults()
@@ -1215,11 +1217,11 @@ def _resolve_metric_config(
             )
 
     oracle_metric_names = set(_oracle_metric_names(metric_registry))
-    if not include_trio_oracle:
+    if not include_oracle_metrics:
         blocked_enabled = sorted(set(enabled_metrics) & oracle_metric_names)
         if blocked_enabled and payload is not None:
             warnings.append(
-                "Trio oracle metrics were configured but no trio results are loaded; "
+                "Oracle metrics were configured but no oracle results are loaded; "
                 f"dropped: {', '.join(blocked_enabled)}."
             )
         enabled_metrics = [name for name in enabled_metrics if name not in oracle_metric_names]
@@ -1228,9 +1230,9 @@ def _resolve_metric_config(
     filtered_profiles: List[RankingProfileSpec] = []
     for profile in profiles:
         blocked_profile_metrics = sorted(set(profile.metric_weights) & oracle_metric_names)
-        if blocked_profile_metrics and not include_trio_oracle:
+        if blocked_profile_metrics and not include_oracle_metrics:
             warnings.append(
-                f"Profile {profile.name!r} references trio oracle metrics but no trio results are loaded; "
+                f"Profile {profile.name!r} references oracle metrics but no oracle results are loaded; "
                 f"dropped: {', '.join(blocked_profile_metrics)}."
             )
         enabled_weights = {
@@ -1795,7 +1797,11 @@ def _ensure_trio_oracle_config(
     for metric_name in _oracle_metric_names(metric_registry):
         if metric_name not in config.enabled_metrics:
             config.enabled_metrics.append(metric_name)
-    if TRIO_ORACLE_PROFILE_NAME not in {profile.name for profile in config.profiles}:
+    has_trio = any(
+        TRIO_PRIMARY_SCORE in record.metrics
+        for record in import_data.records
+    )
+    if has_trio and TRIO_ORACLE_PROFILE_NAME not in {profile.name for profile in config.profiles}:
         config.profiles.append(
             RankingProfileSpec(
                 name=TRIO_ORACLE_PROFILE_NAME,
@@ -1848,11 +1854,12 @@ def _validation_refinement_seed_rows(
     model: SweepMetricExplorerModel,
     *,
     top_k: int = DEFAULT_TRIO_SEED_TOP_K,
+    score_metric: str = TRIO_PRIMARY_SCORE,
 ) -> List[Dict[str, object]]:
     candidate_lookup = _candidate_row_lookup_for_seeds(model)
     grouped: Dict[Tuple[str, str], List[Tuple[float, RawMetricRecord, Optional[TrioOracleRecord]]]] = {}
     for record in model.raw_records:
-        score = record.metrics.get(TRIO_PRIMARY_SCORE)
+        score = record.metrics.get(score_metric)
         if score is None or not math.isfinite(float(score)):
             continue
         trio_record = _trio_record_for_raw_record(model, record)
@@ -1899,6 +1906,15 @@ def _validation_refinement_seed_rows(
     return seed_rows
 
 
+def _validation_refinement_seed_metric(model: SweepMetricExplorerModel) -> Tuple[str, str, str]:
+    records = list(model.trio_oracle_records.values())
+    if any(TRIO_PRIMARY_SCORE in record.metrics for record in records):
+        return TRIO_PRIMARY_SCORE, "trio_validation", "trio_oracle_metrics"
+    if any(HUMAN_BEAD_ORACLE_SCORE in record.metrics for record in records):
+        return HUMAN_BEAD_ORACLE_SCORE, "human_bead", "oracle_metrics"
+    return TRIO_PRIMARY_SCORE, "trio_validation", "trio_oracle_metrics"
+
+
 def export_validation_refinement_seeds(
     model: SweepMetricExplorerModel,
     output_dir: Path,
@@ -1907,7 +1923,8 @@ def export_validation_refinement_seeds(
 ) -> Tuple[Path, Path, int]:
     export_dir = Path(output_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
-    seed_rows = _validation_refinement_seed_rows(model, top_k=top_k)
+    score_metric, oracle_mode, source = _validation_refinement_seed_metric(model)
+    seed_rows = _validation_refinement_seed_rows(model, top_k=top_k, score_metric=score_metric)
     json_path = export_dir / "validation_refinement_seeds.json"
     csv_path = export_dir / "validation_refinement_seeds.csv"
     write_json_atomic(
@@ -1915,7 +1932,9 @@ def export_validation_refinement_seeds(
         {
             "generated_at": _utc_now_iso(),
             "top_k": top_k,
-            "source": "trio_oracle_metrics",
+            "source": source,
+            "score_metric": score_metric,
+            "oracle_mode": oracle_mode,
             "trio_oracle_path": str(model.trio_oracle_path) if model.trio_oracle_path is not None else None,
             "trio_oracle_sources": list(model.trio_oracle_sources),
             "seeds": seed_rows,
@@ -2730,13 +2749,18 @@ def load_sweep_metric_explorer_model(
         trio_warnings: List[str] = []
     else:
         trio_import, trio_warnings = load_trio_oracle_import(review_dir)
-    trio_has_records = trio_import is not None and bool(trio_import.records)
+    oracle_has_records = trio_import is not None and bool(trio_import.records)
+    trio_has_score_records = (
+        trio_import is not None
+        and any(TRIO_PRIMARY_SCORE in record.metrics for record in trio_import.records)
+    )
     config, config_warnings = _resolve_metric_config(
         review_dir,
         metric_registry,
         base_model.scoring_weights,
         metrics_config_path,
-        include_trio_oracle=trio_has_records,
+        include_oracle_metrics=oracle_has_records,
+        include_trio_oracle=trio_has_score_records,
     )
     _ensure_trio_oracle_config(config, metric_registry, trio_import)
     enabled_registry = {
@@ -2803,6 +2827,7 @@ def _raw_metric_fieldnames(model: SweepMetricExplorerModel) -> List[str]:
     ]
     if model.trio_oracle_records:
         fieldnames.extend(TRIO_METADATA_EXPORT_FIELDS)
+        fieldnames.append("oracle_diagnostics_json")
     fieldnames.extend(metric_names)
     return fieldnames
 
@@ -2825,6 +2850,18 @@ def _trio_metadata_export_fields(
         "trio_diff_path": trio_record.diff_path or "",
         "trio_source_path": trio_record.source_path or "",
     }
+
+
+def _oracle_diagnostics_export_fields(
+    model: SweepMetricExplorerModel,
+    record: RawMetricRecord,
+) -> Dict[str, object]:
+    if not model.trio_oracle_records:
+        return {}
+    trio_record = _trio_record_for_raw_record(model, record)
+    if trio_record is None:
+        return {"oracle_diagnostics_json": ""}
+    return {"oracle_diagnostics_json": _compact_json(trio_record.diagnostics)}
 
 
 def _profile_result_rows(model: SweepMetricExplorerModel) -> List[Dict[str, object]]:
@@ -2948,6 +2985,7 @@ def export_metric_report(model: SweepMetricExplorerModel, output_dir: Path) -> P
                     "warnings_json": _compact_json(record.warnings),
                 },
                 **_trio_metadata_export_fields(model, record),
+                **_oracle_diagnostics_export_fields(model, record),
                 **{name: record.metrics.get(name) for name in sorted(model.metric_registry.keys())},
             }
             for record in model.raw_records

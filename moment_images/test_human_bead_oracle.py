@@ -9,12 +9,15 @@ from moment_images.human_bead_oracle import (
     HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN,
     HUMAN_BEAD_ELONGATION_MEAN,
     HUMAN_BEAD_ORACLE_SCORE,
+    HUMAN_BEAD_PER_BEAD_METRICS,
     HUMAN_BEAD_RESIDUAL_GRADIENT_MAX,
     HUMAN_BEAD_RESIDUAL_GRADIENT_P95,
     HumanBead,
     HumanBeadDatasetAnnotations,
-    compute_human_bead_oracle_metrics,
+    _AnnotationSession,
+    build_human_bead_oracle_import,
     build_arg_parser,
+    compute_human_bead_oracle_metrics,
     load_human_bead_annotations,
     main,
     scaled_beads_for_image,
@@ -83,6 +86,44 @@ def test_annotation_json_round_trips_and_rejects_duplicate_datasets(tmp_path: Pa
 
     with pytest.raises(ValueError, match="duplicate"):
         load_human_bead_annotations(path)
+
+
+def test_annotation_session_preserves_existing_datasets_not_in_current_run(tmp_path: Path):
+    first_image = np.full((32, 32), 128, dtype=np.uint8)
+    Image.fromarray(first_image).save(tmp_path / "d1.png")
+    annotations_path = tmp_path / "beads.json"
+    write_human_bead_annotations(
+        annotations_path,
+        {
+            "d1": HumanBeadDatasetAnnotations(
+                dataset_id="d1",
+                image_path="d1.png",
+                image_shape=(32, 32),
+                default_radius_px=4.0,
+                beads=[HumanBead(bead_id="b001", x=12.0, y=12.0, radius_px=4.0)],
+            ),
+            "d2": HumanBeadDatasetAnnotations(
+                dataset_id="d2",
+                image_path="d2.png",
+                image_shape=(32, 32),
+                default_radius_px=5.0,
+                beads=[HumanBead(bead_id="b002", x=20.0, y=20.0, radius_px=5.0)],
+            ),
+        },
+    )
+    existing = load_human_bead_annotations(annotations_path)
+
+    session = _AnnotationSession(
+        {"d1": tmp_path / "d1.png"},
+        annotations_path,
+        existing=existing,
+    )
+    session.save()
+    loaded = load_human_bead_annotations(annotations_path)
+
+    assert sorted(loaded) == ["d1", "d2"]
+    assert loaded["d2"].beads[0].bead_id == "b002"
+    assert loaded["d2"].beads[0].x == pytest.approx(20.0)
 
 
 def test_annotation_loading_rejects_invalid_radius(tmp_path: Path):
@@ -164,6 +205,10 @@ def test_human_bead_metrics_prefer_compact_isotropic_candidate():
     assert compact_result.metrics[HUMAN_BEAD_ORACLE_SCORE] > elongated_result.metrics[HUMAN_BEAD_ORACLE_SCORE]
     assert compact_result.metrics[HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN] > blurred_result.metrics[HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN]
     assert elongated_result.metrics[HUMAN_BEAD_ELONGATION_MEAN] > compact_result.metrics[HUMAN_BEAD_ELONGATION_MEAN]
+    per_bead = compact_result.diagnostics[HUMAN_BEAD_PER_BEAD_METRICS]
+    assert [item["bead_id"] for item in per_bead] == ["b001", "b002", "b003"]
+    assert all(item["rankable"] is True for item in per_bead)
+    assert HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN in per_bead[0]["metrics"]
 
 
 def test_human_bead_metrics_include_optional_residual_gradient_diagnostics():
@@ -250,3 +295,60 @@ def test_cli_preview_and_score_workspace_smoke(tmp_path: Path):
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["rankable"] is True
     assert HUMAN_BEAD_ORACLE_SCORE in payload["metrics"]
+    assert payload["diagnostics"][HUMAN_BEAD_PER_BEAD_METRICS][0]["bead_id"] == "b001"
+    assert HUMAN_BEAD_CORE_ENERGY_FRACTION_MEAN in payload["diagnostics"][HUMAN_BEAD_PER_BEAD_METRICS][0]["metrics"]
+
+
+def test_human_bead_oracle_import_uses_dataset_specific_source_paths(tmp_path: Path):
+    for dataset_id, center in {"d1": (16.0, 16.0), "d2": (20.0, 20.0)}.items():
+        run_dir = tmp_path / "runs" / "stage1" / "c_good" / dataset_id
+        run_dir.mkdir(parents=True)
+        np.savez(
+            run_dir / "workspace.npz",
+            average_rectified_image=_gaussian_bead(shape=(32, 32), center=center, sigma_x=1.8),
+        )
+    annotations = {
+        "d1": HumanBeadDatasetAnnotations(
+            dataset_id="d1",
+            image_path=None,
+            image_shape=(32, 32),
+            default_radius_px=4.0,
+            beads=[HumanBead(bead_id="b001", x=16.0, y=16.0, radius_px=4.0)],
+        ),
+        "d2": HumanBeadDatasetAnnotations(
+            dataset_id="d2",
+            image_path=None,
+            image_shape=(32, 32),
+            default_radius_px=4.0,
+            beads=[HumanBead(bead_id="b001", x=20.0, y=20.0, radius_px=4.0)],
+        ),
+    }
+    d1_annotations = tmp_path / "d1_beads.json"
+    d2_annotations = tmp_path / "d2_beads.json"
+    stage_results = [
+        {
+            "status": "ok",
+            "stage": "stage1",
+            "candidate_id": "c_good",
+            "dataset_id": dataset_id,
+            "run_dir": str(tmp_path / "runs" / "stage1" / "c_good" / dataset_id),
+        }
+        for dataset_id in ("d1", "d2")
+    ]
+
+    import_data = build_human_bead_oracle_import(
+        stage_name="stage1",
+        stage_results=stage_results,
+        annotations=annotations,
+        annotation_source_paths_by_dataset={
+            "d1": d1_annotations,
+            "d2": d2_annotations,
+        },
+    )
+
+    source_by_dataset = {record.dataset_id: record.source_path for record in import_data.records}
+    assert source_by_dataset == {
+        "d1": str(d1_annotations),
+        "d2": str(d2_annotations),
+    }
+    assert import_data.source_paths == [str(d1_annotations), str(d2_annotations)]
