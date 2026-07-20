@@ -25,6 +25,7 @@ from moment_images.human_bead_oracle import (
 )
 from moment_images.human_bead_workbench import (
     HumanBeadWorkbenchState,
+    _generated_dataset_id_for_path,
     collect_dataset_images_from_folder,
 )
 
@@ -220,6 +221,38 @@ def test_collect_dataset_images_from_folder_maps_supported_file_stems(tmp_path: 
 
     assert list(dataset_images) == ["scene_a", "scene_b", "scene_c"]
     assert dataset_images["scene_a"] == tmp_path / "scene_a.PNG"
+
+
+def test_generated_dataset_ids_use_sweep_dataset_for_generic_previews(tmp_path: Path):
+    state = HumanBeadWorkbenchState({}, tmp_path / "beads.json", image_shapes={})
+    first = tmp_path / "runs" / "stage1" / "candidate_a" / "scene_a" / "avg_rectified.png"
+    second = tmp_path / "runs" / "stage1" / "candidate_b" / "scene_b" / "avg_rectified.png"
+
+    for path in (first, second):
+        dataset_id = _generated_dataset_id_for_path(path, state.dataset_images)
+        state.add_dataset_image(dataset_id, path, (32, 32))
+
+    assert state.dataset_ids == ["scene_a", "scene_b"]
+    assert state.dataset_images["scene_a"] == first
+    assert state.dataset_images["scene_b"] == second
+
+
+def test_generated_dataset_ids_disambiguate_same_dataset_preview_paths(tmp_path: Path):
+    state = HumanBeadWorkbenchState({}, tmp_path / "beads.json", image_shapes={})
+    first = tmp_path / "runs" / "stage1" / "candidate_a" / "scene_a" / "avg_rectified.png"
+    second = tmp_path / "runs" / "stage1" / "candidate_b" / "scene_a" / "avg_rectified.png"
+
+    first_id = _generated_dataset_id_for_path(first, state.dataset_images)
+    state.add_dataset_image(first_id, first, (32, 32))
+    second_id = _generated_dataset_id_for_path(second, state.dataset_images)
+    state.add_dataset_image(second_id, second, (32, 32))
+
+    assert first_id == "scene_a"
+    assert second_id.startswith("scene_a_")
+    assert second_id != first_id
+    assert state.dataset_ids == [first_id, second_id]
+    assert state.dataset_images[first_id] == first
+    assert state.dataset_images[second_id] == second
 
 
 def test_annotation_loading_rejects_invalid_radius(tmp_path: Path):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -21,6 +22,107 @@ from moment_images.human_bead_oracle import (
 
 SUPPORTED_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
 MIN_BEAD_RADIUS_PX = 0.5
+GENERIC_PREVIEW_STEMS = frozenset(
+    {
+        "avg_rectified",
+        "average_rectified_image",
+        "rectified_image",
+        "rectified",
+        "preview",
+    }
+)
+_GENERATED_DATASET_ID_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]+")
+_GENERATED_DATASET_ID_UNDERSCORES = re.compile(r"_+")
+
+
+def _sanitize_generated_dataset_id(value: str) -> str:
+    text = _GENERATED_DATASET_ID_UNSAFE.sub("_", str(value).strip())
+    text = _GENERATED_DATASET_ID_UNDERSCORES.sub("_", text).strip("._-")
+    return text or "dataset"
+
+
+def _normalized_path_key(path: Path) -> str:
+    item = Path(path).expanduser()
+    try:
+        item = item.resolve(strict=False)
+    except OSError:
+        pass
+    return str(item).replace("\\", "/").casefold()
+
+
+def _sweep_run_context(path: Path) -> Optional[Tuple[str, str, str]]:
+    parts = list(Path(path).parts)
+    lowered = [part.lower() for part in parts]
+    for index in reversed(range(max(0, len(parts) - 4))):
+        if lowered[index] == "runs" and index + 4 < len(parts):
+            return parts[index + 1], parts[index + 2], parts[index + 3]
+    return None
+
+
+def _dedupe_candidate_ids(candidates: Iterable[str]) -> List[str]:
+    seen: set[str] = set()
+    result: List[str] = []
+    for candidate in candidates:
+        dataset_id = _sanitize_generated_dataset_id(candidate)
+        if dataset_id in seen:
+            continue
+        seen.add(dataset_id)
+        result.append(dataset_id)
+    return result
+
+
+def _base_generated_dataset_id(path: Path) -> str:
+    item = Path(path)
+    stem = item.stem
+    if stem.lower() not in GENERIC_PREVIEW_STEMS:
+        return _sanitize_generated_dataset_id(stem)
+    sweep_context = _sweep_run_context(item)
+    if sweep_context is not None:
+        _stage, _candidate, dataset = sweep_context
+        return _sanitize_generated_dataset_id(dataset)
+    parent_name = item.parent.name
+    return _sanitize_generated_dataset_id(parent_name or stem)
+
+
+def _generated_dataset_id_candidates(path: Path, base_id: str) -> List[str]:
+    item = Path(path)
+    candidates: List[str] = []
+    sweep_context = _sweep_run_context(item)
+    if sweep_context is not None:
+        stage, candidate, _dataset = sweep_context
+        candidates.extend(
+            [
+                f"{base_id}_{candidate}",
+                f"{base_id}_{stage}_{candidate}",
+            ]
+        )
+    parent_name = item.parent.name
+    grandparent_name = item.parent.parent.name
+    if parent_name:
+        candidates.append(f"{base_id}_{parent_name}")
+    if grandparent_name and parent_name:
+        candidates.append(f"{base_id}_{grandparent_name}_{parent_name}")
+    return _dedupe_candidate_ids(candidates)
+
+
+def _generated_dataset_id_for_path(path: Path, existing_dataset_images: Mapping[str, Path]) -> str:
+    new_path_key = _normalized_path_key(Path(path))
+    for dataset_id, existing_path in existing_dataset_images.items():
+        if _normalized_path_key(Path(existing_path)) == new_path_key:
+            return dataset_id
+
+    base_id = _base_generated_dataset_id(Path(path))
+    if base_id not in existing_dataset_images:
+        return base_id
+
+    for candidate_id in _generated_dataset_id_candidates(Path(path), base_id):
+        if candidate_id not in existing_dataset_images:
+            return candidate_id
+
+    suffix = 2
+    while f"{base_id}_{suffix}" in existing_dataset_images:
+        suffix += 1
+    return f"{base_id}_{suffix}"
 
 
 def collect_dataset_images_from_folder(folder: Path) -> Dict[str, Path]:
@@ -712,7 +814,7 @@ class HumanBeadWorkbenchApp:
             except Exception as exc:
                 self.messagebox.showwarning("Add Image", f"Could not load {path}: {exc}")
                 continue
-            dataset_id = Path(path).stem
+            dataset_id = _generated_dataset_id_for_path(Path(path), self.state.dataset_images)
             self.images[dataset_id] = image
             self.state.add_dataset_image(dataset_id, Path(path), (int(image.shape[0]), int(image.shape[1])))
             added += 1
