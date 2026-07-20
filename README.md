@@ -23,7 +23,7 @@ Spinnaker camera environment.
 | Sweep GUI/report export | [Sweep Reporting Guide](moment_images/SWEEP_REPORTING_GUIDE.md) | `python -m moment_images.sweep_visualization path/to/sweep_output` |
 | Raw metric re-ranking | [Sweep Metric Explorer Guide](moment_images/SWEEP_METRIC_EXPLORER_GUIDE.md) | `python -m moment_images.sweep_metric_explorer path/to/sweep_output` |
 | Validation against other cameras | [Validation GUI Guide](moment_images/VALIDATE_RECTIFICATION_GUI_GUIDE.md) | `python -m moment_images.validate_rectification` |
-| Human bead oracle annotations | [Moment Images Package Map](moment_images/README.md) | `python -m moment_images.human_bead_oracle annotate --dataset-image dataset_id=path/to/image --output path/to/human_beads.json` |
+| Human bead oracle annotations | [Human Bead Oracle Guide](moment_images/HUMAN_BEAD_ORACLE_GUIDE.md) | `python -m moment_images.human_bead_oracle annotate --dataset-image dataset_id=path/to/image --output path/to/human_beads.json` |
 | Gain calibration | [Gain Calibration Guide](moment_images/GAIN_CALIBRATION_GUIDE.md) | `python -m moment_images.main_thor_gain --gui` |
 | Point Grey / FLIR acquisition | [Point Grey Acquisition Guide](POINT_GREY_ACQUISITION_GUIDE.md) | `python acquire_images_PG.py --mode stream --output-dir path/to/pg_snaps` |
 

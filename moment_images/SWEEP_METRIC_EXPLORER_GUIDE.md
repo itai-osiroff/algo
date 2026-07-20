@@ -462,6 +462,13 @@ When trio data is loaded, `candidate_metrics.csv` also includes
 `record_count`, `matched_count`, `unmatched_count`, `rankable_count`,
 `cache_path`, `source_paths`, and `seed_count`.
 
+Human bead oracle caches use the same `metric_review/trio_oracle_metrics.json`
+compatibility file. When human-bead records are loaded, the explorer exposes the
+`human_bead_oracle` profile, exports human-bead scalar metrics in
+`candidate_metrics.csv`, and writes per-bead detail in `oracle_diagnostics_json`.
+See [HUMAN_BEAD_ORACLE_GUIDE.md](HUMAN_BEAD_ORACLE_GUIDE.md) for the annotation
+and sweep workflow.
+
 ### Trio benchmark outputs
 
 `moment_images/trio_benchmark.py` is a separate headless post-processing tool

@@ -11,6 +11,7 @@ guides:
 - [Sweep Reporting Guide](SWEEP_REPORTING_GUIDE.md)
 - [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md)
 - [Sweep Metric Explorer Guide](SWEEP_METRIC_EXPLORER_GUIDE.md)
+- [Human Bead Oracle Guide](HUMAN_BEAD_ORACLE_GUIDE.md)
 - [Gain Calibration Guide](GAIN_CALIBRATION_GUIDE.md)
 
 For Point Grey / FLIR camera preview and acquisition, see
@@ -27,7 +28,7 @@ For Point Grey / FLIR camera preview and acquisition, see
 | Raw metric exploration and profile search | `sweep_metric_explorer.py` | [Sweep Metric Explorer Guide](SWEEP_METRIC_EXPLORER_GUIDE.md) |
 | Summary/alpha report regeneration | `../generate_reports.py` | [Sweep Reporting Guide](SWEEP_REPORTING_GUIDE.md) |
 | Rectification validation against external cameras | `validate_rectification.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
-| Human bead oracle annotation and scoring | `human_bead_oracle.py` | This package map |
+| Human bead oracle annotation and scoring | `human_bead_oracle.py` | [Human Bead Oracle Guide](HUMAN_BEAD_ORACLE_GUIDE.md) |
 | Batch validation image preprocessing | `batch_process_validation_images.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
 | Trio benchmark against validation/ThorCam | `trio_benchmark.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
 | Batch trio benchmark evaluation | `trio_benchmark_batch.py` | [Validation GUI Guide](VALIDATE_RECTIFICATION_GUI_GUIDE.md) |
