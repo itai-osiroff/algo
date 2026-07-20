@@ -14,11 +14,16 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 from moment_images.parameter_sweep import (
     SweepExperimentSpec,
+    VALIDATION_ORACLE_DIR_NAME,
+    VALIDATION_ORACLE_STAGE_NAME,
     _artifact_paths_payload,
     _best_configs_payload,
+    _metric_records_from_stage_results,
     _snapshot_generation_products,
     _write_leaderboard_csv,
+    _write_root_ranked_outputs,
     _write_stage_outputs,
+    _write_validation_phase_artifacts,
     score_and_rank_runs,
 )
 from moment_images.reliable_io import read_json_first_valid, write_json_atomic, write_text_atomic
@@ -1056,6 +1061,57 @@ def _stage_execution_payload(discovery: StageDiscovery) -> Dict[str, object]:
     return payload
 
 
+def _validation_skip_enabled(spec: SweepExperimentSpec) -> bool:
+    validation_spec = spec.validation_oracle_sweep
+    return bool(
+        validation_spec is not None
+        and validation_spec.enabled
+        and validation_spec.skip_image_metric_stage
+    )
+
+
+def _validation_oracle_enabled(spec: SweepExperimentSpec) -> bool:
+    validation_spec = spec.validation_oracle_sweep
+    return bool(validation_spec is not None and validation_spec.enabled)
+
+
+def _load_validation_rankings_for_rebuild(output_dir: Path) -> List[Dict[str, object]]:
+    candidates = (
+        output_dir / VALIDATION_ORACLE_DIR_NAME / "validation_phase_rankings.json",
+        output_dir / "validation_leaderboard.json",
+        output_dir / f"{VALIDATION_ORACLE_STAGE_NAME}_summary.json",
+    )
+    diagnostics: Dict[str, object] = {"checked_paths": [str(path) for path in candidates]}
+    for path in candidates:
+        if not path.exists() and not Path(f"{path}.bak").exists():
+            continue
+        try:
+            payload, _, _ = read_json_first_valid(path)
+        except Exception as exc:  # noqa: BLE001
+            diagnostics.setdefault("read_errors", []).append(
+                {"path": str(path), "error": f"{type(exc).__name__}: {exc}"}
+            )
+            continue
+        rankings_raw: object
+        if isinstance(payload, dict):
+            rankings_raw = payload.get("rankings", [])
+        else:
+            rankings_raw = payload
+        if not isinstance(rankings_raw, list):
+            continue
+        rankings = [
+            cast(Dict[str, object], item)
+            for item in rankings_raw
+            if isinstance(item, dict)
+        ]
+        if rankings:
+            return rankings
+    raise RebuildDataError(
+        "validation rankings are required to rebuild validation-guided skip-mode summaries",
+        diagnostics,
+    )
+
+
 def _rebuild_summaries(
     output_dir: Path,
     spec: SweepExperimentSpec,
@@ -1066,18 +1122,80 @@ def _rebuild_summaries(
     run_state = run_state_scope.run_state
     active_generation = _active_generation_id(run_state)
     stage1_discovery = _discover_stage_results(output_dir, "stage1", dataset_ids, run_state_scope)
+    if _validation_skip_enabled(spec):
+        validation_discovery = _discover_stage_results(
+            output_dir,
+            VALIDATION_ORACLE_STAGE_NAME,
+            dataset_ids,
+            run_state_scope,
+        )
+        _append_discovery_context(
+            context,
+            [stage1_discovery, validation_discovery],
+            active_generation,
+        )
+
+        stage1_results = stage1_discovery.results
+        validation_results = validation_discovery.results
+        _validate_rebuild_dataset_ids("stage1", stage1_results, dataset_ids)
+        _validate_rebuild_dataset_ids(VALIDATION_ORACLE_STAGE_NAME, validation_results, dataset_ids)
+        validation_rankings = _load_validation_rankings_for_rebuild(output_dir)
+        validation_metric_records = _metric_records_from_stage_results(validation_results)
+
+        _mark_artifact_writes_started(context)
+        stage1_rankings = score_and_rank_runs(stage1_results, spec.scoring, dataset_ids=dataset_ids)
+        _write_stage_outputs(
+            "stage1",
+            stage1_results,
+            stage1_rankings,
+            output_dir,
+            execution=_stage_execution_payload(stage1_discovery),
+            generation_id=_stage_generation_id(run_state, stage1_results),
+        )
+        _write_validation_phase_artifacts(
+            output_dir=output_dir,
+            stage_results=validation_results,
+            rankings=validation_rankings,
+            execution=_stage_execution_payload(validation_discovery),
+            generation_id=_stage_generation_id(run_state, validation_results),
+        )
+        _write_root_ranked_outputs(
+            output_dir=output_dir,
+            rankings=validation_rankings,
+            metric_records=validation_metric_records,
+            analyze=spec.analyze,
+        )
+        return len(stage1_results), len(validation_results), active_generation
+
     stage2_discovery = _discover_stage_results(output_dir, "stage2", dataset_ids, run_state_scope)
-    _append_discovery_context(context, [stage1_discovery, stage2_discovery], active_generation)
+    validation_discovery: Optional[StageDiscovery] = None
+    discoveries = [stage1_discovery, stage2_discovery]
+    if _validation_oracle_enabled(spec):
+        validation_discovery = _discover_stage_results(
+            output_dir,
+            VALIDATION_ORACLE_STAGE_NAME,
+            dataset_ids,
+            run_state_scope,
+        )
+        discoveries.append(validation_discovery)
+    _append_discovery_context(context, discoveries, active_generation)
 
     stage1_results = stage1_discovery.results
     stage2_results = stage2_discovery.results
     _validate_rebuild_dataset_ids("stage1", stage1_results, dataset_ids)
     _validate_rebuild_dataset_ids("stage2", stage2_results, dataset_ids)
+    validation_results: List[Dict[str, object]] = []
+    if validation_discovery is not None:
+        validation_results = validation_discovery.results
+        _validate_rebuild_dataset_ids(VALIDATION_ORACLE_STAGE_NAME, validation_results, dataset_ids)
 
     stage1_rankings = score_and_rank_runs(stage1_results, spec.scoring, dataset_ids=dataset_ids)
     stage2_rankings: List[Dict[str, object]] = []
     if stage2_results:
         stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
+    validation_rankings: List[Dict[str, object]] = []
+    if validation_results:
+        validation_rankings = _load_validation_rankings_for_rebuild(output_dir)
 
     _mark_artifact_writes_started(context)
     _write_stage_outputs(
@@ -1100,6 +1218,15 @@ def _rebuild_summaries(
             generation_id=_stage_generation_id(run_state, stage2_results),
         )
         final_rankings = stage2_rankings
+
+    if validation_discovery is not None and validation_results:
+        _write_validation_phase_artifacts(
+            output_dir=output_dir,
+            stage_results=validation_results,
+            rankings=validation_rankings,
+            execution=_stage_execution_payload(validation_discovery),
+            generation_id=_stage_generation_id(run_state, validation_results),
+        )
 
     all_metric_records = [
         cast(Dict[str, object], row["metric_record"]) for row in (stage1_results + stage2_results)
@@ -1255,6 +1382,7 @@ def _has_report_inputs(output_dir: Path) -> bool:
         "stage1_summary.json",
         "stage2_summary.json",
         "metric_phase_summary.json",
+        "validation_phase_summary.json",
     )
     if any((output_dir / name).exists() for name in summary_files):
         return True
@@ -1359,7 +1487,13 @@ def main() -> None:
             else:
                 cast(Dict[str, object], rebuild_context)["phase"] = "rebuild_baseline"
                 s1_count, s2_count, active_generation = _rebuild_summaries(output_dir, spec, rebuild_context)
-                print(f"Rebuilt stage summaries from run folders: stage1={s1_count}, stage2={s2_count}")
+                final_stage_label = (
+                    VALIDATION_ORACLE_STAGE_NAME if _validation_skip_enabled(spec) else "stage2"
+                )
+                print(
+                    "Rebuilt stage summaries from run folders: "
+                    f"stage1={s1_count}, {final_stage_label}={s2_count}"
+                )
                 metric_output_dir = output_dir / "metric_experiments"
                 if _has_report_inputs(metric_output_dir):
                     cast(Dict[str, object], rebuild_context)["phase"] = "rebuild_metric_phase"

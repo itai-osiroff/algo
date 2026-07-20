@@ -329,6 +329,7 @@ def _create_modern_fixture(
     *,
     include_stage2_summary: bool = True,
     include_metric_phase: bool = False,
+    include_validation_phase: bool = False,
     include_alpha_report: bool = False,
     include_workspace: bool = False,
     stage_mode: str = "two_stage",
@@ -416,6 +417,47 @@ def _create_modern_fixture(
             _write_workspace(metric_dir / "runs" / "metric_phase" / "m1c0000" / "d1" / "workspace.npz")
         if include_alpha_report:
             _write_alpha_report(metric_dir / "alpha_report.json")
+    if include_validation_phase:
+        validation_rankings = [
+            _ranking(
+                "v1c0000",
+                score=0.97,
+                rank=1,
+                datasets=datasets,
+                stage="validation_phase",
+                params={"max_displacement": 4},
+            )
+        ]
+        _write_json(
+            output_dir / "validation_phase_summary.json",
+            _stage_summary("validation_phase", validation_rankings),
+        )
+        _write_json(
+            output_dir / "validation_summary.json",
+            [
+                {
+                    "run": "validation_phase_v1c0000_d1",
+                    "config": {
+                        "strategy": "combined",
+                        "max_displacement": 4,
+                        "gauss_sigma": 3.0,
+                    },
+                    "global_and_local_metrics": _metrics(18.0),
+                    "displacement_field_metrics": _displacement_metrics(1.1),
+                    "inter_view_consistency_metrics": _consistency_metrics(0.25),
+                    "displacement_score_diagnostics": _diagnostics_payload(),
+                }
+            ],
+        )
+        for dataset_id in datasets:
+            _write_preview(
+                output_dir
+                / "runs"
+                / "validation_phase"
+                / "v1c0000"
+                / dataset_id
+                / "avg_rectified.png"
+            )
     return output_dir
 
 
@@ -618,6 +660,96 @@ def test_load_sweep_visualization_model_supports_metric_phase_outputs(tmp_path):
     assert {"blurred_gradient_corr", "blurred_laplacian_corr"}.issubset(families)
     assert model.diagnostic_availability["score_maps"] is True
     assert "gradient" in model.diagnostic_availability["components"]
+
+
+def test_load_sweep_visualization_model_supports_validation_phase_as_non_primary(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_validation_phase=True,
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.primary_stage_name == "stage2"
+    assert model.stage_order == ["stage1", "stage2", "validation_phase"]
+    validation_rows = [row for row in model.candidates if row.stage == "validation_phase"]
+    assert [row.candidate_id for row in validation_rows] == ["v1c0000"]
+    assert any(record.stage == "validation_phase" for record in model.run_metric_records)
+
+
+def test_load_sweep_visualization_model_prefers_validation_phase_for_skip_mode(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=False,
+        include_validation_phase=True,
+    )
+    manifest_path = output_dir / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["validation_oracle_sweep"] = {
+        "enabled": True,
+        "status": "completed",
+        "skip_image_metric_stage": True,
+    }
+    _write_json(manifest_path, manifest)
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.mode == "spec_validation_guided"
+    assert model.primary_stage_name == "validation_phase"
+    assert model.stage_order == ["stage1", "validation_phase"]
+
+
+def test_load_sweep_visualization_model_ignores_stale_stage2_for_skip_mode(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_validation_phase=True,
+    )
+    manifest_path = output_dir / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["validation_oracle_sweep"] = {
+        "enabled": True,
+        "status": "completed",
+        "skip_image_metric_stage": True,
+    }
+    _write_json(manifest_path, manifest)
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.mode == "spec_validation_guided"
+    assert model.primary_stage_name == "validation_phase"
+    assert model.stage_order == ["stage1", "validation_phase"]
+    assert "stage2" not in model.stages
+    assert any("Ignored stale stage2 artifacts" in warning for warning in model.warnings)
+
+
+def test_load_sweep_visualization_model_ignores_failed_validation_oracle_without_summary(tmp_path):
+    output_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_validation_phase=False,
+    )
+    manifest_path = output_dir / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["validation_oracle_sweep"] = {
+        "enabled": True,
+        "status": "failed",
+        "failed_stage": "validation_phase_benchmark",
+        "error_type": "RuntimeError",
+        "error": "validation benchmark exploded",
+    }
+    _write_json(manifest_path, manifest)
+    _write_json(
+        output_dir / "validation_oracle" / "validation_oracle_manifest.json",
+        manifest["validation_oracle_sweep"],
+    )
+
+    model = load_sweep_visualization_model(output_dir)
+
+    assert model.primary_stage_name == "stage2"
+    assert "validation_phase" not in model.stage_order
+    assert not [row for row in model.candidates if row.stage == "validation_phase"]
 
 
 def test_load_sweep_visualization_model_normalizes_stale_internal_metric_run_names(tmp_path):

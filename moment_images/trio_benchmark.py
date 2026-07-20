@@ -25,6 +25,13 @@ import numpy as np
 from PIL import Image
 from scipy import optimize
 
+from moment_images.bead_quality_diagnostics import (
+    BeadQualityRecord,
+    compute_bead_quality_metrics,
+    detect_validation_bead_centers,
+    save_bead_crop_sheet,
+    write_bead_quality_csv,
+)
 from moment_images.reliable_io import write_csv_atomic, write_json_atomic, write_text_atomic
 from moment_images.unpack_workspace import load_workspace_variables
 from moment_images.validate_rectification import _warp_to_grid, load_rectified_reference
@@ -52,6 +59,8 @@ THORCAM_FOV_COVERAGE_TOO_LOW_WARNING = "thorcam-fov candidate ROI coverage below
 SPARSE_BEAD_EVIDENCE_WARNING = "sparse validation bead evidence in fixed ROI"
 MIN_COMMON_FOV_PIXELS = 16
 MIN_THORCAM_FOV_ROI_COVERAGE = 0.95
+LOCAL_NCC_PATCH_RADIUS = 8
+LOCAL_NCC_SEARCH_RADIUS = 2
 DEFAULT_SCALE_SEARCH = "0.90:1.10:11"
 DEFAULT_GEOMETRIC_SCALE_SEARCH = "0.50:2.00:31"
 DEFAULT_REGISTRATION_ROTATION_SEARCH = "-45:45:19"
@@ -2299,8 +2308,7 @@ def _compute_validation_metrics_core(
     else:
         if len(centers) < 3:
             warnings.append(SPARSE_BEAD_EVIDENCE_WARNING)
-        candidate_centers = _detect_bead_centers(adjusted)
-        bead = _bead_score(centers, candidate_centers)
+        bead = _local_ncc_bead_score(prepared.validation_unit, adjusted, centers, mask=metric_mask)
         sharpness = _sharpness_score(prepared.validation_unit, adjusted, centers, mask=metric_mask)
         weights_used = {
             "validation_signal": 0.30,
@@ -2439,6 +2447,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     thorcam = references.thorcam
     validation_mask = _coerce_metric_mask(references.validation_mask, validation.shape[:2])
     metric_reference_cache = _prepare_validation_metric_reference(validation)
+    validation_bead_centers = detect_validation_bead_centers(validation)
     geometric_reference_cache = (
         _prepare_geometric_reference_cache(validation, cfg)
         if cfg.registration_profile == REGISTRATION_PROFILE_BEAD_GEOMETRIC
@@ -2653,13 +2662,26 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             thorcam,
         )
     top_rows = lf_rows[: max(0, cfg.top_k)]
+    bead_crop_paths: Dict[str, str] = {}
     for row in top_rows:
         _write_comparison_figures(figures_dir, validation, row)
         _write_bead_detection_figure(figures_dir / f"{_figure_prefix(row)}_beads.png", row.registration.aligned_image)
+        crop_path = figures_dir / f"{_figure_prefix(row)}_bead_crops.png"
+        saved_crop = save_bead_crop_sheet(crop_path, validation, row.registration.aligned_image, validation_bead_centers)
+        if saved_crop is not None:
+            bead_crop_paths[row.row_id] = str(Path("figures") / saved_crop.name)
         if cfg.enable_nonrigid_diagnostic:
             _write_affine_diagnostic_figure(figures_dir, validation, row)
     _write_comparison_figures(figures_dir, validation, thor_row)
     _write_bead_detection_figure(figures_dir / "baseline_thorcam_beads.png", thor_row.registration.aligned_image)
+    baseline_crop = save_bead_crop_sheet(
+        figures_dir / "baseline_thorcam_bead_crops.png",
+        validation,
+        thor_row.registration.aligned_image,
+        validation_bead_centers,
+    )
+    if baseline_crop is not None:
+        bead_crop_paths[thor_row.row_id] = str(Path("figures") / baseline_crop.name)
     if cfg.enable_nonrigid_diagnostic:
         _write_affine_diagnostic_figure(figures_dir, validation, thor_row)
 
@@ -2677,6 +2699,13 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         reference_sources=references,
     )
     _write_results_csv(cfg.output_dir / "trio_benchmark_results.csv", rows)
+    _write_bead_quality_metrics_csv(
+        cfg.output_dir / "bead_quality_metrics.csv",
+        rows,
+        validation=validation,
+        validation_bead_centers=validation_bead_centers,
+        bead_crop_paths=bead_crop_paths,
+    )
     _write_registration_hypotheses_csv(cfg.output_dir / "registration_hypotheses.csv", rows)
     if cfg.registration_profile == REGISTRATION_PROFILE_MANUAL_SIMILARITY:
         _write_manual_calibration_artifact(
@@ -3426,6 +3455,38 @@ def _write_results_csv(path: Path, rows: Sequence[BenchmarkResultRow]) -> None:
         "warnings",
     ]
     write_csv_atomic(path, fieldnames, [_row_to_csv(row) for row in rows], create_backup=False)
+
+
+def _write_bead_quality_metrics_csv(
+    path: Path,
+    rows: Sequence[BenchmarkResultRow],
+    *,
+    validation: np.ndarray,
+    validation_bead_centers: Sequence[Tuple[float, float]],
+    bead_crop_paths: Mapping[str, str],
+) -> None:
+    records: List[BeadQualityRecord] = []
+    for row in rows:
+        metrics = compute_bead_quality_metrics(
+            validation,
+            row.registration.aligned_image,
+            centers=validation_bead_centers,
+        )
+        records.append(
+            BeadQualityRecord(
+                source_kind=row.source_kind,
+                stage=row.stage,
+                dataset_id=row.dataset_id,
+                candidate_id=row.candidate_id,
+                row_id=row.row_id,
+                generation_id=row.generation_id,
+                validation_rank=row.validation_rank,
+                validation_rankable=row.registration.validation_rankable,
+                metrics=metrics,
+                bead_crop_path=bead_crop_paths.get(row.row_id),
+            )
+        )
+    write_bead_quality_csv(path, records)
 
 
 def _write_registration_hypotheses_csv(path: Path, rows: Sequence[BenchmarkResultRow]) -> None:
@@ -4313,36 +4374,94 @@ def _detect_bead_centers(image: np.ndarray) -> List[Tuple[float, float]]:
     return centers
 
 
-def _bead_score(validation_centers: Sequence[Tuple[float, float]], candidate_centers: Sequence[Tuple[float, float]]) -> float:
-    if not validation_centers:
+def _local_ncc_bead_score(
+    validation: np.ndarray,
+    candidate: np.ndarray,
+    centers: Sequence[Tuple[float, float]],
+    mask: Optional[np.ndarray] = None,
+) -> float:
+    if not centers:
         return 0.0
-    if not candidate_centers:
+
+    validation_arr = np.asarray(validation, dtype=np.float32)
+    candidate_arr = np.asarray(candidate, dtype=np.float32)
+    local_mask = None if mask is None else np.asarray(mask, dtype=bool)
+    scores: List[float] = []
+    for center in centers:
+        if local_mask is not None and not _mask_has_local_support(
+            local_mask,
+            center,
+            radius=LOCAL_NCC_PATCH_RADIUS,
+        ):
+            continue
+        best_score: Optional[float] = None
+        for dy in range(-LOCAL_NCC_SEARCH_RADIUS, LOCAL_NCC_SEARCH_RADIUS + 1):
+            for dx in range(-LOCAL_NCC_SEARCH_RADIUS, LOCAL_NCC_SEARCH_RADIUS + 1):
+                patches = _local_ncc_patches(
+                    validation_arr,
+                    candidate_arr,
+                    center,
+                    dx=dx,
+                    dy=dy,
+                    radius=LOCAL_NCC_PATCH_RADIUS,
+                    mask=local_mask,
+                )
+                if patches is None:
+                    continue
+                validation_patch, candidate_patch, patch_mask = patches
+                score = max(0.0, _correlation(validation_patch, candidate_patch, mask=patch_mask))
+                best_score = score if best_score is None else max(best_score, score)
+        if best_score is not None:
+            scores.append(best_score)
+    if not scores:
         return 0.0
-    radius = 5.0
-    used: set[int] = set()
-    distances: List[float] = []
-    misses = 0
-    for vx, vy in validation_centers:
-        best_idx = -1
-        best_dist = float("inf")
-        for idx, (cx, cy) in enumerate(candidate_centers):
-            if idx in used:
-                continue
-            dist = float(math.hypot(cx - vx, cy - vy))
-            if dist < best_dist:
-                best_dist = dist
-                best_idx = idx
-        if best_idx >= 0 and best_dist <= radius:
-            used.add(best_idx)
-            distances.append(best_dist)
-        else:
-            misses += 1
-    false_positives = max(0, len(candidate_centers) - len(used))
-    mean_dist = float(np.mean(distances)) if distances else radius
-    miss_rate = misses / max(1, len(validation_centers))
-    false_rate = false_positives / max(1, len(candidate_centers))
-    distance_penalty = min(1.0, mean_dist / radius)
-    return 1.0 - min(1.0, (distance_penalty + miss_rate + false_rate) / 3.0)
+    return float(np.mean(scores))
+
+
+def _local_ncc_patches(
+    validation: np.ndarray,
+    candidate: np.ndarray,
+    center: Tuple[float, float],
+    *,
+    dx: int,
+    dy: int,
+    radius: int,
+    mask: Optional[np.ndarray],
+) -> Optional[Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]]:
+    cx, cy = center
+    base_x0 = int(math.floor(cx)) - int(radius)
+    base_x1 = int(math.floor(cx)) + int(radius) + 1
+    base_y0 = int(math.floor(cy)) - int(radius)
+    base_y1 = int(math.floor(cy)) + int(radius) + 1
+
+    val_y0 = max(base_y0, 0, -int(dy))
+    val_x0 = max(base_x0, 0, -int(dx))
+    val_y1 = min(base_y1, validation.shape[0], candidate.shape[0] - int(dy))
+    val_x1 = min(base_x1, validation.shape[1], candidate.shape[1] - int(dx))
+    if val_y1 <= val_y0 or val_x1 <= val_x0:
+        return None
+
+    cand_y0 = val_y0 + int(dy)
+    cand_y1 = val_y1 + int(dy)
+    cand_x0 = val_x0 + int(dx)
+    cand_x1 = val_x1 + int(dx)
+    if cand_y0 < 0 or cand_x0 < 0 or cand_y1 > candidate.shape[0] or cand_x1 > candidate.shape[1]:
+        return None
+
+    validation_patch = validation[val_y0:val_y1, val_x0:val_x1]
+    candidate_patch = candidate[cand_y0:cand_y1, cand_x0:cand_x1]
+    if validation_patch.shape != candidate_patch.shape or validation_patch.size < 2:
+        return None
+
+    patch_mask: Optional[np.ndarray] = None
+    if mask is not None:
+        validation_mask = mask[val_y0:val_y1, val_x0:val_x1]
+        candidate_mask = mask[cand_y0:cand_y1, cand_x0:cand_x1]
+        patch_mask = validation_mask & candidate_mask
+        if patch_mask.shape != validation_patch.shape or int(np.count_nonzero(patch_mask)) < 2:
+            return None
+
+    return validation_patch, candidate_patch, patch_mask
 
 
 def _sharpness_score(

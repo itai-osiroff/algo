@@ -107,25 +107,48 @@ def _run_state_entry(
     }
 
 
-def _write_spec(spec_path: Path) -> None:
+def _write_spec(
+    spec_path: Path,
+    *,
+    validation_enabled: bool = False,
+    validation_skip: bool = False,
+) -> None:
+    payload: dict[str, object] = {
+        "datasets": [{"id": "d1", "views_path": "unused.npy"}],
+        "strategies": ["pixel"],
+        "stages": {
+            "mode": "single_stage",
+            "total_budget_per_dataset": 1,
+            "stage1_fraction": 1.0,
+            "top_k": 1,
+        },
+        "scoring": {
+            "metric_weights": {"laplacian_variance": 1.0},
+            "robustness_lambda": 0.0,
+            "missing_dataset_penalty": 0.0,
+        },
+        "analyze": True,
+    }
+    if validation_enabled or validation_skip:
+        if validation_enabled and not validation_skip:
+            cast_stages = payload["stages"]
+            assert isinstance(cast_stages, dict)
+            cast_stages["mode"] = "two_stage"
+        payload["validation_oracle_sweep"] = {
+            "enabled": True,
+            "top_k": 1,
+            "budget_per_dataset": 1,
+            "skip_image_metric_stage": bool(validation_skip),
+            "scenes": [
+                {
+                    "dataset_id": "d1",
+                    "validation_workspace": "unused_validation_workspace.npz",
+                }
+            ],
+        }
     _write_json(
         spec_path,
-        {
-            "datasets": [{"id": "d1", "views_path": "unused.npy"}],
-            "strategies": ["pixel"],
-            "stages": {
-                "mode": "single_stage",
-                "total_budget_per_dataset": 1,
-                "stage1_fraction": 1.0,
-                "top_k": 1,
-            },
-            "scoring": {
-                "metric_weights": {"laplacian_variance": 1.0},
-                "robustness_lambda": 0.0,
-                "missing_dataset_penalty": 0.0,
-            },
-            "analyze": True,
-        },
+        payload,
     )
 
 
@@ -292,6 +315,237 @@ def test_rebuild_summaries_preserves_active_generation_id(tmp_path, monkeypatch)
     assert stage_summary["generation_id"] == "gen_new"
     assert {row["generation_id"] for row in stage_summary["rankings"]} == {"gen_new"}
     assert {record["generation_id"] for record in summary_records} == {"gen_new"}
+
+
+def test_rebuild_summaries_promotes_validation_phase_for_skip_mode(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path, validation_skip=True)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_stage1",
+        dataset_id="d1",
+        run_name="stage1_c_stage1_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="validation_phase",
+        candidate_id="c_validation",
+        dataset_id="d1",
+        run_name="validation_phase_c_validation_d1",
+        metric_value=3.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    validation_ranking = {
+        "candidate_id": "c_validation",
+        "strategy": "pixel",
+        "config": {"strategy": "pixel", "dataset_id": "d1"},
+        "params": {"similarity_window_size": 9},
+        "score": 0.98,
+        "mean_dataset_score": 0.98,
+        "std_dataset_score": 0.0,
+        "missing_datasets": [],
+        "dataset_scores": {"d1": 0.98},
+        "runtime_seconds": {"d1": 0.1},
+        "dataset_metrics": {"d1": {"laplacian_variance": 3.0}},
+        "rank": 1,
+        "stage": "validation_phase",
+        "score_metric": "validation_hybrid_v1",
+    }
+    _write_json(output_dir / "validation_oracle" / "validation_phase_rankings.json", [validation_ranking])
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_stage1_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_stage1",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_stage1", "d1"),
+                generation_id="gen_new",
+            ),
+            "validation_phase_c_validation_d1": _run_state_entry(
+                stage_name="validation_phase",
+                candidate_id="c_validation",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "validation_phase", "c_validation", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    )
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    leaderboard = json.loads((output_dir / "leaderboard.json").read_text(encoding="utf-8"))
+    best_configs = json.loads((output_dir / "best_configs.json").read_text(encoding="utf-8"))
+    validation_summary = json.loads((output_dir / "validation_phase_summary.json").read_text(encoding="utf-8"))
+    root_summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert leaderboard == [validation_ranking]
+    assert best_configs["overall_best"]["candidate_id"] == "c_validation"
+    assert validation_summary["rankings"] == [validation_ranking]
+    assert [record["run"] for record in root_summary] == ["validation_phase_c_validation_d1"]
+    assert (output_dir / "validation_leaderboard.csv").exists()
+
+
+def test_rebuild_summaries_refreshes_validation_phase_without_skip_mode(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path, validation_enabled=True)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_stage1",
+        dataset_id="d1",
+        run_name="stage1_c_stage1_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="stage2",
+        candidate_id="c_stage2",
+        dataset_id="d1",
+        run_name="stage2_c_stage2_d1",
+        metric_value=7.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="validation_phase",
+        candidate_id="c_validation",
+        dataset_id="d1",
+        run_name="validation_phase_c_validation_d1",
+        metric_value=3.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    validation_ranking = {
+        "candidate_id": "c_validation",
+        "strategy": "pixel",
+        "config": {"strategy": "pixel", "dataset_id": "d1"},
+        "params": {"similarity_window_size": 9},
+        "score": 0.98,
+        "mean_dataset_score": 0.98,
+        "std_dataset_score": 0.0,
+        "missing_datasets": [],
+        "dataset_scores": {"d1": 0.98},
+        "runtime_seconds": {"d1": 0.1},
+        "dataset_metrics": {"d1": {"laplacian_variance": 3.0}},
+        "rank": 1,
+        "stage": "validation_phase",
+        "score_metric": "validation_hybrid_v1",
+    }
+    _write_json(output_dir / "validation_oracle" / "validation_phase_rankings.json", [validation_ranking])
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_stage1_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_stage1",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_stage1", "d1"),
+                generation_id="gen_new",
+            ),
+            "stage2_c_stage2_d1": _run_state_entry(
+                stage_name="stage2",
+                candidate_id="c_stage2",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage2", "c_stage2", "d1"),
+                generation_id="gen_new",
+            ),
+            "validation_phase_c_validation_d1": _run_state_entry(
+                stage_name="validation_phase",
+                candidate_id="c_validation",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "validation_phase", "c_validation", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    )
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    validation_summary = json.loads((output_dir / "validation_phase_summary.json").read_text(encoding="utf-8"))
+    validation_records = json.loads((output_dir / "validation_summary.json").read_text(encoding="utf-8"))
+    root_leaderboard = json.loads((output_dir / "leaderboard.json").read_text(encoding="utf-8"))
+    root_summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert validation_summary["rankings"] == [validation_ranking]
+    assert [record["run"] for record in validation_records] == ["validation_phase_c_validation_d1"]
+    assert root_leaderboard[0]["candidate_id"] == "c_stage2"
+    assert [record["run"] for record in root_summary] == ["stage1_c_stage1_d1", "stage2_c_stage2_d1"]
+    assert (output_dir / "validation_leaderboard.csv").exists()
+
+
+def test_rebuild_summaries_fails_closed_when_skip_mode_lacks_validation_rankings(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path, validation_skip=True)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_stage1",
+        dataset_id="d1",
+        run_name="stage1_c_stage1_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="validation_phase",
+        candidate_id="c_validation",
+        dataset_id="d1",
+        run_name="validation_phase_c_validation_d1",
+        metric_value=3.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_stage1_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_stage1",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_stage1", "d1"),
+                generation_id="gen_new",
+            ),
+            "validation_phase_c_validation_d1": _run_state_entry(
+                stage_name="validation_phase",
+                candidate_id="c_validation",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "validation_phase", "c_validation", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    )
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    with pytest.raises(Exception, match="validation rankings"):
+        generate_reports.main()
+
+    report = _read_failure_report(output_dir)
+    assert "validation rankings" in report["message"]
 
 
 def test_rebuild_summaries_uses_active_run_state_not_stale_run_folders(tmp_path, monkeypatch):

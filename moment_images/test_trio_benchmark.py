@@ -412,6 +412,49 @@ def test_validation_metrics_penalize_blur_and_center_errors():
     assert sharp_metrics.metrics["validation_bead"] > shifted_metrics.metrics["validation_bead"]
 
 
+def test_validation_bead_local_ncc_allows_tiny_residual_shift_only():
+    validation = _synthetic_beads()
+    aligned = validation.copy()
+    shifted_one_px = cv.warpAffine(
+        validation,
+        np.array([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        validation.shape[::-1],
+        flags=cv.INTER_LINEAR,
+    )
+    shifted_five_px = cv.warpAffine(
+        validation,
+        np.array([[1.0, 0.0, 5.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        validation.shape[::-1],
+        flags=cv.INTER_LINEAR,
+    )
+
+    aligned_metrics = compute_validation_metrics(validation, aligned)
+    shifted_one_metrics = compute_validation_metrics(validation, shifted_one_px)
+    shifted_five_metrics = compute_validation_metrics(validation, shifted_five_px)
+
+    assert aligned_metrics.metrics["validation_bead"] == pytest.approx(1.0, abs=1e-6)
+    assert shifted_one_metrics.metrics["validation_bead"] > 0.98
+    assert (
+        shifted_five_metrics.metrics["validation_bead"]
+        < shifted_one_metrics.metrics["validation_bead"] - 0.20
+    )
+
+
+def test_validation_bead_score_does_not_depend_on_candidate_bead_detection(monkeypatch):
+    validation = _synthetic_beads()
+    candidate = validation.copy()
+    reference_cache = trio_benchmark._prepare_validation_metric_reference(validation)
+
+    def fail_candidate_detection(_image):
+        raise AssertionError("candidate bead detection should not be used for validation_bead")
+
+    monkeypatch.setattr(trio_benchmark, "_detect_bead_centers", fail_candidate_detection)
+
+    metrics = compute_validation_metrics(validation, candidate, reference_cache=reference_cache)
+
+    assert metrics.metrics["validation_bead"] == pytest.approx(1.0, abs=1e-6)
+
+
 def test_validation_metrics_rank_on_common_fov_not_zero_filled_borders():
     validation = _synthetic_beads()
     validation[120:150, 120:150] = 1.0
@@ -1659,10 +1702,12 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
 
     assert result.best_lf_row_id == "stage2:candidate_a"
     assert (output_dir / "trio_benchmark_results.csv").exists()
+    assert (output_dir / "bead_quality_metrics.csv").exists()
     assert (output_dir / "trio_benchmark_summary.json").exists()
     assert (output_dir / "trio_benchmark_report.html").exists()
     assert (output_dir / "figures" / "rank_001_stage2_candidate_a_overlay.png").exists()
     assert (output_dir / "figures" / "rank_001_stage2_candidate_a_affine_diagnostic_overlay.png").exists()
+    assert (output_dir / "figures" / "rank_001_stage2_candidate_a_bead_crops.png").exists()
 
     with (output_dir / "trio_benchmark_results.csv").open(newline="", encoding="utf-8") as fp:
         csv_rows = list(csv.DictReader(fp))
@@ -1684,6 +1729,13 @@ def test_run_benchmark_writes_ranked_outputs_and_preview_fallback(tmp_path, monk
     assert "registration_initializer" in csv_rows[0]
     assert "registration_refined_score" in csv_rows[0]
     assert "registration_runtime_seconds" in csv_rows[0]
+
+    with (output_dir / "bead_quality_metrics.csv").open(newline="", encoding="utf-8") as fp:
+        bead_rows = list(csv.DictReader(fp))
+    lf_bead_rows = [row for row in bead_rows if row["source_kind"] == "lf_candidate"]
+    assert [row["candidate_id"] for row in lf_bead_rows[:2]] == ["candidate_a", "candidate_b"]
+    assert float(lf_bead_rows[0]["compactness_score"]) > float(lf_bead_rows[1]["compactness_score"])
+    assert lf_bead_rows[0]["bead_crop_path"].endswith("rank_001_stage2_candidate_a_bead_crops.png")
     assert "hypotheses_generated" in csv_rows[0]
     assert "hypotheses_prefiltered" in csv_rows[0]
     assert "hypotheses_dense_scored" in csv_rows[0]

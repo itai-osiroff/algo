@@ -11,6 +11,7 @@ from PIL import Image
 matplotlib.use("Agg")
 
 from moment_images import sweep_metric_explorer as explorer
+from moment_images.bead_ranking_diagnostics import main as bead_diagnostics_main
 from moment_images.sweep_metric_explorer import (
     HYDRATE_MODE_LAZY,
     _ensure_profile_results,
@@ -384,6 +385,79 @@ def _write_trio_results(path: Path, *, bad_rankable: bool = True, bad_primary_sc
         writer.writerows(rows)
 
 
+def _write_bead_quality_results(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "source_kind",
+        "stage",
+        "dataset_id",
+        "candidate_id",
+        "row_id",
+        "generation_id",
+        "validation_rank",
+        "validation_rankable",
+        "validation_bead_count",
+        "evaluated_bead_count",
+        "candidate_width_mean_px",
+        "validation_width_mean_px",
+        "width_excess_mean_px",
+        "compactness_score",
+        "support_area_ratio_mean",
+        "support_compactness_score",
+        "peak_contrast_mean",
+        "ringing_penalty_mean",
+        "bead_crop_path",
+    ]
+    rows = [
+        {
+            "source_kind": explorer.TRIO_LF_SOURCE_KIND,
+            "stage": "stage1",
+            "dataset_id": "d1",
+            "candidate_id": "c_good",
+            "row_id": "c_good",
+            "generation_id": "",
+            "validation_rank": 1,
+            "validation_rankable": "true",
+            "validation_bead_count": 8,
+            "evaluated_bead_count": 8,
+            "candidate_width_mean_px": 5.8,
+            "validation_width_mean_px": 4.2,
+            "width_excess_mean_px": 1.6,
+            "compactness_score": 0.58,
+            "support_area_ratio_mean": 1.5,
+            "support_compactness_score": 0.52,
+            "peak_contrast_mean": 0.56,
+            "ringing_penalty_mean": 0.05,
+            "bead_crop_path": "figures/c_good_bead_crops.png",
+        },
+        {
+            "source_kind": explorer.TRIO_LF_SOURCE_KIND,
+            "stage": "stage1",
+            "dataset_id": "d1",
+            "candidate_id": "c_bad",
+            "row_id": "c_bad",
+            "generation_id": "",
+            "validation_rank": 3,
+            "validation_rankable": "true",
+            "validation_bead_count": 8,
+            "evaluated_bead_count": 8,
+            "candidate_width_mean_px": 4.4,
+            "validation_width_mean_px": 4.2,
+            "width_excess_mean_px": 0.2,
+            "compactness_score": 0.94,
+            "support_area_ratio_mean": 1.1,
+            "support_compactness_score": 0.90,
+            "peak_contrast_mean": 0.78,
+            "ringing_penalty_mean": 0.04,
+            "bead_crop_path": "figures/c_bad_bead_crops.png",
+        },
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def _can_create_tk() -> bool:
     try:
         import tkinter as tk
@@ -464,6 +538,62 @@ def test_load_sweep_metric_explorer_model_recomputes_metrics_and_profiles(tmp_pa
     assert good_d1.metrics["vollath_f4_avg"] > bad_d2.metrics["vollath_f4_avg"]
     assert good_d1.metrics["hoyer_avg"] > bad_d2.metrics["hoyer_avg"]
     assert good_d1.metrics["tamura_gradient_avg"] > bad_d2.metrics["tamura_gradient_avg"]
+
+
+def test_load_sweep_metric_explorer_model_defaults_to_validation_phase_for_skip_mode(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    manifest_path = output_dir / "experiment_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["stages"] = {"mode": "two_stage", "top_k": 2}
+    manifest["validation_oracle_sweep"] = {
+        "enabled": True,
+        "status": "completed",
+        "skip_image_metric_stage": True,
+    }
+    _write_json(manifest_path, manifest)
+    validation_ranking = {
+        "candidate_id": "v_good",
+        "strategy": "combined",
+        "config": {
+            "strategy": "combined",
+            "displacement_metric_family": "intensity",
+            "displacement_alpha": 1.0,
+            "metric_formulation_id": "intensity_default",
+            "max_displacement": 4,
+            "gauss_sigma": 3.0,
+        },
+        "params": {"max_displacement": 4, "gauss_sigma": 3.0},
+        "score": 0.97,
+        "mean_dataset_score": 0.97,
+        "std_dataset_score": 0.0,
+        "missing_datasets": [],
+        "dataset_scores": {"d1": 0.97, "d2": 0.96},
+        "runtime_seconds": {"d1": 1.0, "d2": 1.0},
+        "dataset_metrics": {
+            "d1": {"laplacian_variance": 97.0},
+            "d2": {"laplacian_variance": 96.0},
+        },
+        "rank": 1,
+        "stage": "validation_phase",
+    }
+    _write_json(
+        output_dir / "validation_phase_summary.json",
+        {
+            "stage": "validation_phase",
+            "num_runs": 1,
+            "num_successful": 1,
+            "num_failed": 0,
+            "rankings": [validation_ranking],
+            "failed_runs": [],
+            "runs": [],
+            "execution": {"selected_workers": 1, "requested_workers": 1},
+        },
+    )
+
+    model = load_sweep_metric_explorer_model(output_dir)
+
+    assert model.base_model.mode == "spec_validation_guided"
+    assert model.base_model.primary_stage_name == "validation_phase"
 
 
 def test_metric_explorer_model_keeps_reused_metric_stage_records_public(tmp_path):
@@ -1183,6 +1313,41 @@ def test_export_metric_report_and_main(tmp_path):
     assert (cli_export / "candidate_metrics.csv").exists()
     assert (cli_export / "validation_refinement_seeds.json").exists()
     assert (output_dir / "metric_review" / explorer.TRIO_ORACLE_CACHE_FILENAME).exists()
+
+
+def test_bead_ranking_diagnostics_exports_proxy_oracle_disagreements(tmp_path):
+    output_dir = _make_modern_fixture(tmp_path)
+    trio_dir = tmp_path / "trio_bead_diagnostics"
+    trio_csv = trio_dir / "trio_benchmark_results.csv"
+    _write_trio_results(trio_csv)
+    _write_bead_quality_results(trio_dir / "bead_quality_metrics.csv")
+
+    diagnostics_dir = tmp_path / "bead_report"
+    bead_diagnostics_main(
+        [
+            str(output_dir),
+            "--trio-results",
+            str(trio_csv),
+            "--proxy-profile",
+            "saved_original",
+            "--output-dir",
+            str(diagnostics_dir),
+        ]
+    )
+
+    disagreements_path = diagnostics_dir / "bead_disagreements.csv"
+    assert disagreements_path.exists()
+    with disagreements_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows
+    first = rows[0]
+    assert first["dataset_id"] == "d1"
+    assert first["oracle_candidate_id"] == "c_good"
+    assert first["proxy_candidate_id"] == "c_bad"
+    assert first["classification"] == "proxy_sharper_and_compacter"
+    assert float(first["proxy_compactness_score"]) > float(first["oracle_compactness_score"])
+    assert (diagnostics_dir / "bead_diagnostic_summary.json").exists()
+    assert (diagnostics_dir / "index.html").exists()
 
 
 def test_channel_comparison_figure_preserves_image_aspect_ratio(tmp_path):
