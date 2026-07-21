@@ -1078,6 +1078,7 @@ def _validation_oracle_enabled(spec: SweepExperimentSpec) -> bool:
 def _load_validation_rankings_for_rebuild(output_dir: Path) -> List[Dict[str, object]]:
     candidates = (
         output_dir / VALIDATION_ORACLE_DIR_NAME / "validation_phase_rankings.json",
+        output_dir / VALIDATION_ORACLE_DIR_NAME / "validation_oracle_manifest.json",
         output_dir / "validation_leaderboard.json",
         output_dir / f"{VALIDATION_ORACLE_STAGE_NAME}_summary.json",
     )
@@ -1094,7 +1095,7 @@ def _load_validation_rankings_for_rebuild(output_dir: Path) -> List[Dict[str, ob
             continue
         rankings_raw: object
         if isinstance(payload, dict):
-            rankings_raw = payload.get("rankings", [])
+            rankings_raw = payload.get("rankings", payload.get("validation_phase_rankings", []))
         else:
             rankings_raw = payload
         if not isinstance(rankings_raw, list):

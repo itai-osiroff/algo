@@ -396,6 +396,87 @@ def test_rebuild_summaries_promotes_validation_phase_for_skip_mode(tmp_path, mon
     assert (output_dir / "validation_leaderboard.csv").exists()
 
 
+def test_rebuild_summaries_uses_validation_oracle_manifest_rankings_for_skip_mode(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path, validation_skip=True)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_stage1",
+        dataset_id="d1",
+        run_name="stage1_c_stage1_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run(
+        output_dir,
+        stage_name="validation_phase",
+        candidate_id="c_validation",
+        dataset_id="d1",
+        run_name="validation_phase_c_validation_d1",
+        metric_value=3.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    validation_ranking = {
+        "candidate_id": "c_validation",
+        "strategy": "pixel",
+        "config": {"strategy": "pixel", "dataset_id": "d1"},
+        "params": {"similarity_window_size": 9},
+        "score": 0.98,
+        "mean_dataset_score": 0.98,
+        "std_dataset_score": 0.0,
+        "missing_datasets": [],
+        "dataset_scores": {"d1": 0.98},
+        "runtime_seconds": {"d1": 0.1},
+        "dataset_metrics": {"d1": {"laplacian_variance": 3.0}},
+        "rank": 1,
+        "stage": "validation_phase",
+        "score_metric": "human_bead_oracle_score_v1",
+    }
+    _write_json(
+        output_dir / "validation_oracle" / "validation_oracle_manifest.json",
+        {
+            "status": "completed",
+            "oracle_mode": "human_bead",
+            "validation_phase_rankings": [validation_ranking],
+        },
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_stage1_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_stage1",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_stage1", "d1"),
+                generation_id="gen_new",
+            ),
+            "validation_phase_c_validation_d1": _run_state_entry(
+                stage_name="validation_phase",
+                candidate_id="c_validation",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "validation_phase", "c_validation", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    )
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    leaderboard = json.loads((output_dir / "leaderboard.json").read_text(encoding="utf-8"))
+    validation_summary = json.loads((output_dir / "validation_phase_summary.json").read_text(encoding="utf-8"))
+
+    assert leaderboard == [validation_ranking]
+    assert validation_summary["rankings"] == [validation_ranking]
+
+
 def test_rebuild_summaries_refreshes_validation_phase_without_skip_mode(tmp_path, monkeypatch):
     output_dir = tmp_path / "experiment"
     spec_path = tmp_path / "spec.json"
