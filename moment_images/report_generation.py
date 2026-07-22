@@ -175,6 +175,70 @@ def _coerce_nonempty_str(value: object) -> Optional[str]:
     return text or None
 
 
+def _run_state_fingerprint_metric_weights(
+    output_dir: Path,
+    profile_name: str,
+) -> Optional[Dict[str, float]]:
+    run_state_scope = _load_run_state_for_scope(output_dir)
+    run_state = run_state_scope.run_state
+    if not isinstance(run_state, dict):
+        return None
+    fingerprint_payload = run_state.get("fingerprint_payload")
+    if not isinstance(fingerprint_payload, dict):
+        return None
+    spec_payload = fingerprint_payload.get("spec")
+    if not isinstance(spec_payload, dict):
+        return None
+    scoring_payload = spec_payload.get("scoring")
+    if not isinstance(scoring_payload, dict):
+        return None
+    fingerprint_profile = _coerce_nonempty_str(scoring_payload.get("profile_name"))
+    if fingerprint_profile != profile_name:
+        return None
+    weights_raw = scoring_payload.get("metric_weights")
+    if not isinstance(weights_raw, dict):
+        return None
+    weights: Dict[str, float] = {}
+    for key, value in weights_raw.items():
+        try:
+            weights[str(key)] = float(value)
+        except (TypeError, ValueError):
+            return None
+    return weights or None
+
+
+def _load_spec_for_rebuild(
+    output_dir: Path,
+    spec_path: Path,
+    context: Optional[Dict[str, object]],
+) -> SweepExperimentSpec:
+    payload = _load_json(spec_path)
+    try:
+        return SweepExperimentSpec.from_dict(payload)
+    except ValueError as exc:
+        scoring_payload = payload.get("scoring")
+        if not isinstance(scoring_payload, dict):
+            raise
+        profile_name = _coerce_nonempty_str(scoring_payload.get("profile_name"))
+        if profile_name is None or "Unknown scoring profile" not in str(exc):
+            raise
+        fallback_weights = _run_state_fingerprint_metric_weights(output_dir, profile_name)
+        if fallback_weights is None:
+            raise
+
+        hydrated_payload = json.loads(json.dumps(payload))
+        hydrated_scoring = cast(Dict[str, object], hydrated_payload.setdefault("scoring", {}))
+        hydrated_scoring.pop("profile_name", None)
+        hydrated_scoring.pop("profile_config_path", None)
+        hydrated_scoring["metric_weights"] = fallback_weights
+        if context is not None:
+            cast(List[object], context.setdefault("warnings", [])).append(
+                f"scoring profile {profile_name!r} could not be resolved; "
+                "using metric_weights from run_state.json fingerprint_payload."
+            )
+        return SweepExperimentSpec.from_dict(cast(Dict[str, object], hydrated_payload))
+
+
 def _canonical_json(payload: object) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -1140,8 +1204,6 @@ def _rebuild_summaries(
         validation_results = validation_discovery.results
         _validate_rebuild_dataset_ids("stage1", stage1_results, dataset_ids)
         _validate_rebuild_dataset_ids(VALIDATION_ORACLE_STAGE_NAME, validation_results, dataset_ids)
-        validation_rankings = _load_validation_rankings_for_rebuild(output_dir)
-        validation_metric_records = _metric_records_from_stage_results(validation_results)
 
         _mark_artifact_writes_started(context)
         stage1_rankings = score_and_rank_runs(stage1_results, spec.scoring, dataset_ids=dataset_ids)
@@ -1153,6 +1215,18 @@ def _rebuild_summaries(
             execution=_stage_execution_payload(stage1_discovery),
             generation_id=_stage_generation_id(run_state, stage1_results),
         )
+        if not validation_results:
+            if context is not None:
+                cast(List[object], context.setdefault("warnings", [])).append(
+                    "validation-guided skip-mode has no validation_phase results yet; "
+                    "rebuilt provisional stage1 root summaries."
+                )
+            stage1_metric_records = _metric_records_from_stage_results(stage1_results)
+            _write_ranked_outputs(output_dir, stage1_rankings, stage1_metric_records)
+            return len(stage1_results), 0, active_generation
+
+        validation_rankings = _load_validation_rankings_for_rebuild(output_dir)
+        validation_metric_records = _metric_records_from_stage_results(validation_results)
         _write_validation_phase_artifacts(
             output_dir=output_dir,
             stage_results=validation_results,
@@ -1377,6 +1451,19 @@ def _write_rebuild_failure_report(
     return json_path, markdown_path
 
 
+def _clear_rebuild_failure_reports(output_dir: Path) -> None:
+    for filename in (
+        "rebuild_failure_report.json",
+        "rebuild_failure_report.json.bak",
+        "rebuild_failure_report.md",
+        "rebuild_failure_report.md.bak",
+    ):
+        try:
+            (output_dir / filename).unlink()
+        except FileNotFoundError:
+            continue
+
+
 def _has_report_inputs(output_dir: Path) -> bool:
     summary_files = (
         "summary.json",
@@ -1464,7 +1551,7 @@ def main() -> None:
             if not args.spec:
                 raise ValueError("--rebuild-summaries requires --spec so rankings can be recomputed.")
             cast(Dict[str, object], rebuild_context)["phase"] = "load_spec"
-            spec = SweepExperimentSpec.from_dict(_load_json(Path(args.spec)))
+            spec = _load_spec_for_rebuild(output_dir, Path(args.spec), rebuild_context)
             if args.repair_run_state:
                 cast(Dict[str, object], rebuild_context)["phase"] = "repair_run_state"
                 repair_report = _repair_run_state_for_rebuild(output_dir, spec, str(args.repair_run_state))
@@ -1534,6 +1621,8 @@ def main() -> None:
             if rebuild_context is not None:
                 rebuild_context["phase"] = "snapshot_generation_products"
             _snapshot_active_generation_products(experiment_root, generation_id)
+        if rebuild_context is not None:
+            _clear_rebuild_failure_reports(output_dir)
     except Exception as exc:
         if rebuild_context is not None:
             try:

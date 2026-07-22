@@ -574,6 +574,158 @@ def test_rebuild_summaries_refreshes_validation_phase_without_skip_mode(tmp_path
     assert (output_dir / "validation_leaderboard.csv").exists()
 
 
+def test_rebuild_summaries_allows_stage1_only_partial_validation_skip_mode(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path, validation_skip=True)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_stage1",
+        dataset_id="d1",
+        run_name="stage1_c_stage1_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_stage1_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_stage1",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_stage1", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    )
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    stage_summary = json.loads((output_dir / "stage1_summary.json").read_text(encoding="utf-8"))
+    leaderboard = json.loads((output_dir / "leaderboard.json").read_text(encoding="utf-8"))
+    root_summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert stage_summary["num_runs"] == 1
+    assert leaderboard[0]["candidate_id"] == "c_stage1"
+    assert [record["run"] for record in root_summary] == ["stage1_c_stage1_d1"]
+    assert not (output_dir / "validation_phase_summary.json").exists()
+    assert not (output_dir / "rebuild_failure_report.json").exists()
+
+
+def test_rebuild_summaries_uses_run_state_metric_weights_when_profile_config_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    spec_payload = json.loads(spec_path.read_text(encoding="utf-8"))
+    spec_payload["scoring"] = {
+        "profile_name": "missing_custom_profile",
+        "profile_config_path": str(tmp_path / "missing_metrics_config.json"),
+        "runtime_penalty_weight": 0.0,
+        "robustness_lambda": 0.0,
+        "missing_dataset_penalty": 0.0,
+        "metric_scope": "global_and_local_metrics",
+    }
+    _write_json(spec_path, spec_payload)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_stage1",
+        dataset_id="d1",
+        run_name="stage1_c_stage1_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_stage1_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_stage1",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_stage1", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    )
+    run_state = json.loads((output_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state["fingerprint_payload"] = {
+        "spec": {
+            "scoring": {
+                "profile_name": "missing_custom_profile",
+                "profile_config_path": str(tmp_path / "old_metrics_config.json"),
+                "metric_weights": {"laplacian_variance": 1.0},
+            }
+        }
+    }
+    _write_json(output_dir / "run_state.json", run_state)
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    leaderboard = json.loads((output_dir / "leaderboard.json").read_text(encoding="utf-8"))
+    assert leaderboard[0]["candidate_id"] == "c_stage1"
+    assert not (output_dir / "rebuild_failure_report.json").exists()
+
+
+def test_successful_rebuild_clears_stale_failure_reports(tmp_path, monkeypatch):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    _write_spec(spec_path)
+    _write_run(
+        output_dir,
+        stage_name="stage1",
+        candidate_id="c_stage1",
+        dataset_id="d1",
+        run_name="stage1_c_stage1_d1",
+        metric_value=5.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "stage1_c_stage1_d1": _run_state_entry(
+                stage_name="stage1",
+                candidate_id="c_stage1",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "stage1", "c_stage1", "d1"),
+                generation_id="gen_new",
+            ),
+        },
+    )
+    for name in (
+        "rebuild_failure_report.json",
+        "rebuild_failure_report.json.bak",
+        "rebuild_failure_report.md",
+        "rebuild_failure_report.md.bak",
+    ):
+        (output_dir / name).write_text("stale failure", encoding="utf-8")
+    _set_rebuild_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    for name in (
+        "rebuild_failure_report.json",
+        "rebuild_failure_report.json.bak",
+        "rebuild_failure_report.md",
+        "rebuild_failure_report.md.bak",
+    ):
+        assert not (output_dir / name).exists()
+
+
 def test_rebuild_summaries_fails_closed_when_skip_mode_lacks_validation_rankings(tmp_path, monkeypatch):
     output_dir = tmp_path / "experiment"
     spec_path = tmp_path / "spec.json"
