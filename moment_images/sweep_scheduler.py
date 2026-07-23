@@ -24,6 +24,7 @@ MEMORY_SAFETY_FRACTION = 0.70
 ADAPTIVE_COLD_START_MULTIPLIER = 1.50
 ADAPTIVE_PEAK_MARGIN = 1.25
 ADAPTIVE_SCHEDULER_MODEL_VERSION = 1
+MEMORY_PRESSURE_POLL_SECONDS = 0.25
 SCHEDULER_MODE_ADAPTIVE_MEMORY = "adaptive_memory"
 SCHEDULER_MODE_FIXED_BATCH = "fixed_batch"
 SCHEDULER_MODES = {
@@ -295,11 +296,36 @@ def adaptive_host_memory_signature() -> Dict[str, object]:
 
 
 @dataclass(frozen=True)
-class AdaptiveTaskChoice:
+class AdaptiveTaskDecision:
+    action: Literal["submit", "wait", "reject"]
     task: Optional[dict]
-    rejected_task: Optional[dict]
     reservation_bytes: int
     reason: str
+
+
+def build_memory_limit_result(task: Mapping[str, object], message: str) -> Dict[str, object]:
+    """Build the canonical result for work excluded by memory containment."""
+
+    return {
+        "status": "failed",
+        "stage": task.get("stage"),
+        "candidate_id": task.get("candidate_id"),
+        "dataset_id": task.get("dataset_id"),
+        "strategy": task.get("strategy"),
+        "run_uid": task.get("run_uid"),
+        "runtime_seconds": 0.0,
+        "config": task.get("config"),
+        "params": task.get("params"),
+        "candidate_signature": task.get("candidate_signature"),
+        "dataset_signature": task.get("dataset_signature"),
+        "run_signature": task.get("run_signature"),
+        "generation_id": task.get("generation_id"),
+        "task_index": task.get("task_index"),
+        "run_dir": task.get("run_dir"),
+        "artifact_paths": task.get("artifact_paths"),
+        "failure_kind": "memory_limit_exceeded",
+        "error": message,
+    }
 
 
 def choose_adaptive_task(
@@ -312,7 +338,7 @@ def choose_adaptive_task(
     active_unspent_growth_bytes: int,
     active_rss_bytes: int,
     memory_limit_bytes: Optional[int],
-) -> AdaptiveTaskChoice:
+) -> AdaptiveTaskDecision:
     """Choose a fitting task, prioritizing starved work before short work."""
 
     live_growth_budget = max(
@@ -355,7 +381,7 @@ def choose_adaptive_task(
                     int(item[0].get("task_index", 0)),
                 ),
             )
-            return AdaptiveTaskChoice(task, None, reservation, "starvation_priority")
+            return AdaptiveTaskDecision("submit", task, reservation, "starvation_priority")
         task, reservation = min(
             fitting,
             key=lambda item: (
@@ -363,26 +389,14 @@ def choose_adaptive_task(
                 int(item[0].get("task_index", 0)),
             ),
         )
-        return AdaptiveTaskChoice(task, None, reservation, "throughput_priority")
+        return AdaptiveTaskDecision("submit", task, reservation, "throughput_priority")
 
     if rejected is not None:
         task, reservation = rejected
-        return AdaptiveTaskChoice(None, task, reservation, "memory_limit_exceeded")
+        return AdaptiveTaskDecision("reject", task, reservation, "memory_limit_exceeded")
     if not active_unspent_growth_bytes and pending_tasks:
-        task = min(
-            pending_tasks,
-            key=lambda item: (
-                learning.runtime_seconds(item),
-                int(item.get("task_index", 0)),
-            ),
-        )
-        return AdaptiveTaskChoice(
-            None,
-            task,
-            learning.reservation_bytes(task),
-            "memory_limit_exceeded",
-        )
-    return AdaptiveTaskChoice(None, None, 0, "waiting_for_memory")
+        return AdaptiveTaskDecision("wait", None, 0, "waiting_for_memory")
+    return AdaptiveTaskDecision("wait", None, 0, "waiting_for_memory")
 
 
 def get_psutil_available_memory_bytes() -> Optional[int]:
@@ -614,6 +628,7 @@ def execute_pool_attempt(
     memory_probe: Callable[[], Optional[int]] = get_available_memory_bytes,
     executor_factory: Callable[..., object] = ProcessPoolExecutor,
     wait_fn: Callable[..., Tuple[Sequence[object], Sequence[object]]] = wait,
+    sleep_fn: Callable[[float], None] = time.sleep,
     learning: Optional[AdaptiveLearningState] = None,
     memory_limit_bytes: Optional[int] = None,
     worker_started_callback: Optional[Callable[[int], None]] = None,
@@ -646,6 +661,8 @@ def execute_pool_attempt(
         "learned_profile_count": 0,
         "cold_profile_count": 0,
         "memory_limit_bytes": memory_limit_bytes,
+        "memory_pressure_wait_count": 0,
+        "memory_pressure_wait_seconds": 0.0,
     }
 
     def task_estimate(task: Mapping[str, object]) -> int:
@@ -721,32 +738,13 @@ def execute_pool_attempt(
         active_reserved_bytes[future] = task_estimate(task)
         update_concurrency_telemetry()
 
-    def memory_limit_result(task: dict, reservation: int) -> dict:
-        return {
-            "status": "failed",
-            "stage": task.get("stage"),
-            "candidate_id": task.get("candidate_id"),
-            "dataset_id": task.get("dataset_id"),
-            "strategy": task.get("strategy"),
-            "run_uid": task.get("run_uid"),
-            "runtime_seconds": 0.0,
-            "config": task.get("config"),
-            "params": task.get("params"),
-            "task_index": task.get("task_index"),
-            "run_dir": task.get("run_dir"),
-            "artifact_paths": task.get("artifact_paths"),
-            "failure_kind": "memory_limit_exceeded",
-            "error": (
-                "Predicted task growth exceeds the configured aggregate memory limit "
-                f"({reservation} bytes reservation; {memory_limit_bytes} bytes limit)."
-            ),
-        }
-
-    def admit_ready_tasks(executor: object) -> None:
+    def admit_ready_tasks(executor: object) -> bool:
+        waiting_for_memory = False
         while pending_tasks and len(active_tasks) < int(workers):
             budget = effective_budget()
             current_reserved = reserved_total()
             selected_index: Optional[int] = None
+            choice: Optional[AdaptiveTaskDecision] = None
             if budget is None:
                 if active_tasks:
                     break
@@ -768,20 +766,31 @@ def execute_pool_attempt(
                         active_rss_bytes=0,
                         memory_limit_bytes=memory_limit_bytes,
                     )
-                    if choice.rejected_task is not None:
-                        task = choice.rejected_task
+                    if choice.action == "reject" and choice.task is not None:
+                        task = choice.task
                         pending_tasks.remove(task)
-                        result = memory_limit_result(task, choice.reservation_bytes)
+                        result = build_memory_limit_result(
+                            task,
+                            "Predicted task growth exceeds the configured aggregate memory limit "
+                            f"({choice.reservation_bytes} bytes reservation; "
+                            f"{memory_limit_bytes} bytes limit).",
+                        )
                         completed_results.append(result)
                         completed_indices.add(int(task["task_index"]))
                         if on_result is not None:
                             on_result(task, result)
                         continue
-                    if choice.task is not None and current_reserved + choice.reservation_bytes <= budget:
+                    if (
+                        choice.action == "submit"
+                        and choice.task is not None
+                        and current_reserved + choice.reservation_bytes <= budget
+                    ):
                         selected_index = pending_tasks.index(choice.task)
             if selected_index is None:
+                waiting_for_memory = choice is not None and choice.action == "wait"
                 break
             submit_pending(executor, selected_index)
+        return waiting_for_memory
 
     def unfinished_tasks() -> list[dict]:
         return [
@@ -798,6 +807,16 @@ def execute_pool_attempt(
                     cancel()
                 except Exception:
                     pass
+
+    def record_memory_pressure_wait() -> None:
+        sleep_fn(MEMORY_PRESSURE_POLL_SECONDS)
+        telemetry["memory_pressure_wait_count"] = (
+            int(telemetry["memory_pressure_wait_count"]) + 1
+        )
+        telemetry["memory_pressure_wait_seconds"] = (
+            float(telemetry["memory_pressure_wait_seconds"])
+            + MEMORY_PRESSURE_POLL_SECONDS
+        )
 
     try:
         kwargs = process_pool_kwargs(
@@ -826,10 +845,13 @@ def execute_pool_attempt(
                     raise RuntimeError("ProcessPoolExecutor did not expose started worker PIDs")
                 for pid in pids:
                     worker_started_callback(pid)
-            admit_ready_tasks(executor)
             while active_tasks or pending_tasks:
                 if not active_tasks and pending_tasks:
-                    admit_ready_tasks(executor)
+                    waiting_for_memory = admit_ready_tasks(executor)
+                    if not active_tasks:
+                        if waiting_for_memory:
+                            record_memory_pressure_wait()
+                        continue
                 done_futures, _ = wait_fn(list(active_tasks.keys()), return_when=FIRST_COMPLETED)
                 for future in list(done_futures):
                     task = active_tasks.pop(future)
@@ -852,7 +874,9 @@ def execute_pool_attempt(
                 if executor_exc is not None:
                     cancel_active_futures()
                     break
-                admit_ready_tasks(executor)
+                waiting_for_memory = admit_ready_tasks(executor)
+                if not active_tasks and pending_tasks and waiting_for_memory:
+                    record_memory_pressure_wait()
 
             pending_tasks = [] if executor_exc is None else unfinished_tasks()
     except Exception as exc:  # noqa: BLE001 - covers pool init/spawn failures.

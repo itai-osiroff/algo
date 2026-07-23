@@ -9,7 +9,9 @@ import moment_images.parameter_sweep as parameter_sweep
 from moment_images.parameter_sweep import SweepSchedulingSpec
 from moment_images.sweep_scheduler import (
     AdaptiveLearningState,
+    SweepSchedulingSpec,
     choose_adaptive_task,
+    execute_pool_attempt,
     memory_profile_key,
 )
 
@@ -309,6 +311,108 @@ def test_choose_adaptive_task_rejects_predicted_oversize_task():
         memory_limit_bytes=500,
     )
 
-    assert choice.task is None
-    assert choice.rejected_task is task
+    assert choice.action == "reject"
+    assert choice.task is task
     assert choice.reason == "memory_limit_exceeded"
+
+
+def test_choose_adaptive_task_waits_for_temporary_memory_pressure():
+    task = _scheduler_task("later", 400, 0)
+
+    choice = choose_adaptive_task(
+        [task],
+        learning=AdaptiveLearningState(),
+        now_seconds=0.0,
+        available_bytes=500,
+        safety_fraction=0.7,
+        active_unspent_growth_bytes=0,
+        active_rss_bytes=0,
+        memory_limit_bytes=1_000,
+    )
+
+    assert choice.action == "wait"
+    assert choice.task is None
+    assert choice.reason == "waiting_for_memory"
+
+
+def test_execute_pool_attempt_retries_temporary_memory_pressure_before_dispatch():
+    task = _scheduler_task("later", 100, 0)
+    available_samples = iter([100, 100, 100, 100, 1_000, 1_000])
+    sleep_calls: list[float] = []
+    submitted: list[str] = []
+
+    def executor_factory(max_workers, initializer=None, max_tasks_per_child=None):
+        return _FakeExecutor(
+            max_workers,
+            initializer=initializer,
+            max_tasks_per_child=max_tasks_per_child,
+            result_factory=_build_eval_result,
+            submitted=submitted,
+        )
+
+    outcome = execute_pool_attempt(
+        [task],
+        workers=1,
+        scheduling=SweepSchedulingSpec(mode="adaptive_memory", memory_safety_fraction=0.7),
+        worker_fn=lambda _task: _build_eval_result(_task),
+        initializer=None,
+        memory_probe=lambda: next(available_samples),
+        executor_factory=executor_factory,
+        wait_fn=lambda futures, return_when: (list(futures), []),
+        sleep_fn=sleep_calls.append,
+    )
+
+    assert outcome.error is None
+    assert [result["run_uid"] for result in outcome.completed_results] == ["later"]
+    assert submitted == ["later"]
+    assert sleep_calls == [0.25, 0.25]
+    assert outcome.telemetry["memory_pressure_wait_count"] == 2
+
+
+def test_adaptive_pool_keeps_unfinished_work_retryable_after_enforced_oom(monkeypatch):
+    tasks = [
+        _scheduler_task("failed", 100, 0),
+        _scheduler_task("queued", 100, 1),
+    ]
+
+    class FakeEnforcer:
+        def current_bytes(self):
+            return None
+
+        def memory_events(self):
+            return {"oom": 1, "oom_kill": 1}
+
+        def close(self):
+            return None
+
+    def result_factory(task: dict) -> dict:
+        if task["run_uid"] == "failed":
+            raise BrokenProcessPool("worker was killed")
+        return _build_eval_result(task)
+
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 1_000)
+    monkeypatch.setattr(
+        parameter_sweep,
+        "worker_registration_environment",
+        lambda _enforcer: {"MOMENT_IMAGES_TEST_CGROUP": "1"},
+    )
+    _install_fake_executor(monkeypatch, result_factory=result_factory)
+    monkeypatch.setattr(
+        parameter_sweep,
+        "wait",
+        lambda futures, return_when: ([list(futures)[0]], list(futures)[1:]),
+    )
+
+    completed, pending, error, telemetry = parameter_sweep._execute_adaptive_pool_batch(
+        tasks,
+        workers=2,
+        memory_safety_fraction=0.7,
+        worker_recycle_tasks=None,
+        memory_telemetry=True,
+        memory_enforcer=FakeEnforcer(),
+    )
+
+    assert completed == []
+    assert isinstance(error, BrokenProcessPool)
+    assert [task["run_uid"] for task in pending] == ["failed", "queued"]
+    assert telemetry["memory_oom_detected"] is True

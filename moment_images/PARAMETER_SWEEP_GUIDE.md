@@ -143,7 +143,10 @@ by the adaptive memory scheduler rather than submitting a full fixed batch:
 executed artifacts, then prioritizes starved work before the shortest predicted
 run that fits the current RAM budget. Cold profiles reserve 1.5x the estimate;
 learned profiles reserve 1.25x the largest observed RSS growth. A predicted
-oversize run is recorded as `memory_limit_exceeded` rather than forced through.
+run above the stage memory limit is recorded as `memory_limit_exceeded` rather
+than forced through. A run below that limit waits and re-probes every 250 ms
+when temporary host pressure leaves insufficient live RAM; it remains
+interruptible with Ctrl+C rather than being recorded as permanently oversized.
 
 `memory_enforcement` is `"auto"` by default. On Linux, `auto` uses a delegated
 cgroup v2 root named by `MOMENT_IMAGES_CGROUP_ROOT`; it creates only a child
@@ -162,6 +165,9 @@ batch starts.
 min-available-memory snapshots; adaptive admission still uses memory probes
 when telemetry is off. Install `psutil` from `requirements.txt` for live RSS
 and available-memory telemetry.
+If an enforced multi-worker pool reports an OOM event, completed results are
+kept and unfinished work retries with fewer workers. At one worker, only the
+attempted task is recorded as `memory_limit_exceeded`; later tasks continue.
 `worker_recycle_tasks` may be `null` or an integer `>= 1`; it maps to
 `ProcessPoolExecutor(max_tasks_per_child=...)` on Python runtimes that support
 that setting.

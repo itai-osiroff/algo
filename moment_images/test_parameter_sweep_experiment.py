@@ -131,6 +131,41 @@ def _scheduler_task(run_uid: str, estimated_peak_bytes: int, task_index: int) ->
     }
 
 
+def _install_direct_adaptive_pool_runner(monkeypatch, fake_run):
+    def fake_execute_adaptive_pool_batch(
+        tasks,
+        workers,
+        memory_safety_fraction,
+        worker_recycle_tasks,
+        memory_telemetry,
+        on_result=None,
+        **_kwargs,
+    ):
+        del workers, memory_safety_fraction, worker_recycle_tasks, memory_telemetry
+        completed = []
+        for task in tasks:
+            result, _crashed = fake_run(task)
+            completed.append(result)
+            if on_result is not None:
+                on_result(task, result)
+        return (
+            completed,
+            [],
+            None,
+            {
+                "scheduler_mode": "adaptive_memory",
+                "memory_budget_bytes": None,
+                "max_concurrent_tasks_observed": 1 if tasks else 0,
+                "max_reserved_peak_bytes_observed": max(
+                    (int(task["estimated_peak_bytes"]) for task in tasks),
+                    default=0,
+                ),
+            },
+        )
+
+    monkeypatch.setattr(parameter_sweep, "_execute_adaptive_pool_batch", fake_execute_adaptive_pool_batch)
+
+
 def _install_fast_artifact_runner(monkeypatch):
     calls: list[str] = []
 
@@ -190,6 +225,7 @@ def _install_fast_artifact_runner(monkeypatch):
         )
 
     monkeypatch.setattr(parameter_sweep, "_run_task_isolated", fake_run)
+    _install_direct_adaptive_pool_runner(monkeypatch, fake_run)
     return calls
 
 
@@ -262,6 +298,7 @@ def _install_window_score_artifact_runner(monkeypatch):
         )
 
     monkeypatch.setattr(parameter_sweep, "_run_task_isolated", fake_run)
+    _install_direct_adaptive_pool_runner(monkeypatch, fake_run)
     return calls
 
 
@@ -343,6 +380,7 @@ def _install_bead_score_artifact_runner(monkeypatch):
         )
 
     monkeypatch.setattr(parameter_sweep, "_run_task_isolated", fake_run)
+    _install_direct_adaptive_pool_runner(monkeypatch, fake_run)
     return calls
 
 
@@ -443,6 +481,7 @@ def _install_structured_artifact_runner(monkeypatch):
         )
 
     monkeypatch.setattr(parameter_sweep, "_run_task_isolated", fake_run)
+    _install_direct_adaptive_pool_runner(monkeypatch, fake_run)
     return calls
 
 
@@ -1046,13 +1085,14 @@ def test_execute_adaptive_pool_batch_prioritizes_short_cold_task(monkeypatch):
         memory_safety_fraction=0.5,
         worker_recycle_tasks=None,
         memory_telemetry=True,
+        memory_limit_bytes=500,
         on_result=None,
     )
 
     assert error is None
     assert pending == []
-    assert [result["run_uid"] for result in completed] == ["small_c", "large_a", "large_b"]
-    assert [result["status"] for result in completed] == ["ok", "failed", "failed"]
+    assert [result["run_uid"] for result in completed] == ["large_a", "large_b", "small_c"]
+    assert [result["status"] for result in completed] == ["failed", "failed", "ok"]
     assert wait_snapshots[0] == ["small_c"]
     assert telemetry["max_concurrent_tasks_observed"] == 1
     assert telemetry["max_reserved_peak_bytes_observed"] == 150
@@ -1091,6 +1131,7 @@ def test_execute_adaptive_pool_batch_marks_oversized_task_without_dispatch(monke
         memory_safety_fraction=0.5,
         worker_recycle_tasks=None,
         memory_telemetry=True,
+        memory_limit_bytes=50,
         on_result=None,
     )
 
@@ -1353,6 +1394,153 @@ def test_evaluate_stage_smoke_runs_synthetic_views_in_scheduler_modes(monkeypatc
     assert evaluation.execution["scheduler_mode"] == scheduler_mode
     assert evaluation.execution["completed_runs"] == 1
     assert Path(str(evaluation.stage_results[0]["run_dir"])).exists()
+
+
+def test_adaptive_single_worker_validates_required_enforcement_before_dispatch(monkeypatch, tmp_path):
+    calls = _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+    dataset = PreparedDataset(
+        dataset_id="d1",
+        views_path=views_path,
+        hdr_enabled=False,
+        hdr_exposure_times=None,
+        normalize_to_8bit=False,
+        views_shape=tuple(int(dim) for dim in views.shape),
+        views_dtype=str(views.dtype),
+        views_itemsize=int(views.dtype.itemsize),
+    )
+    candidate = SweepCandidate(
+        strategy="pixel",
+        params={"similarity_window_size": 1},
+        config=RectificationRunConfig(strategy="pixel", similarity_window_size=1, max_displacement=0),
+        candidate_id="c0",
+    )
+
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 10**12)
+    monkeypatch.setattr(
+        parameter_sweep,
+        "create_memory_enforcer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("required unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="required unavailable"):
+        parameter_sweep._evaluate_stage(
+            stage_name="stage1",
+            candidates=[candidate],
+            datasets=[dataset],
+            output_dir=tmp_path / "required",
+            save_figures_flag=False,
+            requested_workers=1,
+            scheduling=SweepSchedulingSpec(
+                mode="adaptive_memory",
+                memory_enforcement="required",
+            ),
+        )
+
+    assert calls == []
+
+
+def test_adaptive_oom_degrades_to_isolated_tasks_and_continues(monkeypatch, tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+    dataset = PreparedDataset(
+        dataset_id="d1",
+        views_path=views_path,
+        hdr_enabled=False,
+        hdr_exposure_times=None,
+        normalize_to_8bit=False,
+        views_shape=tuple(int(dim) for dim in views.shape),
+        views_dtype=str(views.dtype),
+        views_itemsize=int(views.dtype.itemsize),
+    )
+    candidates = [
+        SweepCandidate(
+            strategy="pixel",
+            params={"similarity_window_size": window},
+            config=RectificationRunConfig(
+                strategy="pixel",
+                similarity_window_size=window,
+                max_displacement=0,
+            ),
+            candidate_id=f"c{window}",
+        )
+        for window in (1, 3)
+    ]
+    calls: list[tuple[int, list[str]]] = []
+
+    class FakeEnforcer:
+        status = SimpleNamespace(
+            mode="enforced",
+            backend="test",
+            reason="test containment",
+            limit_bytes=700,
+        )
+
+        def close(self):
+            return None
+
+    def fake_execute_adaptive_pool_batch(
+        tasks,
+        workers,
+        memory_safety_fraction,
+        worker_recycle_tasks,
+        memory_telemetry,
+        on_result=None,
+        **_kwargs,
+    ):
+        calls.append((int(workers), [str(task["run_uid"]) for task in tasks]))
+        if int(workers) == 2:
+            return [], list(tasks), BrokenProcessPool("cgroup oom"), {
+                "scheduler_mode": "adaptive_memory",
+                "memory_oom_detected": True,
+                "memory_events": {"oom": 1},
+                "memory_pressure_wait_count": 1,
+                "memory_pressure_wait_seconds": 0.25,
+            }
+        assert len(tasks) == 1
+        if str(tasks[0]["candidate_id"]) == "c1":
+            return [], list(tasks), BrokenProcessPool("cgroup oom"), {
+                "scheduler_mode": "adaptive_memory",
+                "memory_oom_detected": True,
+                "memory_events": {"oom": 1},
+                "memory_pressure_wait_count": 2,
+                "memory_pressure_wait_seconds": 0.5,
+            }
+        result = _build_eval_result(tasks[0], status="ok")
+        return [result], [], None, {
+            "scheduler_mode": "adaptive_memory",
+            "memory_events": {},
+            "memory_pressure_wait_count": 3,
+            "memory_pressure_wait_seconds": 0.75,
+        }
+
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 1_000)
+    monkeypatch.setattr(parameter_sweep, "create_memory_enforcer", lambda *_args, **_kwargs: FakeEnforcer())
+    monkeypatch.setattr(parameter_sweep, "_execute_adaptive_pool_batch", fake_execute_adaptive_pool_batch)
+
+    evaluation = parameter_sweep._evaluate_stage(
+        stage_name="stage1",
+        candidates=candidates,
+        datasets=[dataset],
+        output_dir=tmp_path / "oom",
+        save_figures_flag=False,
+        requested_workers=2,
+        scheduling=SweepSchedulingSpec(mode="adaptive_memory"),
+    )
+
+    assert [workers for workers, _task_ids in calls] == [2, 1, 1]
+    assert len(evaluation.stage_results) == 2
+    assert evaluation.stage_results[0]["failure_kind"] == "memory_limit_exceeded"
+    assert evaluation.stage_results[1]["status"] == "ok"
+    assert evaluation.execution["degrade_events"][0]["event"] == "memory_enforcement_oom"
+    assert evaluation.execution["degrade_events"][0]["workers_before"] == 2
+    assert evaluation.execution["degrade_events"][0]["workers_after"] == 1
+    assert evaluation.execution["memory_pressure_wait_count"] == 6
+    assert evaluation.execution["memory_pressure_wait_seconds"] == 1.5
+    assert evaluation.execution["memory_events"] == {"oom": 2}
 
 
 def test_evaluate_stage_keeps_adaptive_process_cap_when_memory_unknown(monkeypatch, tmp_path):
@@ -1631,11 +1819,36 @@ def test_evaluate_stage_records_failed_isolated_worker(monkeypatch, tmp_path):
     )
 
     monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 10**12)
-    monkeypatch.setattr(
-        parameter_sweep,
-        "_run_task_isolated",
-        lambda task: (_build_eval_result(task, status="failed"), True),
-    )
+
+    class FakeEnforcer:
+        status = SimpleNamespace(
+            mode="enforced",
+            backend="test",
+            reason="test containment",
+            limit_bytes=10**12,
+        )
+
+        def close(self):
+            return None
+
+    def fake_execute_adaptive_pool_batch(
+        tasks,
+        workers,
+        memory_safety_fraction,
+        worker_recycle_tasks,
+        memory_telemetry,
+        on_result=None,
+        **_kwargs,
+    ):
+        assert workers == 1
+        assert len(tasks) == 1
+        assert worker_recycle_tasks is None
+        return [], list(tasks), BrokenProcessPool("worker crashed"), {
+            "scheduler_mode": "adaptive_memory",
+        }
+
+    monkeypatch.setattr(parameter_sweep, "create_memory_enforcer", lambda *_args, **_kwargs: FakeEnforcer())
+    monkeypatch.setattr(parameter_sweep, "_execute_adaptive_pool_batch", fake_execute_adaptive_pool_batch)
 
     evaluation = parameter_sweep._evaluate_stage(
         stage_name="stage1",
@@ -1648,6 +1861,7 @@ def test_evaluate_stage_records_failed_isolated_worker(monkeypatch, tmp_path):
 
     assert len(evaluation.stage_results) == 1
     assert evaluation.stage_results[0]["status"] == "failed"
+    assert evaluation.stage_results[0]["failure_kind"] == "worker_crash"
     assert evaluation.execution["isolated_crash_count"] == 1
     assert evaluation.execution["used_isolated_mode"] is True
 

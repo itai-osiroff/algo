@@ -77,6 +77,7 @@ from moment_images.sweep_scheduler import (
     SCHEDULER_MODE_FIXED_BATCH,
     SCHEDULER_MODES,
     SweepSchedulingSpec,
+    build_memory_limit_result,
 )
 from moment_images.metric_profiles import (
     build_metric_registry,
@@ -3766,33 +3767,10 @@ def _execute_adaptive_pool_batch(
         if memory_enforcer is not None:
             memory_events = cast(Any, memory_enforcer).memory_events()
             outcome.telemetry["memory_events"] = dict(memory_events)
-            if int(memory_events.get("oom", 0) or 0) or int(
-                memory_events.get("oom_kill", 0) or 0
-            ):
-                failures: List[Dict[str, object]] = []
-                for task in outcome.pending_tasks:
-                    result = {
-                        "status": "failed",
-                        "stage": task.get("stage"),
-                        "candidate_id": task.get("candidate_id"),
-                        "dataset_id": task.get("dataset_id"),
-                        "strategy": task.get("strategy"),
-                        "run_uid": task.get("run_uid"),
-                        "runtime_seconds": 0.0,
-                        "config": task.get("config"),
-                        "params": task.get("params"),
-                        "task_index": task.get("task_index"),
-                        "run_dir": task.get("run_dir"),
-                        "artifact_paths": task.get("artifact_paths"),
-                        "failure_kind": "memory_limit_exceeded",
-                        "error": "Worker cgroup reported an OOM memory-limit event.",
-                    }
-                    failures.append(result)
-                    if on_result is not None:
-                        on_result(task, result)
-                outcome.completed_results.extend(failures)
-                outcome.pending_tasks = []
-                outcome.error = None
+            outcome.telemetry["memory_oom_detected"] = bool(
+                int(memory_events.get("oom", 0) or 0)
+                or int(memory_events.get("oom_kill", 0) or 0)
+            )
     finally:
         monitor_stop.set()
         monitor.join(timeout=0.5)
@@ -4604,6 +4582,9 @@ def _evaluate_stage(
         "max_worker_rss_bytes_observed": None,
         "max_aggregate_worker_rss_bytes_observed": None,
         "memory_telemetry_enabled": bool(scheduling.memory_telemetry),
+        "memory_pressure_wait_count": 0,
+        "memory_pressure_wait_seconds": 0.0,
+        "memory_events": {},
         "worker_recycle_tasks": scheduling.worker_recycle_tasks,
         **memory_enforcement_status,
         "learned_profile_count": 0,
@@ -4656,6 +4637,22 @@ def _evaluate_stage(
                 if current is None
                 else max(int(current), int(aggregate_rss))
             )
+        scheduler_telemetry["memory_pressure_wait_count"] = (
+            int(scheduler_telemetry["memory_pressure_wait_count"])
+            + int(batch_telemetry.get("memory_pressure_wait_count", 0) or 0)
+        )
+        scheduler_telemetry["memory_pressure_wait_seconds"] = (
+            float(scheduler_telemetry["memory_pressure_wait_seconds"])
+            + float(batch_telemetry.get("memory_pressure_wait_seconds", 0.0) or 0.0)
+        )
+        batch_memory_events = batch_telemetry.get("memory_events")
+        if isinstance(batch_memory_events, Mapping):
+            memory_events = cast(Dict[str, int], scheduler_telemetry["memory_events"])
+            for event, count in batch_memory_events.items():
+                try:
+                    memory_events[str(event)] = int(memory_events.get(str(event), 0)) + int(count)
+                except (TypeError, ValueError):
+                    continue
 
     remaining_tasks = list(tasks_to_execute)
     current_workers = selected_workers
@@ -4704,7 +4701,7 @@ def _evaluate_stage(
                 if run_state_path is not None:
                     _persist_run_state(run_state_path, run_state)
 
-            if current_workers <= 1:
+            if current_workers <= 1 and scheduling.mode == SCHEDULER_MODE_FIXED_BATCH:
                 _merge_scheduler_telemetry(
                     {
                         "max_concurrent_tasks_observed": 1 if remaining_tasks else 0,
@@ -4758,6 +4755,11 @@ def _evaluate_stage(
                 )
                 _record_learning_if_valid(task, result)
 
+            isolated_adaptive_attempt = (
+                scheduling.mode == SCHEDULER_MODE_ADAPTIVE_MEMORY and current_workers <= 1
+            )
+            attempt_tasks = remaining_tasks[:1] if isolated_adaptive_attempt else remaining_tasks
+            batch_telemetry: Mapping[str, object] = {}
             if scheduling.mode == SCHEDULER_MODE_ADAPTIVE_MEMORY:
                 attempt_enforcer = (
                     create_memory_enforcer(
@@ -4802,10 +4804,12 @@ def _evaluate_stage(
                         )
                     scheduler_telemetry.update(memory_enforcement_status)
                 completed_batch, pending_batch, exec_error, batch_telemetry = _execute_adaptive_pool_batch(
-                    remaining_tasks,
+                    attempt_tasks,
                     workers=current_workers,
                     memory_safety_fraction=scheduling.memory_safety_fraction,
-                    worker_recycle_tasks=scheduling.worker_recycle_tasks,
+                    worker_recycle_tasks=(
+                        None if isolated_adaptive_attempt else scheduling.worker_recycle_tasks
+                    ),
                     memory_telemetry=scheduling.memory_telemetry,
                     learning=adaptive_learning,
                     memory_limit_bytes=memory_limit_bytes,
@@ -4839,13 +4843,43 @@ def _evaluate_stage(
                     _commit_pooled_result(task, result)
 
             if exec_error is None:
+                if isolated_adaptive_attempt and len(remaining_tasks) > 1:
+                    remaining_tasks = [
+                        task
+                        for task in remaining_tasks
+                        if int(task["task_index"]) not in completed_task_indices
+                    ]
+                    continue
                 break
+
+            if isolated_adaptive_attempt:
+                task = attempt_tasks[0]
+                if bool(batch_telemetry.get("memory_oom_detected", False)):
+                    result = build_memory_limit_result(
+                        task,
+                        "Worker memory containment reported an OOM memory-limit event.",
+                    )
+                else:
+                    isolated_crash_count += 1
+                    result = _build_worker_crash_result(task, 0.0, exec_error)
+                result["task_index"] = task["task_index"]
+                _commit_pooled_result(task, result)
+                remaining_tasks = [
+                    pending_task
+                    for pending_task in remaining_tasks
+                    if int(pending_task["task_index"]) != int(task["task_index"])
+                ]
+                continue
 
             pool_crash_count += 1
             next_workers = max(1, current_workers // 2)
             degrade_events.append(
                 {
-                    "event": "pool_failure",
+                    "event": (
+                        "memory_enforcement_oom"
+                        if bool(batch_telemetry.get("memory_oom_detected", False))
+                        else "pool_failure"
+                    ),
                     "error_type": type(exec_error).__name__,
                     "error": str(exec_error),
                     "broken_process_pool": isinstance(exec_error, BrokenProcessPool),
