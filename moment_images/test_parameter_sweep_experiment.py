@@ -806,6 +806,7 @@ def test_scheduling_spec_defaults_and_validation():
     assert scheduling.memory_safety_fraction == parameter_sweep.MEMORY_SAFETY_FRACTION
     assert scheduling.memory_telemetry is True
     assert scheduling.worker_recycle_tasks is None
+    assert scheduling.memory_enforcement == "auto"
 
     fixed = SweepSchedulingSpec.from_dict(
         {
@@ -813,12 +814,14 @@ def test_scheduling_spec_defaults_and_validation():
             "memory_safety_fraction": 0.5,
             "memory_telemetry": False,
             "worker_recycle_tasks": 3,
+            "memory_enforcement": "required",
         }
     )
     assert fixed.mode == "fixed_batch"
     assert fixed.memory_safety_fraction == 0.5
     assert fixed.memory_telemetry is False
     assert fixed.worker_recycle_tasks == 3
+    assert fixed.memory_enforcement == "required"
 
     with pytest.raises(ValueError, match="scheduling.mode"):
         SweepSchedulingSpec(mode="unknown")
@@ -826,6 +829,19 @@ def test_scheduling_spec_defaults_and_validation():
         SweepSchedulingSpec(memory_safety_fraction=0.0)
     with pytest.raises(ValueError, match="worker_recycle_tasks"):
         SweepSchedulingSpec(worker_recycle_tasks=0)
+    with pytest.raises(ValueError, match="memory_enforcement"):
+        SweepSchedulingSpec(memory_enforcement="unsafe")
+
+
+def test_adaptive_execution_requires_psutil(monkeypatch):
+    monkeypatch.setattr(parameter_sweep.sweep_scheduler, "psutil", None)
+
+    with pytest.raises(RuntimeError, match="requires psutil"):
+        parameter_sweep._require_adaptive_memory_telemetry(SweepSchedulingSpec())
+
+    parameter_sweep._require_adaptive_memory_telemetry(
+        SweepSchedulingSpec(mode="fixed_batch")
+    )
 
 
 @pytest.mark.parametrize(
@@ -837,6 +853,7 @@ def test_scheduling_spec_defaults_and_validation():
         ({"worker_recycle_tasks": True}, "worker_recycle_tasks"),
         ({"memory_safety_fraction": "0.7"}, "memory_safety_fraction"),
         ({"memory_safety_fraction": False}, "memory_safety_fraction"),
+        ({"memory_enforcement": 1}, "memory_enforcement"),
     ],
 )
 def test_scheduling_spec_rejects_coerced_json_values(payload, match):
@@ -855,6 +872,7 @@ def test_experiment_spec_parses_stage_scheduling(tmp_path):
                     "memory_safety_fraction": 0.6,
                     "memory_telemetry": False,
                     "worker_recycle_tasks": 2,
+                    "memory_enforcement": "advisory",
                 },
             },
         }
@@ -865,6 +883,7 @@ def test_experiment_spec_parses_stage_scheduling(tmp_path):
     assert spec.stages.scheduling.memory_safety_fraction == 0.6
     assert spec.stages.scheduling.memory_telemetry is False
     assert spec.stages.scheduling.worker_recycle_tasks == 2
+    assert spec.stages.scheduling.memory_enforcement == "advisory"
 
 
 def test_parse_args_accepts_scheduler_overrides():
@@ -879,6 +898,8 @@ def test_parse_args_accepts_scheduler_overrides():
             "--worker-recycle-tasks",
             "4",
             "--no-memory-telemetry",
+            "--memory-enforcement",
+            "required",
         ]
     )
 
@@ -886,6 +907,7 @@ def test_parse_args_accepts_scheduler_overrides():
     assert args.memory_safety_fraction == 0.55
     assert args.worker_recycle_tasks == 4
     assert args.memory_telemetry is False
+    assert args.memory_enforcement == "required"
 
 
 def test_run_from_namespace_applies_scheduler_overrides(monkeypatch, tmp_path):
@@ -919,6 +941,8 @@ def test_run_from_namespace_applies_scheduler_overrides(monkeypatch, tmp_path):
             "--worker-recycle-tasks",
             "2",
             "--no-memory-telemetry",
+            "--memory-enforcement",
+            "required",
         ]
     )
 
@@ -930,6 +954,7 @@ def test_run_from_namespace_applies_scheduler_overrides(monkeypatch, tmp_path):
     assert spec.stages.scheduling.memory_safety_fraction == 0.4
     assert spec.stages.scheduling.worker_recycle_tasks == 2
     assert spec.stages.scheduling.memory_telemetry is False
+    assert spec.stages.scheduling.memory_enforcement == "required"
 
 
 def test_select_stage_worker_count_respects_memory_cap():
@@ -976,7 +1001,7 @@ def test_select_stage_worker_count_uses_requested_cap_for_adaptive_default():
     assert selection["scheduler_mode"] == "adaptive_memory"
 
 
-def test_execute_adaptive_pool_batch_packs_small_tasks_around_large(monkeypatch):
+def test_execute_adaptive_pool_batch_prioritizes_short_cold_task(monkeypatch):
     tasks = [
         _scheduler_task("large_a", 400, 0),
         _scheduler_task("large_b", 400, 1),
@@ -1026,13 +1051,14 @@ def test_execute_adaptive_pool_batch_packs_small_tasks_around_large(monkeypatch)
 
     assert error is None
     assert pending == []
-    assert [result["run_uid"] for result in completed] == ["large_a", "small_c", "large_b"]
-    assert wait_snapshots[0] == ["large_a", "small_c"]
-    assert telemetry["max_concurrent_tasks_observed"] == 2
-    assert telemetry["max_reserved_peak_bytes_observed"] == 500
+    assert [result["run_uid"] for result in completed] == ["small_c", "large_a", "large_b"]
+    assert [result["status"] for result in completed] == ["ok", "failed", "failed"]
+    assert wait_snapshots[0] == ["small_c"]
+    assert telemetry["max_concurrent_tasks_observed"] == 1
+    assert telemetry["max_reserved_peak_bytes_observed"] == 150
 
 
-def test_execute_adaptive_pool_batch_runs_oversized_task_alone(monkeypatch):
+def test_execute_adaptive_pool_batch_marks_oversized_task_without_dispatch(monkeypatch):
     tasks = [_scheduler_task("oversized", 1000, 0)]
     monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 100)
 
@@ -1071,8 +1097,10 @@ def test_execute_adaptive_pool_batch_runs_oversized_task_alone(monkeypatch):
     assert error is None
     assert pending == []
     assert [result["run_uid"] for result in completed] == ["oversized"]
-    assert telemetry["max_concurrent_tasks_observed"] == 1
-    assert telemetry["max_reserved_peak_bytes_observed"] == 1000
+    assert completed[0]["status"] == "failed"
+    assert completed[0]["failure_kind"] == "memory_limit_exceeded"
+    assert telemetry["max_concurrent_tasks_observed"] == 0
+    assert telemetry["max_reserved_peak_bytes_observed"] == 0
 
 
 def test_execute_adaptive_pool_batch_returns_unfinished_tasks_after_pool_crash(monkeypatch):
@@ -1111,7 +1139,7 @@ def test_execute_adaptive_pool_batch_returns_unfinished_tasks_after_pool_crash(m
     completed, pending, error, telemetry = parameter_sweep._execute_adaptive_pool_batch(
         tasks,
         workers=3,
-        memory_safety_fraction=0.5,
+        memory_safety_fraction=0.7,
         worker_recycle_tasks=None,
         memory_telemetry=True,
         on_result=None,
@@ -1120,7 +1148,7 @@ def test_execute_adaptive_pool_batch_returns_unfinished_tasks_after_pool_crash(m
     assert completed == []
     assert isinstance(error, BrokenProcessPool)
     assert sorted(task["run_uid"] for task in pending) == ["large_a", "large_b", "small_c"]
-    assert telemetry["max_concurrent_tasks_observed"] == 2
+    assert telemetry["max_concurrent_tasks_observed"] == 1
 
 
 def test_execute_adaptive_pool_batch_surfaces_callback_failure(monkeypatch):
@@ -1361,6 +1389,7 @@ def test_evaluate_stage_keeps_adaptive_process_cap_when_memory_unknown(monkeypat
         worker_recycle_tasks,
         memory_telemetry,
         on_result=None,
+        **_kwargs,
     ):
         observed_workers.append(int(workers))
         completed = [_build_eval_result(task, status="ok") for task in tasks]
@@ -1479,7 +1508,7 @@ def test_evaluate_stage_persists_pooled_results_before_batch_retry(monkeypatch, 
     )
 
     assert len(evaluation.stage_results) == 2
-    assert persisted == {"status": "ok", "attempts": 1, "completed_runs": 1}
+    assert persisted == {"status": "failed", "attempts": 1, "completed_runs": 1}
 
 
 def test_evaluate_stage_surfaces_pooled_persistence_failure_without_pool_retry(monkeypatch, tmp_path):

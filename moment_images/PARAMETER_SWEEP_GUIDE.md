@@ -132,24 +132,36 @@ by the adaptive memory scheduler rather than submitting a full fixed batch:
       "mode": "adaptive_memory",
       "memory_safety_fraction": 0.7,
       "memory_telemetry": true,
-      "worker_recycle_tasks": null
+      "worker_recycle_tasks": null,
+      "memory_enforcement": "auto"
     }
   }
 }
 ```
 
-`adaptive_memory` estimates each task's peak bytes and admits any pending task
-that fits the current RAM budget. It can run smaller tasks while a large task
-waits. The budget is rebased upward only when no pool tasks are active, and it
-shrinks immediately if available memory drops during an active epoch. If memory
-cannot be read, adaptive mode serializes pool admission one task at a time.
+`adaptive_memory` learns an RSS-growth and runtime profile from valid newly
+executed artifacts, then prioritizes starved work before the shortest predicted
+run that fits the current RAM budget. Cold profiles reserve 1.5x the estimate;
+learned profiles reserve 1.25x the largest observed RSS growth. A predicted
+oversize run is recorded as `memory_limit_exceeded` rather than forced through.
+
+`memory_enforcement` is `"auto"` by default. On Linux, `auto` uses a delegated
+cgroup v2 root named by `MOMENT_IMAGES_CGROUP_ROOT`; it creates only a child
+cgroup and applies `memory.high` at 90% and `memory.max` at the stage limit. On
+Windows it uses a Job Object. `"required"` fails before tasks start when the
+platform mechanism is unavailable; `"advisory"` retains learned admission only.
+Set `MOMENT_IMAGES_CGROUP_ROOT` to a writable delegated cgroup v2 directory
+whose `cgroup.controllers` includes `memory`; the sweep never probes or alters
+an arbitrary host cgroup root.
 
 Use `"mode": "fixed_batch"` to restore the older fixed-batch behavior. In fixed
 mode, available RAM is used only to choose the batch worker count before the
 batch starts.
 
-`memory_telemetry` controls per-result RSS sampling and min-available-memory
-snapshots; adaptive admission still uses memory probes when telemetry is off.
+`memory_telemetry` controls per-result 50 ms RSS sampling and
+min-available-memory snapshots; adaptive admission still uses memory probes
+when telemetry is off. Install `psutil` from `requirements.txt` for live RSS
+and available-memory telemetry.
 `worker_recycle_tasks` may be `null` or an integer `>= 1`; it maps to
 `ProcessPoolExecutor(max_tasks_per_child=...)` on Python runtimes that support
 that setting.
@@ -181,6 +193,7 @@ CLI overrides are available:
 ```bash
 python -m moment_images.parameter_sweep --spec sweep_spec.json --metrics-config metric_review/metrics_config.json --scoring-profile guide_focus_mix
 python -m moment_images.parameter_sweep --spec sweep_spec.json --scheduler-mode fixed_batch --memory-safety-fraction 0.6 --worker-recycle-tasks 8 --no-memory-telemetry
+python -m moment_images.parameter_sweep --spec sweep_spec.json --memory-enforcement required
 ```
 
 Profiles that depend on `saved_score` or `saved_mean_dataset_score` are

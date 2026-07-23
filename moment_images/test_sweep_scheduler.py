@@ -7,6 +7,11 @@ import pytest
 
 import moment_images.parameter_sweep as parameter_sweep
 from moment_images.parameter_sweep import SweepSchedulingSpec
+from moment_images.sweep_scheduler import (
+    AdaptiveLearningState,
+    choose_adaptive_task,
+    memory_profile_key,
+)
 
 
 def _scheduler_task(run_uid: str, estimated_peak_bytes: int, task_index: int) -> dict:
@@ -129,7 +134,7 @@ def test_adaptive_scheduler_does_not_inflate_budget_while_active(monkeypatch):
     completed, pending, error, telemetry = parameter_sweep._execute_adaptive_pool_batch(
         tasks,
         workers=3,
-        memory_safety_fraction=0.5,
+        memory_safety_fraction=0.7,
         worker_recycle_tasks=None,
         memory_telemetry=True,
         on_result=None,
@@ -137,10 +142,10 @@ def test_adaptive_scheduler_does_not_inflate_budget_while_active(monkeypatch):
 
     assert error is None
     assert pending == []
-    assert [result["run_uid"] for result in completed] == ["small", "large", "medium"]
-    assert wait_snapshots == [["large", "small"], ["large"], ["medium"]]
+    assert [result["run_uid"] for result in completed] == ["large", "small", "medium"]
+    assert wait_snapshots == [["large"], ["medium", "small"], ["medium"]]
     assert telemetry["max_concurrent_tasks_observed"] == 2
-    assert telemetry["max_reserved_peak_bytes_observed"] == 500
+    assert telemetry["max_reserved_peak_bytes_observed"] == 600
 
 
 def test_adaptive_scheduler_serializes_when_memory_probe_unknown(monkeypatch):
@@ -240,3 +245,70 @@ def test_adaptive_worker_plan_keeps_process_cap_when_memory_unknown():
     assert adaptive["scheduler_mode"] == "adaptive_memory"
     assert fixed["selected_workers"] == 2
     assert fixed["scheduler_mode"] == "fixed_batch"
+
+
+def test_learning_state_replaces_cold_estimate_with_observed_peak_growth():
+    task = _scheduler_task("pixel", 1_000, 0)
+    task["views_shape"] = [2, 2, 16, 16]
+    task["views_dtype"] = "float32"
+    task["save_figures"] = False
+    learning = AdaptiveLearningState()
+
+    assert learning.reservation_bytes(task) == 1_500
+
+    learning.record_success(task, peak_growth_bytes=800, runtime_seconds=4.0)
+
+    assert learning.reservation_bytes(task) == 1_000
+    model = learning.models[memory_profile_key(task)]
+    assert model.sample_count == 1
+    assert model.runtime_ewma_seconds == 4.0
+
+
+def test_choose_adaptive_task_promotes_starved_task_over_shorter_work():
+    long_waiting = _scheduler_task("long", 100, 0)
+    short_waiting = _scheduler_task("short", 100, 1)
+    for task in (long_waiting, short_waiting):
+        task["views_shape"] = [2, 2, 16, 16]
+        task["views_dtype"] = "float32"
+        task["save_figures"] = False
+    long_waiting["queued_at_seconds"] = 0.0
+    short_waiting["queued_at_seconds"] = 10.0
+    learning = AdaptiveLearningState()
+    learning.record_success(long_waiting, peak_growth_bytes=50, runtime_seconds=5.0)
+    learning.record_success(short_waiting, peak_growth_bytes=50, runtime_seconds=1.0)
+
+    choice = choose_adaptive_task(
+        [long_waiting, short_waiting],
+        learning=learning,
+        now_seconds=11.0,
+        available_bytes=1_000,
+        safety_fraction=0.7,
+        active_unspent_growth_bytes=0,
+        active_rss_bytes=0,
+        memory_limit_bytes=1_000,
+    )
+
+    assert choice.task is long_waiting
+    assert choice.reason == "starvation_priority"
+
+
+def test_choose_adaptive_task_rejects_predicted_oversize_task():
+    task = _scheduler_task("oversize", 1_000, 0)
+    task["views_shape"] = [2, 2, 16, 16]
+    task["views_dtype"] = "float32"
+    task["save_figures"] = False
+
+    choice = choose_adaptive_task(
+        [task],
+        learning=AdaptiveLearningState(),
+        now_seconds=0.0,
+        available_bytes=500,
+        safety_fraction=0.7,
+        active_unspent_growth_bytes=0,
+        active_rss_bytes=0,
+        memory_limit_bytes=500,
+    )
+
+    assert choice.task is None
+    assert choice.rejected_task is task
+    assert choice.reason == "memory_limit_exceeded"

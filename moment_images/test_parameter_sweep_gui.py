@@ -72,6 +72,7 @@ def test_state_to_spec_roundtrip_with_scheduling_controls(tmp_path):
     state.memory_safety_fraction = "0.55"
     state.memory_telemetry = False
     state.worker_recycle_tasks = "3"
+    state.memory_enforcement = "required"
     state.metric_experiments_enabled = True
     state.metric_experiments_candidate_source = "independent_search"
     state.metric_experiments_shortlist_top_k = "4"
@@ -85,12 +86,14 @@ def test_state_to_spec_roundtrip_with_scheduling_controls(tmp_path):
         "memory_safety_fraction": 0.55,
         "memory_telemetry": False,
         "worker_recycle_tasks": 3,
+        "memory_enforcement": "required",
     }
     assert payload["experimental_metric_sweep"]["search_stages"]["scheduling"] == scheduling
     assert roundtrip.scheduler_mode == "fixed_batch"
     assert roundtrip.memory_safety_fraction == "0.55"
     assert roundtrip.memory_telemetry is False
     assert roundtrip.worker_recycle_tasks == "3"
+    assert roundtrip.memory_enforcement == "required"
 
     state.worker_recycle_tasks = ""
     blank_payload = state_to_spec_dict(state)

@@ -113,7 +113,8 @@
       "mode": "adaptive_memory",
       "memory_safety_fraction": 0.7,
       "memory_telemetry": true,
-      "worker_recycle_tasks": null
+      "worker_recycle_tasks": null,
+      "memory_enforcement": "auto"
     }
   },
   "scoring": {

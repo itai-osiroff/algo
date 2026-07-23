@@ -7,8 +7,10 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+import json
 from pathlib import Path
 from typing import Callable, Dict, Literal, Mapping, Optional, Sequence, Tuple, cast
 
@@ -19,11 +21,22 @@ except Exception:  # noqa: BLE001 - memory telemetry falls back to stdlib probes
 
 
 MEMORY_SAFETY_FRACTION = 0.70
+ADAPTIVE_COLD_START_MULTIPLIER = 1.50
+ADAPTIVE_PEAK_MARGIN = 1.25
+ADAPTIVE_SCHEDULER_MODEL_VERSION = 1
 SCHEDULER_MODE_ADAPTIVE_MEMORY = "adaptive_memory"
 SCHEDULER_MODE_FIXED_BATCH = "fixed_batch"
 SCHEDULER_MODES = {
     SCHEDULER_MODE_ADAPTIVE_MEMORY,
     SCHEDULER_MODE_FIXED_BATCH,
+}
+MEMORY_ENFORCEMENT_AUTO = "auto"
+MEMORY_ENFORCEMENT_REQUIRED = "required"
+MEMORY_ENFORCEMENT_ADVISORY = "advisory"
+MEMORY_ENFORCEMENT_MODES = {
+    MEMORY_ENFORCEMENT_AUTO,
+    MEMORY_ENFORCEMENT_REQUIRED,
+    MEMORY_ENFORCEMENT_ADVISORY,
 }
 
 
@@ -35,6 +48,7 @@ class SweepSchedulingSpec:
     memory_safety_fraction: float = MEMORY_SAFETY_FRACTION
     memory_telemetry: bool = True
     worker_recycle_tasks: Optional[int] = None
+    memory_enforcement: Literal["auto", "required", "advisory"] = MEMORY_ENFORCEMENT_AUTO
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, str):
@@ -60,6 +74,20 @@ class SweepSchedulingSpec:
 
         if not isinstance(self.memory_telemetry, bool):
             raise ValueError("stages.scheduling.memory_telemetry must be a boolean.")
+
+        if not isinstance(self.memory_enforcement, str):
+            raise ValueError(
+                "stages.scheduling.memory_enforcement must be 'auto', 'required', or 'advisory'."
+            )
+        normalized_enforcement = self.memory_enforcement.strip().lower()
+        if normalized_enforcement not in MEMORY_ENFORCEMENT_MODES:
+            raise ValueError(
+                "stages.scheduling.memory_enforcement must be 'auto', 'required', or 'advisory'."
+            )
+        self.memory_enforcement = cast(
+            Literal["auto", "required", "advisory"],
+            normalized_enforcement,
+        )
 
         if self.worker_recycle_tasks is not None:
             if isinstance(self.worker_recycle_tasks, bool) or not isinstance(
@@ -90,6 +118,10 @@ class SweepSchedulingSpec:
             ),
             memory_telemetry=cast(bool, raw.get("memory_telemetry", True)),
             worker_recycle_tasks=cast(Optional[int], raw.get("worker_recycle_tasks")),
+            memory_enforcement=cast(
+                Literal["auto", "required", "advisory"],
+                raw.get("memory_enforcement", MEMORY_ENFORCEMENT_AUTO),
+            ),
         )
 
 
@@ -115,6 +147,242 @@ class PoolBatchOutcome:
     pending_tasks: list[dict]
     error: Optional[BaseException]
     telemetry: Dict[str, object]
+
+
+@dataclass
+class LearnedTaskProfile:
+    """Observed resource data for one memory-equivalent task profile."""
+
+    sample_count: int = 0
+    max_peak_growth_bytes: int = 0
+    runtime_ewma_seconds: Optional[float] = None
+
+    def record_success(self, peak_growth_bytes: int, runtime_seconds: float) -> None:
+        self.sample_count += 1
+        self.max_peak_growth_bytes = max(
+            int(self.max_peak_growth_bytes),
+            max(0, int(peak_growth_bytes)),
+        )
+        runtime = max(0.0, float(runtime_seconds))
+        if self.runtime_ewma_seconds is None:
+            self.runtime_ewma_seconds = runtime
+        else:
+            self.runtime_ewma_seconds = (
+                0.25 * runtime + 0.75 * float(self.runtime_ewma_seconds)
+            )
+
+
+def memory_profile_key(task: Mapping[str, object]) -> str:
+    """Return a stable key containing only settings that materially affect memory."""
+
+    config = task.get("config")
+    config_map = config if isinstance(config, Mapping) else {}
+    profile = {
+        "strategy": str(task.get("strategy", config_map.get("strategy", ""))).lower(),
+        "views_shape": list(task.get("views_shape", [])),
+        "views_dtype": str(task.get("views_dtype", "")),
+        "save_figures": bool(task.get("save_figures", False)),
+        "hdr_enabled": bool(config_map.get("hdr_enabled", False)),
+        "sub_pix_factor": int(config_map.get("sub_pix_factor", 1) or 1),
+        "max_displacement": config_map.get("max_displacement"),
+        "similarity_window_size": config_map.get("similarity_window_size"),
+        "refinement_window_size": config_map.get("refinement_window_size"),
+        "displacement_metric_family": config_map.get("displacement_metric_family"),
+        "displacement_component_weights": config_map.get("displacement_component_weights"),
+        "combined_reference_mode": config_map.get("combined_reference_mode"),
+    }
+    return json.dumps(profile, sort_keys=True, separators=(",", ":"), default=str)
+
+
+@dataclass
+class AdaptiveLearningState:
+    """In-memory task profile models used to predict admission cost and runtime."""
+
+    models: Dict[str, LearnedTaskProfile] = field(default_factory=dict)
+
+    def model_for(self, task: Mapping[str, object]) -> Optional[LearnedTaskProfile]:
+        return self.models.get(memory_profile_key(task))
+
+    def reservation_bytes(self, task: Mapping[str, object]) -> int:
+        model = self.model_for(task)
+        if model is not None and model.sample_count > 0:
+            return max(1, int(math.ceil(model.max_peak_growth_bytes * ADAPTIVE_PEAK_MARGIN)))
+        estimated = max(1, int(task.get("estimated_peak_bytes", 1) or 1))
+        return int(math.ceil(estimated * ADAPTIVE_COLD_START_MULTIPLIER))
+
+    def runtime_seconds(self, task: Mapping[str, object]) -> float:
+        model = self.model_for(task)
+        if model is not None and model.runtime_ewma_seconds is not None:
+            return max(0.001, float(model.runtime_ewma_seconds))
+        return max(
+            0.001,
+            float(
+                task.get("estimated_runtime_seconds", task.get("runtime_seconds", 60.0))
+                or 60.0
+            ),
+        )
+
+    def record_success(
+        self,
+        task: Mapping[str, object],
+        *,
+        peak_growth_bytes: int,
+        runtime_seconds: float,
+    ) -> None:
+        key = memory_profile_key(task)
+        model = self.models.setdefault(key, LearnedTaskProfile())
+        model.record_success(peak_growth_bytes, runtime_seconds)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "model_version": ADAPTIVE_SCHEDULER_MODEL_VERSION,
+            "profiles": {
+                key: {
+                    "sample_count": int(model.sample_count),
+                    "max_peak_growth_bytes": int(model.max_peak_growth_bytes),
+                    "runtime_ewma_seconds": model.runtime_ewma_seconds,
+                }
+                for key, model in self.models.items()
+                if model.sample_count > 0
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "AdaptiveLearningState":
+        if not isinstance(payload, Mapping):
+            return cls()
+        if payload.get("model_version") != ADAPTIVE_SCHEDULER_MODEL_VERSION:
+            return cls()
+        raw_profiles = payload.get("profiles")
+        if not isinstance(raw_profiles, Mapping):
+            return cls()
+        models: Dict[str, LearnedTaskProfile] = {}
+        for key, raw_model in raw_profiles.items():
+            if not isinstance(key, str) or not isinstance(raw_model, Mapping):
+                continue
+            try:
+                sample_count = int(raw_model.get("sample_count", 0))
+                growth = max(0, int(raw_model.get("max_peak_growth_bytes", 0)))
+                runtime_raw = raw_model.get("runtime_ewma_seconds")
+                runtime = None if runtime_raw is None else max(0.0, float(runtime_raw))
+            except (TypeError, ValueError):
+                continue
+            if sample_count > 0:
+                models[key] = LearnedTaskProfile(sample_count, growth, runtime)
+        return cls(models=models)
+
+
+def adaptive_host_memory_signature() -> Dict[str, object]:
+    """Return a portable identity for deciding whether learned RSS is reusable."""
+
+    total_memory: Optional[int] = None
+    if psutil is not None:
+        try:
+            total_memory = int(psutil.virtual_memory().total)
+        except Exception:
+            total_memory = None
+    if total_memory is None:
+        try:
+            total_memory = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+        except Exception:
+            total_memory = None
+    return {
+        "model_version": ADAPTIVE_SCHEDULER_MODEL_VERSION,
+        "platform": platform.system().lower(),
+        "machine": platform.machine().lower(),
+        "total_memory_bytes": total_memory,
+    }
+
+
+@dataclass(frozen=True)
+class AdaptiveTaskChoice:
+    task: Optional[dict]
+    rejected_task: Optional[dict]
+    reservation_bytes: int
+    reason: str
+
+
+def choose_adaptive_task(
+    pending_tasks: Sequence[dict],
+    *,
+    learning: AdaptiveLearningState,
+    now_seconds: float,
+    available_bytes: int,
+    safety_fraction: float,
+    active_unspent_growth_bytes: int,
+    active_rss_bytes: int,
+    memory_limit_bytes: Optional[int],
+) -> AdaptiveTaskChoice:
+    """Choose a fitting task, prioritizing starved work before short work."""
+
+    live_growth_budget = max(
+        0,
+        int(
+            math.floor(
+                (int(available_bytes) + int(active_unspent_growth_bytes))
+                * safety_fraction
+            )
+        ),
+    )
+    fitting: list[tuple[dict, int]] = []
+    rejected: Optional[tuple[dict, int]] = None
+    for task in pending_tasks:
+        reservation = learning.reservation_bytes(task)
+        exceeds_limit = (
+            memory_limit_bytes is not None
+            and int(active_rss_bytes) + int(active_unspent_growth_bytes) + reservation
+            > int(memory_limit_bytes)
+        )
+        if exceeds_limit:
+            if rejected is None:
+                rejected = (task, reservation)
+            continue
+        if int(active_unspent_growth_bytes) + reservation <= live_growth_budget:
+            fitting.append((task, reservation))
+
+    if fitting:
+        starved = [
+            item
+            for item in fitting
+            if now_seconds - float(item[0].get("queued_at_seconds", now_seconds))
+            >= 2.0 * learning.runtime_seconds(item[0])
+        ]
+        if starved:
+            task, reservation = min(
+                starved,
+                key=lambda item: (
+                    float(item[0].get("queued_at_seconds", now_seconds)),
+                    int(item[0].get("task_index", 0)),
+                ),
+            )
+            return AdaptiveTaskChoice(task, None, reservation, "starvation_priority")
+        task, reservation = min(
+            fitting,
+            key=lambda item: (
+                learning.runtime_seconds(item[0]),
+                int(item[0].get("task_index", 0)),
+            ),
+        )
+        return AdaptiveTaskChoice(task, None, reservation, "throughput_priority")
+
+    if rejected is not None:
+        task, reservation = rejected
+        return AdaptiveTaskChoice(None, task, reservation, "memory_limit_exceeded")
+    if not active_unspent_growth_bytes and pending_tasks:
+        task = min(
+            pending_tasks,
+            key=lambda item: (
+                learning.runtime_seconds(item),
+                int(item.get("task_index", 0)),
+            ),
+        )
+        return AdaptiveTaskChoice(
+            None,
+            task,
+            learning.reservation_bytes(task),
+            "memory_limit_exceeded",
+        )
+    return AdaptiveTaskChoice(None, None, 0, "waiting_for_memory")
 
 
 def get_psutil_available_memory_bytes() -> Optional[int]:
@@ -329,6 +597,12 @@ def process_pool_kwargs(
     return kwargs
 
 
+def _pool_startup_probe() -> None:
+    """Give ProcessPoolExecutor a harmless unit of work to start every worker."""
+
+    time.sleep(0.05)
+
+
 def execute_pool_attempt(
     tasks: Sequence[dict],
     workers: int,
@@ -340,6 +614,9 @@ def execute_pool_attempt(
     memory_probe: Callable[[], Optional[int]] = get_available_memory_bytes,
     executor_factory: Callable[..., object] = ProcessPoolExecutor,
     wait_fn: Callable[..., Tuple[Sequence[object], Sequence[object]]] = wait,
+    learning: Optional[AdaptiveLearningState] = None,
+    memory_limit_bytes: Optional[int] = None,
+    worker_started_callback: Optional[Callable[[int], None]] = None,
 ) -> PoolBatchOutcome:
     if scheduling.mode != SCHEDULER_MODE_ADAPTIVE_MEMORY:
         raise ValueError("execute_pool_attempt only supports adaptive_memory scheduling.")
@@ -351,6 +628,10 @@ def execute_pool_attempt(
     callback_exc: Optional[BaseException] = None
     active_tasks: Dict[object, dict] = {}
     active_reserved_bytes: Dict[object, int] = {}
+    learning = learning or AdaptiveLearningState()
+    queued_at_seconds = time.monotonic()
+    for task in pending_tasks:
+        task.setdefault("queued_at_seconds", queued_at_seconds)
     epoch_budget_bytes: Optional[int] = None
     telemetry: Dict[str, object] = {
         "scheduler_mode": SCHEDULER_MODE_ADAPTIVE_MEMORY,
@@ -362,10 +643,13 @@ def execute_pool_attempt(
         "min_available_memory_bytes_observed": None,
         "memory_telemetry_enabled": bool(scheduling.memory_telemetry),
         "worker_recycle_tasks": scheduling.worker_recycle_tasks,
+        "learned_profile_count": 0,
+        "cold_profile_count": 0,
+        "memory_limit_bytes": memory_limit_bytes,
     }
 
     def task_estimate(task: Mapping[str, object]) -> int:
-        return max(1, int(task.get("estimated_peak_bytes", 1) or 1))
+        return learning.reservation_bytes(task)
 
     def reserved_total() -> int:
         return int(sum(active_reserved_bytes.values()))
@@ -437,6 +721,27 @@ def execute_pool_attempt(
         active_reserved_bytes[future] = task_estimate(task)
         update_concurrency_telemetry()
 
+    def memory_limit_result(task: dict, reservation: int) -> dict:
+        return {
+            "status": "failed",
+            "stage": task.get("stage"),
+            "candidate_id": task.get("candidate_id"),
+            "dataset_id": task.get("dataset_id"),
+            "strategy": task.get("strategy"),
+            "run_uid": task.get("run_uid"),
+            "runtime_seconds": 0.0,
+            "config": task.get("config"),
+            "params": task.get("params"),
+            "task_index": task.get("task_index"),
+            "run_dir": task.get("run_dir"),
+            "artifact_paths": task.get("artifact_paths"),
+            "failure_kind": "memory_limit_exceeded",
+            "error": (
+                "Predicted task growth exceeds the configured aggregate memory limit "
+                f"({reservation} bytes reservation; {memory_limit_bytes} bytes limit)."
+            ),
+        }
+
     def admit_ready_tasks(executor: object) -> None:
         while pending_tasks and len(active_tasks) < int(workers):
             budget = effective_budget()
@@ -447,12 +752,33 @@ def execute_pool_attempt(
                     break
                 selected_index = 0
             else:
-                for idx, task in enumerate(pending_tasks):
-                    if current_reserved + task_estimate(task) <= budget:
-                        selected_index = idx
+                available = observe_available_memory()
+                if available is None:
+                    if active_tasks:
                         break
-                if selected_index is None and not active_tasks:
                     selected_index = 0
+                else:
+                    choice = choose_adaptive_task(
+                        pending_tasks,
+                        learning=learning,
+                        now_seconds=time.monotonic(),
+                        available_bytes=int(available),
+                        safety_fraction=scheduling.memory_safety_fraction,
+                        active_unspent_growth_bytes=current_reserved,
+                        active_rss_bytes=0,
+                        memory_limit_bytes=memory_limit_bytes,
+                    )
+                    if choice.rejected_task is not None:
+                        task = choice.rejected_task
+                        pending_tasks.remove(task)
+                        result = memory_limit_result(task, choice.reservation_bytes)
+                        completed_results.append(result)
+                        completed_indices.add(int(task["task_index"]))
+                        if on_result is not None:
+                            on_result(task, result)
+                        continue
+                    if choice.task is not None and current_reserved + choice.reservation_bytes <= budget:
+                        selected_index = pending_tasks.index(choice.task)
             if selected_index is None:
                 break
             submit_pending(executor, selected_index)
@@ -481,6 +807,25 @@ def execute_pool_attempt(
             executor_factory=executor_factory,
         )
         with executor_factory(**kwargs) as executor:
+            if worker_started_callback is not None:
+                probes = [executor.submit(_pool_startup_probe) for _ in range(int(workers))]  # type: ignore[attr-defined]
+                for probe in probes:
+                    probe.result()  # type: ignore[attr-defined]
+                processes = getattr(executor, "_processes", {})
+                process_values = (
+                    processes.values() if isinstance(processes, Mapping) else ()
+                )
+                pids = sorted(
+                    {
+                        int(pid)
+                        for process in process_values
+                        if (pid := getattr(process, "pid", None)) is not None and int(pid) > 0
+                    }
+                )
+                if not pids:
+                    raise RuntimeError("ProcessPoolExecutor did not expose started worker PIDs")
+                for pid in pids:
+                    worker_started_callback(pid)
             admit_ready_tasks(executor)
             while active_tasks or pending_tasks:
                 if not active_tasks and pending_tasks:
@@ -520,5 +865,13 @@ def execute_pool_attempt(
         completed_results=completed_results,
         pending_tasks=pending_tasks,
         error=executor_exc,
-        telemetry=telemetry,
+        telemetry={
+            **telemetry,
+            "learned_profile_count": sum(
+                1 for model in learning.models.values() if model.sample_count > 0
+            ),
+            "cold_profile_count": sum(
+                1 for task in tasks if learning.model_for(task) is None
+            ),
+        },
     )

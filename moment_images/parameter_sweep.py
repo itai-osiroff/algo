@@ -38,6 +38,7 @@ from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 
 from moment_images import sweep_scheduler
+from moment_images.memory_enforcement import create_memory_enforcer, worker_registration_environment
 from moment_images.im_process import (
     COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE,
     RectificationRunConfig,
@@ -70,6 +71,8 @@ from moment_images.reliable_io import (
 )
 from moment_images.sweep_scheduler import (
     MEMORY_SAFETY_FRACTION,
+    MEMORY_ENFORCEMENT_AUTO,
+    MEMORY_ENFORCEMENT_MODES,
     SCHEDULER_MODE_ADAPTIVE_MEMORY,
     SCHEDULER_MODE_FIXED_BATCH,
     SCHEDULER_MODES,
@@ -589,6 +592,7 @@ def _clone_stage_spec(spec: Optional[SweepStageSpec]) -> Optional[SweepStageSpec
             memory_safety_fraction=spec.scheduling.memory_safety_fraction,
             memory_telemetry=spec.scheduling.memory_telemetry,
             worker_recycle_tasks=spec.scheduling.worker_recycle_tasks,
+            memory_enforcement=spec.scheduling.memory_enforcement,
         ),
     )
 
@@ -2942,6 +2946,36 @@ def _persist_run_state(state_path: Path, state: Dict[str, object]) -> None:
     write_json_atomic(state_path, state, indent=2, sort_keys=False, create_backup=True)
 
 
+def _adaptive_learning_state_for_host(
+    run_state: Optional[Dict[str, object]],
+) -> sweep_scheduler.AdaptiveLearningState:
+    """Load learned profiles only when the host memory signature still matches."""
+
+    if run_state is None:
+        return sweep_scheduler.AdaptiveLearningState()
+    signature = sweep_scheduler.adaptive_host_memory_signature()
+    stored = run_state.get("adaptive_scheduler_learning")
+    if not isinstance(stored, Mapping) or stored.get("host_memory_signature") != signature:
+        run_state["adaptive_scheduler_learning"] = {
+            "host_memory_signature": signature,
+            **sweep_scheduler.AdaptiveLearningState().to_dict(),
+        }
+        return sweep_scheduler.AdaptiveLearningState()
+    return sweep_scheduler.AdaptiveLearningState.from_dict(stored)
+
+
+def _persist_adaptive_learning_state(
+    run_state: Optional[Dict[str, object]],
+    learning: sweep_scheduler.AdaptiveLearningState,
+) -> None:
+    if run_state is None:
+        return
+    run_state["adaptive_scheduler_learning"] = {
+        "host_memory_signature": sweep_scheduler.adaptive_host_memory_signature(),
+        **learning.to_dict(),
+    }
+
+
 def _load_or_initialize_run_state(
     output_dir: Path,
     fingerprint_payload: Dict[str, object],
@@ -3367,6 +3401,14 @@ def _set_parallel_thread_limits() -> None:
 
 def _pool_worker_initializer() -> None:
     _set_parallel_thread_limits()
+    cgroup_procs = os.environ.get("MOMENT_IMAGES_WORKER_CGROUP_PROCS")
+    if cgroup_procs:
+        try:
+            Path(cgroup_procs).write_text(f"{os.getpid()}\n", encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001 - required containment must not be bypassed.
+            raise RuntimeError(
+                f"Worker could not join delegated memory cgroup: {cgroup_procs}"
+            ) from exc
     try:
         import cv2 as cv  # Local import keeps startup cost inside workers.
 
@@ -3393,6 +3435,17 @@ def _get_available_memory_bytes_stdlib() -> Optional[int]:
 
 def _get_available_memory_bytes() -> Optional[int]:
     return sweep_scheduler.get_available_memory_bytes()
+
+
+def _require_adaptive_memory_telemetry(scheduling: SweepSchedulingSpec) -> None:
+    if (
+        scheduling.mode == SCHEDULER_MODE_ADAPTIVE_MEMORY
+        and sweep_scheduler.psutil is None
+    ):
+        raise RuntimeError(
+            "adaptive_memory scheduling requires psutil for live available-memory and RSS telemetry. "
+            "Install dependencies with: python -m pip install -r requirements.txt"
+        )
 
 
 def _task_view_geometry(task: Dict[str, object]) -> Tuple[int, int, int, int, int]:
@@ -3633,30 +3686,182 @@ def _execute_adaptive_pool_batch(
     memory_safety_fraction: float,
     worker_recycle_tasks: Optional[int],
     memory_telemetry: bool,
+    learning: Optional[sweep_scheduler.AdaptiveLearningState] = None,
+    memory_limit_bytes: Optional[int] = None,
+    memory_enforcer: Optional[object] = None,
     on_result: Optional[Callable[[Dict[str, object], Dict[str, object]], None]] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Optional[BaseException], Dict[str, object]]:
-    outcome = sweep_scheduler.execute_pool_attempt(
-        list(tasks),
-        workers=workers,
-        scheduling=SweepSchedulingSpec(
-            mode=SCHEDULER_MODE_ADAPTIVE_MEMORY,
-            memory_safety_fraction=memory_safety_fraction,
-            memory_telemetry=memory_telemetry,
-            worker_recycle_tasks=worker_recycle_tasks,
-        ),
-        worker_fn=_evaluate_candidate_task,
-        initializer=_pool_worker_initializer,
-        on_result=on_result,
-        memory_probe=_get_available_memory_bytes,
-        executor_factory=ProcessPoolExecutor,
-        wait_fn=wait,
+    registration_env = (
+        worker_registration_environment(cast(Any, memory_enforcer))
+        if memory_enforcer is not None
+        else {}
     )
+    monitor_stop = threading.Event()
+    monitor_samples: Dict[str, Optional[int]] = {
+        "max_aggregate_worker_rss_bytes_observed": None,
+        "min_available_memory_bytes_observed": None,
+    }
+    worker_pids: set[int] = set()
+    worker_started_callback: Optional[Callable[[int], None]] = None
+    if memory_enforcer is not None and not registration_env:
+        def worker_started_callback(pid: int) -> None:
+            cast(Any, memory_enforcer).add_worker(pid)
+            worker_pids.add(pid)
+
+    def monitor_memory() -> None:
+        while not monitor_stop.wait(0.25):
+            aggregate = (
+                cast(Any, memory_enforcer).current_bytes()
+                if memory_enforcer is not None
+                else None
+            )
+            if aggregate is None and worker_pids and sweep_scheduler.psutil is not None:
+                try:
+                    aggregate = sum(
+                        int(sweep_scheduler.psutil.Process(pid).memory_info().rss)
+                        for pid in worker_pids
+                    )
+                except Exception:
+                    aggregate = None
+            if aggregate is not None:
+                previous = monitor_samples["max_aggregate_worker_rss_bytes_observed"]
+                monitor_samples["max_aggregate_worker_rss_bytes_observed"] = (
+                    int(aggregate)
+                    if previous is None
+                    else max(int(previous), int(aggregate))
+                )
+            available = _get_available_memory_bytes()
+            if available is not None:
+                previous = monitor_samples["min_available_memory_bytes_observed"]
+                monitor_samples["min_available_memory_bytes_observed"] = (
+                    int(available)
+                    if previous is None
+                    else min(int(previous), int(available))
+                )
+
+    monitor = threading.Thread(target=monitor_memory, name="sweep-parent-memory-monitor", daemon=True)
+    monitor.start()
+    previous_env = {key: os.environ.get(key) for key in registration_env}
+    os.environ.update(registration_env)
+    try:
+        outcome = sweep_scheduler.execute_pool_attempt(
+            list(tasks),
+            workers=workers,
+            scheduling=SweepSchedulingSpec(
+                mode=SCHEDULER_MODE_ADAPTIVE_MEMORY,
+                memory_safety_fraction=memory_safety_fraction,
+                memory_telemetry=memory_telemetry,
+                worker_recycle_tasks=worker_recycle_tasks,
+            ),
+            worker_fn=_evaluate_candidate_task,
+            initializer=_pool_worker_initializer,
+            on_result=on_result,
+            memory_probe=_get_available_memory_bytes,
+            executor_factory=ProcessPoolExecutor,
+            wait_fn=wait,
+            learning=learning,
+            memory_limit_bytes=memory_limit_bytes,
+            worker_started_callback=worker_started_callback,
+        )
+        if memory_enforcer is not None:
+            memory_events = cast(Any, memory_enforcer).memory_events()
+            outcome.telemetry["memory_events"] = dict(memory_events)
+            if int(memory_events.get("oom", 0) or 0) or int(
+                memory_events.get("oom_kill", 0) or 0
+            ):
+                failures: List[Dict[str, object]] = []
+                for task in outcome.pending_tasks:
+                    result = {
+                        "status": "failed",
+                        "stage": task.get("stage"),
+                        "candidate_id": task.get("candidate_id"),
+                        "dataset_id": task.get("dataset_id"),
+                        "strategy": task.get("strategy"),
+                        "run_uid": task.get("run_uid"),
+                        "runtime_seconds": 0.0,
+                        "config": task.get("config"),
+                        "params": task.get("params"),
+                        "task_index": task.get("task_index"),
+                        "run_dir": task.get("run_dir"),
+                        "artifact_paths": task.get("artifact_paths"),
+                        "failure_kind": "memory_limit_exceeded",
+                        "error": "Worker cgroup reported an OOM memory-limit event.",
+                    }
+                    failures.append(result)
+                    if on_result is not None:
+                        on_result(task, result)
+                outcome.completed_results.extend(failures)
+                outcome.pending_tasks = []
+                outcome.error = None
+    finally:
+        monitor_stop.set()
+        monitor.join(timeout=0.5)
+        if "outcome" in locals():
+            outcome.telemetry.update(monitor_samples)
+        for key, previous in previous_env.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+        if memory_enforcer is not None:
+            cast(Any, memory_enforcer).close()
     return (
         outcome.completed_results,
         outcome.pending_tasks,
         outcome.error,
         outcome.telemetry,
     )
+
+
+def _start_worker_memory_sampler(enabled: bool) -> Tuple[Optional[int], Optional[threading.Event], Optional[threading.Thread], Dict[str, Optional[int]]]:
+    """Sample worker RSS while a task runs without changing its compute path."""
+
+    rss_start = _get_current_process_rss_bytes() if enabled else None
+    samples: Dict[str, Optional[int]] = {"rss_peak_bytes": rss_start}
+    if not enabled or rss_start is None:
+        return rss_start, None, None, samples
+
+    stopped = threading.Event()
+
+    def sample() -> None:
+        while not stopped.wait(0.05):
+            rss = _get_current_process_rss_bytes()
+            if rss is not None:
+                current = samples["rss_peak_bytes"]
+                samples["rss_peak_bytes"] = rss if current is None else max(current, rss)
+
+    sampler = threading.Thread(target=sample, name="sweep-rss-sampler", daemon=True)
+    sampler.start()
+    return rss_start, stopped, sampler, samples
+
+
+def _finish_worker_memory_sampler(
+    *,
+    rss_start: Optional[int],
+    stopped: Optional[threading.Event],
+    sampler: Optional[threading.Thread],
+    samples: Mapping[str, Optional[int]],
+) -> Dict[str, Optional[int]]:
+    if stopped is not None:
+        stopped.set()
+    if sampler is not None:
+        sampler.join(timeout=0.2)
+    rss_end = _get_current_process_rss_bytes()
+    peak = samples.get("rss_peak_bytes")
+    if rss_end is not None:
+        peak = rss_end if peak is None else max(peak, rss_end)
+    return {
+        "rss_bytes_start": rss_start,
+        "rss_bytes_peak": peak,
+        "rss_bytes_end": rss_end,
+        "rss_delta_bytes": (
+            None if rss_start is None or rss_end is None else int(rss_end - rss_start)
+        ),
+        "rss_peak_growth_bytes": (
+            None if rss_start is None or peak is None else max(0, int(peak - rss_start))
+        ),
+        "sample_interval_seconds": 0.05,
+    }
 
 
 def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
@@ -3666,7 +3871,9 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
     dataset_id = str(task["dataset_id"])
     strategy = str(task["strategy"])
     collect_memory_telemetry = bool(task.get("memory_telemetry", True))
-    rss_start = _get_current_process_rss_bytes() if collect_memory_telemetry else None
+    rss_start, sampler_stop, sampler, rss_samples = _start_worker_memory_sampler(
+        collect_memory_telemetry
+    )
     started = time.perf_counter()
     try:
         views = _load_views(Path(cast(str, task["views_path"])))
@@ -3707,16 +3914,15 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
             "run_signature": task.get("run_signature"),
             "generation_id": task.get("generation_id"),
             "artifact_paths": artifact_paths,
+            "worker_pid": os.getpid(),
         }
         if collect_memory_telemetry:
-            rss_end = _get_current_process_rss_bytes()
-            payload["memory_telemetry"] = {
-                "rss_bytes_start": rss_start,
-                "rss_bytes_end": rss_end,
-                "rss_delta_bytes": None
-                if rss_start is None or rss_end is None
-                else int(rss_end - rss_start),
-            }
+            payload["memory_telemetry"] = _finish_worker_memory_sampler(
+                rss_start=rss_start,
+                stopped=sampler_stop,
+                sampler=sampler,
+                samples=rss_samples,
+            )
         return payload
     except Exception as exc:  # noqa: BLE001 - preserve failed run details
         elapsed = time.perf_counter() - started
@@ -3738,16 +3944,15 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
             "artifact_paths": task.get("artifact_paths"),
             "error": str(exc),
             "traceback": traceback.format_exc(),
+            "worker_pid": os.getpid(),
         }
         if collect_memory_telemetry:
-            rss_end = _get_current_process_rss_bytes()
-            payload["memory_telemetry"] = {
-                "rss_bytes_start": rss_start,
-                "rss_bytes_end": rss_end,
-                "rss_delta_bytes": None
-                if rss_start is None or rss_end is None
-                else int(rss_end - rss_start),
-            }
+            payload["memory_telemetry"] = _finish_worker_memory_sampler(
+                rss_start=rss_start,
+                stopped=sampler_stop,
+                sampler=sampler,
+                samples=rss_samples,
+            )
         return payload
 
 
@@ -3798,6 +4003,11 @@ def _record_stage_task_result(
 
     entry = state_runs.get(str(task["run_uid"]))
     if entry is not None:
+        artifact_validation = _validate_run_artifacts(Path(cast(str, task["run_dir"])))
+        if result.get("status") == "ok" and not bool(artifact_validation.get("valid", False)):
+            result["status"] = "failed"
+            result["failure_kind"] = "artifact_invalid"
+            result["error"] = "Worker reported success but required artifacts failed validation."
         attempts = cast(List[Dict[str, object]], entry.setdefault("attempts", []))
         attempts.append(
             {
@@ -3815,7 +4025,7 @@ def _record_stage_task_result(
                 entry["status"] = "ok"
         else:
             entry["status"] = "failed"
-        entry["artifact_validation"] = _validate_run_artifacts(Path(cast(str, task["run_dir"])))
+        entry["artifact_validation"] = artifact_validation
 
     _update_stage_progress_state(
         run_state=run_state,
@@ -4341,6 +4551,9 @@ def _evaluate_stage(
         }
         return StageEvaluationResult(stage_results=stage_results, execution=execution)
 
+    if tasks_to_execute:
+        _require_adaptive_memory_telemetry(scheduling)
+
     if run_state is not None and run_state_path is not None:
         _persist_run_state(run_state_path, run_state)
 
@@ -4354,6 +4567,27 @@ def _evaluate_stage(
         scheduling=scheduling,
     )
     selected_workers = int(worker_plan["selected_workers"])
+    adaptive_learning = _adaptive_learning_state_for_host(run_state)
+    memory_limit_bytes = cast(Optional[int], worker_plan.get("memory_budget_bytes"))
+    memory_enforcement_status: Dict[str, object] = {
+        "memory_enforcement": "advisory",
+        "memory_enforcement_backend": "none",
+        "memory_enforcement_reason": "fixed_batch does not use adaptive memory containment",
+        "memory_limit_bytes": None,
+    }
+    if scheduling.mode == SCHEDULER_MODE_ADAPTIVE_MEMORY:
+        if memory_limit_bytes is None:
+            if scheduling.memory_enforcement == "required":
+                raise RuntimeError(
+                    "Required memory enforcement needs a known available-memory snapshot. "
+                    "Install psutil and verify host memory telemetry."
+                )
+            memory_enforcement_status = {
+                "memory_enforcement": "advisory",
+                "memory_enforcement_backend": "none",
+                "memory_enforcement_reason": "available memory is unknown",
+                "memory_limit_bytes": None,
+            }
 
     degrade_events: List[Dict[str, object]] = []
     pool_crash_count = 0
@@ -4367,8 +4601,13 @@ def _evaluate_stage(
         "max_concurrent_tasks_observed": 0,
         "max_reserved_peak_bytes_observed": 0,
         "min_available_memory_bytes_observed": None,
+        "max_worker_rss_bytes_observed": None,
+        "max_aggregate_worker_rss_bytes_observed": None,
         "memory_telemetry_enabled": bool(scheduling.memory_telemetry),
         "worker_recycle_tasks": scheduling.worker_recycle_tasks,
+        **memory_enforcement_status,
+        "learned_profile_count": 0,
+        "cold_profile_count": len(tasks_to_execute),
     }
 
     def _merge_scheduler_telemetry(batch_telemetry: Mapping[str, object]) -> None:
@@ -4409,9 +4648,46 @@ def _evaluate_stage(
                 if current is None
                 else min(int(current), int(observed))
             )
+        aggregate_rss = batch_telemetry.get("max_aggregate_worker_rss_bytes_observed")
+        if aggregate_rss is not None:
+            current = scheduler_telemetry["max_aggregate_worker_rss_bytes_observed"]
+            scheduler_telemetry["max_aggregate_worker_rss_bytes_observed"] = (
+                int(aggregate_rss)
+                if current is None
+                else max(int(current), int(aggregate_rss))
+            )
 
     remaining_tasks = list(tasks_to_execute)
     current_workers = selected_workers
+    execution_started = time.perf_counter()
+    valid_new_completion_times: List[float] = []
+
+    def _record_learning_if_valid(task: Dict[str, object], result: Dict[str, object]) -> None:
+        if result.get("status") != "ok":
+            return
+        if not bool(_validate_run_artifacts(Path(cast(str, task["run_dir"]))).get("valid", False)):
+            return
+        memory = result.get("memory_telemetry")
+        if isinstance(memory, Mapping):
+            worker_peak = memory.get("rss_bytes_peak")
+            if worker_peak is not None:
+                current_peak = scheduler_telemetry["max_worker_rss_bytes_observed"]
+                scheduler_telemetry["max_worker_rss_bytes_observed"] = (
+                    int(worker_peak)
+                    if current_peak is None
+                    else max(int(current_peak), int(worker_peak))
+                )
+            peak_growth = memory.get("rss_peak_growth_bytes")
+            if peak_growth is not None:
+                adaptive_learning.record_success(
+                    task,
+                    peak_growth_bytes=int(peak_growth),
+                    runtime_seconds=float(result.get("runtime_seconds", 0.0)),
+                )
+                _persist_adaptive_learning_state(run_state, adaptive_learning)
+                if run_state is not None and run_state_path is not None:
+                    _persist_run_state(run_state_path, run_state)
+        valid_new_completion_times.append(time.perf_counter())
     with tqdm(total=len(tasks), desc=progress_desc, unit="run") as progress_bar:
         if stage_results:
             completed_task_indices.update(int(item["task_index"]) for item in stage_results)
@@ -4457,6 +4733,7 @@ def _evaluate_stage(
                         skipped_valid_count=skipped_valid_count,
                         recomputed_count=recomputed_count,
                     )
+                    _record_learning_if_valid(task, result)
                 break
 
             def _commit_pooled_result(task: Dict[str, object], result: Dict[str, object]) -> None:
@@ -4479,14 +4756,60 @@ def _evaluate_stage(
                     skipped_valid_count=skipped_valid_count,
                     recomputed_count=recomputed_count,
                 )
+                _record_learning_if_valid(task, result)
 
             if scheduling.mode == SCHEDULER_MODE_ADAPTIVE_MEMORY:
+                attempt_enforcer = (
+                    create_memory_enforcer(
+                        scheduling.memory_enforcement,
+                        int(memory_limit_bytes),
+                    )
+                    if memory_limit_bytes is not None
+                    else None
+                )
+                if attempt_enforcer is not None:
+                    if (
+                        attempt_enforcer.status.backend == "windows-job-object"
+                        and scheduling.worker_recycle_tasks is not None
+                    ):
+                        attempt_enforcer.close()
+                        if scheduling.memory_enforcement == "required":
+                            raise RuntimeError(
+                                "required Windows Job Object enforcement cannot be combined with "
+                                "worker_recycle_tasks because replacement worker attachment is not "
+                                "guaranteed before dispatch."
+                            )
+                        attempt_enforcer = None
+                        memory_enforcement_status.update(
+                            {
+                                "memory_enforcement": "advisory",
+                                "memory_enforcement_backend": "windows-job-object",
+                                "memory_enforcement_reason": (
+                                    "worker recycling disables guaranteed Job Object attachment; "
+                                    "using advisory admission"
+                                ),
+                                "memory_limit_bytes": None,
+                            }
+                        )
+                    elif attempt_enforcer is not None:
+                        memory_enforcement_status.update(
+                            {
+                                "memory_enforcement": attempt_enforcer.status.mode,
+                                "memory_enforcement_backend": attempt_enforcer.status.backend,
+                                "memory_enforcement_reason": attempt_enforcer.status.reason,
+                                "memory_limit_bytes": attempt_enforcer.status.limit_bytes,
+                            }
+                        )
+                    scheduler_telemetry.update(memory_enforcement_status)
                 completed_batch, pending_batch, exec_error, batch_telemetry = _execute_adaptive_pool_batch(
                     remaining_tasks,
                     workers=current_workers,
                     memory_safety_fraction=scheduling.memory_safety_fraction,
                     worker_recycle_tasks=scheduling.worker_recycle_tasks,
                     memory_telemetry=scheduling.memory_telemetry,
+                    learning=adaptive_learning,
+                    memory_limit_bytes=memory_limit_bytes,
+                    memory_enforcer=attempt_enforcer,
                     on_result=_commit_pooled_result,
                 )
                 _merge_scheduler_telemetry(batch_telemetry)
@@ -4546,6 +4869,19 @@ def _evaluate_stage(
     execution["metric_backfilled_count"] = int(metric_backfilled_count)
     execution["metric_backfill_failed_count"] = int(metric_backfill_failed_count)
     execution["used_isolated_mode"] = bool(isolated_crash_count > 0 or current_workers == 1)
+    elapsed_minutes = max((time.perf_counter() - execution_started) / 60.0, 1e-9)
+    execution["completed_valid_new_runs"] = len(valid_new_completion_times)
+    execution["completed_valid_new_runs_per_minute"] = len(valid_new_completion_times) / elapsed_minutes
+    rolling_cutoff = time.perf_counter() - 60.0
+    execution["rolling_completed_valid_new_runs_per_minute"] = float(
+        sum(completed_at >= rolling_cutoff for completed_at in valid_new_completion_times)
+    )
+    execution["learned_profile_count"] = sum(
+        1 for model in adaptive_learning.models.values() if model.sample_count > 0
+    )
+    execution["cold_profile_count"] = sum(
+        1 for task in tasks_to_execute if adaptive_learning.model_for(task) is None
+    )
     if run_state is not None:
         active_run_uids = {str(task["run_uid"]) for task in tasks}
         for run_uid, entry in state_runs.items():
@@ -7697,6 +8033,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Disable psutil memory telemetry in --spec mode.",
     )
     parser.add_argument(
+        "--memory-enforcement",
+        choices=sorted(MEMORY_ENFORCEMENT_MODES),
+        default=None,
+        help="Override stages.scheduling.memory_enforcement in --spec mode.",
+    )
+    parser.add_argument(
         "--metrics-config",
         help="Metric explorer config file containing shared scoring profiles.",
     )
@@ -7912,6 +8254,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         memory_fraction_override = getattr(args, "memory_safety_fraction", None)
         worker_recycle_override = getattr(args, "worker_recycle_tasks", None)
         memory_telemetry_override = getattr(args, "memory_telemetry", None)
+        memory_enforcement_override = getattr(args, "memory_enforcement", None)
         if any(
             item is not None
             for item in (
@@ -7919,6 +8262,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
                 memory_fraction_override,
                 worker_recycle_override,
                 memory_telemetry_override,
+                memory_enforcement_override,
             )
         ):
             overridden_scheduling = SweepSchedulingSpec(
@@ -7941,6 +8285,11 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
                     if worker_recycle_override is not None
                     else spec.stages.scheduling.worker_recycle_tasks
                 ),
+                memory_enforcement=cast(
+                    Literal["auto", "required", "advisory"],
+                    memory_enforcement_override
+                    or spec.stages.scheduling.memory_enforcement,
+                ),
             )
             spec.stages.scheduling = overridden_scheduling
             if (
@@ -7952,6 +8301,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
                     memory_safety_fraction=overridden_scheduling.memory_safety_fraction,
                     memory_telemetry=overridden_scheduling.memory_telemetry,
                     worker_recycle_tasks=overridden_scheduling.worker_recycle_tasks,
+                    memory_enforcement=overridden_scheduling.memory_enforcement,
                 )
         metrics_config_override = getattr(args, "metrics_config", None)
         scoring_profile_override = getattr(args, "scoring_profile", None)
@@ -7992,6 +8342,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         or getattr(args, "memory_safety_fraction", None) is not None
         or getattr(args, "worker_recycle_tasks", None) is not None
         or getattr(args, "memory_telemetry", None) is not None
+        or getattr(args, "memory_enforcement", None) is not None
     ):
         raise SystemExit(
             "--extend-existing, --merge-from, --relocate-path, --adopt-relocated, "
@@ -8195,6 +8546,7 @@ class SpecGuiState:
     memory_safety_fraction: str = str(MEMORY_SAFETY_FRACTION)
     memory_telemetry: bool = True
     worker_recycle_tasks: str = ""
+    memory_enforcement: str = MEMORY_ENFORCEMENT_AUTO
     refinement_method: str = "auto_fine"
     refinement_extrapolation: str = "half_step_bounded"
     analyze: bool = True
@@ -8673,6 +9025,7 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
     if scheduler_mode not in SCHEDULER_MODES:
         raise ValueError("Scheduler mode must be either 'adaptive_memory' or 'fixed_batch'.")
     memory_safety_fraction = float(state.memory_safety_fraction.strip())
+    memory_enforcement = state.memory_enforcement.strip().lower() or MEMORY_ENFORCEMENT_AUTO
     worker_recycle_tasks = (
         int(state.worker_recycle_tasks.strip())
         if state.worker_recycle_tasks.strip()
@@ -8683,6 +9036,7 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
         "memory_safety_fraction": memory_safety_fraction,
         "memory_telemetry": bool(state.memory_telemetry),
         "worker_recycle_tasks": worker_recycle_tasks,
+        "memory_enforcement": memory_enforcement,
     }
     SweepSchedulingSpec.from_dict(scheduling_payload)
 
@@ -8902,6 +9256,7 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         if scheduling.worker_recycle_tasks is None
         else str(scheduling.worker_recycle_tasks)
     )
+    state.memory_enforcement = scheduling.memory_enforcement
     refinement = cast(Dict[str, object], stages.get("refinement", {}))
     state.refinement_method = str(refinement.get("method", state.refinement_method))
     state.refinement_extrapolation = str(
@@ -9269,6 +9624,9 @@ def validate_state(state: SpecGuiState) -> List[str]:
     scheduler_mode = state.scheduler_mode.strip().lower() or SCHEDULER_MODE_ADAPTIVE_MEMORY
     if scheduler_mode not in SCHEDULER_MODES:
         issues.append("Scheduler mode must be either 'adaptive_memory' or 'fixed_batch'.")
+    memory_enforcement = state.memory_enforcement.strip().lower() or MEMORY_ENFORCEMENT_AUTO
+    if memory_enforcement not in MEMORY_ENFORCEMENT_MODES:
+        issues.append("Memory enforcement must be 'auto', 'required', or 'advisory'.")
     try:
         memory_fraction = float(state.memory_safety_fraction.strip())
         if not np.isfinite(memory_fraction) or memory_fraction <= 0.0 or memory_fraction > 1.0:
@@ -9955,6 +10313,17 @@ class SpecGuiApp:
         self.worker_recycle_entry = self.ttk.Entry(stage_frame, width=8)
         self.worker_recycle_entry.grid(row=2, column=7, padx=4, pady=2)
         self._register_editable(self.worker_recycle_entry)
+        self.ttk.Label(stage_frame, text="Memory enforcement").grid(row=3, column=0, sticky="w")
+        self.memory_enforcement_var = self.tk.StringVar(value=MEMORY_ENFORCEMENT_AUTO)
+        self.memory_enforcement_combo = self.ttk.Combobox(
+            stage_frame,
+            textvariable=self.memory_enforcement_var,
+            values=sorted(MEMORY_ENFORCEMENT_MODES),
+            width=16,
+            state="readonly",
+        )
+        self.memory_enforcement_combo.grid(row=3, column=1, padx=4, pady=2)
+        self._register_editable(self.memory_enforcement_combo)
 
         toggles_frame = self.ttk.Frame(basic_frame)
         toggles_frame.grid(row=6, column=0, columnspan=3, sticky="w", padx=4, pady=2)
@@ -10760,6 +11129,7 @@ class SpecGuiApp:
             memory_safety_fraction=self.memory_safety_entry.get().strip(),
             memory_telemetry=bool(self.memory_telemetry_var.get()),
             worker_recycle_tasks=self.worker_recycle_entry.get().strip(),
+            memory_enforcement=self.memory_enforcement_var.get().strip(),
             refinement_method=self.refinement_method_var.get().strip(),
             refinement_extrapolation=self.refinement_extrapolation_var.get().strip(),
             analyze=bool(self.analyze_var.get()),
@@ -10854,6 +11224,7 @@ class SpecGuiApp:
         self.memory_telemetry_var.set(state.memory_telemetry)
         self.worker_recycle_entry.delete(0, self.tk.END)
         self.worker_recycle_entry.insert(0, state.worker_recycle_tasks)
+        self.memory_enforcement_var.set(state.memory_enforcement)
         self.refinement_method_var.set(state.refinement_method)
         self.refinement_extrapolation_var.set(state.refinement_extrapolation)
         self.analyze_var.set(state.analyze)
