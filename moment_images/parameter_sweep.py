@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
@@ -37,6 +37,7 @@ from tqdm import tqdm
 from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 
+from moment_images import sweep_scheduler
 from moment_images.im_process import (
     COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE,
     RectificationRunConfig,
@@ -66,6 +67,13 @@ from moment_images.reliable_io import (
     write_csv_atomic,
     write_json_atomic,
     write_npy_atomic,
+)
+from moment_images.sweep_scheduler import (
+    MEMORY_SAFETY_FRACTION,
+    SCHEDULER_MODE_ADAPTIVE_MEMORY,
+    SCHEDULER_MODE_FIXED_BATCH,
+    SCHEDULER_MODES,
+    SweepSchedulingSpec,
 )
 from moment_images.metric_profiles import (
     build_metric_registry,
@@ -97,7 +105,6 @@ from moment_images.trio_oracle_metrics import (
 )
 
 
-MEMORY_SAFETY_FRACTION = 0.70
 THREAD_LIMIT_ENV_VARS = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -392,6 +399,7 @@ class SweepStageSpec:
     top_k: int = 8
     max_workers: Optional[int] = None
     refinement: SweepStageRefinementSpec = field(default_factory=SweepStageRefinementSpec)
+    scheduling: SweepSchedulingSpec = field(default_factory=SweepSchedulingSpec)
 
     def __post_init__(self) -> None:
         normalized_mode = str(self.mode).strip().lower()
@@ -401,6 +409,10 @@ class SweepStageSpec:
         if not isinstance(self.refinement, SweepStageRefinementSpec):
             self.refinement = SweepStageRefinementSpec.from_dict(
                 cast(Optional[Dict[str, object]], self.refinement)
+            )
+        if not isinstance(self.scheduling, SweepSchedulingSpec):
+            self.scheduling = SweepSchedulingSpec.from_dict(
+                cast(Optional[Dict[str, object]], self.scheduling)
             )
 
 
@@ -421,6 +433,9 @@ def _stage_spec_from_dict(payload: Optional[Dict[str, object]]) -> SweepStageSpe
         ),
         refinement=SweepStageRefinementSpec.from_dict(
             cast(Optional[Dict[str, object]], raw.get("refinement"))
+        ),
+        scheduling=SweepSchedulingSpec.from_dict(
+            cast(Optional[Dict[str, object]], raw.get("scheduling"))
         ),
     )
 
@@ -568,6 +583,12 @@ def _clone_stage_spec(spec: Optional[SweepStageSpec]) -> Optional[SweepStageSpec
         refinement=SweepStageRefinementSpec(
             method=spec.refinement.method,
             extrapolation=spec.refinement.extrapolation,
+        ),
+        scheduling=SweepSchedulingSpec(
+            mode=spec.scheduling.mode,
+            memory_safety_fraction=spec.scheduling.memory_safety_fraction,
+            memory_telemetry=spec.scheduling.memory_telemetry,
+            worker_recycle_tasks=spec.scheduling.worker_recycle_tasks,
         ),
     )
 
@@ -888,6 +909,9 @@ class SweepExperimentSpec:
             max_workers=cast(Optional[int], stages_raw.get("max_workers")),
             refinement=SweepStageRefinementSpec.from_dict(
                 cast(Optional[Dict[str, object]], stages_raw.get("refinement"))
+            ),
+            scheduling=SweepSchedulingSpec.from_dict(
+                cast(Optional[Dict[str, object]], stages_raw.get("scheduling"))
             ),
         )
 
@@ -3352,86 +3376,23 @@ def _pool_worker_initializer() -> None:
 
 
 def _get_macos_available_memory_bytes() -> Optional[int]:
-    try:
-        vm_stat_output = subprocess.check_output(["vm_stat"], text=True, stderr=subprocess.DEVNULL)
-    except Exception:  # noqa: BLE001 - OS-level querying can fail on restricted environments.
-        return None
+    return sweep_scheduler.get_macos_available_memory_bytes()
 
-    page_size = 4096
-    free_pages = 0
-    inactive_pages = 0
-    speculative_pages = 0
-    for line in vm_stat_output.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Mach Virtual Memory Statistics:"):
-            if "page size of " in stripped and " bytes" in stripped:
-                try:
-                    token = stripped.split("page size of ", 1)[1].split(" bytes", 1)[0]
-                    page_size = int(token.replace(".", "").strip())
-                except Exception:  # noqa: BLE001
-                    page_size = 4096
-            continue
-        if ":" not in stripped:
-            continue
-        key, raw_value = stripped.split(":", 1)
-        value_token = raw_value.strip().replace(".", "")
-        try:
-            page_count = int(value_token)
-        except Exception:  # noqa: BLE001
-            continue
-        lowered = key.strip().lower()
-        if lowered == "pages free":
-            free_pages = page_count
-        elif lowered == "pages inactive":
-            inactive_pages = page_count
-        elif lowered == "pages speculative":
-            speculative_pages = page_count
 
-    total_pages = free_pages + inactive_pages + speculative_pages
-    if total_pages <= 0:
-        return None
-    return int(total_pages * page_size)
+def _get_psutil_available_memory_bytes() -> Optional[int]:
+    return sweep_scheduler.get_psutil_available_memory_bytes()
+
+
+def _get_current_process_rss_bytes() -> Optional[int]:
+    return sweep_scheduler.get_current_process_rss_bytes()
+
+
+def _get_available_memory_bytes_stdlib() -> Optional[int]:
+    return sweep_scheduler.get_available_memory_bytes_stdlib()
 
 
 def _get_available_memory_bytes() -> Optional[int]:
-    system_name = platform.system().lower()
-    if system_name == "windows":
-        try:
-            import ctypes
-
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            status = MEMORYSTATUSEX()
-            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            kernel32 = ctypes.windll.kernel32
-            if kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) == 0:
-                return None
-            return int(status.ullAvailPhys)
-        except Exception:  # noqa: BLE001
-            return None
-
-    try:
-        page_count = int(os.sysconf("SC_AVPHYS_PAGES"))
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        if page_count > 0 and page_size > 0:
-            return int(page_count * page_size)
-    except Exception:  # noqa: BLE001
-        pass
-
-    if system_name == "darwin":
-        return _get_macos_available_memory_bytes()
-    return None
+    return sweep_scheduler.get_available_memory_bytes()
 
 
 def _task_view_geometry(task: Dict[str, object]) -> Tuple[int, int, int, int, int]:
@@ -3542,35 +3503,14 @@ def _select_stage_worker_count(
     tasks: Sequence[Dict[str, object]],
     requested_workers: int,
     available_memory_bytes: Optional[int],
+    scheduling: Optional[SweepSchedulingSpec] = None,
 ) -> Dict[str, object]:
-    if not tasks:
-        return {
-            "requested_workers": int(max(1, requested_workers)),
-            "available_memory_bytes": available_memory_bytes,
-            "max_task_peak_bytes": 0,
-            "memory_cap_workers": None,
-            "selected_workers": 1,
-            "safety_fraction": MEMORY_SAFETY_FRACTION,
-        }
-
-    max_task_peak_bytes = max(int(task["estimated_peak_bytes"]) for task in tasks)
-    memory_cap_workers: Optional[int] = None
-    if available_memory_bytes is not None and max_task_peak_bytes > 0:
-        capped = int(math.floor((float(available_memory_bytes) * MEMORY_SAFETY_FRACTION) / float(max_task_peak_bytes)))
-        memory_cap_workers = max(1, capped)
-
-    selected_workers = max(1, min(int(requested_workers), len(tasks)))
-    if memory_cap_workers is not None:
-        selected_workers = max(1, min(selected_workers, memory_cap_workers))
-
-    return {
-        "requested_workers": int(max(1, requested_workers)),
-        "available_memory_bytes": available_memory_bytes,
-        "max_task_peak_bytes": int(max_task_peak_bytes),
-        "memory_cap_workers": memory_cap_workers,
-        "selected_workers": int(selected_workers),
-        "safety_fraction": MEMORY_SAFETY_FRACTION,
-    }
+    return sweep_scheduler.plan_workers(
+        tasks,
+        requested_workers,
+        scheduling=scheduling or SweepSchedulingSpec(),
+        available_bytes=available_memory_bytes,
+    ).to_dict()
 
 
 def _build_worker_crash_result(
@@ -3619,11 +3559,25 @@ def _run_task_isolated(task: Dict[str, object]) -> Tuple[Dict[str, object], bool
         return failed, True
 
 
+def _process_pool_kwargs(workers: int, worker_recycle_tasks: Optional[int] = None) -> Dict[str, object]:
+    return sweep_scheduler.process_pool_kwargs(
+        workers,
+        worker_recycle_tasks,
+        initializer=_pool_worker_initializer,
+        executor_factory=ProcessPoolExecutor,
+    )
+
+
 def _execute_pool_batch(
     tasks: Sequence[Dict[str, object]],
     workers: int,
+    worker_recycle_tasks: Optional[int] = None,
     on_result: Optional[Callable[[Dict[str, object], Dict[str, object]], None]] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Optional[BaseException]]:
+    if callable(worker_recycle_tasks) and on_result is None:
+        on_result = cast(Callable[[Dict[str, object], Dict[str, object]], None], worker_recycle_tasks)
+        worker_recycle_tasks = None
+
     completed_results: List[Dict[str, object]] = []
     completed_indices: set[int] = set()
     pending_tasks = list(tasks)
@@ -3631,7 +3585,7 @@ def _execute_pool_batch(
     callback_exc: Optional[BaseException] = None
 
     try:
-        with ProcessPoolExecutor(max_workers=workers, initializer=_pool_worker_initializer) as executor:
+        with ProcessPoolExecutor(**_process_pool_kwargs(workers, worker_recycle_tasks)) as executor:
             future_map = {
                 executor.submit(_evaluate_candidate_task, task): task for task in tasks
             }
@@ -3673,12 +3627,46 @@ def _execute_pool_batch(
     return completed_results, pending_tasks, executor_exc
 
 
+def _execute_adaptive_pool_batch(
+    tasks: Sequence[Dict[str, object]],
+    workers: int,
+    memory_safety_fraction: float,
+    worker_recycle_tasks: Optional[int],
+    memory_telemetry: bool,
+    on_result: Optional[Callable[[Dict[str, object], Dict[str, object]], None]] = None,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Optional[BaseException], Dict[str, object]]:
+    outcome = sweep_scheduler.execute_pool_attempt(
+        list(tasks),
+        workers=workers,
+        scheduling=SweepSchedulingSpec(
+            mode=SCHEDULER_MODE_ADAPTIVE_MEMORY,
+            memory_safety_fraction=memory_safety_fraction,
+            memory_telemetry=memory_telemetry,
+            worker_recycle_tasks=worker_recycle_tasks,
+        ),
+        worker_fn=_evaluate_candidate_task,
+        initializer=_pool_worker_initializer,
+        on_result=on_result,
+        memory_probe=_get_available_memory_bytes,
+        executor_factory=ProcessPoolExecutor,
+        wait_fn=wait,
+    )
+    return (
+        outcome.completed_results,
+        outcome.pending_tasks,
+        outcome.error,
+        outcome.telemetry,
+    )
+
+
 def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
     run_uid = str(task["run_uid"])
     stage = str(task["stage"])
     candidate_id = str(task["candidate_id"])
     dataset_id = str(task["dataset_id"])
     strategy = str(task["strategy"])
+    collect_memory_telemetry = bool(task.get("memory_telemetry", True))
+    rss_start = _get_current_process_rss_bytes() if collect_memory_telemetry else None
     started = time.perf_counter()
     try:
         views = _load_views(Path(cast(str, task["views_path"])))
@@ -3702,7 +3690,7 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
             figures = generate_rectification_figures(result)
             _persist_figures(figures, output_dir / run_name / "figures")
         elapsed = time.perf_counter() - started
-        return {
+        payload = {
             "status": "ok",
             "stage": stage,
             "candidate_id": candidate_id,
@@ -3720,9 +3708,19 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
             "generation_id": task.get("generation_id"),
             "artifact_paths": artifact_paths,
         }
+        if collect_memory_telemetry:
+            rss_end = _get_current_process_rss_bytes()
+            payload["memory_telemetry"] = {
+                "rss_bytes_start": rss_start,
+                "rss_bytes_end": rss_end,
+                "rss_delta_bytes": None
+                if rss_start is None or rss_end is None
+                else int(rss_end - rss_start),
+            }
+        return payload
     except Exception as exc:  # noqa: BLE001 - preserve failed run details
         elapsed = time.perf_counter() - started
-        return {
+        payload = {
             "status": "failed",
             "stage": stage,
             "candidate_id": candidate_id,
@@ -3741,6 +3739,16 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
             "error": str(exc),
             "traceback": traceback.format_exc(),
         }
+        if collect_memory_telemetry:
+            rss_end = _get_current_process_rss_bytes()
+            payload["memory_telemetry"] = {
+                "rss_bytes_start": rss_start,
+                "rss_bytes_end": rss_end,
+                "rss_delta_bytes": None
+                if rss_start is None or rss_end is None
+                else int(rss_end - rss_start),
+            }
+        return payload
 
 
 def _default_max_workers(explicit: Optional[int]) -> int:
@@ -4094,7 +4102,9 @@ def _evaluate_stage(
     merge_sources: Sequence[Path] = (),
     merge_log: Optional[Dict[str, object]] = None,
     dry_run: bool = False,
+    scheduling: Optional[SweepSchedulingSpec] = None,
 ) -> StageEvaluationResult:
+    scheduling = scheduling or SweepSchedulingSpec()
     tasks: List[Dict[str, object]] = []
     for candidate in candidates:
         candidate_root = output_dir / "runs" / stage_name / candidate.candidate_id
@@ -4123,6 +4133,7 @@ def _evaluate_stage(
                     "views_shape": list(dataset.views_shape),
                     "views_dtype": dataset.views_dtype,
                     "views_itemsize": int(dataset.views_itemsize),
+                    "memory_telemetry": bool(scheduling.memory_telemetry),
                     "candidate_signature": candidate_signature,
                     "dataset_signature": dataset_signature,
                     "run_signature": run_signature,
@@ -4144,7 +4155,17 @@ def _evaluate_stage(
                 "available_memory_bytes": _get_available_memory_bytes(),
                 "max_task_peak_bytes": 0,
                 "memory_cap_workers": None,
-                "safety_fraction": MEMORY_SAFETY_FRACTION,
+                "safety_fraction": float(scheduling.memory_safety_fraction),
+                "memory_safety_fraction": float(scheduling.memory_safety_fraction),
+                "scheduler_mode": scheduling.mode,
+                "memory_budget_bytes": None,
+                "min_memory_budget_bytes_observed": None,
+                "max_memory_budget_bytes_observed": None,
+                "max_concurrent_tasks_observed": 0,
+                "max_reserved_peak_bytes_observed": 0,
+                "min_available_memory_bytes_observed": None,
+                "memory_telemetry_enabled": bool(scheduling.memory_telemetry),
+                "worker_recycle_tasks": scheduling.worker_recycle_tasks,
                 "degrade_events": [],
                 "pool_crash_count": 0,
                 "isolated_crash_count": 0,
@@ -4285,13 +4306,26 @@ def _evaluate_stage(
 
     if dry_run:
         pending_count = len(tasks_to_execute)
+        dry_run_available_memory = _get_available_memory_bytes()
+        dry_run_worker_plan = _select_stage_worker_count(
+            tasks_to_execute or tasks,
+            requested_workers,
+            dry_run_available_memory,
+            scheduling=scheduling,
+        )
         execution = {
+            **dry_run_worker_plan,
             "requested_workers": int(max(1, requested_workers)),
             "selected_workers": 0,
-            "available_memory_bytes": _get_available_memory_bytes(),
+            "available_memory_bytes": dry_run_available_memory,
             "max_task_peak_bytes": max(int(task["estimated_peak_bytes"]) for task in tasks),
-            "memory_cap_workers": None,
-            "safety_fraction": MEMORY_SAFETY_FRACTION,
+            "memory_telemetry_enabled": bool(scheduling.memory_telemetry),
+            "worker_recycle_tasks": scheduling.worker_recycle_tasks,
+            "min_memory_budget_bytes_observed": dry_run_worker_plan.get("memory_budget_bytes"),
+            "max_memory_budget_bytes_observed": dry_run_worker_plan.get("memory_budget_bytes"),
+            "max_concurrent_tasks_observed": 0,
+            "max_reserved_peak_bytes_observed": 0,
+            "min_available_memory_bytes_observed": None,
             "degrade_events": [],
             "pool_crash_count": 0,
             "isolated_crash_count": 0,
@@ -4313,13 +4347,68 @@ def _evaluate_stage(
     progress_desc = f"Evaluating {stage_name}"
     _set_parallel_thread_limits()
     available_memory_bytes = _get_available_memory_bytes()
-    worker_plan = _select_stage_worker_count(tasks_to_execute, requested_workers, available_memory_bytes)
+    worker_plan = _select_stage_worker_count(
+        tasks_to_execute,
+        requested_workers,
+        available_memory_bytes,
+        scheduling=scheduling,
+    )
     selected_workers = int(worker_plan["selected_workers"])
 
     degrade_events: List[Dict[str, object]] = []
     pool_crash_count = 0
     isolated_crash_count = 0
     completed_task_indices: set[int] = set()
+    scheduler_telemetry: Dict[str, object] = {
+        "scheduler_mode": scheduling.mode,
+        "memory_budget_bytes": worker_plan.get("memory_budget_bytes"),
+        "min_memory_budget_bytes_observed": worker_plan.get("memory_budget_bytes"),
+        "max_memory_budget_bytes_observed": worker_plan.get("memory_budget_bytes"),
+        "max_concurrent_tasks_observed": 0,
+        "max_reserved_peak_bytes_observed": 0,
+        "min_available_memory_bytes_observed": None,
+        "memory_telemetry_enabled": bool(scheduling.memory_telemetry),
+        "worker_recycle_tasks": scheduling.worker_recycle_tasks,
+    }
+
+    def _merge_scheduler_telemetry(batch_telemetry: Mapping[str, object]) -> None:
+        if (
+            scheduler_telemetry.get("memory_budget_bytes") is None
+            and batch_telemetry.get("memory_budget_bytes") is not None
+        ):
+            scheduler_telemetry["memory_budget_bytes"] = batch_telemetry.get("memory_budget_bytes")
+        min_budget = batch_telemetry.get("min_memory_budget_bytes_observed")
+        if min_budget is not None:
+            current_budget = scheduler_telemetry["min_memory_budget_bytes_observed"]
+            scheduler_telemetry["min_memory_budget_bytes_observed"] = (
+                int(min_budget)
+                if current_budget is None
+                else min(int(current_budget), int(min_budget))
+            )
+        max_budget = batch_telemetry.get("max_memory_budget_bytes_observed")
+        if max_budget is not None:
+            current_budget = scheduler_telemetry["max_memory_budget_bytes_observed"]
+            scheduler_telemetry["max_memory_budget_bytes_observed"] = (
+                int(max_budget)
+                if current_budget is None
+                else max(int(current_budget), int(max_budget))
+            )
+        scheduler_telemetry["max_concurrent_tasks_observed"] = max(
+            int(scheduler_telemetry["max_concurrent_tasks_observed"]),
+            int(batch_telemetry.get("max_concurrent_tasks_observed", 0) or 0),
+        )
+        scheduler_telemetry["max_reserved_peak_bytes_observed"] = max(
+            int(scheduler_telemetry["max_reserved_peak_bytes_observed"]),
+            int(batch_telemetry.get("max_reserved_peak_bytes_observed", 0) or 0),
+        )
+        observed = batch_telemetry.get("min_available_memory_bytes_observed")
+        if observed is not None:
+            current = scheduler_telemetry["min_available_memory_bytes_observed"]
+            scheduler_telemetry["min_available_memory_bytes_observed"] = (
+                int(observed)
+                if current is None
+                else min(int(current), int(observed))
+            )
 
     remaining_tasks = list(tasks_to_execute)
     current_workers = selected_workers
@@ -4340,6 +4429,15 @@ def _evaluate_stage(
                     _persist_run_state(run_state_path, run_state)
 
             if current_workers <= 1:
+                _merge_scheduler_telemetry(
+                    {
+                        "max_concurrent_tasks_observed": 1 if remaining_tasks else 0,
+                        "max_reserved_peak_bytes_observed": max(
+                            (int(task.get("estimated_peak_bytes", 0)) for task in remaining_tasks),
+                            default=0,
+                        ),
+                    }
+                )
                 for task in remaining_tasks:
                     result, crashed = _run_task_isolated(task)
                     if crashed:
@@ -4382,11 +4480,33 @@ def _evaluate_stage(
                     recomputed_count=recomputed_count,
                 )
 
-            completed_batch, pending_batch, exec_error = _execute_pool_batch(
-                remaining_tasks,
-                workers=current_workers,
-                on_result=_commit_pooled_result,
-            )
+            if scheduling.mode == SCHEDULER_MODE_ADAPTIVE_MEMORY:
+                completed_batch, pending_batch, exec_error, batch_telemetry = _execute_adaptive_pool_batch(
+                    remaining_tasks,
+                    workers=current_workers,
+                    memory_safety_fraction=scheduling.memory_safety_fraction,
+                    worker_recycle_tasks=scheduling.worker_recycle_tasks,
+                    memory_telemetry=scheduling.memory_telemetry,
+                    on_result=_commit_pooled_result,
+                )
+                _merge_scheduler_telemetry(batch_telemetry)
+            else:
+                fixed_reserved = sum(
+                    int(task.get("estimated_peak_bytes", 0))
+                    for task in remaining_tasks[:current_workers]
+                )
+                _merge_scheduler_telemetry(
+                    {
+                        "max_concurrent_tasks_observed": min(current_workers, len(remaining_tasks)),
+                        "max_reserved_peak_bytes_observed": fixed_reserved,
+                    }
+                )
+                completed_batch, pending_batch, exec_error = _execute_pool_batch(
+                    remaining_tasks,
+                    workers=current_workers,
+                    worker_recycle_tasks=scheduling.worker_recycle_tasks,
+                    on_result=_commit_pooled_result,
+                )
             if completed_batch:
                 by_uid = {str(task["run_uid"]): task for task in remaining_tasks}
                 for result in completed_batch:
@@ -4416,6 +4536,7 @@ def _evaluate_stage(
 
     stage_results.sort(key=lambda item: int(item.get("task_index", 0)))
     execution = dict(worker_plan)
+    execution.update(scheduler_telemetry)
     execution["degrade_events"] = degrade_events
     execution["pool_crash_count"] = int(pool_crash_count)
     execution["isolated_crash_count"] = int(isolated_crash_count)
@@ -4800,6 +4921,13 @@ def _metric_search_stages(experimental_spec: ExperimentalMetricSweepSpec) -> Swe
     )
 
 
+def _effective_metric_search_workers(requested_workers: int, search_stages: SweepStageSpec) -> int:
+    parent_cap = max(1, int(requested_workers))
+    if search_stages.max_workers is None:
+        return parent_cap
+    return max(1, min(parent_cap, int(search_stages.max_workers)))
+
+
 def _independent_metric_stage_budgets(stage_spec: SweepStageSpec) -> Tuple[int, int]:
     total = max(1, int(stage_spec.total_budget_per_dataset))
     if stage_spec.mode == "single_stage":
@@ -5125,6 +5253,7 @@ def _preview_independent_metric_search(
     merge_log: Dict[str, object],
 ) -> Dict[str, object]:
     search_stages = _metric_search_stages(experimental_spec)
+    metric_requested_workers = _effective_metric_search_workers(requested_workers, search_stages)
     stage1_budget, stage2_budget = _independent_metric_stage_budgets(search_stages)
     metric_stage1_candidates: List[SweepCandidate] = []
     metric_stage1_execution: Optional[Dict[str, object]] = None
@@ -5153,7 +5282,7 @@ def _preview_independent_metric_search(
             datasets=prepared_datasets,
             output_dir=metric_output_dir,
             save_figures_flag=spec.save_figures,
-            requested_workers=requested_workers,
+            requested_workers=metric_requested_workers,
             scoring=spec.scoring,
             run_state=run_state,
             run_state_path=run_state_path,
@@ -5161,6 +5290,7 @@ def _preview_independent_metric_search(
             merge_sources=merge_sources,
             merge_log=merge_log,
             dry_run=True,
+            scheduling=search_stages.scheduling,
         )
         metric_stage1_execution = metric_stage1_eval.execution
         metric_candidates = _assign_candidate_ids(
@@ -5179,7 +5309,7 @@ def _preview_independent_metric_search(
         datasets=prepared_datasets,
         output_dir=metric_output_dir,
         save_figures_flag=spec.save_figures,
-        requested_workers=requested_workers,
+        requested_workers=metric_requested_workers,
         scoring=spec.scoring,
         run_state=run_state,
         run_state_path=run_state_path,
@@ -5187,6 +5317,7 @@ def _preview_independent_metric_search(
         merge_sources=merge_sources,
         merge_log=merge_log,
         dry_run=True,
+        scheduling=search_stages.scheduling,
     )
     payload = _metric_experiment_plan_payload(
         experimental_spec=experimental_spec,
@@ -5250,6 +5381,7 @@ def _preview_baseline_shortlist_metric_phase(
         merge_sources=merge_sources,
         merge_log=merge_log,
         dry_run=True,
+        scheduling=spec.stages.scheduling,
     )
     payload = _metric_experiment_plan_payload(
         experimental_spec=experimental_spec,
@@ -5571,6 +5703,7 @@ def build_sweep_run_preview(
         merge_sources=merge_sources,
         merge_log=merge_log,
         dry_run=True,
+        scheduling=spec.stages.scheduling,
     )
     stage1_rankings = score_and_rank_runs(
         stage1_eval.stage_results,
@@ -5611,6 +5744,7 @@ def build_sweep_run_preview(
             merge_sources=merge_sources,
             merge_log=merge_log,
             dry_run=True,
+            scheduling=spec.stages.scheduling,
         )
         stage2_rankings = score_and_rank_runs(
             stage2_eval.stage_results,
@@ -6548,6 +6682,7 @@ def _run_validation_oracle_workflow(
             merge_sources=merge_sources,
             merge_log=merge_log,
             dry_run=False,
+            scheduling=spec.stages.scheduling,
         )
         validation_phase_results = validation_eval.stage_results
 
@@ -6655,6 +6790,7 @@ def _run_independent_metric_search_phase(
     merge_log: Dict[str, object],
 ) -> Dict[str, object]:
     search_stages = _metric_search_stages(experimental_metric_spec)
+    metric_requested_workers = _effective_metric_search_workers(requested_workers, search_stages)
     stage1_budget, stage2_budget = _independent_metric_stage_budgets(search_stages)
     metric_stage1_candidates: List[SweepCandidate] = []
     metric_stage1_execution: Optional[Dict[str, object]] = None
@@ -6686,7 +6822,7 @@ def _run_independent_metric_search_phase(
             datasets=prepared_datasets,
             output_dir=metric_output_dir,
             save_figures_flag=spec.save_figures,
-            requested_workers=requested_workers,
+            requested_workers=metric_requested_workers,
             scoring=spec.scoring,
             run_state=run_state,
             run_state_path=run_state_path,
@@ -6694,6 +6830,7 @@ def _run_independent_metric_search_phase(
             merge_sources=merge_sources,
             merge_log=merge_log,
             dry_run=False,
+            scheduling=search_stages.scheduling,
         )
         metric_stage1_execution = metric_stage1_eval.execution
         metric_stage1_rankings = score_and_rank_runs(
@@ -6726,7 +6863,7 @@ def _run_independent_metric_search_phase(
         datasets=prepared_datasets,
         output_dir=metric_output_dir,
         save_figures_flag=spec.save_figures,
-        requested_workers=requested_workers,
+        requested_workers=metric_requested_workers,
         scoring=spec.scoring,
         run_state=run_state,
         run_state_path=run_state_path,
@@ -6734,6 +6871,7 @@ def _run_independent_metric_search_phase(
         merge_sources=merge_sources,
         merge_log=merge_log,
         dry_run=False,
+        scheduling=search_stages.scheduling,
     )
     metric_results = metric_eval.stage_results
     metric_rankings = score_and_rank_runs(
@@ -6982,6 +7120,7 @@ def run_sweep_experiment(
         merge_sources=merge_sources,
         merge_log=merge_log,
         dry_run=dry_run,
+        scheduling=spec.stages.scheduling,
     )
     stage1_results = stage1_eval.stage_results
     stage1_rankings = score_and_rank_runs(stage1_results, spec.scoring, dataset_ids=dataset_ids)
@@ -7035,6 +7174,7 @@ def run_sweep_experiment(
             merge_sources=merge_sources,
             merge_log=merge_log,
             dry_run=dry_run,
+            scheduling=spec.stages.scheduling,
         )
         stage2_results = stage2_eval.stage_results
         stage2_rankings = score_and_rank_runs(stage2_results, spec.scoring, dataset_ids=dataset_ids)
@@ -7240,6 +7380,7 @@ def run_sweep_experiment(
                 merge_sources=merge_sources,
                 merge_log=merge_log,
                 dry_run=False,
+                scheduling=spec.stages.scheduling,
             )
             metric_results = metric_eval.stage_results
             metric_rankings = score_and_rank_runs(
@@ -7531,6 +7672,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Override parallel worker count in --spec mode.",
     )
     parser.add_argument(
+        "--scheduler-mode",
+        choices=sorted(SCHEDULER_MODES),
+        default=None,
+        help="Override stages.scheduling.mode in --spec mode.",
+    )
+    parser.add_argument(
+        "--memory-safety-fraction",
+        type=float,
+        default=None,
+        help="Override stages.scheduling.memory_safety_fraction in --spec mode.",
+    )
+    parser.add_argument(
+        "--worker-recycle-tasks",
+        type=int,
+        default=None,
+        help="Recycle process-pool workers after this many tasks in --spec mode.",
+    )
+    parser.add_argument(
+        "--no-memory-telemetry",
+        action="store_false",
+        dest="memory_telemetry",
+        default=None,
+        help="Disable psutil memory telemetry in --spec mode.",
+    )
+    parser.add_argument(
         "--metrics-config",
         help="Metric explorer config file containing shared scoring profiles.",
     )
@@ -7742,6 +7908,51 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         workers_override = getattr(args, "workers", None)
         if workers_override is not None:
             spec.stages.max_workers = int(workers_override)
+        scheduler_mode_override = getattr(args, "scheduler_mode", None)
+        memory_fraction_override = getattr(args, "memory_safety_fraction", None)
+        worker_recycle_override = getattr(args, "worker_recycle_tasks", None)
+        memory_telemetry_override = getattr(args, "memory_telemetry", None)
+        if any(
+            item is not None
+            for item in (
+                scheduler_mode_override,
+                memory_fraction_override,
+                worker_recycle_override,
+                memory_telemetry_override,
+            )
+        ):
+            overridden_scheduling = SweepSchedulingSpec(
+                mode=cast(
+                    Literal["adaptive_memory", "fixed_batch"],
+                    scheduler_mode_override or spec.stages.scheduling.mode,
+                ),
+                memory_safety_fraction=(
+                    float(memory_fraction_override)
+                    if memory_fraction_override is not None
+                    else spec.stages.scheduling.memory_safety_fraction
+                ),
+                memory_telemetry=(
+                    bool(memory_telemetry_override)
+                    if memory_telemetry_override is not None
+                    else spec.stages.scheduling.memory_telemetry
+                ),
+                worker_recycle_tasks=(
+                    int(worker_recycle_override)
+                    if worker_recycle_override is not None
+                    else spec.stages.scheduling.worker_recycle_tasks
+                ),
+            )
+            spec.stages.scheduling = overridden_scheduling
+            if (
+                spec.experimental_metric_sweep is not None
+                and spec.experimental_metric_sweep.search_stages is not None
+            ):
+                spec.experimental_metric_sweep.search_stages.scheduling = SweepSchedulingSpec(
+                    mode=overridden_scheduling.mode,
+                    memory_safety_fraction=overridden_scheduling.memory_safety_fraction,
+                    memory_telemetry=overridden_scheduling.memory_telemetry,
+                    worker_recycle_tasks=overridden_scheduling.worker_recycle_tasks,
+                )
         metrics_config_override = getattr(args, "metrics_config", None)
         scoring_profile_override = getattr(args, "scoring_profile", None)
         if metrics_config_override is not None:
@@ -7777,10 +7988,14 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         or bool(getattr(args, "merge_from", None))
         or bool(getattr(args, "relocate_path", None))
         or bool(getattr(args, "adopt_relocated", False))
+        or getattr(args, "scheduler_mode", None) is not None
+        or getattr(args, "memory_safety_fraction", None) is not None
+        or getattr(args, "worker_recycle_tasks", None) is not None
+        or getattr(args, "memory_telemetry", None) is not None
     ):
         raise SystemExit(
             "--extend-existing, --merge-from, --relocate-path, --adopt-relocated, "
-            "and --dry-run are supported only with --spec."
+            "--dry-run, and scheduler overrides are supported only with --spec."
         )
 
     if args.save_figures and not args.live_plot:
@@ -7976,6 +8191,10 @@ class SpecGuiState:
     stage1_fraction: str = "0.6"
     top_k: str = "8"
     max_workers: str = ""
+    scheduler_mode: str = SCHEDULER_MODE_ADAPTIVE_MEMORY
+    memory_safety_fraction: str = str(MEMORY_SAFETY_FRACTION)
+    memory_telemetry: bool = True
+    worker_recycle_tasks: str = ""
     refinement_method: str = "auto_fine"
     refinement_extrapolation: str = "half_step_bounded"
     analyze: bool = True
@@ -8450,6 +8669,22 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             stage1_fraction_value = float(state.stage1_fraction.strip())
         except Exception:
             stage1_fraction_value = SweepStageSpec().stage1_fraction
+    scheduler_mode = state.scheduler_mode.strip().lower() or SCHEDULER_MODE_ADAPTIVE_MEMORY
+    if scheduler_mode not in SCHEDULER_MODES:
+        raise ValueError("Scheduler mode must be either 'adaptive_memory' or 'fixed_batch'.")
+    memory_safety_fraction = float(state.memory_safety_fraction.strip())
+    worker_recycle_tasks = (
+        int(state.worker_recycle_tasks.strip())
+        if state.worker_recycle_tasks.strip()
+        else None
+    )
+    scheduling_payload: Dict[str, object] = {
+        "mode": scheduler_mode,
+        "memory_safety_fraction": memory_safety_fraction,
+        "memory_telemetry": bool(state.memory_telemetry),
+        "worker_recycle_tasks": worker_recycle_tasks,
+    }
+    SweepSchedulingSpec.from_dict(scheduling_payload)
 
     scoring_payload: Dict[str, object] = {
         "runtime_penalty_weight": float(state.runtime_penalty_weight.strip()),
@@ -8477,6 +8712,7 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             "max_workers": (
                 int(state.max_workers.strip()) if state.max_workers.strip() else None
             ),
+            "scheduling": dict(scheduling_payload),
             "refinement": {
                 "method": refinement_method,
                 "extrapolation": refinement_extrapolation,
@@ -8518,6 +8754,7 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
                 "max_workers": (
                     int(state.max_workers.strip()) if state.max_workers.strip() else None
                 ),
+                "scheduling": dict(scheduling_payload),
                 "refinement": {
                     "method": refinement_method,
                     "extrapolation": refinement_extrapolation,
@@ -8653,6 +8890,17 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
     state.top_k = str(stages.get("top_k", state.top_k))
     state.max_workers = (
         "" if stages.get("max_workers") is None else str(stages.get("max_workers"))
+    )
+    scheduling = SweepSchedulingSpec.from_dict(
+        cast(Optional[Dict[str, object]], stages.get("scheduling"))
+    )
+    state.scheduler_mode = scheduling.mode
+    state.memory_safety_fraction = str(scheduling.memory_safety_fraction)
+    state.memory_telemetry = bool(scheduling.memory_telemetry)
+    state.worker_recycle_tasks = (
+        ""
+        if scheduling.worker_recycle_tasks is None
+        else str(scheduling.worker_recycle_tasks)
     )
     refinement = cast(Dict[str, object], stages.get("refinement", {}))
     state.refinement_method = str(refinement.get("method", state.refinement_method))
@@ -9017,6 +9265,22 @@ def validate_state(state: SpecGuiState) -> List[str]:
                 issues.append("Max workers must be >= 1 when provided.")
         except Exception:
             issues.append("Max workers must be an integer when provided.")
+
+    scheduler_mode = state.scheduler_mode.strip().lower() or SCHEDULER_MODE_ADAPTIVE_MEMORY
+    if scheduler_mode not in SCHEDULER_MODES:
+        issues.append("Scheduler mode must be either 'adaptive_memory' or 'fixed_batch'.")
+    try:
+        memory_fraction = float(state.memory_safety_fraction.strip())
+        if not np.isfinite(memory_fraction) or memory_fraction <= 0.0 or memory_fraction > 1.0:
+            issues.append("Memory safety fraction must be in (0, 1].")
+    except Exception:
+        issues.append("Memory safety fraction must be numeric.")
+    if state.worker_recycle_tasks.strip():
+        try:
+            if int(state.worker_recycle_tasks.strip()) < 1:
+                issues.append("Worker recycle tasks must be >= 1 when provided.")
+        except Exception:
+            issues.append("Worker recycle tasks must be an integer when provided.")
 
     if not state.datasets:
         issues.append("At least one dataset row is required.")
@@ -9664,6 +9928,33 @@ class SpecGuiApp:
         )
         self.refinement_extrapolation_combo.grid(row=1, column=3, padx=4, pady=2)
         self._register_editable(self.refinement_extrapolation_combo)
+        self.ttk.Label(stage_frame, text="Scheduler").grid(row=2, column=0, sticky="w")
+        self.scheduler_mode_var = self.tk.StringVar(value=SCHEDULER_MODE_ADAPTIVE_MEMORY)
+        self.scheduler_mode_combo = self.ttk.Combobox(
+            stage_frame,
+            textvariable=self.scheduler_mode_var,
+            values=[SCHEDULER_MODE_ADAPTIVE_MEMORY, SCHEDULER_MODE_FIXED_BATCH],
+            width=16,
+            state="readonly",
+        )
+        self.scheduler_mode_combo.grid(row=2, column=1, padx=4, pady=2)
+        self._register_editable(self.scheduler_mode_combo)
+        self.ttk.Label(stage_frame, text="RAM budget fraction (0-1)").grid(row=2, column=2, sticky="w")
+        self.memory_safety_entry = self.ttk.Entry(stage_frame, width=6)
+        self.memory_safety_entry.grid(row=2, column=3, padx=4, pady=2)
+        self._register_editable(self.memory_safety_entry)
+        self.memory_telemetry_var = self.tk.BooleanVar(value=True)
+        memory_telemetry_chk = self.ttk.Checkbutton(
+            stage_frame,
+            text="Record memory telemetry",
+            variable=self.memory_telemetry_var,
+        )
+        memory_telemetry_chk.grid(row=2, column=4, columnspan=2, sticky="w", padx=4, pady=2)
+        self._register_editable(memory_telemetry_chk)
+        self.ttk.Label(stage_frame, text="Recycle after tasks").grid(row=2, column=6, sticky="w")
+        self.worker_recycle_entry = self.ttk.Entry(stage_frame, width=8)
+        self.worker_recycle_entry.grid(row=2, column=7, padx=4, pady=2)
+        self._register_editable(self.worker_recycle_entry)
 
         toggles_frame = self.ttk.Frame(basic_frame)
         toggles_frame.grid(row=6, column=0, columnspan=3, sticky="w", padx=4, pady=2)
@@ -10465,6 +10756,10 @@ class SpecGuiApp:
             stage1_fraction=self.stage1_fraction_entry.get().strip(),
             top_k=self.top_k_entry.get().strip(),
             max_workers=self.max_workers_entry.get().strip(),
+            scheduler_mode=self.scheduler_mode_var.get().strip(),
+            memory_safety_fraction=self.memory_safety_entry.get().strip(),
+            memory_telemetry=bool(self.memory_telemetry_var.get()),
+            worker_recycle_tasks=self.worker_recycle_entry.get().strip(),
             refinement_method=self.refinement_method_var.get().strip(),
             refinement_extrapolation=self.refinement_extrapolation_var.get().strip(),
             analyze=bool(self.analyze_var.get()),
@@ -10553,6 +10848,12 @@ class SpecGuiApp:
         self.top_k_entry.insert(0, state.top_k)
         self.max_workers_entry.delete(0, self.tk.END)
         self.max_workers_entry.insert(0, state.max_workers)
+        self.scheduler_mode_var.set(state.scheduler_mode)
+        self.memory_safety_entry.delete(0, self.tk.END)
+        self.memory_safety_entry.insert(0, state.memory_safety_fraction)
+        self.memory_telemetry_var.set(state.memory_telemetry)
+        self.worker_recycle_entry.delete(0, self.tk.END)
+        self.worker_recycle_entry.insert(0, state.worker_recycle_tasks)
         self.refinement_method_var.set(state.refinement_method)
         self.refinement_extrapolation_var.set(state.refinement_extrapolation)
         self.analyze_var.set(state.analyze)

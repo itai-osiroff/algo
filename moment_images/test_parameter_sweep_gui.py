@@ -66,6 +66,40 @@ def test_state_to_spec_and_back_roundtrip(tmp_path):
     assert roundtrip.metric_experiments_enabled is False
 
 
+def test_state_to_spec_roundtrip_with_scheduling_controls(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.scheduler_mode = "fixed_batch"
+    state.memory_safety_fraction = "0.55"
+    state.memory_telemetry = False
+    state.worker_recycle_tasks = "3"
+    state.metric_experiments_enabled = True
+    state.metric_experiments_candidate_source = "independent_search"
+    state.metric_experiments_shortlist_top_k = "4"
+
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    scheduling = payload["stages"]["scheduling"]
+    assert scheduling == {
+        "mode": "fixed_batch",
+        "memory_safety_fraction": 0.55,
+        "memory_telemetry": False,
+        "worker_recycle_tasks": 3,
+    }
+    assert payload["experimental_metric_sweep"]["search_stages"]["scheduling"] == scheduling
+    assert roundtrip.scheduler_mode == "fixed_batch"
+    assert roundtrip.memory_safety_fraction == "0.55"
+    assert roundtrip.memory_telemetry is False
+    assert roundtrip.worker_recycle_tasks == "3"
+
+    state.worker_recycle_tasks = ""
+    blank_payload = state_to_spec_dict(state)
+    blank_roundtrip = spec_dict_to_state(blank_payload)
+
+    assert blank_payload["stages"]["scheduling"]["worker_recycle_tasks"] is None
+    assert blank_roundtrip.worker_recycle_tasks == ""
+
+
 def test_state_to_spec_roundtrip_supports_single_stage_mode(tmp_path):
     state = _build_valid_state(tmp_path)
     state.stage_mode = "single_stage"
@@ -483,6 +517,19 @@ def test_validate_state_reports_invalid_refinement_settings(tmp_path):
     assert any("Refinement extrapolation" in issue for issue in issues)
 
 
+def test_validate_state_reports_invalid_scheduling_settings(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.scheduler_mode = "bad"
+    state.memory_safety_fraction = "1.5"
+    state.worker_recycle_tasks = "0"
+
+    issues = validate_state(state)
+
+    assert any("Scheduler mode" in issue for issue in issues)
+    assert any("Memory safety fraction" in issue for issue in issues)
+    assert any("Worker recycle tasks" in issue for issue in issues)
+
+
 def test_validate_state_extension_requires_output_dir(tmp_path):
     state = _build_valid_state(tmp_path)
     state.run_mode = "extend"
@@ -649,6 +696,7 @@ def _make_root_or_skip():
 
 
 def test_spec_gui_captures_and_restores_pixel_shift_power_entries():
+
     from moment_images import parameter_sweep as ps
 
     root = _make_root_or_skip()
@@ -666,6 +714,31 @@ def test_spec_gui_captures_and_restores_pixel_shift_power_entries():
         assert state.combined_pixel_shift_powers == "1.5,2.0"
         assert app.pixel_shift_power_entry.get() == "0.5,1.0"
         assert app.comb_shift_power_entry.get() == "1.5,2.0"
+    finally:
+        root.destroy()
+
+
+def test_gui_scheduling_controls_use_explicit_memory_labels():
+    from moment_images import parameter_sweep as ps
+
+    root = _make_root_or_skip()
+    try:
+        app = ps.SpecGuiApp(root)
+        stage_frame = app.memory_safety_entry.master
+        labels = [
+            child.cget("text")
+            for child in stage_frame.winfo_children()
+            if child.winfo_class() == "TLabel"
+        ]
+        checks = [
+            child.cget("text")
+            for child in stage_frame.winfo_children()
+            if child.winfo_class() == "TCheckbutton"
+        ]
+
+        assert "RAM budget fraction (0-1)" in labels
+        assert "Recycle after tasks" in labels
+        assert "Record memory telemetry" in checks
     finally:
         root.destroy()
 

@@ -121,6 +121,43 @@ midpoint and bounded edge candidates around high-ranking coarse settings.
 `neighbor` is available for the older behavior that reuses configured neighbor
 values only.
 
+`stages.max_workers` is the hard process ceiling. By default, tasks are admitted
+by the adaptive memory scheduler rather than submitting a full fixed batch:
+
+```json
+{
+  "stages": {
+    "max_workers": 12,
+    "scheduling": {
+      "mode": "adaptive_memory",
+      "memory_safety_fraction": 0.7,
+      "memory_telemetry": true,
+      "worker_recycle_tasks": null
+    }
+  }
+}
+```
+
+`adaptive_memory` estimates each task's peak bytes and admits any pending task
+that fits the current RAM budget. It can run smaller tasks while a large task
+waits. The budget is rebased upward only when no pool tasks are active, and it
+shrinks immediately if available memory drops during an active epoch. If memory
+cannot be read, adaptive mode serializes pool admission one task at a time.
+
+Use `"mode": "fixed_batch"` to restore the older fixed-batch behavior. In fixed
+mode, available RAM is used only to choose the batch worker count before the
+batch starts.
+
+`memory_telemetry` controls per-result RSS sampling and min-available-memory
+snapshots; adaptive admission still uses memory probes when telemetry is off.
+`worker_recycle_tasks` may be `null` or an integer `>= 1`; it maps to
+`ProcessPoolExecutor(max_tasks_per_child=...)` on Python runtimes that support
+that setting.
+
+Independent metric search inherits the parent `stages.max_workers` as a global
+ceiling. An explicit `experimental_metric_sweep.search_stages.max_workers` may
+lower that cap but cannot raise it above the parent cap.
+
 ## Scoring Profiles
 
 `scoring.metric_weights` can define metric weights directly. A spec can also
@@ -143,6 +180,7 @@ CLI overrides are available:
 
 ```bash
 python -m moment_images.parameter_sweep --spec sweep_spec.json --metrics-config metric_review/metrics_config.json --scoring-profile guide_focus_mix
+python -m moment_images.parameter_sweep --spec sweep_spec.json --scheduler-mode fixed_batch --memory-safety-fraction 0.6 --worker-recycle-tasks 8 --no-memory-telemetry
 ```
 
 Profiles that depend on `saved_score` or `saved_mean_dataset_score` are

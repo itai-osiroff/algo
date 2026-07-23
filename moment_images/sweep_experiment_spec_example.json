@@ -108,6 +108,12 @@
     "refinement": {
       "method": "auto_fine",
       "extrapolation": "half_step_bounded"
+    },
+    "scheduling": {
+      "mode": "adaptive_memory",
+      "memory_safety_fraction": 0.7,
+      "memory_telemetry": true,
+      "worker_recycle_tasks": null
     }
   },
   "scoring": {

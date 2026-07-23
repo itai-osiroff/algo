@@ -16,6 +16,7 @@ from moment_images.parameter_sweep import (
     ExperimentalMetricSweepSpec,
     MetricFormulationSpec,
     PreparedDataset,
+    StageEvaluationResult,
     SweepDatasetSpec,
     SweepCandidate,
     SweepExperimentSpec,
@@ -23,6 +24,7 @@ from moment_images.parameter_sweep import (
     SweepSearchSpace,
     SweepStageRefinementSpec,
     SweepStageSpec,
+    SweepSchedulingSpec,
     generate_coarse_candidates,
     generate_refined_candidates,
     run_sweep_experiment,
@@ -112,6 +114,21 @@ def _build_eval_result(task: dict, status: str = "ok") -> dict:
     else:
         payload["error"] = "worker crashed"
     return payload
+
+
+def _scheduler_task(run_uid: str, estimated_peak_bytes: int, task_index: int) -> dict:
+    return {
+        "stage": "stage1",
+        "candidate_id": run_uid,
+        "dataset_id": "d1",
+        "strategy": "pixel",
+        "run_uid": run_uid,
+        "runtime_seconds": 0.01,
+        "config": {"strategy": "pixel"},
+        "params": {},
+        "task_index": task_index,
+        "estimated_peak_bytes": int(estimated_peak_bytes),
+    }
 
 
 def _install_fast_artifact_runner(monkeypatch):
@@ -782,7 +799,163 @@ def test_experiment_spec_rejects_profile_and_explicit_weights(tmp_path):
         )
 
 
+def test_scheduling_spec_defaults_and_validation():
+    scheduling = SweepSchedulingSpec()
+
+    assert scheduling.mode == "adaptive_memory"
+    assert scheduling.memory_safety_fraction == parameter_sweep.MEMORY_SAFETY_FRACTION
+    assert scheduling.memory_telemetry is True
+    assert scheduling.worker_recycle_tasks is None
+
+    fixed = SweepSchedulingSpec.from_dict(
+        {
+            "mode": "fixed_batch",
+            "memory_safety_fraction": 0.5,
+            "memory_telemetry": False,
+            "worker_recycle_tasks": 3,
+        }
+    )
+    assert fixed.mode == "fixed_batch"
+    assert fixed.memory_safety_fraction == 0.5
+    assert fixed.memory_telemetry is False
+    assert fixed.worker_recycle_tasks == 3
+
+    with pytest.raises(ValueError, match="scheduling.mode"):
+        SweepSchedulingSpec(mode="unknown")
+    with pytest.raises(ValueError, match="memory_safety_fraction"):
+        SweepSchedulingSpec(memory_safety_fraction=0.0)
+    with pytest.raises(ValueError, match="worker_recycle_tasks"):
+        SweepSchedulingSpec(worker_recycle_tasks=0)
+
+
+@pytest.mark.parametrize(
+    "payload,match",
+    [
+        ({"memory_telemetry": "false"}, "memory_telemetry"),
+        ({"memory_telemetry": 0}, "memory_telemetry"),
+        ({"worker_recycle_tasks": 1.9}, "worker_recycle_tasks"),
+        ({"worker_recycle_tasks": True}, "worker_recycle_tasks"),
+        ({"memory_safety_fraction": "0.7"}, "memory_safety_fraction"),
+        ({"memory_safety_fraction": False}, "memory_safety_fraction"),
+    ],
+)
+def test_scheduling_spec_rejects_coerced_json_values(payload, match):
+    with pytest.raises(ValueError, match=match):
+        SweepSchedulingSpec.from_dict(payload)
+
+
+def test_experiment_spec_parses_stage_scheduling(tmp_path):
+    spec = SweepExperimentSpec.from_dict(
+        {
+            "datasets": [{"id": "d1", "views": str(tmp_path / "views.npy")}],
+            "stages": {
+                "max_workers": 12,
+                "scheduling": {
+                    "mode": "fixed_batch",
+                    "memory_safety_fraction": 0.6,
+                    "memory_telemetry": False,
+                    "worker_recycle_tasks": 2,
+                },
+            },
+        }
+    )
+
+    assert spec.stages.max_workers == 12
+    assert spec.stages.scheduling.mode == "fixed_batch"
+    assert spec.stages.scheduling.memory_safety_fraction == 0.6
+    assert spec.stages.scheduling.memory_telemetry is False
+    assert spec.stages.scheduling.worker_recycle_tasks == 2
+
+
+def test_parse_args_accepts_scheduler_overrides():
+    args = parameter_sweep.parse_args(
+        [
+            "--spec",
+            "sweep.json",
+            "--scheduler-mode",
+            "fixed_batch",
+            "--memory-safety-fraction",
+            "0.55",
+            "--worker-recycle-tasks",
+            "4",
+            "--no-memory-telemetry",
+        ]
+    )
+
+    assert args.scheduler_mode == "fixed_batch"
+    assert args.memory_safety_fraction == 0.55
+    assert args.worker_recycle_tasks == 4
+    assert args.memory_telemetry is False
+
+
+def test_run_from_namespace_applies_scheduler_overrides(monkeypatch, tmp_path):
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(
+        json.dumps(
+            {
+                "output_dir": str(tmp_path / "out"),
+                "datasets": [{"id": "d1", "views": str(tmp_path / "views.npy")}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run_sweep(spec, **kwargs):
+        captured["spec"] = spec
+        captured["kwargs"] = kwargs
+        return Path(spec.output_dir)
+
+    monkeypatch.setattr(parameter_sweep, "run_sweep_experiment", fake_run_sweep)
+
+    args = parameter_sweep.parse_args(
+        [
+            "--spec",
+            str(spec_path),
+            "--scheduler-mode",
+            "fixed_batch",
+            "--memory-safety-fraction",
+            "0.4",
+            "--worker-recycle-tasks",
+            "2",
+            "--no-memory-telemetry",
+        ]
+    )
+
+    output_dir = parameter_sweep._run_from_namespace(args)
+
+    spec = captured["spec"]
+    assert output_dir == tmp_path / "out"
+    assert spec.stages.scheduling.mode == "fixed_batch"
+    assert spec.stages.scheduling.memory_safety_fraction == 0.4
+    assert spec.stages.scheduling.worker_recycle_tasks == 2
+    assert spec.stages.scheduling.memory_telemetry is False
+
+
 def test_select_stage_worker_count_respects_memory_cap():
+    tasks = [
+        {"estimated_peak_bytes": 200},
+        {"estimated_peak_bytes": 200},
+        {"estimated_peak_bytes": 200},
+        {"estimated_peak_bytes": 200},
+        {"estimated_peak_bytes": 200},
+    ]
+
+    selection = parameter_sweep._select_stage_worker_count(
+        tasks=tasks,
+        requested_workers=8,
+        available_memory_bytes=1000,
+        scheduling=SweepSchedulingSpec(mode="fixed_batch"),
+    )
+
+    assert selection["memory_cap_workers"] == 3
+    assert selection["selected_workers"] == 3
+    assert selection["requested_workers"] == 8
+    assert selection["max_task_peak_bytes"] == 200
+    assert selection["scheduler_mode"] == "fixed_batch"
+
+
+def test_select_stage_worker_count_uses_requested_cap_for_adaptive_default():
     tasks = [
         {"estimated_peak_bytes": 200},
         {"estimated_peak_bytes": 200},
@@ -798,9 +971,233 @@ def test_select_stage_worker_count_respects_memory_cap():
     )
 
     assert selection["memory_cap_workers"] == 3
-    assert selection["selected_workers"] == 3
+    assert selection["selected_workers"] == 5
     assert selection["requested_workers"] == 8
-    assert selection["max_task_peak_bytes"] == 200
+    assert selection["scheduler_mode"] == "adaptive_memory"
+
+
+def test_execute_adaptive_pool_batch_packs_small_tasks_around_large(monkeypatch):
+    tasks = [
+        _scheduler_task("large_a", 400, 0),
+        _scheduler_task("large_b", 400, 1),
+        _scheduler_task("small_c", 100, 2),
+    ]
+    wait_snapshots: list[list[str]] = []
+
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 1000)
+
+    class FakeFuture:
+        def __init__(self, task):
+            self.task = task
+
+        def result(self):
+            return _build_eval_result(self.task, status="ok")
+
+    class FakeExecutor:
+        def __init__(self, max_workers, initializer=None, max_tasks_per_child=None):
+            assert max_workers == 3
+            assert max_tasks_per_child is None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, func, task):
+            return FakeFuture(task)
+
+    def fake_wait(futures, return_when):
+        ordered = list(futures)
+        wait_snapshots.append([future.task["run_uid"] for future in ordered])
+        return {ordered[0]}, set(ordered[1:])
+
+    monkeypatch.setattr(parameter_sweep, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(parameter_sweep, "wait", fake_wait)
+
+    completed, pending, error, telemetry = parameter_sweep._execute_adaptive_pool_batch(
+        tasks,
+        workers=3,
+        memory_safety_fraction=0.5,
+        worker_recycle_tasks=None,
+        memory_telemetry=True,
+        on_result=None,
+    )
+
+    assert error is None
+    assert pending == []
+    assert [result["run_uid"] for result in completed] == ["large_a", "small_c", "large_b"]
+    assert wait_snapshots[0] == ["large_a", "small_c"]
+    assert telemetry["max_concurrent_tasks_observed"] == 2
+    assert telemetry["max_reserved_peak_bytes_observed"] == 500
+
+
+def test_execute_adaptive_pool_batch_runs_oversized_task_alone(monkeypatch):
+    tasks = [_scheduler_task("oversized", 1000, 0)]
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 100)
+
+    class FakeFuture:
+        def __init__(self, task):
+            self.task = task
+
+        def result(self):
+            return _build_eval_result(self.task, status="ok")
+
+    class FakeExecutor:
+        def __init__(self, max_workers, initializer=None, max_tasks_per_child=None):
+            assert max_workers == 4
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, func, task):
+            return FakeFuture(task)
+
+    monkeypatch.setattr(parameter_sweep, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(parameter_sweep, "wait", lambda futures, return_when: ({list(futures)[0]}, set()))
+
+    completed, pending, error, telemetry = parameter_sweep._execute_adaptive_pool_batch(
+        tasks,
+        workers=4,
+        memory_safety_fraction=0.5,
+        worker_recycle_tasks=None,
+        memory_telemetry=True,
+        on_result=None,
+    )
+
+    assert error is None
+    assert pending == []
+    assert [result["run_uid"] for result in completed] == ["oversized"]
+    assert telemetry["max_concurrent_tasks_observed"] == 1
+    assert telemetry["max_reserved_peak_bytes_observed"] == 1000
+
+
+def test_execute_adaptive_pool_batch_returns_unfinished_tasks_after_pool_crash(monkeypatch):
+    tasks = [
+        _scheduler_task("large_a", 400, 0),
+        _scheduler_task("large_b", 400, 1),
+        _scheduler_task("small_c", 100, 2),
+    ]
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 1000)
+
+    class FakeFuture:
+        def __init__(self, task):
+            self.task = task
+
+        def result(self):
+            if self.task["run_uid"] == "large_a":
+                raise BrokenProcessPool("pool crashed")
+            return _build_eval_result(self.task, status="ok")
+
+    class FakeExecutor:
+        def __init__(self, max_workers, initializer=None, max_tasks_per_child=None):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, func, task):
+            return FakeFuture(task)
+
+    monkeypatch.setattr(parameter_sweep, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(parameter_sweep, "wait", lambda futures, return_when: ({list(futures)[0]}, set(list(futures)[1:])))
+
+    completed, pending, error, telemetry = parameter_sweep._execute_adaptive_pool_batch(
+        tasks,
+        workers=3,
+        memory_safety_fraction=0.5,
+        worker_recycle_tasks=None,
+        memory_telemetry=True,
+        on_result=None,
+    )
+
+    assert completed == []
+    assert isinstance(error, BrokenProcessPool)
+    assert sorted(task["run_uid"] for task in pending) == ["large_a", "large_b", "small_c"]
+    assert telemetry["max_concurrent_tasks_observed"] == 2
+
+
+def test_execute_adaptive_pool_batch_surfaces_callback_failure(monkeypatch):
+    tasks = [_scheduler_task("a", 100, 0)]
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 1000)
+
+    class FakeFuture:
+        def __init__(self, task):
+            self.task = task
+
+        def result(self):
+            return _build_eval_result(self.task, status="ok")
+
+    class FakeExecutor:
+        def __init__(self, max_workers, initializer=None, max_tasks_per_child=None):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, func, task):
+            return FakeFuture(task)
+
+    monkeypatch.setattr(parameter_sweep, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(parameter_sweep, "wait", lambda futures, return_when: ({list(futures)[0]}, set()))
+
+    with pytest.raises(RuntimeError, match="persist exploded"):
+        parameter_sweep._execute_adaptive_pool_batch(
+            tasks,
+            workers=2,
+            memory_safety_fraction=0.7,
+            worker_recycle_tasks=None,
+            memory_telemetry=True,
+            on_result=lambda _task, _result: (_ for _ in ()).throw(RuntimeError("persist exploded")),
+        )
+
+
+def test_execute_pool_batch_accepts_legacy_positional_callback(monkeypatch):
+    tasks = [_scheduler_task("a", 100, 0)]
+    callback_calls: list[str] = []
+
+    class FakeFuture:
+        def __init__(self, task):
+            self.task = task
+
+        def result(self):
+            return _build_eval_result(self.task, status="ok")
+
+    class FakeExecutor:
+        def __init__(self, max_workers, initializer=None, max_tasks_per_child=None):
+            assert max_tasks_per_child is None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, func, task):
+            return FakeFuture(task)
+
+    monkeypatch.setattr(parameter_sweep, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(parameter_sweep, "as_completed", lambda futures: list(futures))
+
+    completed, pending, error = parameter_sweep._execute_pool_batch(
+        tasks,
+        2,
+        lambda task, _result: callback_calls.append(str(task["run_uid"])),
+    )
+
+    assert error is None
+    assert pending == []
+    assert [result["run_uid"] for result in completed] == ["a"]
+    assert callback_calls == ["a"]
 
 
 def test_evaluate_stage_degrades_worker_count_and_continues(monkeypatch, tmp_path):
@@ -849,9 +1246,10 @@ def test_evaluate_stage_degrades_worker_count_and_continues(monkeypatch, tmp_pat
 
     call_state = {"count": 0}
 
-    def fake_execute_pool_batch(tasks, workers, on_result=None):
+    def fake_execute_pool_batch(tasks, workers, worker_recycle_tasks=None, on_result=None):
         call_state["count"] += 1
         assert workers in {2, 4}
+        assert worker_recycle_tasks is None
         if call_state["count"] == 1:
             completed = [_build_eval_result(tasks[0], status="ok")]
             if on_result is not None:
@@ -878,6 +1276,7 @@ def test_evaluate_stage_degrades_worker_count_and_continues(monkeypatch, tmp_pat
         output_dir=tmp_path,
         save_figures_flag=False,
         requested_workers=4,
+        scheduling=SweepSchedulingSpec(mode="fixed_batch"),
     )
 
     assert len(evaluation.stage_results) == 4
@@ -885,6 +1284,129 @@ def test_evaluate_stage_degrades_worker_count_and_continues(monkeypatch, tmp_pat
     assert evaluation.execution["degrade_events"][0]["workers_before"] == 4
     assert evaluation.execution["degrade_events"][0]["workers_after"] == 2
     assert call_state["count"] == 2
+
+
+@pytest.mark.parametrize("scheduler_mode", ["adaptive_memory", "fixed_batch"])
+def test_evaluate_stage_smoke_runs_synthetic_views_in_scheduler_modes(monkeypatch, tmp_path, scheduler_mode):
+    calls = _install_fast_artifact_runner(monkeypatch)
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+    dataset = PreparedDataset(
+        dataset_id="d1",
+        views_path=views_path,
+        hdr_enabled=False,
+        hdr_exposure_times=None,
+        normalize_to_8bit=False,
+        views_shape=tuple(int(dim) for dim in views.shape),
+        views_dtype=str(views.dtype),
+        views_itemsize=int(views.dtype.itemsize),
+    )
+    candidate = SweepCandidate(
+        strategy="pixel",
+        params={"similarity_window_size": 1},
+        config=RectificationRunConfig(strategy="pixel", similarity_window_size=1, max_displacement=0),
+        candidate_id="c0",
+    )
+
+    evaluation = parameter_sweep._evaluate_stage(
+        stage_name="stage1",
+        candidates=[candidate],
+        datasets=[dataset],
+        output_dir=tmp_path / scheduler_mode,
+        save_figures_flag=False,
+        requested_workers=1,
+        scheduling=SweepSchedulingSpec(mode=scheduler_mode),
+    )
+
+    assert calls == ["stage1_c0_d1"]
+    assert len(evaluation.stage_results) == 1
+    assert evaluation.stage_results[0]["status"] == "ok"
+    assert evaluation.execution["scheduler_mode"] == scheduler_mode
+    assert evaluation.execution["completed_runs"] == 1
+    assert Path(str(evaluation.stage_results[0]["run_dir"])).exists()
+
+
+def test_evaluate_stage_keeps_adaptive_process_cap_when_memory_unknown(monkeypatch, tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+    dataset = PreparedDataset(
+        dataset_id="d1",
+        views_path=views_path,
+        hdr_enabled=False,
+        hdr_exposure_times=None,
+        normalize_to_8bit=False,
+        views_shape=tuple(int(dim) for dim in views.shape),
+        views_dtype=str(views.dtype),
+        views_itemsize=int(views.dtype.itemsize),
+    )
+    candidates = [
+        SweepCandidate(
+            strategy="pixel",
+            params={"similarity_window_size": 1},
+            config=RectificationRunConfig(strategy="pixel", similarity_window_size=1, max_displacement=0),
+            candidate_id=f"c{idx}",
+        )
+        for idx in range(2)
+    ]
+    observed_workers: list[int] = []
+
+    monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: None)
+
+    def fake_execute_adaptive_pool_batch(
+        tasks,
+        workers,
+        memory_safety_fraction,
+        worker_recycle_tasks,
+        memory_telemetry,
+        on_result=None,
+    ):
+        observed_workers.append(int(workers))
+        completed = [_build_eval_result(task, status="ok") for task in tasks]
+        if on_result is not None:
+            for task, result in zip(tasks, completed):
+                on_result(task, result)
+        return (
+            completed,
+            [],
+            None,
+            {
+                "scheduler_mode": "adaptive_memory",
+                "memory_budget_bytes": None,
+                "max_concurrent_tasks_observed": 1,
+                "max_reserved_peak_bytes_observed": max(
+                    int(task["estimated_peak_bytes"]) for task in tasks
+                ),
+            },
+        )
+
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_execute_adaptive_pool_batch",
+        fake_execute_adaptive_pool_batch,
+    )
+    monkeypatch.setattr(
+        parameter_sweep,
+        "_run_task_isolated",
+        lambda task: pytest.fail("adaptive mode should use the pool path even when memory is unknown"),
+    )
+
+    evaluation = parameter_sweep._evaluate_stage(
+        stage_name="stage1",
+        candidates=candidates,
+        datasets=[dataset],
+        output_dir=tmp_path / "unknown_memory",
+        save_figures_flag=False,
+        requested_workers=4,
+        scheduling=SweepSchedulingSpec(mode="adaptive_memory"),
+    )
+
+    assert observed_workers == [2]
+    assert len(evaluation.stage_results) == 2
+    assert evaluation.execution["requested_workers"] == 4
+    assert evaluation.execution["selected_workers"] == 2
+    assert evaluation.execution["scheduler_mode"] == "adaptive_memory"
 
 
 def test_evaluate_stage_persists_pooled_results_before_batch_retry(monkeypatch, tmp_path):
@@ -918,8 +1440,9 @@ def test_evaluate_stage_persists_pooled_results_before_batch_retry(monkeypatch, 
 
     monkeypatch.setattr(parameter_sweep, "_get_available_memory_bytes", lambda: 10**12)
 
-    def fake_execute_pool_batch(tasks, workers, on_result=None):
+    def fake_execute_pool_batch(tasks, workers, worker_recycle_tasks=None, on_result=None):
         call_state["count"] += 1
+        assert worker_recycle_tasks is None
         if call_state["count"] == 1:
             completed = [_build_eval_result(tasks[0], status="ok")]
             if on_result is not None:
@@ -952,6 +1475,7 @@ def test_evaluate_stage_persists_pooled_results_before_batch_retry(monkeypatch, 
         requested_workers=2,
         run_state=run_state,
         run_state_path=run_state_path,
+        scheduling=SweepSchedulingSpec(mode="fixed_batch"),
     )
 
     assert len(evaluation.stage_results) == 2
@@ -1048,6 +1572,7 @@ def test_evaluate_stage_surfaces_pooled_persistence_failure_without_pool_retry(m
             requested_workers=2,
             run_state=run_state,
             run_state_path=run_state_path,
+            scheduling=SweepSchedulingSpec(mode="fixed_batch"),
         )
 
     assert executor_state["instances"] == 1
@@ -1616,6 +2141,138 @@ def test_spec_from_dict_supports_independent_metric_search_stages(tmp_path):
     assert spec.experimental_metric_sweep.search_stages is not None
     assert spec.experimental_metric_sweep.search_stages.mode == "single_stage"
     assert spec.experimental_metric_sweep.search_stages.total_budget_per_dataset == 2
+
+
+def _prepared_metric_dataset(tmp_path: Path) -> PreparedDataset:
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4))
+    return PreparedDataset(
+        dataset_id="d1",
+        views_path=views_path,
+        hdr_enabled=False,
+        hdr_exposure_times=None,
+        normalize_to_8bit=False,
+        views_shape=(2, 2, 4, 4),
+        views_dtype="float32",
+        views_itemsize=4,
+    )
+
+
+def _independent_metric_spec_with_search_cap(tmp_path: Path, search_workers: int) -> SweepExperimentSpec:
+    return SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(tmp_path / "views.npy"))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            mode="single_stage",
+            total_budget_per_dataset=1,
+            top_k=1,
+            max_workers=8,
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        experimental_metric_sweep=ExperimentalMetricSweepSpec(
+            enabled=True,
+            candidate_source="independent_search",
+            search_stages=SweepStageSpec(
+                mode="single_stage",
+                total_budget_per_dataset=1,
+                top_k=1,
+                max_workers=search_workers,
+            ),
+            formulations=[
+                MetricFormulationSpec(
+                    formulation_id="intensity_default",
+                    family="intensity",
+                    alphas=[1.0],
+                )
+            ],
+        ),
+        output_dir=str(tmp_path / "out"),
+        save_figures=False,
+        analyze=False,
+    )
+
+
+def test_preview_independent_metric_search_uses_search_stage_worker_cap(monkeypatch, tmp_path):
+    spec = _independent_metric_spec_with_search_cap(tmp_path, search_workers=2)
+    experimental = spec.experimental_metric_sweep
+    assert experimental is not None
+    prepared = [_prepared_metric_dataset(tmp_path)]
+    calls: list[int] = []
+
+    def fake_evaluate_stage(**kwargs):
+        calls.append(int(kwargs["requested_workers"]))
+        return StageEvaluationResult(
+            stage_results=[],
+            execution={
+                "requested_workers": kwargs["requested_workers"],
+                "selected_workers": kwargs["requested_workers"],
+                "pending_run_count": 0,
+                "skipped_valid_count": 0,
+            },
+        )
+
+    monkeypatch.setattr(parameter_sweep, "_evaluate_stage", fake_evaluate_stage)
+
+    parameter_sweep._preview_independent_metric_search(
+        spec=spec,
+        experimental_spec=experimental,
+        prepared_datasets=prepared,
+        metric_output_dir=tmp_path / "metrics",
+        requested_workers=8,
+        run_state={},
+        run_state_path=None,
+        generation_id="gen",
+        merge_sources=(),
+        merge_log={},
+    )
+
+    assert calls == [2]
+
+
+def test_run_independent_metric_search_uses_search_stage_worker_cap(monkeypatch, tmp_path):
+    spec = _independent_metric_spec_with_search_cap(tmp_path, search_workers=2)
+    experimental = spec.experimental_metric_sweep
+    assert experimental is not None
+    prepared = [_prepared_metric_dataset(tmp_path)]
+    calls: list[int] = []
+
+    def fake_evaluate_stage(**kwargs):
+        calls.append(int(kwargs["requested_workers"]))
+        return StageEvaluationResult(
+            stage_results=[],
+            execution={
+                "requested_workers": kwargs["requested_workers"],
+                "selected_workers": kwargs["requested_workers"],
+            },
+        )
+
+    monkeypatch.setattr(parameter_sweep, "_evaluate_stage", fake_evaluate_stage)
+    monkeypatch.setattr(parameter_sweep, "score_and_rank_runs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(parameter_sweep, "_write_phase_summary_artifacts", lambda **kwargs: None)
+
+    parameter_sweep._run_independent_metric_search_phase(
+        spec=spec,
+        experimental_metric_spec=experimental,
+        prepared_datasets=prepared,
+        dataset_ids=["d1"],
+        metric_output_dir=tmp_path / "metrics",
+        requested_workers=8,
+        run_state={},
+        run_state_path=None,
+        generation_id="gen",
+        merge_sources=(),
+        merge_log={},
+    )
+
+    assert calls == [2]
 
 
 def test_spec_from_dict_supports_single_stage_mode_and_defaults_to_two_stage():

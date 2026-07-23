@@ -45,6 +45,7 @@ Core workflows use:
 - `Pillow`
 - `opencv-python`
 - `tqdm`
+- `psutil`
 - `h5py`
 - `Django`
 - `matlabengine` on Python versions below 3.14 when MATLAB export/integration is needed
