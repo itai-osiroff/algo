@@ -56,6 +56,7 @@ from moment_images.rectification_strategy import (
     DEFAULT_DISPLACEMENT_ALPHA,
     DEFAULT_DISPLACEMENT_METRIC_FAMILY,
     normalize_displacement_metric_family,
+    normalize_pixel_shift_power,
 )
 from moment_images.reliable_io import (
     FirstValidReadError,
@@ -7984,11 +7985,13 @@ class SpecGuiState:
     pixel_gauss_sigmas: str = "3.0,5.0"
     pixel_disp_gauss_sigmas: str = "0.0,1.0"
     pixel_thresholds: str = "0.05"
+    pixel_shift_powers: str = "1.0"
     combined_refinement_window_sizes: str = "15,25"
     combined_max_displacements: str = "5,15"
     combined_gauss_sigmas: str = "3.0,5.0"
     combined_disp_gauss_sigmas: str = "0.0,1.0"
     combined_pixel_thresholds: str = "0.05"
+    combined_pixel_shift_powers: str = "1.0"
     combined_global_thresholds: str = "0.1,0.15"
     combined_correlation_pad_widths: str = str(RectificationRunConfig().correlation_pad_width)
     pixel_sub_pix_factors: str = "1,2"
@@ -8063,6 +8066,16 @@ def _parse_float_list_csv(value: str, field_name: str) -> List[float]:
     if not result:
         raise ValueError(f"{field_name} cannot be empty.")
     return result
+
+
+def _parse_pixel_shift_power_list_csv(value: str, field_name: str) -> List[float]:
+    """Parse powers with the same finite-positive contract as rectification."""
+
+    values = _parse_float_list_csv(value, field_name)
+    try:
+        return [normalize_pixel_shift_power(item) for item in values]
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must contain finite positive numbers.") from exc
 
 
 def _parse_bool_list_csv(value: str, field_name: str) -> List[bool]:
@@ -8351,6 +8364,9 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             "pixel_thresholds": _parse_float_list_csv(
                 state.pixel_thresholds, "pixel thresholds"
             ),
+            "pixel_shift_powers": _parse_pixel_shift_power_list_csv(
+                state.pixel_shift_powers, "pixel shift powers"
+            ),
             "sub_pix_factors": _parse_int_list_csv(
                 state.pixel_sub_pix_factors, "pixel sub-pixel factors"
             ),
@@ -8377,6 +8393,9 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             ),
             "pixel_thresholds": _parse_float_list_csv(
                 state.combined_pixel_thresholds, "combined pixel thresholds"
+            ),
+            "pixel_shift_powers": _parse_pixel_shift_power_list_csv(
+                state.combined_pixel_shift_powers, "combined pixel shift powers"
             ),
             "global_thresholds": _parse_float_list_csv(
                 state.combined_global_thresholds, "combined global thresholds"
@@ -8661,6 +8680,9 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         state.pixel_thresholds = _list_to_csv(
             cast(List[object], pixel_space.get("pixel_thresholds", []))
         ) or state.pixel_thresholds
+        state.pixel_shift_powers = _list_to_csv(
+            cast(List[object], pixel_space.get("pixel_shift_powers", []))
+        ) or state.pixel_shift_powers
         state.pixel_sub_pix_factors = _list_to_csv(
             cast(List[object], pixel_space.get("sub_pix_factors", []))
         ) or state.pixel_sub_pix_factors
@@ -8688,6 +8710,9 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         state.combined_pixel_thresholds = _list_to_csv(
             cast(List[object], combined_space.get("pixel_thresholds", []))
         ) or state.combined_pixel_thresholds
+        state.combined_pixel_shift_powers = _list_to_csv(
+            cast(List[object], combined_space.get("pixel_shift_powers", []))
+        ) or state.combined_pixel_shift_powers
         state.combined_global_thresholds = _list_to_csv(
             cast(List[object], combined_space.get("global_thresholds", []))
         ) or state.combined_global_thresholds
@@ -9050,6 +9075,7 @@ def validate_state(state: SpecGuiState) -> List[str]:
                 ("pixel gauss sigmas", state.pixel_gauss_sigmas, "float"),
                 ("pixel disp gauss sigmas", state.pixel_disp_gauss_sigmas, "float"),
                 ("pixel thresholds", state.pixel_thresholds, "float"),
+                ("pixel shift powers", state.pixel_shift_powers, "pixel_shift_power"),
                 ("pixel sub-pixel factors", state.pixel_sub_pix_factors, "int"),
                 ("pixel sigma pyramid", state.pixel_sigma_pyramid, "bool"),
                 ("pixel zero fill roll", state.pixel_zero_fill_roll, "bool"),
@@ -9063,6 +9089,11 @@ def validate_state(state: SpecGuiState) -> List[str]:
                 ("combined gauss sigmas", state.combined_gauss_sigmas, "float"),
                 ("combined disp gauss sigmas", state.combined_disp_gauss_sigmas, "float"),
                 ("combined pixel thresholds", state.combined_pixel_thresholds, "float"),
+                (
+                    "combined pixel shift powers",
+                    state.combined_pixel_shift_powers,
+                    "pixel_shift_power",
+                ),
                 ("combined global thresholds", state.combined_global_thresholds, "float"),
                 ("combined correlation pad widths", state.combined_correlation_pad_widths, "int"),
                 ("combined sub-pixel factors", state.combined_sub_pix_factors, "int"),
@@ -9084,6 +9115,8 @@ def validate_state(state: SpecGuiState) -> List[str]:
                 _parse_int_list_csv(value, field_name)
             elif field_type == "float":
                 _parse_float_list_csv(value, field_name)
+            elif field_type == "pixel_shift_power":
+                _parse_pixel_shift_power_list_csv(value, field_name)
             else:
                 _parse_bool_list_csv(value, field_name)
         except ValueError as exc:
@@ -9656,15 +9689,17 @@ class SpecGuiApp:
         self.pixel_gauss_entry = self._build_labeled_entry(left, 2, "Pixel gauss sigmas", "3.0,5.0")
         self.pixel_disp_gauss_entry = self._build_labeled_entry(left, 3, "Pixel disp gauss sigmas", "0.0,1.0")
         self.pixel_thresh_entry = self._build_labeled_entry(left, 4, "Pixel thresholds", "0.05")
+        self.pixel_shift_power_entry = self._build_labeled_entry(left, 5, "Pixel shift powers", "1.0")
 
         self.comb_window_entry = self._build_labeled_entry(right, 0, "Combined refinement windows", "15,25")
         self.comb_disp_entry = self._build_labeled_entry(right, 1, "Combined max displacements", "5,15")
         self.comb_gauss_entry = self._build_labeled_entry(right, 2, "Combined gauss sigmas", "3.0,5.0")
         self.comb_disp_gauss_entry = self._build_labeled_entry(right, 3, "Combined disp gauss sigmas", "0.0,1.0")
         self.comb_thresh_entry = self._build_labeled_entry(right, 4, "Combined pixel thresholds", "0.05")
-        self.comb_global_thresh_entry = self._build_labeled_entry(right, 5, "Combined global thresholds", "0.1,0.15")
+        self.comb_shift_power_entry = self._build_labeled_entry(right, 5, "Combined pixel shift powers", "1.0")
+        self.comb_global_thresh_entry = self._build_labeled_entry(right, 6, "Combined global thresholds", "0.1,0.15")
         self.comb_corr_pad_entry = self._build_labeled_entry(
-            right, 6, "Combined correlation pad widths", str(RectificationRunConfig().correlation_pad_width)
+            right, 7, "Combined correlation pad widths", str(RectificationRunConfig().correlation_pad_width)
         )
 
         dataset_frame = self.ttk.LabelFrame(self.content_frame, text="Datasets")
@@ -10439,11 +10474,13 @@ class SpecGuiApp:
             pixel_gauss_sigmas=self.pixel_gauss_entry.get().strip(),
             pixel_disp_gauss_sigmas=self.pixel_disp_gauss_entry.get().strip(),
             pixel_thresholds=self.pixel_thresh_entry.get().strip(),
+            pixel_shift_powers=self.pixel_shift_power_entry.get().strip(),
             combined_refinement_window_sizes=self.comb_window_entry.get().strip(),
             combined_max_displacements=self.comb_disp_entry.get().strip(),
             combined_gauss_sigmas=self.comb_gauss_entry.get().strip(),
             combined_disp_gauss_sigmas=self.comb_disp_gauss_entry.get().strip(),
             combined_pixel_thresholds=self.comb_thresh_entry.get().strip(),
+            combined_pixel_shift_powers=self.comb_shift_power_entry.get().strip(),
             combined_global_thresholds=self.comb_global_thresh_entry.get().strip(),
             combined_correlation_pad_widths=self.comb_corr_pad_entry.get().strip(),
             pixel_sub_pix_factors=self.pixel_subpix_entry.get().strip(),
@@ -10563,11 +10600,13 @@ class SpecGuiApp:
             (self.pixel_gauss_entry, state.pixel_gauss_sigmas),
             (self.pixel_disp_gauss_entry, state.pixel_disp_gauss_sigmas),
             (self.pixel_thresh_entry, state.pixel_thresholds),
+            (self.pixel_shift_power_entry, state.pixel_shift_powers),
             (self.comb_window_entry, state.combined_refinement_window_sizes),
             (self.comb_disp_entry, state.combined_max_displacements),
             (self.comb_gauss_entry, state.combined_gauss_sigmas),
             (self.comb_disp_gauss_entry, state.combined_disp_gauss_sigmas),
             (self.comb_thresh_entry, state.combined_pixel_thresholds),
+            (self.comb_shift_power_entry, state.combined_pixel_shift_powers),
             (self.comb_global_thresh_entry, state.combined_global_thresholds),
             (self.comb_corr_pad_entry, state.combined_correlation_pad_widths),
             (self.pixel_subpix_entry, state.pixel_sub_pix_factors),

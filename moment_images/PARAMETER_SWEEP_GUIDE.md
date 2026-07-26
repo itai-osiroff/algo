@@ -84,6 +84,10 @@ Common pixel/combined search fields:
 - `pixel_shift_powers` (positive signed powers, default `[1.0]`)
 - `zero_fill_roll`
 
+In the spec-based sweep GUI, enter comma-separated values in the **Pixel shift
+powers** and **Combined pixel shift powers** controls. The two strategy lists
+are independent; every value must be finite and greater than zero.
+
 `pixel_shift_powers` applies only to pixelwise intensity matching (including the
 pixelwise stage of `combined`). At values other than `1.0`, the shifted moving
 view is evaluated as `sign(x) * abs(x) ** power`; non-finite inputs are treated
