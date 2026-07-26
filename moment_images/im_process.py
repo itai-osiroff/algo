@@ -1,7 +1,8 @@
 import os
 import sys
+import warnings
 import PIL
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from PIL import Image
 import numpy as np
@@ -20,6 +21,7 @@ if __package__ is None or __package__ == "":
         BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         GlobalTranslationRectificationStrategy,
         PixelwisePatchRectificationStrategy,
+        _sanitize_pixel_shift_power_inputs,
         resolve_displacement_metric_spec,
         resolve_reference_view,
     )
@@ -31,6 +33,7 @@ else:
         BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         GlobalTranslationRectificationStrategy,
         PixelwisePatchRectificationStrategy,
+        _sanitize_pixel_shift_power_inputs,
         resolve_displacement_metric_spec,
         resolve_reference_view,
     )
@@ -105,7 +108,8 @@ class RectificationRunConfig:
     ``displacement_metric_family`` and ``displacement_alpha`` control how local
     pixelwise displacement candidates are ranked; ``alpha`` is the local
     displacement score blend weight between the intensity term and any selected
-    auxiliary blurred-correlation components.
+    auxiliary blurred-correlation components. ``pixel_shift_power`` applies a
+    signed power to the shifted moving view for intensity matching only.
     """
 
     strategy: str = "pixel"
@@ -122,6 +126,7 @@ class RectificationRunConfig:
     pixel_sigma_pyramid: bool = False
     zero_fill_roll: bool = True
     sub_pix_factor: int = 2
+    pixel_shift_power: float = 1.0
     combined_use_global_avg_reference: bool = True
     combined_reference_mode: Optional[str] = None
     displacement_metric_family: str = "intensity"
@@ -133,6 +138,13 @@ class RectificationRunConfig:
     normalize_to_8bit: bool = False
 
     def __post_init__(self) -> None:
+        try:
+            self.pixel_shift_power = float(self.pixel_shift_power)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pixel_shift_power must be a finite positive float.") from exc
+        if not np.isfinite(self.pixel_shift_power) or self.pixel_shift_power <= 0.0:
+            raise ValueError("pixel_shift_power must be a finite positive float.")
+
         self.combined_reference_mode = normalize_combined_reference_mode(
             self.combined_reference_mode,
             use_global_avg_reference=bool(self.combined_use_global_avg_reference),
@@ -180,6 +192,67 @@ class RectificationResult:
     global_rectified_views: Optional[np.ndarray] = None
     global_avg_image: Optional[np.ndarray] = None
     pixel_similarity: Optional[Any] = None
+    runtime_warnings: List[Dict[str, object]] = field(default_factory=list)
+
+
+def _sanitize_powered_run_inputs(
+    views: np.ndarray,
+    pixel_shift_power: float,
+) -> Tuple[np.ndarray, List[Dict[str, object]]]:
+    """Sanitize all non-finite views once before a powered pixel/combined run."""
+
+    source = np.asarray(views)
+    if source.ndim == 4:
+        sanitized, _, records = _sanitize_pixel_shift_power_inputs(
+            source,
+            None,
+            pixel_shift_power,
+            emit_runtime_warning=False,
+        )
+        warning_record = records[0]
+    elif source.ndim == 5:
+        sanitized = np.empty_like(source, dtype=np.float64)
+        per_view: Dict[str, object] = {}
+        for exposure_index in range(source.shape[0]):
+            sanitized_exposure, _, records = _sanitize_pixel_shift_power_inputs(
+                source[exposure_index],
+                None,
+                pixel_shift_power,
+                emit_runtime_warning=False,
+            )
+            sanitized[exposure_index] = sanitized_exposure
+            exposure_views = records[0]["views"]
+            assert isinstance(exposure_views, dict)
+            for view_key, counts in exposure_views.items():
+                per_view[f"exposure_{exposure_index}_{view_key}"] = counts
+        warning_record = {
+            "code": "pixel_shift_power_input_sanitized",
+            "pixel_shift_power": pixel_shift_power,
+            "views": per_view,
+        }
+    else:
+        return source, []
+
+    warning_views = warning_record["views"]
+    assert isinstance(warning_views, dict)
+    needs_warning = any(
+        isinstance(counts, dict)
+        and (
+            bool(counts.get("negative_finite"))
+            or bool(counts.get("nan"))
+            or bool(counts.get("positive_infinity"))
+            or bool(counts.get("negative_infinity"))
+        )
+        for counts in warning_views.values()
+    )
+    if needs_warning:
+        warnings.warn(
+            "pixel_shift_power used signed power after sanitizing negative or non-finite "
+            "scoring inputs; inspect runtime_warnings for per-view counts.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return sanitized, [warning_record]
 
 
 def add_colorbar(mappable: Any, ax: Optional[plt.Axes] = None) -> None:
@@ -274,7 +347,17 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         strategy.
     """
 
+    strategy = config.strategy.lower()
+    if strategy not in {"global", "pixel", "combined"}:
+        raise ValueError("strategy must be one of 'global', 'pixel', or 'combined'")
+
     views_input = np.asarray(views)
+    runtime_warnings: List[Dict[str, object]] = []
+    if strategy in {"pixel", "combined"} and config.pixel_shift_power != 1.0:
+        views_input, runtime_warnings = _sanitize_powered_run_inputs(
+            views_input,
+            config.pixel_shift_power,
+        )
     exposure_views: Optional[np.ndarray] = None
     if views_input.ndim == 5:
         if not config.hdr_enabled:
@@ -300,10 +383,6 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
     global_rectified_views = None
     global_avg_image = None
     pixel_similarity = None
-
-    strategy = config.strategy.lower()
-    if strategy not in {"global", "pixel", "combined"}:
-        raise ValueError("strategy must be one of 'global', 'pixel', or 'combined'")
 
     if strategy == "global":
         rectification_strategy = GlobalTranslationRectificationStrategy(
@@ -353,7 +432,11 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             metric_family=config.displacement_metric_family,
             alpha=config.displacement_alpha,
             component_weights=config.displacement_component_weights,
+            pixel_shift_power=config.pixel_shift_power,
+            emit_runtime_warning=not bool(runtime_warnings),
         )
+        if runtime_warnings and hasattr(pixel_similarity, "runtime_warnings"):
+            pixel_similarity.runtime_warnings = runtime_warnings
         if exposure_views is not None:
             rectified_view_stack = []
             for exposure in exposure_views:
@@ -438,7 +521,11 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             metric_family=config.displacement_metric_family,
             alpha=config.displacement_alpha,
             component_weights=config.displacement_component_weights,
+            pixel_shift_power=config.pixel_shift_power,
+            emit_runtime_warning=not bool(runtime_warnings),
         )
+        if runtime_warnings and hasattr(pixel_similarity, "runtime_warnings"):
+            pixel_similarity.runtime_warnings = runtime_warnings
         avg_image, rectified_views = rectification_strategy_pixel.rectify(
             global_rectified_views, pixel_similarity, ref_view_idx
         )
@@ -454,6 +541,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         global_rectified_views=global_rectified_views,
         global_avg_image=global_avg_image,
         pixel_similarity=pixel_similarity,
+        runtime_warnings=runtime_warnings,
     )
 
 

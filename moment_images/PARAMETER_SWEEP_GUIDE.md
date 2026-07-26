@@ -23,6 +23,19 @@ Legacy single-dataset CLI flags remain available:
 python -m moment_images.parameter_sweep --views path/to/views.npy --strategy pixel
 ```
 
+For pixel and combined legacy sweeps, shifted-view power is configured with a
+positive range:
+
+- `--pixel-shift-power-start` (default `1.0`)
+- `--pixel-shift-power-stop` (default `1.0`)
+- `--pixel-shift-power-step` (default `1.0`)
+
+For example, this evaluates signed powers `0.5`, `1.0`, `1.5`, and `2.0`:
+
+```bash
+python -m moment_images.parameter_sweep --views path/to/views.npy --strategy pixel --pixel-shift-power-start 0.5 --pixel-shift-power-stop 2.0 --pixel-shift-power-step 0.5
+```
+
 ## Spec Structure
 
 A sweep spec usually contains:
@@ -68,7 +81,13 @@ Common pixel/combined search fields:
 - `pixel_thresholds`
 - `sub_pix_factors`
 - `pixel_sigma_pyramid`
+- `pixel_shift_powers` (positive signed powers, default `[1.0]`)
 - `zero_fill_roll`
+
+`pixel_shift_powers` applies only to pixelwise intensity matching (including the
+pixelwise stage of `combined`). At values other than `1.0`, the shifted moving
+view is evaluated as `sign(x) * abs(x) ** power`; non-finite inputs are treated
+as zero for scoring and recorded in each run's diagnostics.
 
 Combined/global-specific fields:
 

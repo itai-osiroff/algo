@@ -39,6 +39,13 @@ def test_build_metric_record_handles_global_and_local_metrics():
         global_rectified_views=None,
         global_avg_image=np.full((2, 2), 2.0, dtype=float),
         pixel_similarity=None,
+        runtime_warnings=[
+            {
+                "code": "pixel_shift_power_input_sanitized",
+                "pixel_shift_power": 0.5,
+                "views": {"view_0_0": {"nan": 1}},
+            }
+        ],
     )
 
     record = build_metric_record("run1", config, result)
@@ -50,6 +57,7 @@ def test_build_metric_record_handles_global_and_local_metrics():
     assert record["metric_formulation"]["family"] == config.displacement_metric_family
     assert "displacement_field_metrics" in record
     assert "inter_view_consistency_metrics" in record
+    assert record["runtime_warnings"] == result.runtime_warnings
 
 
 def test_analyze_summary_data_reports_extrema_and_means():

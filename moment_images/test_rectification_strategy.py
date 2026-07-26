@@ -4,6 +4,7 @@ from typing import Tuple
 
 import numpy as np
 
+import moment_images.rectification_strategy as rectification_strategy
 from moment_images.rectification_strategy import (
     BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
     BLURRED_GRADIENT_CORR_METRIC_FAMILY,
@@ -116,6 +117,160 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
         self.assertIsNone(result.component_score_maps)
         self.assertIsNone(result.component_score_maps_raw)
         self.assertIsNone(result.view_score_summary)
+
+    def test_pixel_shift_power_sanitizes_signed_nonfinite_inputs_and_reports_diagnostics(self) -> None:
+        views = np.array(
+            [[[[4.0, -4.0, 0.0], [np.nan, np.inf, -np.inf], [1.0, -1.0, 2.0]]]],
+            dtype=np.float32,
+        )
+        reference = np.ones((3, 3), dtype=np.float32)
+
+        with self.assertWarnsRegex(RuntimeWarning, "pixel_shift_power"):
+            result = self.strategy.compute_similarity_matrices(
+                views,
+                (0, 0),
+                max_disp=0,
+                gauss_sigma=1.0,
+                gauss_size=5,
+                sub_pix_factor=1,
+                reference_view=reference,
+                pixel_shift_power=0.5,
+            )
+
+        self.assertTrue(np.isfinite(result.scores).all())
+        self.assertTrue(np.isfinite(result.coordinates).all())
+        self.assertEqual(len(result.runtime_warnings), 1)
+        diagnostics = result.runtime_warnings[0]
+        self.assertEqual(diagnostics["pixel_shift_power"], 0.5)
+        self.assertEqual(diagnostics["views"]["view_0_0"]["negative_finite"], 2)
+        self.assertEqual(diagnostics["views"]["view_0_0"]["zero"], 1)
+        self.assertEqual(diagnostics["views"]["view_0_0"]["nan"], 1)
+        self.assertEqual(diagnostics["views"]["view_0_0"]["positive_infinity"], 1)
+        self.assertEqual(diagnostics["views"]["view_0_0"]["negative_infinity"], 1)
+
+    def test_pixel_shift_power_one_matches_legacy_similarity(self) -> None:
+        views = np.array(
+            [[[[0.0, 1.0, 2.0], [1.0, 2.0, 3.0], [2.0, 3.0, 4.0]]]],
+            dtype=np.float32,
+        )
+        reference = np.array(
+            [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]],
+            dtype=np.float32,
+        )
+
+        legacy = self.strategy.compute_similarity_matrices(
+            views,
+            (0, 0),
+            max_disp=1,
+            gauss_sigma=1.0,
+            gauss_size=5,
+            sub_pix_factor=1,
+            reference_view=reference,
+        )
+        explicit_default = self.strategy.compute_similarity_matrices(
+            views,
+            (0, 0),
+            max_disp=1,
+            gauss_sigma=1.0,
+            gauss_size=5,
+            sub_pix_factor=1,
+            reference_view=reference,
+            pixel_shift_power=1.0,
+        )
+
+        np.testing.assert_array_equal(explicit_default.scores, legacy.scores)
+        np.testing.assert_array_equal(explicit_default.disps_y, legacy.disps_y)
+        np.testing.assert_array_equal(explicit_default.disps_x, legacy.disps_x)
+        self.assertEqual(explicit_default.runtime_warnings, [])
+
+    def test_pixel_shift_power_is_used_in_intensity_product_and_normalization(self) -> None:
+        views = np.array([[[[-4.0, 0.0], [9.0, 16.0]]]], dtype=np.float32)
+        reference = np.array([[2.0, 3.0], [5.0, 7.0]], dtype=np.float32)
+        filtered_inputs: list[np.ndarray] = []
+
+        def identity_filter(values: np.ndarray, **kwargs: object) -> np.ndarray:
+            filtered_inputs.append(np.asarray(values).copy())
+            return np.asarray(values)
+
+        original_filter = rectification_strategy.gaussian_filter
+        rectification_strategy.gaussian_filter = identity_filter
+        try:
+            with self.assertWarnsRegex(RuntimeWarning, "pixel_shift_power"):
+                self.strategy.compute_similarity_matrices(
+                    views,
+                    (0, 0),
+                    max_disp=0,
+                    gauss_sigma=1.0,
+                    gauss_size=5,
+                    sub_pix_factor=1,
+                    reference_view=reference,
+                    pixel_shift_power=0.5,
+                )
+        finally:
+            rectification_strategy.gaussian_filter = original_filter
+
+        expected_powered = np.array([[-2.0, 0.0], [3.0, 4.0]], dtype=np.float32)
+        np.testing.assert_allclose(filtered_inputs[1], reference * expected_powered)
+        np.testing.assert_allclose(filtered_inputs[2], expected_powered**2)
+
+    def test_pixel_shift_power_leaves_gradient_component_scores_unpowered(self) -> None:
+        views, reference, _, _ = self._make_shifted_blob_case()
+        common_kwargs = {
+            "max_disp": 4,
+            "gauss_sigma": 1.0,
+            "gauss_size": 5,
+            "normalized_conv": False,
+            "sub_pix_factor": 1,
+            "reference_view": reference,
+            "metric_family": BLURRED_GRADIENT_CORR_METRIC_FAMILY,
+            "alpha": 0.0,
+        }
+
+        baseline = self.metric_strategy.compute_similarity_matrices(
+            views,
+            (0, 0),
+            **common_kwargs,
+        )
+        powered = self.metric_strategy.compute_similarity_matrices(
+            views,
+            (0, 0),
+            **common_kwargs,
+            pixel_shift_power=0.5,
+        )
+
+        assert baseline.component_score_maps_raw is not None
+        assert powered.component_score_maps_raw is not None
+        np.testing.assert_allclose(
+            powered.component_score_maps_raw["gradient"],
+            baseline.component_score_maps_raw["gradient"],
+        )
+
+    def test_sigma_pyramid_forwards_pixel_shift_power_to_each_pass(self) -> None:
+        views = np.ones((1, 1, 3, 3), dtype=np.float32)
+        zero_coords = np.zeros((3, 3, 1, 1, 2), dtype=np.float32)
+        zero_scores = np.zeros((3, 3, 1, 1), dtype=np.float64)
+        zero_disps = np.zeros((3, 3, 1, 1), dtype=np.float32)
+        fake_result = PixelwiseSimilarityResult(
+            coordinates=zero_coords,
+            scores=zero_scores,
+            disps_y=zero_disps,
+            disps_x=zero_disps,
+        )
+        with mock.patch.object(
+            self.strategy,
+            "_compute_similarity_matrices_single",
+            return_value=fake_result,
+        ) as compute:
+            self.strategy.compute_similarity_matrices(
+                views,
+                (0, 0),
+                gauss_sigma=2,
+                use_sigma_pyramid=True,
+                pixel_shift_power=0.5,
+            )
+
+        assert compute.call_count == 2
+        assert all(call.kwargs["pixel_shift_power"] == 0.5 for call in compute.call_args_list)
 
     def test_rectify_uses_backward_mapping(self) -> None:
         views = np.zeros((2, 2, 3, 3), dtype=np.float32)

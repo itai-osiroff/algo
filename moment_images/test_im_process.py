@@ -32,6 +32,13 @@ def test_rectification_run_config_defaults_to_intensity_mode():
     assert config.displacement_component_weights is None
     assert config.metric_formulation_id == "intensity_default"
     assert config.combined_reference_mode == "global_average"
+    assert config.pixel_shift_power == 1.0
+
+
+@pytest.mark.parametrize("value", [0.0, -0.5, float("nan"), float("inf"), float("-inf")])
+def test_rectification_run_config_rejects_invalid_pixel_shift_power(value):
+    with pytest.raises(ValueError, match="pixel_shift_power"):
+        RectificationRunConfig(pixel_shift_power=value)
 
 
 def test_rectification_run_config_rejects_non_default_intensity_settings():
@@ -103,6 +110,85 @@ def test_rectification_run_config_preserves_legacy_center_view_behavior():
 
     assert config.combined_reference_mode == "center_view"
     assert config.combined_use_global_avg_reference is False
+
+
+def test_rectify_views_from_config_forwards_pixel_shift_power(monkeypatch):
+    views = np.arange(9, dtype=np.float32).reshape(1, 1, 3, 3)
+    captured: dict[str, object] = {}
+
+    def fake_compute_similarity_matrices(self, views: np.ndarray, ref_view_idx, **kwargs: object):
+        captured["pixel_shift_power"] = kwargs.get("pixel_shift_power")
+        return "pixel_similarity"
+
+    def fake_rectify(self, views: np.ndarray, sim_mat=None, ref_view_idx=None):
+        return np.mean(views, axis=(0, 1)), np.asarray(views)
+
+    monkeypatch.setattr(
+        im_process.PixelwisePatchRectificationStrategy,
+        "compute_similarity_matrices",
+        fake_compute_similarity_matrices,
+    )
+    monkeypatch.setattr(im_process.PixelwisePatchRectificationStrategy, "rectify", fake_rectify)
+
+    result = im_process.rectify_views_from_config(
+        views,
+        RectificationRunConfig(
+            strategy="pixel",
+            similarity_window_size=1,
+            max_displacement=0,
+            gauss_sigma=1.0,
+            gauss_size=5,
+            disp_gauss_sigma=0.0,
+            disp_gauss_size=1,
+            sub_pix_factor=1,
+            pixel_shift_power=0.5,
+        ),
+    )
+
+    assert captured["pixel_shift_power"] == 0.5
+    assert result.pixel_similarity == "pixel_similarity"
+
+
+def test_powered_combined_run_sanitizes_inputs_before_global_scoring(monkeypatch):
+    views = np.arange(36, dtype=np.float32).reshape(2, 2, 3, 3)
+    views[0, 0, 0, 0] = np.nan
+    views[1, 1, 0, 1] = np.inf
+    views[0, 1, 0, 2] = -4.0
+    captured: dict[str, np.ndarray] = {}
+
+    def fake_global_similarity(self, global_views: np.ndarray, ref_view_idx, **kwargs: object):
+        captured["global_views"] = np.asarray(global_views).copy()
+        return np.zeros((2, 2, 2, 2, 2), dtype=np.int64)
+
+    monkeypatch.setattr(
+        im_process.GlobalTranslationRectificationStrategy,
+        "compute_similarity_matrix",
+        fake_global_similarity,
+    )
+
+    with pytest.warns(RuntimeWarning, match="pixel_shift_power"):
+        result = im_process.rectify_views_from_config(
+            views,
+            RectificationRunConfig(
+                strategy="combined",
+                refinement_window_size=1,
+                max_displacement=0,
+                gauss_sigma=1.0,
+                gauss_size=5,
+                disp_gauss_sigma=0.0,
+                disp_gauss_size=1,
+                sub_pix_factor=1,
+                pixel_shift_power=0.5,
+            ),
+        )
+
+    assert np.isfinite(captured["global_views"]).all()
+    assert np.isfinite(result.rectified_views).all()
+    assert len(result.runtime_warnings) == 1
+    diagnostics = result.runtime_warnings[0]
+    assert diagnostics["views"]["view_0_0"]["nan"] == 1
+    assert diagnostics["views"]["view_1_1"]["positive_infinity"] == 1
+    assert diagnostics["views"]["view_0_1"]["negative_finite"] == 1
 
 
 def test_rectify_views_from_config_combined_can_use_iterative_rebuild(monkeypatch):

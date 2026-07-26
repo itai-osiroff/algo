@@ -46,6 +46,9 @@
         false,
         true
       ],
+      "pixel_shift_powers": [
+        1.0
+      ],
       "zero_fill_roll": [
         true
       ]
@@ -84,6 +87,9 @@
       "pixel_sigma_pyramid": [
         false,
         true
+      ],
+      "pixel_shift_powers": [
+        1.0
       ],
       "combined_use_global_avg_reference": [
         true
