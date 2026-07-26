@@ -1621,9 +1621,19 @@ def _build_raw_records(
         dataset_ids = _candidate_dataset_ids(row, model)
         for dataset_id in dataset_ids:
             row_id = f"{row.row_id}:{dataset_id}"
-            workspace_path = _workspace_path_for_row(model, row, dataset_id)
-            preview_path = _preview_path_for_row(model, row, dataset_id)
             run_record = run_record_lookup.get((row.stage, row.candidate_id, dataset_id))
+            run_workspace_path = (
+                None if run_record is None else _optional_str(getattr(run_record, "workspace_path", None))
+            )
+            workspace_path = (
+                Path(run_workspace_path)
+                if run_workspace_path is not None
+                else _workspace_path_for_row(model, row, dataset_id)
+            )
+            workspace_path_text = str(workspace_path) if workspace_path.exists() else None
+            preview_path = _preview_path_for_row(model, row, dataset_id)
+            if preview_path is None and run_record is not None:
+                preview_path = _optional_str(getattr(run_record, "preview_path", None))
             summary_metrics = _summary_metric_values(row, dataset_id, run_record, metric_registry)
             summary_metrics["saved_score"] = _candidate_score_for_dataset(row, dataset_id) or float("nan")
             summary_metrics["saved_mean_dataset_score"] = row.mean_dataset_score or float("nan")
@@ -1639,7 +1649,7 @@ def _build_raw_records(
                     alpha=row.alpha,
                     formulation_id=row.formulation_id,
                     preview_path=preview_path,
-                    workspace_path=str(workspace_path) if workspace_path.exists() else None,
+                    workspace_path=workspace_path_text,
                     saved_score=_candidate_score_for_dataset(row, dataset_id),
                     saved_mean_dataset_score=row.mean_dataset_score,
                     metrics={},
@@ -1668,7 +1678,7 @@ def _build_raw_records(
                     alpha=alpha,
                     formulation_id=formulation_id,
                     preview_path=preview_path,
-                    workspace_path=str(workspace_path) if workspace_path.exists() else None,
+                    workspace_path=workspace_path_text,
                     saved_score=_candidate_score_for_dataset(row, dataset_id),
                     saved_mean_dataset_score=row.mean_dataset_score,
                     metrics={
@@ -2739,7 +2749,11 @@ def load_sweep_metric_explorer_model(
     """Load sweep artifacts and recompute focus metrics from raw workspace bundles."""
 
     base_model = load_sweep_visualization_model(path)
-    review_dir = base_model.experiment_root / "metric_review"
+    review_dir = (
+        base_model.source_dir / "metric_review"
+        if base_model.path_scope == "live_validation_snapshot"
+        else base_model.experiment_root / "metric_review"
+    )
     review_dir.mkdir(parents=True, exist_ok=True)
     annotations_path = review_dir / "annotations.json"
     annotations = _load_annotations(annotations_path)

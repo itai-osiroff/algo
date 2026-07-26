@@ -5987,8 +5987,10 @@ def _run_validation_oracle_benchmarks(
     sweep_dir: Path,
     dataset_ids: Sequence[str],
     stage_name: str,
+    oracle_output_dir: Optional[Path] = None,
+    metric_review_dir: Optional[Path] = None,
 ) -> Tuple[object, Dict[str, object]]:
-    oracle_root = sweep_dir / VALIDATION_ORACLE_DIR_NAME
+    oracle_root = oracle_output_dir or (sweep_dir / VALIDATION_ORACLE_DIR_NAME)
     stage_root = oracle_root / stage_name
     csv_paths: List[Path] = []
     scene_results: List[Dict[str, object]] = []
@@ -6021,7 +6023,7 @@ def _run_validation_oracle_benchmarks(
             }
         )
 
-    import_data = import_trio_oracle_results(sweep_dir / "metric_review", [oracle_root])
+    import_data = import_trio_oracle_results(metric_review_dir or (sweep_dir / "metric_review"), [oracle_root])
     manifest = {
         "stage": stage_name,
         "score_metric": TRIO_PRIMARY_SCORE,
@@ -6080,8 +6082,10 @@ def _run_human_bead_oracle_stage(
     dataset_ids: Sequence[str],
     stage_name: str,
     stage_results: Sequence[Dict[str, object]],
+    oracle_output_dir: Optional[Path] = None,
+    metric_review_dir: Optional[Path] = None,
 ) -> Tuple[object, Dict[str, object]]:
-    oracle_root = sweep_dir / VALIDATION_ORACLE_DIR_NAME
+    oracle_root = oracle_output_dir or (sweep_dir / VALIDATION_ORACLE_DIR_NAME)
     stage_root = oracle_root / stage_name
     stage_root.mkdir(parents=True, exist_ok=True)
     annotations_by_dataset, source_paths_by_dataset = _human_bead_annotations_for_scenes(
@@ -6094,7 +6098,10 @@ def _run_human_bead_oracle_stage(
         annotations=annotations_by_dataset,
         annotation_source_paths_by_dataset=source_paths_by_dataset,
     )
-    import_data = write_human_bead_oracle_import(sweep_dir / "metric_review", stage_import)
+    import_data = write_human_bead_oracle_import(
+        metric_review_dir or (sweep_dir / "metric_review"),
+        stage_import,
+    )
     source_paths = list(dict.fromkeys(source_paths_by_dataset.values()))
     manifest = {
         "stage": stage_name,
@@ -6123,6 +6130,7 @@ def _rank_stage_with_validation_oracle(
     dataset_ids: Sequence[str],
     scoring: SweepScoringSpec,
     score_metric: str = TRIO_PRIMARY_SCORE,
+    allow_partial_dataset_rankability: bool = False,
 ) -> List[Dict[str, object]]:
     records = cast(Any, validation_import).records
     trio_lookup = {
@@ -6202,23 +6210,28 @@ def _rank_stage_with_validation_oracle(
     missing_rankable = [
         dataset_id for dataset_id, count in rankable_count_by_dataset.items() if count <= 0
     ]
-    if missing_rankable:
+    if missing_rankable and not allow_partial_dataset_rankability:
         raise ValueError(
             f"validation_oracle_sweep produced no rankable {score_metric} LF rows "
             "for dataset(s): "
             + ", ".join(missing_rankable)
         )
+    ranked_dataset_ids = [
+        dataset_id for dataset_id in dataset_ids if rankable_count_by_dataset.get(dataset_id, 0) > 0
+    ]
+    if not ranked_dataset_ids:
+        raise ValueError("validation_oracle_sweep produced no rankable validation rankings.")
 
     rankings: List[Dict[str, object]] = []
     for slot in grouped.values():
         dataset_scores_map = cast(Dict[str, float], slot["dataset_scores"])
         present_scores = [
             dataset_scores_map[dataset_id]
-            for dataset_id in dataset_ids
+            for dataset_id in ranked_dataset_ids
             if dataset_id in dataset_scores_map
         ]
         missing = [
-            dataset_id for dataset_id in dataset_ids if dataset_id not in dataset_scores_map
+            dataset_id for dataset_id in ranked_dataset_ids if dataset_id not in dataset_scores_map
         ]
         mean_score = float(np.mean(present_scores)) if present_scores else -float("inf")
         std_score = float(np.std(present_scores)) if present_scores else 0.0
@@ -6244,6 +6257,8 @@ def _rank_stage_with_validation_oracle(
                 "run_dirs": slot["run_dirs"],
                 "artifact_paths": slot["artifact_paths"],
                 "score_metric": score_metric,
+                "ranked_dataset_ids": list(ranked_dataset_ids),
+                "unrankable_observed_dataset_ids": list(missing_rankable),
             }
         )
     if not rankings:

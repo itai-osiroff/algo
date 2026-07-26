@@ -2,12 +2,23 @@ import os
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import generate_reports
+from moment_images.parameter_sweep import (
+    SweepScoringSpec,
+    _rank_stage_with_validation_oracle,
+)
+from moment_images.trio_oracle_metrics import (
+    TRIO_LF_SOURCE_KIND,
+    TRIO_PRIMARY_SCORE,
+    TrioOracleRecord,
+)
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -163,6 +174,72 @@ def _set_rebuild_argv(monkeypatch, output_dir: Path, spec_path: Path) -> None:
             str(spec_path),
             "--rebuild-summaries",
         ],
+    )
+
+
+def _set_live_validation_report_argv(monkeypatch, output_dir: Path, spec_path: Path) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_reports.py",
+            str(output_dir),
+            "--spec",
+            str(spec_path),
+            "--rebuild-summaries",
+            "--live-validation-report",
+        ],
+    )
+
+
+def _validation_stage_result(candidate_id: str, dataset_id: str, score: float = 1.0) -> dict[str, object]:
+    run_uid = f"validation_phase_{candidate_id}_{dataset_id}"
+    return {
+        "run": run_uid,
+        "status": "ok",
+        "stage": "validation_phase",
+        "candidate_id": candidate_id,
+        "dataset_id": dataset_id,
+        "strategy": "pixel",
+        "run_uid": run_uid,
+        "run_dir": f"C:/source/runs/validation_phase/{candidate_id}/{dataset_id}",
+        "config": {"strategy": "pixel", "metric_formulation_id": "baseline"},
+        "params": {"strategy": "pixel", "metric_formulation_id": "baseline"},
+        "runtime_seconds": 0.1,
+        "metric_record": {
+            "run": run_uid,
+            "config": {"strategy": "pixel", "metric_formulation_id": "baseline"},
+            "global_and_local_metrics": {"laplacian_variance": score},
+        },
+        "generation_id": "gen_new",
+        "run_signature": f"signature-{run_uid}",
+        "artifact_paths": {
+            "run_dir": f"C:/source/runs/validation_phase/{candidate_id}/{dataset_id}",
+            "metric_record": f"C:/source/runs/validation_phase/{candidate_id}/{dataset_id}/metric_record.json",
+        },
+    }
+
+
+def _oracle_record(
+    candidate_id: str,
+    dataset_id: str,
+    score: float,
+    *,
+    rankable: bool = True,
+) -> TrioOracleRecord:
+    return TrioOracleRecord(
+        source_kind=TRIO_LF_SOURCE_KIND,
+        stage="validation_phase",
+        candidate_id=candidate_id,
+        dataset_id=dataset_id,
+        generation_id="gen_new",
+        row_id=f"validation_phase:{candidate_id}:{dataset_id}",
+        validation_rank=1 if rankable else None,
+        validation_rankable=rankable,
+        ranking_exclusion_reason=None if rankable else "underconstrained",
+        metrics={TRIO_PRIMARY_SCORE: score},
+        diagnostics={},
+        source_path="oracle.csv",
     )
 
 
@@ -724,6 +801,213 @@ def test_successful_rebuild_clears_stale_failure_reports(tmp_path, monkeypatch):
         "rebuild_failure_report.md.bak",
     ):
         assert not (output_dir / name).exists()
+
+
+def test_live_validation_report_marks_partial_human_bead_snapshot_without_mutating_source_root(
+    tmp_path,
+    monkeypatch,
+):
+    output_dir = tmp_path / "experiment"
+    spec_path = tmp_path / "spec.json"
+    annotation_path = tmp_path / "human_beads.json"
+    _write_spec(spec_path, validation_skip=True)
+    spec_payload = json.loads(spec_path.read_text(encoding="utf-8"))
+    validation_spec = spec_payload["validation_oracle_sweep"]
+    assert isinstance(validation_spec, dict)
+    datasets = spec_payload["datasets"]
+    assert isinstance(datasets, list)
+    datasets.append({"id": "d2", "views_path": "unused_d2.npy"})
+    validation_spec["oracle_mode"] = "human_bead"
+    validation_spec["scenes"] = [
+        {
+            "dataset_id": "d1",
+            "human_bead_annotations": str(annotation_path),
+        },
+        {
+            "dataset_id": "d2",
+            "human_bead_annotations": str(annotation_path),
+        },
+    ]
+    _write_json(spec_path, spec_payload)
+    _write_json(
+        annotation_path,
+        {
+            "datasets": [
+                {
+                    "dataset_id": "d1",
+                    "image_shape": [96, 96],
+                    "default_radius_px": 4.0,
+                    "beads": [
+                        {"id": "b1", "x": 24.0, "y": 24.0, "radius_px": 4.0},
+                        {"id": "b2", "x": 48.0, "y": 48.0, "radius_px": 4.0},
+                        {"id": "b3", "x": 72.0, "y": 72.0, "radius_px": 4.0},
+                    ],
+                },
+                {
+                    "dataset_id": "d2",
+                    "image_shape": [96, 96],
+                    "default_radius_px": 4.0,
+                    "beads": [
+                        {"id": "b1", "x": 24.0, "y": 24.0, "radius_px": 4.0},
+                        {"id": "b2", "x": 48.0, "y": 48.0, "radius_px": 4.0},
+                        {"id": "b3", "x": 72.0, "y": 72.0, "radius_px": 4.0},
+                    ],
+                },
+            ]
+        },
+    )
+    _write_run(
+        output_dir,
+        stage_name="validation_phase",
+        candidate_id="c_validation",
+        dataset_id="d1",
+        run_name="validation_phase_c_validation_d1",
+        metric_value=3.0,
+        formulation_id="baseline",
+        alpha=1.0,
+        generation_id="gen_new",
+    )
+    image = np.zeros((96, 96), dtype=np.float32)
+    for x, y in ((24, 24), (48, 48), (72, 72)):
+        image[y - 2 : y + 3, x - 2 : x + 3] = 1.0
+    np.savez_compressed(
+        _run_dir(output_dir, "validation_phase", "c_validation", "d1") / "workspace.npz",
+        average_rectified_image=image,
+    )
+    _write_run_state(
+        output_dir,
+        active_generation_id="gen_new",
+        runs={
+            "validation_phase_c_validation_d1": _run_state_entry(
+                stage_name="validation_phase",
+                candidate_id="c_validation",
+                dataset_id="d1",
+                run_dir=_run_dir(output_dir, "validation_phase", "c_validation", "d1"),
+                generation_id="gen_new",
+            )
+        },
+    )
+    _write_json(output_dir / "leaderboard.json", [{"candidate_id": "final_before_live_report"}])
+    original_run_state = (output_dir / "run_state.json").read_text(encoding="utf-8")
+    original_leaderboard = (output_dir / "leaderboard.json").read_text(encoding="utf-8")
+    _set_live_validation_report_argv(monkeypatch, output_dir, spec_path)
+
+    generate_reports.main()
+
+    snapshots = list((output_dir / "reports" / "live_validation").iterdir())
+    assert len(snapshots) == 1
+    snapshot_dir = snapshots[0]
+    manifest = json.loads((snapshot_dir / "live_validation_report.json").read_text(encoding="utf-8"))
+    leaderboard = json.loads((snapshot_dir / "validation_leaderboard.json").read_text(encoding="utf-8"))
+    validation_summary = json.loads((snapshot_dir / "validation_summary.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "provisional"
+    assert manifest["source_sweep_dir"] == str(output_dir.resolve())
+    assert manifest["observed_dataset_ids"] == ["d1"]
+    assert manifest["ranked_dataset_ids"] == ["d1"]
+    assert manifest["unrankable_observed_dataset_ids"] == []
+    assert manifest["missing_dataset_ids"] == ["d2"]
+    assert leaderboard[0]["candidate_id"] == "c_validation"
+    assert leaderboard[0]["score_metric"] == "human_bead_oracle_score_v1"
+    assert leaderboard[0]["report_status"] == "provisional"
+    assert leaderboard[0]["ranked_dataset_ids"] == ["d1"]
+    assert leaderboard[0]["missing_report_dataset_ids"] == ["d2"]
+    assert leaderboard[0]["unrankable_report_dataset_ids"] == []
+    assert validation_summary[0]["run_dir"] == str(
+        _run_dir(output_dir, "validation_phase", "c_validation", "d1")
+    )
+    assert validation_summary[0]["artifact_paths"]["metric_record"] == str(
+        _run_dir(output_dir, "validation_phase", "c_validation", "d1") / "metric_record.json"
+    )
+    assert (snapshot_dir / "metric_review" / "trio_oracle_metrics.json").exists()
+    assert (snapshot_dir / "validation_phase_summary.json").exists()
+    assert (snapshot_dir / "leaderboard.json").exists()
+    assert (snapshot_dir / "summary.json").exists()
+    assert (snapshot_dir / "analysis.json").exists()
+    assert (snapshot_dir / "alpha_report.json").exists()
+    assert (output_dir / "run_state.json").read_text(encoding="utf-8") == original_run_state
+    assert (output_dir / "leaderboard.json").read_text(encoding="utf-8") == original_leaderboard
+    assert not (output_dir / "validation_oracle").exists()
+    assert not (output_dir / "metric_review").exists()
+
+
+def test_validation_oracle_ranker_preserves_strict_dataset_rankability_by_default():
+    stage_results = [
+        _validation_stage_result("c_good", "d1", 1.0),
+        _validation_stage_result("c_good", "d2", 1.0),
+    ]
+    validation_import = SimpleNamespace(
+        records=[
+            _oracle_record("c_good", "d1", 0.8),
+            _oracle_record("c_good", "d2", 0.9, rankable=False),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="d2"):
+        _rank_stage_with_validation_oracle(
+            stage_name="validation_phase",
+            stage_results=stage_results,
+            validation_import=validation_import,
+            dataset_ids=["d1", "d2"],
+            scoring=SweepScoringSpec(robustness_lambda=0.0, missing_dataset_penalty=10.0),
+            score_metric=TRIO_PRIMARY_SCORE,
+        )
+
+
+def test_validation_oracle_ranker_allows_live_rankable_subset_without_missing_penalty():
+    stage_results = [
+        _validation_stage_result("c_good", "d1", 1.0),
+        _validation_stage_result("c_good", "d2", 1.0),
+        _validation_stage_result("c_bad", "d1", 1.0),
+        _validation_stage_result("c_bad", "d2", 1.0),
+    ]
+    validation_import = SimpleNamespace(
+        records=[
+            _oracle_record("c_good", "d1", 0.8),
+            _oracle_record("c_good", "d2", 0.99, rankable=False),
+            _oracle_record("c_bad", "d1", 0.6),
+            _oracle_record("c_bad", "d2", 0.99, rankable=False),
+        ]
+    )
+
+    rankings = _rank_stage_with_validation_oracle(
+        stage_name="validation_phase",
+        stage_results=stage_results,
+        validation_import=validation_import,
+        dataset_ids=["d1", "d2"],
+        scoring=SweepScoringSpec(robustness_lambda=0.0, missing_dataset_penalty=10.0),
+        score_metric=TRIO_PRIMARY_SCORE,
+        allow_partial_dataset_rankability=True,
+    )
+
+    assert [row["candidate_id"] for row in rankings] == ["c_good", "c_bad"]
+    assert rankings[0]["score"] == pytest.approx(0.8)
+    assert rankings[0]["missing_datasets"] == []
+    assert rankings[0]["ranked_dataset_ids"] == ["d1"]
+    assert rankings[0]["unrankable_observed_dataset_ids"] == ["d2"]
+
+
+def test_validation_oracle_ranker_live_fails_when_no_completed_run_is_rankable():
+    stage_results = [
+        _validation_stage_result("c_good", "d1", 1.0),
+        _validation_stage_result("c_good", "d2", 1.0),
+    ]
+    validation_import = SimpleNamespace(
+        records=[
+            _oracle_record("c_good", "d1", 0.8, rankable=False),
+            _oracle_record("c_good", "d2", 0.9, rankable=False),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="no rankable validation rankings"):
+        _rank_stage_with_validation_oracle(
+            stage_name="validation_phase",
+            stage_results=stage_results,
+            validation_import=validation_import,
+            dataset_ids=["d1", "d2"],
+            scoring=SweepScoringSpec(robustness_lambda=0.0, missing_dataset_penalty=10.0),
+            score_metric=TRIO_PRIMARY_SCORE,
+            allow_partial_dataset_rankability=True,
+        )
 
 
 def test_rebuild_summaries_fails_closed_when_skip_mode_lacks_validation_rankings(tmp_path, monkeypatch):

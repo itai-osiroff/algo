@@ -700,6 +700,154 @@ def test_load_sweep_visualization_model_prefers_validation_phase_for_skip_mode(t
     assert model.stage_order == ["stage1", "validation_phase"]
 
 
+def test_live_validation_snapshot_uses_source_run_artifacts_and_only_validation_stage(tmp_path):
+    source_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_workspace=True,
+    )
+    source_run_dir = source_dir / "runs" / "validation_phase" / "v1c0000" / "d1"
+    _write_preview(source_run_dir / "avg_rectified.png")
+    _write_workspace(source_run_dir / "workspace.npz")
+    _write_metric_record(
+        source_run_dir / "metric_record.json",
+        run="validation_phase_v1c0000_d1",
+        family="intensity",
+        alpha=1.0,
+        formulation_id="intensity_default",
+        metric_base=25.0,
+    )
+    source_state = json.loads((source_dir / "run_state.json").read_text(encoding="utf-8"))
+    source_state["active_generation_id"] = "gen_source"
+    source_state["spec_generations"] = [
+        {"generation_id": "gen_old", "action": "run"},
+        {"generation_id": "gen_source", "action": "extend"},
+    ]
+    _write_json(source_dir / "run_state.json", source_state)
+    metric_record = json.loads((source_run_dir / "metric_record.json").read_text(encoding="utf-8"))
+    metric_record["generation_id"] = "gen_source"
+    ranking = _ranking(
+        "v1c0000",
+        score=0.93,
+        rank=1,
+        datasets=["d1"],
+        stage="validation_phase",
+    )
+    ranking["generation_id"] = "gen_source"
+    snapshot_dir = tmp_path / "live_snapshot"
+    _write_json(
+        snapshot_dir / "live_validation_report.json",
+        {
+            "schema_version": 1,
+            "status": "provisional",
+            "source_sweep_dir": str(source_dir.resolve()),
+            "source_run_state_path": str((source_dir / "run_state.json").resolve()),
+            "source_generation_id": "gen_source",
+            "stage": "validation_phase",
+            "configured_dataset_ids": ["d1", "d2"],
+            "observed_dataset_ids": ["d1"],
+            "missing_dataset_ids": ["d2"],
+        },
+    )
+    _write_json(
+        snapshot_dir / "validation_phase_summary.json",
+        _stage_summary("validation_phase", [ranking]),
+    )
+    _write_json(snapshot_dir / "validation_summary.json", [metric_record])
+    _write_json(snapshot_dir / "summary.json", [metric_record])
+    _write_json(snapshot_dir / "leaderboard.json", [ranking])
+
+    model = load_sweep_visualization_model(snapshot_dir)
+
+    assert model.stage_order == ["validation_phase"]
+    assert model.primary_stage_name == "validation_phase"
+    row = model.candidates[0]
+    assert row.candidate_id == "v1c0000"
+    assert row.preview_paths["d1"] == str(source_run_dir / "avg_rectified.png")
+    record = next(record for record in model.run_metric_records if record.stage == "validation_phase")
+    assert record.workspace_path == str(source_run_dir / "workspace.npz")
+    assert "d2" in model.datasets
+    assert generation_scope_options(model) == ["All", "Active", "gen_source"]
+
+
+def test_live_validation_snapshot_prefers_absolute_artifact_references_for_noncanonical_run(tmp_path):
+    source_dir = _create_modern_fixture(
+        tmp_path,
+        include_stage2_summary=True,
+        include_workspace=True,
+    )
+    source_state = json.loads((source_dir / "run_state.json").read_text(encoding="utf-8"))
+    source_state["active_generation_id"] = "gen_source"
+    _write_json(source_dir / "run_state.json", source_state)
+    external_run_dir = tmp_path / "external_validation_runs" / "v_external" / "d1"
+    preview_path = external_run_dir / "avg_rectified.png"
+    workspace_path = external_run_dir / "workspace.npz"
+    metric_record_path = external_run_dir / "metric_record.json"
+    _write_preview(preview_path)
+    _write_workspace(workspace_path)
+    _write_metric_record(
+        metric_record_path,
+        run="validation_phase_v_external_d1",
+        family="intensity",
+        alpha=1.0,
+        formulation_id="intensity_default",
+        metric_base=25.0,
+    )
+    artifact_paths = {
+        "run_dir": str(external_run_dir),
+        "avg_rectified": str(preview_path),
+        "workspace": str(workspace_path),
+        "metric_record": str(metric_record_path),
+    }
+    metric_record = json.loads(metric_record_path.read_text(encoding="utf-8"))
+    metric_record["run_dir"] = str(external_run_dir)
+    metric_record["artifact_paths"] = dict(artifact_paths)
+    metric_record["generation_id"] = "gen_source"
+    _write_json(metric_record_path, metric_record)
+    ranking = _ranking(
+        "v_external",
+        score=0.93,
+        rank=1,
+        datasets=["d1"],
+        stage="validation_phase",
+    )
+    ranking["generation_id"] = "gen_source"
+    ranking["artifact_paths"] = {"d1": dict(artifact_paths)}
+    ranking["run_dirs"] = {"d1": str(external_run_dir)}
+    ranking["missing_report_dataset_ids"] = ["d2"]
+    ranking["unrankable_observed_dataset_ids"] = ["d3"]
+    snapshot_dir = tmp_path / "live_snapshot"
+    _write_json(
+        snapshot_dir / "live_validation_report.json",
+        {
+            "schema_version": 1,
+            "status": "provisional",
+            "source_sweep_dir": str(source_dir.resolve()),
+            "source_run_state_path": str((source_dir / "run_state.json").resolve()),
+            "source_generation_id": "gen_source",
+            "stage": "validation_phase",
+            "configured_dataset_ids": ["d1", "d2", "d3"],
+            "observed_dataset_ids": ["d1", "d3"],
+            "missing_dataset_ids": ["d2"],
+        },
+    )
+    _write_json(snapshot_dir / "validation_phase_summary.json", _stage_summary("validation_phase", [ranking]))
+    _write_json(snapshot_dir / "validation_summary.json", [metric_record])
+    _write_json(snapshot_dir / "summary.json", [metric_record])
+    _write_json(snapshot_dir / "leaderboard.json", [ranking])
+
+    model = load_sweep_visualization_model(snapshot_dir)
+
+    row = model.candidates[0]
+    assert row.preview_paths["d1"] == str(preview_path)
+    assert set(row.missing_datasets) == {"d2", "d3"}
+    record = next(record for record in model.run_metric_records if record.candidate_id == "v_external")
+    assert record.workspace_path == str(workspace_path)
+    assert record.metric_record_path == str(metric_record_path)
+    assert model.experiment_metadata["live_validation_report"]["status"] == "provisional"
+    assert model.experiment_metadata["live_validation_report"]["missing_dataset_ids"] == ["d2"]
+
+
 def test_load_sweep_visualization_model_ignores_stale_stage2_for_skip_mode(tmp_path):
     output_dir = _create_modern_fixture(
         tmp_path,

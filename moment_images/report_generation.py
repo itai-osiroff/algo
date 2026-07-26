@@ -19,7 +19,12 @@ from moment_images.parameter_sweep import (
     _artifact_paths_payload,
     _best_configs_payload,
     _metric_records_from_stage_results,
+    _rank_stage_with_validation_oracle,
+    _run_human_bead_oracle_stage,
+    _run_validation_oracle_benchmarks,
     _snapshot_generation_products,
+    _validate_validation_oracle_scene_lookup,
+    _validation_oracle_score_metric,
     _write_leaderboard_csv,
     _write_root_ranked_outputs,
     _write_stage_outputs,
@@ -87,6 +92,14 @@ def parse_args() -> argparse.Namespace:
         "--rebuild-summaries",
         action="store_true",
         help="Rebuild stage1/stage2/final summary+leaderboard artifacts from run folders.",
+    )
+    parser.add_argument(
+        "--live-validation-report",
+        action="store_true",
+        help=(
+            "Build an isolated, provisional validation-oracle report snapshot from completed "
+            "validation_phase runs. Requires --rebuild-summaries and --spec."
+        ),
     )
     parser.add_argument(
         "--repair-run-state",
@@ -1177,6 +1190,269 @@ def _load_validation_rankings_for_rebuild(output_dir: Path) -> List[Dict[str, ob
     )
 
 
+def _new_live_validation_snapshot_dir(output_dir: Path) -> Path:
+    snapshots_root = output_dir / "reports" / "live_validation"
+    snapshots_root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    for suffix in range(1, 10_000):
+        name = timestamp if suffix == 1 else f"{timestamp}_{suffix:02d}"
+        candidate = snapshots_root / name
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"Could not create a unique live-validation snapshot under {snapshots_root}")
+
+
+def _live_validation_execution_payload(
+    discovery: StageDiscovery,
+    *,
+    observed_dataset_ids: Sequence[str],
+    missing_dataset_ids: Sequence[str],
+    ranked_dataset_ids: Sequence[str],
+    unrankable_observed_dataset_ids: Sequence[str],
+) -> Dict[str, object]:
+    payload = _stage_execution_payload(discovery)
+    payload.update(
+        {
+            "live_validation_report": True,
+            "status": "provisional",
+            "observed_dataset_ids": list(observed_dataset_ids),
+            "missing_dataset_ids": list(missing_dataset_ids),
+            "ranked_dataset_ids": list(ranked_dataset_ids),
+            "unrankable_observed_dataset_ids": list(unrankable_observed_dataset_ids),
+        }
+    )
+    return payload
+
+
+def _live_validation_metric_records(
+    stage_results: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    for stage_result in stage_results:
+        metric_record = stage_result.get("metric_record")
+        if stage_result.get("status") != "ok" or not isinstance(metric_record, dict):
+            continue
+        record = dict(cast(Dict[str, object], metric_record))
+        for key in (
+            "run",
+            "run_uid",
+            "stage",
+            "candidate_id",
+            "dataset_id",
+            "strategy",
+            "generation_id",
+            "candidate_signature",
+            "dataset_signature",
+            "run_signature",
+        ):
+            if key in stage_result:
+                record[key] = stage_result[key]
+        run_dir = _coerce_nonempty_str(stage_result.get("run_dir"))
+        if run_dir is not None:
+            record["run_dir"] = run_dir
+        artifact_paths = stage_result.get("artifact_paths")
+        if isinstance(artifact_paths, dict):
+            record["artifact_paths"] = dict(cast(Dict[str, object], artifact_paths))
+        elif run_dir is not None:
+            record["artifact_paths"] = _artifact_paths_payload(Path(run_dir))
+        records.append(record)
+    return records
+
+
+def _build_live_validation_report(
+    output_dir: Path,
+    spec: SweepExperimentSpec,
+    *,
+    spec_path: Path,
+) -> Path:
+    validation_spec = spec.validation_oracle_sweep
+    if validation_spec is None or not validation_spec.enabled:
+        raise RebuildDataError(
+            "--live-validation-report requires an enabled validation_oracle_sweep in --spec."
+        )
+
+    configured_dataset_ids = [item.dataset_id for item in spec.datasets]
+    run_state_scope = _load_run_state_for_scope(output_dir)
+    validation_discovery = _discover_stage_results(
+        output_dir,
+        VALIDATION_ORACLE_STAGE_NAME,
+        configured_dataset_ids,
+        run_state_scope,
+    )
+    validation_results = validation_discovery.results
+    _validate_rebuild_dataset_ids(
+        VALIDATION_ORACLE_STAGE_NAME,
+        validation_results,
+        configured_dataset_ids,
+    )
+    if not validation_results:
+        raise RebuildDataError(
+            "No completed active validation_phase runs are available for a live validation report.",
+            diagnostics=validation_discovery.to_report(),
+        )
+
+    observed_dataset_ids = [
+        dataset_id
+        for dataset_id in configured_dataset_ids
+        if any(str(result.get("dataset_id", "")) == dataset_id for result in validation_results)
+    ]
+    missing_dataset_ids = [
+        dataset_id for dataset_id in configured_dataset_ids if dataset_id not in observed_dataset_ids
+    ]
+    if not observed_dataset_ids:
+        raise RebuildDataError(
+            "No completed validation_phase runs match the datasets configured by --spec.",
+            diagnostics=validation_discovery.to_report(),
+        )
+
+    snapshot_dir = _new_live_validation_snapshot_dir(output_dir)
+    try:
+        scene_lookup = _validate_validation_oracle_scene_lookup(
+            validation_spec,
+            configured_dataset_ids,
+        )
+        oracle_dir = snapshot_dir / VALIDATION_ORACLE_DIR_NAME
+        metric_review_dir = snapshot_dir / "metric_review"
+        if validation_spec.oracle_mode == "human_bead":
+            validation_import, oracle_manifest = _run_human_bead_oracle_stage(
+                scene_lookup=scene_lookup,
+                sweep_dir=output_dir,
+                dataset_ids=observed_dataset_ids,
+                stage_name=VALIDATION_ORACLE_STAGE_NAME,
+                stage_results=validation_results,
+                oracle_output_dir=oracle_dir,
+                metric_review_dir=metric_review_dir,
+            )
+        else:
+            validation_import, oracle_manifest = _run_validation_oracle_benchmarks(
+                validation_spec=validation_spec,
+                scene_lookup=scene_lookup,
+                sweep_dir=output_dir,
+                dataset_ids=observed_dataset_ids,
+                stage_name=VALIDATION_ORACLE_STAGE_NAME,
+                oracle_output_dir=oracle_dir,
+                metric_review_dir=metric_review_dir,
+            )
+
+        score_metric = _validation_oracle_score_metric(validation_spec)
+        try:
+            rankings = _rank_stage_with_validation_oracle(
+                stage_name=VALIDATION_ORACLE_STAGE_NAME,
+                stage_results=validation_results,
+                validation_import=validation_import,
+                dataset_ids=observed_dataset_ids,
+                scoring=spec.scoring,
+                score_metric=score_metric,
+                allow_partial_dataset_rankability=True,
+            )
+        except ValueError as exc:
+            raise RebuildDataError(
+                "No completed validation_phase run could be oracle-ranked for a live validation report.",
+                diagnostics={
+                    "configured_dataset_ids": list(configured_dataset_ids),
+                    "observed_dataset_ids": list(observed_dataset_ids),
+                    "missing_dataset_ids": list(missing_dataset_ids),
+                    "score_metric": score_metric,
+                    "ranker_error": str(exc),
+                },
+            ) from exc
+        ranked_dataset_ids = [
+            str(item)
+            for item in cast(List[object], rankings[0].get("ranked_dataset_ids", []))
+        ]
+        unrankable_observed_dataset_ids = [
+            str(item)
+            for item in cast(List[object], rankings[0].get("unrankable_observed_dataset_ids", []))
+        ]
+        for ranking in rankings:
+            ranking["report_status"] = "provisional"
+            ranking["configured_dataset_ids"] = list(configured_dataset_ids)
+            ranking["observed_dataset_ids"] = list(observed_dataset_ids)
+            ranking["ranked_dataset_ids"] = list(ranked_dataset_ids)
+            ranking["missing_report_dataset_ids"] = list(missing_dataset_ids)
+            ranking["unrankable_report_dataset_ids"] = list(unrankable_observed_dataset_ids)
+            ranking["unrankable_observed_dataset_ids"] = list(unrankable_observed_dataset_ids)
+
+        generation_id = _stage_generation_id(run_state_scope.run_state, validation_results)
+        execution = _live_validation_execution_payload(
+            validation_discovery,
+            observed_dataset_ids=observed_dataset_ids,
+            missing_dataset_ids=missing_dataset_ids,
+            ranked_dataset_ids=ranked_dataset_ids,
+            unrankable_observed_dataset_ids=unrankable_observed_dataset_ids,
+        )
+        metric_records = _live_validation_metric_records(validation_results)
+        _write_validation_phase_artifacts(
+            output_dir=snapshot_dir,
+            stage_results=validation_results,
+            rankings=rankings,
+            execution=execution,
+            generation_id=generation_id,
+        )
+        write_json_atomic(
+            snapshot_dir / "validation_summary.json",
+            metric_records,
+            indent=2,
+            sort_keys=False,
+            create_backup=False,
+        )
+        _write_root_ranked_outputs(
+            output_dir=snapshot_dir,
+            rankings=rankings,
+            metric_records=metric_records,
+            analyze=spec.analyze,
+        )
+        write_json_atomic(
+            oracle_dir / "live_validation_oracle_manifest.json",
+            {
+                "status": "provisional",
+                "oracle_mode": validation_spec.oracle_mode,
+                "score_metric": score_metric,
+                "oracle_stage": oracle_manifest,
+                "num_ranked": len(rankings),
+            },
+            indent=2,
+            sort_keys=False,
+            create_backup=False,
+        )
+        write_json_atomic(
+            snapshot_dir / "live_validation_report.json",
+            {
+                "schema_version": 1,
+                "status": "provisional",
+                "created_at": _utc_now_iso(),
+                "source_sweep_dir": str(output_dir.resolve()),
+                "source_run_state_path": (
+                    None
+                    if run_state_scope.state_source is None
+                    else str(run_state_scope.state_source.resolve())
+                ),
+                "source_generation_id": generation_id,
+                "spec_path": str(spec_path.resolve()),
+                "stage": VALIDATION_ORACLE_STAGE_NAME,
+                "oracle_mode": validation_spec.oracle_mode,
+                "score_metric": score_metric,
+                "configured_dataset_ids": list(configured_dataset_ids),
+                "observed_dataset_ids": list(observed_dataset_ids),
+                "ranked_dataset_ids": list(ranked_dataset_ids),
+                "unrankable_observed_dataset_ids": list(unrankable_observed_dataset_ids),
+                "missing_dataset_ids": list(missing_dataset_ids),
+                "num_validation_runs": len(validation_results),
+                "num_ranked": len(rankings),
+            },
+            indent=2,
+            sort_keys=False,
+            create_backup=False,
+        )
+    except Exception:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+        raise
+    return snapshot_dir
+
+
 def _rebuild_summaries(
     output_dir: Path,
     spec: SweepExperimentSpec,
@@ -1533,8 +1809,10 @@ def main() -> None:
 
     if args.repair_run_state and not args.rebuild_summaries:
         raise ValueError("--repair-run-state requires --rebuild-summaries.")
+    if args.live_validation_report and not args.rebuild_summaries:
+        raise ValueError("--live-validation-report requires --rebuild-summaries and --spec.")
 
-    if args.rebuild_summaries:
+    if args.rebuild_summaries and not args.live_validation_report:
         rebuild_context = {
             "output_dir": str(output_dir),
             "spec_path": args.spec,
@@ -1550,8 +1828,24 @@ def main() -> None:
         if args.rebuild_summaries:
             if not args.spec:
                 raise ValueError("--rebuild-summaries requires --spec so rankings can be recomputed.")
-            cast(Dict[str, object], rebuild_context)["phase"] = "load_spec"
+            if rebuild_context is not None:
+                rebuild_context["phase"] = "load_spec"
             spec = _load_spec_for_rebuild(output_dir, Path(args.spec), rebuild_context)
+            if args.live_validation_report:
+                snapshot_dir = _build_live_validation_report(
+                    output_dir,
+                    spec,
+                    spec_path=Path(args.spec),
+                )
+                _generate_reports_for_scope(
+                    snapshot_dir,
+                    primary_metric=args.primary_metric,
+                    tolerate_partial_outputs=tolerate_partial_outputs,
+                )
+                print(f"Live validation report snapshot: {snapshot_dir}")
+                print(f"View: python -m moment_images.sweep_visualization {snapshot_dir}")
+                print(f"Explore: python -m moment_images.sweep_metric_explorer {snapshot_dir}")
+                return
             if args.repair_run_state:
                 cast(Dict[str, object], rebuild_context)["phase"] = "repair_run_state"
                 repair_report = _repair_run_state_for_rebuild(output_dir, spec, str(args.repair_run_state))

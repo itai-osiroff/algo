@@ -13,7 +13,7 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from matplotlib.figure import Figure
@@ -378,6 +378,67 @@ def _coerce_optional_str(value: object) -> Optional[str]:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _existing_path_text(value: object) -> Optional[str]:
+    path_text = _coerce_optional_str(value)
+    if path_text is None:
+        return None
+    path = Path(path_text)
+    return str(path) if _candidate_path_exists(path) else None
+
+
+def _artifact_path_from_payload(
+    artifact_paths: Optional[Mapping[str, object]],
+    key: str,
+    fallback_name: str,
+) -> Optional[str]:
+    if not isinstance(artifact_paths, Mapping):
+        return None
+    direct = _existing_path_text(artifact_paths.get(key))
+    if direct is not None:
+        return direct
+    run_dir_text = _coerce_optional_str(artifact_paths.get("run_dir"))
+    if run_dir_text is None:
+        return None
+    candidate = Path(run_dir_text) / fallback_name
+    return str(candidate) if _candidate_path_exists(candidate) else None
+
+
+def _ranking_artifact_paths_for_dataset(
+    ranking: Optional[Dict[str, object]],
+    dataset_id: str,
+) -> Optional[Mapping[str, object]]:
+    if not isinstance(ranking, dict):
+        return None
+    artifact_paths = ranking.get("artifact_paths")
+    if not isinstance(artifact_paths, dict):
+        return None
+    dataset_paths = artifact_paths.get(dataset_id)
+    if isinstance(dataset_paths, dict):
+        return cast(Mapping[str, object], dataset_paths)
+    if any(key in artifact_paths for key in ("run_dir", "avg_rectified", "workspace", "metric_record")):
+        return cast(Mapping[str, object], artifact_paths)
+    return None
+
+
+def _ranking_run_dir_for_dataset(
+    ranking: Optional[Dict[str, object]],
+    dataset_id: str,
+) -> Optional[str]:
+    if not isinstance(ranking, dict):
+        return None
+    run_dirs = ranking.get("run_dirs")
+    if not isinstance(run_dirs, dict):
+        return None
+    return _coerce_optional_str(run_dirs.get(dataset_id))
+
+
+def _path_from_run_dir(run_dir_text: Optional[str], filename: str) -> Optional[str]:
+    if run_dir_text is None:
+        return None
+    candidate = Path(run_dir_text) / filename
+    return str(candidate) if _candidate_path_exists(candidate) else None
 
 
 def _compact_json(value: object) -> str:
@@ -1021,9 +1082,21 @@ def _discover_preview_paths(
     stage_name: str,
     candidate_id: str,
     dataset_ids: Sequence[str],
+    ranking: Optional[Dict[str, object]] = None,
 ) -> Dict[str, str]:
     preview_paths: Dict[str, str] = {}
     for dataset_id in dataset_ids:
+        artifact_preview_path = _artifact_path_from_payload(
+            _ranking_artifact_paths_for_dataset(ranking, dataset_id),
+            "avg_rectified",
+            "avg_rectified.png",
+        ) or _path_from_run_dir(
+            _ranking_run_dir_for_dataset(ranking, dataset_id),
+            "avg_rectified.png",
+        )
+        if artifact_preview_path is not None:
+            preview_paths[dataset_id] = artifact_preview_path
+            continue
         preview_path = base_dir / "runs" / stage_name / candidate_id / dataset_id / "avg_rectified.png"
         if preview_path.exists():
             preview_paths[dataset_id] = str(preview_path)
@@ -1035,15 +1108,32 @@ def _discover_run_artifact_paths(
     stage_name: str,
     candidate_id: str,
     dataset_id: str,
+    artifact_paths: Optional[Mapping[str, object]] = None,
+    run_dir_text: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    preview_from_payload = _artifact_path_from_payload(
+        artifact_paths,
+        "avg_rectified",
+        "avg_rectified.png",
+    ) or _path_from_run_dir(run_dir_text, "avg_rectified.png")
+    workspace_from_payload = _artifact_path_from_payload(
+        artifact_paths,
+        "workspace",
+        "workspace.npz",
+    ) or _path_from_run_dir(run_dir_text, "workspace.npz")
+    metric_record_from_payload = _artifact_path_from_payload(
+        artifact_paths,
+        "metric_record",
+        "metric_record.json",
+    ) or _path_from_run_dir(run_dir_text, "metric_record.json")
     run_dir = base_dir / "runs" / stage_name / candidate_id / dataset_id
     preview_path = run_dir / "avg_rectified.png"
     workspace_path = run_dir / "workspace.npz"
     metric_record_path = run_dir / "metric_record.json"
     return (
-        str(preview_path) if preview_path.exists() else None,
-        str(workspace_path) if _candidate_path_exists(workspace_path) else None,
-        str(metric_record_path) if _candidate_path_exists(metric_record_path) else None,
+        preview_from_payload or (str(preview_path) if preview_path.exists() else None),
+        workspace_from_payload or (str(workspace_path) if _candidate_path_exists(workspace_path) else None),
+        metric_record_from_payload or (str(metric_record_path) if _candidate_path_exists(metric_record_path) else None),
     )
 
 
@@ -1254,6 +1344,19 @@ def _candidate_row_from_ranking(
         stage_name=stage_name,
         candidate_id=candidate_id,
         dataset_ids=sorted(set(dataset_scores) | set(dataset_metrics) | set(dataset_runtimes)),
+        ranking=ranking,
+    )
+    missing_datasets = list(
+        dict.fromkeys(
+            str(item)
+            for field_name in (
+                "missing_datasets",
+                "missing_report_dataset_ids",
+                "unrankable_report_dataset_ids",
+                "unrankable_observed_dataset_ids",
+            )
+            for item in cast(List[object], ranking.get(field_name, []))
+        )
     )
     ranking_metric_name, ranking_metric_value = _resolve_ranking_metric(metric_means, primary_metric)
     return CandidateVisualizationRow(
@@ -1273,7 +1376,7 @@ def _candidate_row_from_ranking(
         dataset_metrics=dataset_metrics,
         metric_means=metric_means,
         mean_runtime_seconds=_mean_value(dataset_runtimes),
-        missing_datasets=[str(item) for item in cast(List[object], ranking.get("missing_datasets", []))],
+        missing_datasets=missing_datasets,
         params=dict(params),
         config=dict(config),
         family=family,
@@ -1544,11 +1647,18 @@ def _build_run_metric_record(
         cast(Optional[Dict[str, object]], metric_record.get("metric_formulation")),
     )
     ranking_metric_name, ranking_metric_value = _resolve_ranking_metric(image_metrics, primary_metric)
+    metric_artifact_paths = metric_record.get("artifact_paths")
     preview_path, workspace_path, discovered_metric_record_path = _discover_run_artifact_paths(
         base_dir=base_dir,
         stage_name=stage_name,
         candidate_id=candidate_id,
         dataset_id=dataset_id,
+        artifact_paths=(
+            cast(Mapping[str, object], metric_artifact_paths)
+            if isinstance(metric_artifact_paths, dict)
+            else None
+        ),
+        run_dir_text=_coerce_optional_str(metric_record.get("run_dir")),
     )
     candidate_row = candidate_lookup.get((stage_name, candidate_id))
     score = None
@@ -1673,6 +1783,31 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
     source_dir, experiment_root, metric_phase_dir, path_scope = _resolve_visualization_scope(selected_path)
     warnings: List[str] = []
     used_files: List[str] = []
+    summary_root = experiment_root
+    live_validation_report, live_validation_report_path = _read_json_optional(
+        summary_root / "live_validation_report.json",
+        validator=lambda obj: isinstance(obj, dict),
+        warnings=warnings,
+    )
+    is_live_validation_snapshot = isinstance(live_validation_report, dict)
+    if live_validation_report_path is not None:
+        used_files.append(str(live_validation_report_path))
+    if is_live_validation_snapshot:
+        source_sweep_dir = _coerce_optional_str(
+            cast(Dict[str, object], live_validation_report).get("source_sweep_dir")
+        )
+        if source_sweep_dir is None:
+            raise ValueError(
+                f"Live validation snapshot {summary_root} is missing source_sweep_dir."
+            )
+        source_sweep_root = Path(source_sweep_dir)
+        if not source_sweep_root.exists():
+            raise FileNotFoundError(
+                f"Live validation snapshot source sweep directory not found: {source_sweep_root}"
+            )
+        experiment_root = source_sweep_root
+        metric_phase_dir = None
+        path_scope = "live_validation_snapshot"
 
     experiment_manifest, manifest_path = _read_json_optional(
         experiment_root / "experiment_manifest.json",
@@ -1706,6 +1841,10 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         "experiment_root": str(experiment_root.resolve()),
         "path_scope": path_scope,
     }
+    if is_live_validation_snapshot:
+        experiment_metadata["live_validation_report"] = dict(
+            cast(Dict[str, object], live_validation_report)
+        )
     datasets: List[str] = []
     strategies: List[str] = []
 
@@ -1756,6 +1895,15 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
             ]
         if spec_payload:
             experiment_metadata["spec"] = spec_payload
+    if is_live_validation_snapshot and not datasets:
+        datasets = [
+            str(item)
+            for item in cast(
+                List[object],
+                cast(Dict[str, object], live_validation_report).get("configured_dataset_ids", []),
+            )
+            if _coerce_optional_str(item) is not None
+        ]
 
     primary_metric, primary_metric_source = _resolve_primary_metric(
         cast(Optional[Dict[str, object]], experiment_manifest),
@@ -1766,6 +1914,20 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         cast(Optional[Dict[str, object]], run_state),
         cast(Optional[Dict[str, object]], experiment_manifest),
     )
+    if is_live_validation_snapshot:
+        snapshot_generation_id = _coerce_optional_str(
+            cast(Dict[str, object], live_validation_report).get("source_generation_id")
+        )
+        generation_summary["active_generation_id"] = snapshot_generation_id
+        generation_summary["previous_generation_id"] = None
+        generation_summary["ordered_generation_ids"] = (
+            [] if snapshot_generation_id is None else [snapshot_generation_id]
+        )
+        generation_summary["spec_generations"] = (
+            []
+            if snapshot_generation_id is None
+            else [{"generation_id": snapshot_generation_id, "action": "live_validation_report"}]
+        )
     configured_stage_mode = _resolve_configured_stage_mode(
         cast(Optional[Dict[str, object]], experiment_manifest),
         cast(Optional[Dict[str, object]], run_state),
@@ -1787,9 +1949,9 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
 
     if modern_artifacts_present:
         summary_locations: Dict[str, Path] = {
-            "stage1": experiment_root / "stage1_summary.json",
-            "stage2": experiment_root / "stage2_summary.json",
-            VALIDATION_ORACLE_STAGE_NAME: experiment_root / "validation_phase_summary.json",
+            "stage1": summary_root / "stage1_summary.json",
+            "stage2": summary_root / "stage2_summary.json",
+            VALIDATION_ORACLE_STAGE_NAME: summary_root / "validation_phase_summary.json",
         }
         if metric_phase_dir is not None:
             summary_locations["metric_phase"] = metric_phase_dir / "metric_phase_summary.json"
@@ -1808,7 +1970,7 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
                 used_files.append(str(used_path))
 
         root_summary_payload, root_summary_path = _read_json_optional(
-            experiment_root / "summary.json",
+            summary_root / "summary.json",
             validator=lambda obj: isinstance(obj, list),
             warnings=warnings,
         )
@@ -1825,7 +1987,7 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         validation_summary_payload: Optional[List[Dict[str, object]]] = None
         metric_alpha_report_path: Optional[Path] = None
         validation_summary_raw, validation_summary_path = _read_json_optional(
-            experiment_root / "validation_summary.json",
+            summary_root / "validation_summary.json",
             validator=lambda obj: isinstance(obj, list),
             warnings=warnings,
         )
@@ -1856,7 +2018,7 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
                 used_files.append(str(metric_alpha_report_path))
 
         root_alpha_report_payload, root_alpha_report_path = _read_json_optional(
-            experiment_root / "alpha_report.json",
+            summary_root / "alpha_report.json",
             validator=lambda obj: isinstance(obj, dict),
             warnings=warnings,
         )
@@ -1865,6 +2027,10 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
 
         for stage_name in ("stage1", "stage2", "metric_phase", VALIDATION_ORACLE_STAGE_NAME):
             summary_payload = summary_payloads.get(stage_name)
+            if is_live_validation_snapshot and stage_name != VALIDATION_ORACLE_STAGE_NAME:
+                continue
+            if is_live_validation_snapshot and summary_payload is None:
+                continue
             if summary_payload is None and not (
                 isinstance(run_state, dict)
                 and stage_name in cast(Dict[str, object], run_state.get("stages", {}))
@@ -1975,8 +2141,8 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
                 ),
             )
 
-        metric_record_paths = _scan_metric_record_paths(experiment_root)
-        if metric_phase_dir is not None:
+        metric_record_paths = [] if is_live_validation_snapshot else _scan_metric_record_paths(experiment_root)
+        if not is_live_validation_snapshot and metric_phase_dir is not None:
             metric_record_paths.extend(_scan_metric_record_paths(metric_phase_dir))
         for metric_record_path in sorted(set(metric_record_paths)):
             payload, used_path = _read_json_optional(
@@ -2013,7 +2179,9 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
             ]
 
         stage2_present = bool(summary_payloads.get("stage2")) and not validation_guided_mode
-        if path_scope == "metric_phase_dir":
+        if is_live_validation_snapshot:
+            mode = "live_validation_snapshot"
+        elif path_scope == "metric_phase_dir":
             mode = "metric_phase_dir"
         elif validation_guided_mode:
             mode = "spec_validation_guided"
@@ -2170,23 +2338,29 @@ def _load_sweep_visualization_model_impl(path: Path) -> SweepVisualizationModel:
         rows.sort(key=lambda row: (row.rank, row.candidate_id))
         ordered_candidate_rows.extend(rows)
 
-    previous_generation_candidates, previous_generation_files = _load_generation_product_candidates(
-        experiment_root=experiment_root,
-        generation_id=_coerce_optional_str(generation_summary.get("previous_generation_id")),
-        primary_metric=primary_metric,
-        warnings=warnings,
-    )
-    used_files.extend(previous_generation_files)
-    generation_summary["previous_generation_candidate_count"] = len(previous_generation_candidates)
-    all_generation_candidates, all_generation_run_metric_records, all_generation_files = _build_all_generation_collections(
-        experiment_root=experiment_root,
-        generation_summary=generation_summary,
-        active_candidates=ordered_candidate_rows,
-        active_run_metric_records=run_metric_records,
-        primary_metric=primary_metric,
-        warnings=warnings,
-    )
-    used_files.extend(all_generation_files)
+    if is_live_validation_snapshot:
+        previous_generation_candidates = []
+        all_generation_candidates = list(ordered_candidate_rows)
+        all_generation_run_metric_records = list(run_metric_records)
+        generation_summary["previous_generation_candidate_count"] = 0
+    else:
+        previous_generation_candidates, previous_generation_files = _load_generation_product_candidates(
+            experiment_root=experiment_root,
+            generation_id=_coerce_optional_str(generation_summary.get("previous_generation_id")),
+            primary_metric=primary_metric,
+            warnings=warnings,
+        )
+        used_files.extend(previous_generation_files)
+        generation_summary["previous_generation_candidate_count"] = len(previous_generation_candidates)
+        all_generation_candidates, all_generation_run_metric_records, all_generation_files = _build_all_generation_collections(
+            experiment_root=experiment_root,
+            generation_summary=generation_summary,
+            active_candidates=ordered_candidate_rows,
+            active_run_metric_records=run_metric_records,
+            primary_metric=primary_metric,
+            warnings=warnings,
+        )
+        used_files.extend(all_generation_files)
     generation_summary["all_generation_candidate_count"] = len(all_generation_candidates)
     generation_summary["all_generation_run_record_count"] = len(all_generation_run_metric_records)
 

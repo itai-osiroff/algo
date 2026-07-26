@@ -118,6 +118,32 @@ python generate_reports.py path/to/sweep_output --strict
 `--spec` is required when rebuilding stage/final summaries because the tool
 needs the experiment definition to reconstruct rankings consistently.
 
+### Live Validation-Oracle Snapshots
+
+While a validation-guided sweep is still running, generate a provisional,
+isolated oracle-ranked snapshot from the completed `validation_phase` runs:
+
+```bash
+python generate_reports.py path/to/sweep_output --spec path/to/spec.json --rebuild-summaries --live-validation-report
+```
+
+The command uses the `validation_oracle_sweep` mode and scoring schema in the
+spec (human-bead annotations or TRIO benchmarks) and writes a fresh snapshot
+under `reports/live_validation/<UTC-timestamp>/`. It does not modify the active
+sweep's run state, final summaries, oracle outputs, or `metric_review/`.
+
+Open the printed snapshot path with the existing tools:
+
+```bash
+python -m moment_images.sweep_visualization path/to/live_snapshot
+python -m moment_images.sweep_metric_explorer path/to/live_snapshot
+```
+
+The viewers read report products and writable `metric_review/` data from the
+snapshot while resolving previews and workspaces from the source sweep. Live
+snapshots are marked `provisional`; their `live_validation_report.json` records
+the completed and missing dataset coverage.
+
 ## Alpha Reports
 
 Alpha reports summarize optional metric experiment results by formulation

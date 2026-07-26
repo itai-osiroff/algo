@@ -540,6 +540,167 @@ def test_load_sweep_metric_explorer_model_recomputes_metrics_and_profiles(tmp_pa
     assert good_d1.metrics["tamura_gradient_avg"] > bad_d2.metrics["tamura_gradient_avg"]
 
 
+def test_metric_explorer_keeps_live_snapshot_review_files_out_of_source_sweep(tmp_path):
+    source_dir = _make_modern_fixture(tmp_path)
+    source_run_dir = source_dir / "runs" / "validation_phase" / "v_live" / "d1"
+    source_image = _square_feature()
+    _write_preview(source_run_dir / "avg_rectified.png", source_image)
+    _write_workspace(source_run_dir / "workspace.npz", source_image)
+    metric_record = {
+        "run": "validation_phase_v_live_d1",
+        "config": {
+            "strategy": "combined",
+            "displacement_metric_family": "intensity",
+            "displacement_alpha": 1.0,
+            "metric_formulation_id": "intensity_default",
+        },
+        "global_and_local_metrics": {"laplacian_variance": 42.0},
+        "displacement_field_metrics": {},
+        "inter_view_consistency_metrics": {},
+    }
+    _write_json(source_run_dir / "metric_record.json", metric_record)
+    ranking = {
+        "candidate_id": "v_live",
+        "strategy": "combined",
+        "config": dict(metric_record["config"]),
+        "params": dict(metric_record["config"]),
+        "score": 0.88,
+        "mean_dataset_score": 0.88,
+        "std_dataset_score": 0.0,
+        "missing_datasets": [],
+        "dataset_scores": {"d1": 0.88},
+        "runtime_seconds": {"d1": 1.0},
+        "dataset_metrics": {"d1": {"laplacian_variance": 42.0}},
+        "rank": 1,
+    }
+    snapshot_dir = tmp_path / "live_snapshot"
+    _write_json(
+        snapshot_dir / "live_validation_report.json",
+        {
+            "schema_version": 1,
+            "status": "provisional",
+            "source_sweep_dir": str(source_dir.resolve()),
+            "source_run_state_path": str((source_dir / "run_state.json").resolve()),
+            "stage": "validation_phase",
+            "configured_dataset_ids": ["d1", "d2"],
+            "observed_dataset_ids": ["d1"],
+            "missing_dataset_ids": ["d2"],
+        },
+    )
+    _write_json(
+        snapshot_dir / "validation_phase_summary.json",
+        {
+            "stage": "validation_phase",
+            "num_runs": 1,
+            "num_successful": 1,
+            "num_failed": 0,
+            "rankings": [ranking],
+            "failed_runs": [],
+            "runs": [],
+            "execution": {},
+        },
+    )
+    _write_json(snapshot_dir / "validation_summary.json", [metric_record])
+    _write_json(snapshot_dir / "summary.json", [metric_record])
+    _write_json(snapshot_dir / "leaderboard.json", [ranking])
+
+    model = load_sweep_metric_explorer_model(snapshot_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+
+    assert model.review_dir == snapshot_dir / "metric_review"
+    assert model.raw_records[0].workspace_path == str(source_run_dir / "workspace.npz")
+    assert not (source_dir / "metric_review").exists()
+
+
+def test_metric_explorer_uses_live_snapshot_absolute_workspace_references(tmp_path):
+    source_dir = _make_modern_fixture(tmp_path)
+    source_state = json.loads((source_dir / "run_state.json").read_text(encoding="utf-8"))
+    source_state["active_generation_id"] = "gen_source"
+    _write_json(source_dir / "run_state.json", source_state)
+    external_run_dir = tmp_path / "external_validation_runs" / "v_external" / "d1"
+    source_image = _square_feature()
+    preview_path = external_run_dir / "avg_rectified.png"
+    workspace_path = external_run_dir / "workspace.npz"
+    metric_record_path = external_run_dir / "metric_record.json"
+    _write_preview(preview_path, source_image)
+    _write_workspace(workspace_path, source_image)
+    artifact_paths = {
+        "run_dir": str(external_run_dir),
+        "avg_rectified": str(preview_path),
+        "workspace": str(workspace_path),
+        "metric_record": str(metric_record_path),
+    }
+    metric_record = {
+        "run": "validation_phase_v_external_d1",
+        "run_dir": str(external_run_dir),
+        "artifact_paths": dict(artifact_paths),
+        "generation_id": "gen_source",
+        "config": {
+            "strategy": "combined",
+            "displacement_metric_family": "intensity",
+            "displacement_alpha": 1.0,
+            "metric_formulation_id": "intensity_default",
+        },
+        "global_and_local_metrics": {"laplacian_variance": 42.0},
+        "displacement_field_metrics": {},
+        "inter_view_consistency_metrics": {},
+    }
+    _write_json(metric_record_path, metric_record)
+    ranking = {
+        "candidate_id": "v_external",
+        "generation_id": "gen_source",
+        "strategy": "combined",
+        "config": dict(metric_record["config"]),
+        "params": dict(metric_record["config"]),
+        "score": 0.88,
+        "mean_dataset_score": 0.88,
+        "std_dataset_score": 0.0,
+        "missing_datasets": [],
+        "dataset_scores": {"d1": 0.88},
+        "runtime_seconds": {"d1": 1.0},
+        "dataset_metrics": {"d1": {"laplacian_variance": 42.0}},
+        "rank": 1,
+        "artifact_paths": {"d1": dict(artifact_paths)},
+        "run_dirs": {"d1": str(external_run_dir)},
+    }
+    snapshot_dir = tmp_path / "live_snapshot"
+    _write_json(
+        snapshot_dir / "live_validation_report.json",
+        {
+            "schema_version": 1,
+            "status": "provisional",
+            "source_sweep_dir": str(source_dir.resolve()),
+            "source_run_state_path": str((source_dir / "run_state.json").resolve()),
+            "source_generation_id": "gen_source",
+            "stage": "validation_phase",
+            "configured_dataset_ids": ["d1"],
+            "observed_dataset_ids": ["d1"],
+            "missing_dataset_ids": [],
+        },
+    )
+    _write_json(
+        snapshot_dir / "validation_phase_summary.json",
+        {
+            "stage": "validation_phase",
+            "num_runs": 1,
+            "num_successful": 1,
+            "num_failed": 0,
+            "rankings": [ranking],
+            "failed_runs": [],
+            "runs": [],
+            "execution": {},
+        },
+    )
+    _write_json(snapshot_dir / "validation_summary.json", [metric_record])
+    _write_json(snapshot_dir / "summary.json", [metric_record])
+    _write_json(snapshot_dir / "leaderboard.json", [ranking])
+
+    model = load_sweep_metric_explorer_model(snapshot_dir, hydrate_mode=HYDRATE_MODE_LAZY)
+
+    assert model.review_dir == snapshot_dir / "metric_review"
+    assert model.raw_records[0].workspace_path == str(workspace_path)
+    assert not (source_dir / "metric_review").exists()
+
+
 def test_load_sweep_metric_explorer_model_defaults_to_validation_phase_for_skip_mode(tmp_path):
     output_dir = _make_modern_fixture(tmp_path)
     manifest_path = output_dir / "experiment_manifest.json"
