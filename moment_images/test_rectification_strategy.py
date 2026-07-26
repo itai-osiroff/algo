@@ -148,6 +148,23 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
         self.assertEqual(diagnostics["views"]["view_0_0"]["positive_infinity"], 1)
         self.assertEqual(diagnostics["views"]["view_0_0"]["negative_infinity"], 1)
 
+    def test_normalize_pixel_shift_power_validates_shared_contract(self) -> None:
+        normalizer = rectification_strategy.normalize_pixel_shift_power
+
+        self.assertEqual(normalizer("0.5"), 0.5)
+        views = np.ones((1, 1, 3, 3), dtype=np.float32)
+        for invalid_value in (0.0, -0.5, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaisesRegex(ValueError, "pixel_shift_power"):
+                    normalizer(invalid_value)
+                with self.assertRaisesRegex(ValueError, "pixel_shift_power"):
+                    self.strategy.compute_similarity_matrices(
+                        views,
+                        (0, 0),
+                        max_disp=0,
+                        pixel_shift_power=invalid_value,
+                    )
+
     def test_pixel_shift_power_one_matches_legacy_similarity(self) -> None:
         views = np.array(
             [[[[0.0, 1.0, 2.0], [1.0, 2.0, 3.0], [2.0, 3.0, 4.0]]]],
@@ -244,6 +261,46 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
             powered.component_score_maps_raw["gradient"],
             baseline.component_score_maps_raw["gradient"],
         )
+
+    def test_pixel_shift_power_preserves_raw_auxiliary_inputs_with_nonfinite_values(self) -> None:
+        views = np.array(
+            [[[[np.nan, 1.0, 2.0], [1.0, 2.0, 3.0], [2.0, 3.0, 4.0]]]],
+            dtype=np.float32,
+        )
+        reference = np.ones((3, 3), dtype=np.float32)
+        for metric_family, component_name in (
+            (BLURRED_GRADIENT_CORR_METRIC_FAMILY, "gradient"),
+            (BLURRED_LAPLACIAN_CORR_METRIC_FAMILY, "laplacian"),
+        ):
+            with self.subTest(component_name=component_name):
+                common_kwargs = {
+                    "max_disp": 0,
+                    "gauss_sigma": 1.0,
+                    "gauss_size": 5,
+                    "sub_pix_factor": 1,
+                    "reference_view": reference,
+                    "metric_family": metric_family,
+                    "alpha": 0.0,
+                    "emit_runtime_warning": False,
+                }
+                baseline = self.strategy.compute_similarity_matrices(
+                    views,
+                    (0, 0),
+                    **common_kwargs,
+                )
+                powered = self.strategy.compute_similarity_matrices(
+                    views,
+                    (0, 0),
+                    **common_kwargs,
+                    pixel_shift_power=0.5,
+                )
+
+                assert baseline.component_score_maps_raw is not None
+                assert powered.component_score_maps_raw is not None
+                np.testing.assert_equal(
+                    powered.component_score_maps_raw[component_name],
+                    baseline.component_score_maps_raw[component_name],
+                )
 
     def test_sigma_pyramid_forwards_pixel_shift_power_to_each_pass(self) -> None:
         views = np.ones((1, 1, 3, 3), dtype=np.float32)

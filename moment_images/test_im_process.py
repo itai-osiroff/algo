@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pytest
 
@@ -149,7 +151,7 @@ def test_rectify_views_from_config_forwards_pixel_shift_power(monkeypatch):
     assert result.pixel_similarity == "pixel_similarity"
 
 
-def test_powered_combined_run_sanitizes_inputs_before_global_scoring(monkeypatch):
+def test_powered_combined_run_preserves_raw_global_and_rectification_inputs(monkeypatch):
     views = np.arange(36, dtype=np.float32).reshape(2, 2, 3, 3)
     views[0, 0, 0, 0] = np.nan
     views[1, 1, 0, 1] = np.inf
@@ -160,10 +162,28 @@ def test_powered_combined_run_sanitizes_inputs_before_global_scoring(monkeypatch
         captured["global_views"] = np.asarray(global_views).copy()
         return np.zeros((2, 2, 2, 2, 2), dtype=np.int64)
 
+    def fake_global_rectify(self, stage_views: np.ndarray, sim_mat=None, ref_view_idx=None):
+        captured["global_rectification_views"] = np.asarray(stage_views).copy()
+        return np.asarray(stage_views[0, 0]), np.asarray(stage_views).copy()
+
+    def fake_pixel_rectify(self, stage_views: np.ndarray, sim_mat=None, ref_view_idx=None):
+        captured["pixel_rectification_views"] = np.asarray(stage_views).copy()
+        return np.asarray(stage_views[0, 0]), np.asarray(stage_views).copy()
+
     monkeypatch.setattr(
         im_process.GlobalTranslationRectificationStrategy,
         "compute_similarity_matrix",
         fake_global_similarity,
+    )
+    monkeypatch.setattr(
+        im_process.GlobalTranslationRectificationStrategy,
+        "rectify",
+        fake_global_rectify,
+    )
+    monkeypatch.setattr(
+        im_process.PixelwisePatchRectificationStrategy,
+        "rectify",
+        fake_pixel_rectify,
     )
 
     with pytest.warns(RuntimeWarning, match="pixel_shift_power"):
@@ -182,13 +202,211 @@ def test_powered_combined_run_sanitizes_inputs_before_global_scoring(monkeypatch
             ),
         )
 
-    assert np.isfinite(captured["global_views"]).all()
-    assert np.isfinite(result.rectified_views).all()
+    np.testing.assert_equal(captured["global_views"], views)
+    np.testing.assert_equal(captured["global_rectification_views"], views)
+    np.testing.assert_equal(captured["pixel_rectification_views"], views)
+    np.testing.assert_equal(result.input_views, views)
+    np.testing.assert_equal(result.global_rectified_views, views)
+    np.testing.assert_equal(result.rectified_views, views)
     assert len(result.runtime_warnings) == 1
+    assert result.pixel_similarity is not None
+    assert result.runtime_warnings == result.pixel_similarity.runtime_warnings
     diagnostics = result.runtime_warnings[0]
     assert diagnostics["views"]["view_0_0"]["nan"] == 1
     assert diagnostics["views"]["view_1_1"]["positive_infinity"] == 1
     assert diagnostics["views"]["view_0_1"]["negative_finite"] == 1
+
+
+def test_powered_pixel_run_preserves_raw_rectification_inputs(monkeypatch):
+    views = np.arange(9, dtype=np.float32).reshape(1, 1, 3, 3)
+    views[0, 0, 0, 0] = np.nan
+    views[0, 0, 0, 1] = np.inf
+    views[0, 0, 0, 2] = -4.0
+    captured: dict[str, np.ndarray] = {}
+
+    def fake_pixel_rectify(self, stage_views: np.ndarray, sim_mat=None, ref_view_idx=None):
+        captured["pixel_rectification_views"] = np.asarray(stage_views).copy()
+        return np.asarray(stage_views[0, 0]), np.asarray(stage_views).copy()
+
+    monkeypatch.setattr(
+        im_process.PixelwisePatchRectificationStrategy,
+        "rectify",
+        fake_pixel_rectify,
+    )
+
+    with pytest.warns(RuntimeWarning, match="pixel_shift_power"):
+        result = im_process.rectify_views_from_config(
+            views,
+            RectificationRunConfig(
+                strategy="pixel",
+                similarity_window_size=1,
+                max_displacement=0,
+                gauss_sigma=1.0,
+                gauss_size=5,
+                disp_gauss_sigma=0.0,
+                disp_gauss_size=1,
+                sub_pix_factor=1,
+                pixel_shift_power=0.5,
+            ),
+        )
+
+    np.testing.assert_equal(captured["pixel_rectification_views"], views)
+    np.testing.assert_equal(result.input_views, views)
+    np.testing.assert_equal(result.rectified_views, views)
+    assert result.pixel_similarity is not None
+    assert result.runtime_warnings == result.pixel_similarity.runtime_warnings
+    assert result.runtime_warnings[0]["views"]["view_0_0"]["nan"] == 1
+
+
+def test_powered_hdr_run_diagnoses_only_the_scored_exposure(monkeypatch):
+    first_exposure = np.arange(9, dtype=np.float32).reshape(1, 1, 3, 3) + 1.0
+    second_exposure = first_exposure.copy()
+    second_exposure[0, 0, 0, 0] = np.nan
+    views = np.stack([first_exposure, second_exposure], axis=0)
+    rectification_inputs: list[np.ndarray] = []
+    similarity_inputs: list[np.ndarray] = []
+
+    original_compute_similarity = (
+        im_process.PixelwisePatchRectificationStrategy.compute_similarity_matrices
+    )
+
+    def capture_similarity_inputs(self, scoring_views: np.ndarray, ref_view_idx, **kwargs: object):
+        similarity_inputs.append(np.asarray(scoring_views).copy())
+        return original_compute_similarity(self, scoring_views, ref_view_idx, **kwargs)
+
+    def fake_pixel_rectify(self, stage_views: np.ndarray, sim_mat=None, ref_view_idx=None):
+        rectification_inputs.append(np.asarray(stage_views).copy())
+        return np.asarray(stage_views[0, 0]), np.asarray(stage_views).copy()
+
+    monkeypatch.setattr(
+        im_process.PixelwisePatchRectificationStrategy,
+        "rectify",
+        fake_pixel_rectify,
+    )
+    monkeypatch.setattr(
+        im_process.PixelwisePatchRectificationStrategy,
+        "compute_similarity_matrices",
+        capture_similarity_inputs,
+    )
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        result = im_process.rectify_views_from_config(
+            views,
+            RectificationRunConfig(
+                strategy="pixel",
+                similarity_window_size=1,
+                max_displacement=0,
+                gauss_sigma=1.0,
+                gauss_size=5,
+                disp_gauss_sigma=0.0,
+                disp_gauss_size=1,
+                sub_pix_factor=1,
+                pixel_shift_power=0.5,
+                hdr_enabled=True,
+                hdr_exposure_times=[1.0, 0.5],
+            ),
+        )
+
+    assert not [
+        warning
+        for warning in caught_warnings
+        if issubclass(warning.category, RuntimeWarning)
+        and "pixel_shift_power" in str(warning.message)
+    ]
+    assert len(result.runtime_warnings) == 1
+    diagnostics = result.runtime_warnings[0]
+    assert set(diagnostics["views"]) == {"view_0_0"}
+    assert diagnostics["views"]["view_0_0"]["nan"] == 0
+    assert len(similarity_inputs) == 1
+    np.testing.assert_equal(similarity_inputs[0], first_exposure)
+    assert len(rectification_inputs) == 2
+    np.testing.assert_equal(rectification_inputs[1], second_exposure)
+
+
+def test_powered_combined_hdr_run_diagnoses_only_the_first_globally_rectified_exposure(
+    monkeypatch,
+):
+    first_exposure = np.arange(9, dtype=np.float32).reshape(1, 1, 3, 3) + 1.0
+    second_exposure = first_exposure.copy()
+    second_exposure[0, 0, 0, 0] = np.nan
+    views = np.stack([first_exposure, second_exposure], axis=0)
+    pixel_rectification_inputs: list[np.ndarray] = []
+    similarity_inputs: list[np.ndarray] = []
+
+    original_compute_similarity = (
+        im_process.PixelwisePatchRectificationStrategy.compute_similarity_matrices
+    )
+
+    def fake_global_similarity(self, global_views: np.ndarray, ref_view_idx, **kwargs: object):
+        return np.zeros((1, 1, 2, 2, 2), dtype=np.int64)
+
+    def fake_global_rectify(self, stage_views: np.ndarray, sim_mat=None, ref_view_idx=None):
+        return np.asarray(stage_views[0, 0]), np.asarray(stage_views).copy()
+
+    def fake_pixel_rectify(self, stage_views: np.ndarray, sim_mat=None, ref_view_idx=None):
+        pixel_rectification_inputs.append(np.asarray(stage_views).copy())
+        return np.asarray(stage_views[0, 0]), np.asarray(stage_views).copy()
+
+    def capture_similarity_inputs(self, scoring_views: np.ndarray, ref_view_idx, **kwargs: object):
+        similarity_inputs.append(np.asarray(scoring_views).copy())
+        return original_compute_similarity(self, scoring_views, ref_view_idx, **kwargs)
+
+    monkeypatch.setattr(
+        im_process.GlobalTranslationRectificationStrategy,
+        "compute_similarity_matrix",
+        fake_global_similarity,
+    )
+    monkeypatch.setattr(
+        im_process.GlobalTranslationRectificationStrategy,
+        "rectify",
+        fake_global_rectify,
+    )
+    monkeypatch.setattr(
+        im_process.PixelwisePatchRectificationStrategy,
+        "rectify",
+        fake_pixel_rectify,
+    )
+    monkeypatch.setattr(
+        im_process.PixelwisePatchRectificationStrategy,
+        "compute_similarity_matrices",
+        capture_similarity_inputs,
+    )
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        result = im_process.rectify_views_from_config(
+            views,
+            RectificationRunConfig(
+                strategy="combined",
+                refinement_window_size=1,
+                max_displacement=0,
+                gauss_sigma=1.0,
+                gauss_size=5,
+                disp_gauss_sigma=0.0,
+                disp_gauss_size=1,
+                sub_pix_factor=1,
+                pixel_shift_power=0.5,
+                hdr_enabled=True,
+                hdr_exposure_times=[1.0, 0.5],
+            ),
+        )
+
+    assert not [
+        warning
+        for warning in caught_warnings
+        if issubclass(warning.category, RuntimeWarning)
+        and "pixel_shift_power" in str(warning.message)
+    ]
+    assert len(result.runtime_warnings) == 1
+    diagnostics = result.runtime_warnings[0]
+    assert set(diagnostics["views"]) == {"view_0_0", "external_reference"}
+    assert diagnostics["views"]["view_0_0"]["nan"] == 0
+    assert len(similarity_inputs) == 1
+    np.testing.assert_equal(similarity_inputs[0], first_exposure)
+    assert len(pixel_rectification_inputs) == 2
+    np.testing.assert_equal(pixel_rectification_inputs[0], first_exposure)
+    np.testing.assert_equal(pixel_rectification_inputs[1], second_exposure)
 
 
 def test_rectify_views_from_config_combined_can_use_iterative_rebuild(monkeypatch):

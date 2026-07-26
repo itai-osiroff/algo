@@ -87,7 +87,10 @@ Common pixel/combined search fields:
 `pixel_shift_powers` applies only to pixelwise intensity matching (including the
 pixelwise stage of `combined`). At values other than `1.0`, the shifted moving
 view is evaluated as `sign(x) * abs(x) ** power`; non-finite inputs are treated
-as zero for scoring and recorded in each run's diagnostics.
+as zero only in the scoring copy and recorded in each run's diagnostics. This
+does not alter global matching, raw/HDR view stacks, or rectified output. HDR
+diagnostics describe the first exposure used to estimate the pixel displacement
+field, not subsequent exposures that only receive that field.
 
 Combined/global-specific fields:
 
