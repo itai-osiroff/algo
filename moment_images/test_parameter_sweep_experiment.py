@@ -2887,6 +2887,75 @@ def test_run_sweep_resume_skips_recompute_for_valid_artifacts(monkeypatch, tmp_p
     assert "skipped_valid" in statuses
 
 
+def test_run_sweep_resume_allows_scheduler_mode_change_without_new_generation(tmp_path):
+    views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, views)
+
+    adaptive_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            total_budget_per_dataset=2,
+            stage1_fraction=0.5,
+            top_k=1,
+            max_workers=1,
+            scheduling=SweepSchedulingSpec(mode="adaptive_memory"),
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "scheduler_resume"),
+        save_figures=False,
+        analyze=False,
+    )
+    out_dir = run_sweep_experiment(adaptive_spec)
+    state_before = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    metric_record_path = next(out_dir.glob("runs/stage1/*/*/metric_record.json"))
+    metric_record_path.write_text("{corrupted", encoding="utf-8")
+
+    fixed_spec = SweepExperimentSpec(
+        datasets=[SweepDatasetSpec(dataset_id="d1", views_path=str(views_path))],
+        search_spaces={
+            "pixel": _pixel_space(
+                similarity_window_sizes=[1],
+                max_displacements=[0],
+                sub_pix_factors=[1],
+                pixel_sigma_pyramid=[False],
+            )
+        },
+        strategies=["pixel"],
+        stages=SweepStageSpec(
+            total_budget_per_dataset=2,
+            stage1_fraction=0.5,
+            top_k=1,
+            max_workers=1,
+            scheduling=SweepSchedulingSpec(mode="fixed_batch"),
+        ),
+        scoring=SweepScoringSpec(metric_weights={"laplacian_variance": 1.0}),
+        output_dir=str(tmp_path / "scheduler_resume"),
+        save_figures=False,
+        analyze=False,
+    )
+
+    run_sweep_experiment(fixed_spec, output_dir=out_dir)
+
+    state_after = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert state_after["active_generation_id"] == state_before["active_generation_id"]
+    assert len(state_after["spec_generations"]) == len(state_before["spec_generations"])
+    stage_summary = json.loads(
+        (out_dir / "stage1_summary.json").read_text(encoding="utf-8")
+    )
+    assert stage_summary["execution"]["scheduler_mode"] == "fixed_batch"
+    assert "recomputed" in {entry["status"] for entry in state_after["runs"].values()}
+
+
 def test_run_sweep_recomputes_when_metric_record_is_corrupted(tmp_path):
     views = np.arange(64, dtype=np.float32).reshape(2, 2, 4, 4)
     views_path = tmp_path / "views.npy"

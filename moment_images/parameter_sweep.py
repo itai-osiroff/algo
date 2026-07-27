@@ -2768,6 +2768,23 @@ def _normalize_fingerprint_payload_for_resume_compat(
         spec_snapshot = dict(spec_payload)
         if spec_snapshot.get("output_dir") is not None:
             spec_snapshot["output_dir"] = "<output_dir>"
+        # Scheduling is an execution policy, not part of the experiment's
+        # semantic identity.  This lets an interrupted sweep resume in a
+        # different scheduler mode without creating a new generation.
+        stages_snapshot = spec_snapshot.get("stages")
+        if isinstance(stages_snapshot, dict):
+            normalized_stages = dict(stages_snapshot)
+            normalized_stages.pop("scheduling", None)
+            spec_snapshot["stages"] = normalized_stages
+        experimental_snapshot = spec_snapshot.get("experimental_metric_sweep")
+        if isinstance(experimental_snapshot, dict):
+            normalized_experimental = dict(experimental_snapshot)
+            search_stages_snapshot = normalized_experimental.get("search_stages")
+            if isinstance(search_stages_snapshot, dict):
+                normalized_search_stages = dict(search_stages_snapshot)
+                normalized_search_stages.pop("scheduling", None)
+                normalized_experimental["search_stages"] = normalized_search_stages
+            spec_snapshot["experimental_metric_sweep"] = normalized_experimental
         scoring_snapshot = spec_snapshot.get("scoring")
         if isinstance(scoring_snapshot, dict):
             normalized_scoring = dict(scoring_snapshot)

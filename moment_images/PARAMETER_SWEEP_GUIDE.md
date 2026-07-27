@@ -318,6 +318,18 @@ python -m moment_images.parameter_sweep --spec sweep_spec.json --output-dir path
 
 - Resume reuses valid completed artifacts when the experiment fingerprint is
   compatible.
+- Scheduling is treated as an execution policy for resume compatibility. If a
+  sweep was interrupted, you can restart the same output directory with a
+  different scheduler mode without `--extend-existing`; the active generation
+  and output layout are preserved. For example:
+
+  ```bash
+  python -m moment_images.parameter_sweep \
+    --spec sweep_spec.json \
+    --output-dir path/to/sweep \
+    --scheduler-mode fixed_batch
+  ```
+
 - `--extend-existing` is for compatible spec expansion.
 - `--merge-from` copies valid compatible completed runs from other sweep roots.
 - `--relocate-path OLD=NEW` rewrites spec paths before loading datasets and
