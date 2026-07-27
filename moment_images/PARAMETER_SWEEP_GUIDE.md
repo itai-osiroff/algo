@@ -96,6 +96,22 @@ does not alter global matching, raw/HDR view stacks, or rectified output. HDR
 diagnostics describe the first exposure used to estimate the pixel displacement
 field, not subsequent exposures that only receive that field.
 
+### Combined power-field blend
+
+Combined sweeps may additionally specify `pixel_power_blend_enabled`,
+`pixel_power_blend_raised_powers`, `pixel_power_blend_alphas`, and
+`pixel_power_blend_delta_caps`. An enabled candidate performs baseline matching
+at power `1.0` and raised-power matching, then blends their displacement fields
+with a per-vector residual cap. Enabled candidates require raised powers greater
+than `1.0`, `pixel_shift_powers: [1.0]`, and `pixel_sigma_pyramid: [false]`.
+
+The sweep stores reusable baseline/challenger fields in
+`.pixel_power_blend_cache/`; alpha and cap are intentionally excluded from that
+cache identity. Cache entries are keyed by a SHA-256 digest of the prepared
+views file and matching-field settings, and concurrent workers coalesce a
+shared field computation. `workspace.npz` records the anchor/challenger
+displacement fields, raw residual maps, and `pixel_power_blend_diagnostics_json`.
+
 Combined/global-specific fields:
 
 - `correlation_pad_widths`

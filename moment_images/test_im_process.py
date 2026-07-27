@@ -1,10 +1,15 @@
 import warnings
 
+from concurrent.futures import ThreadPoolExecutor
+import time
+
 import numpy as np
 import pytest
 
 import moment_images.im_process as im_process
 from moment_images.im_process import RectificationRunConfig, save_workspace_variables
+from moment_images.power_blend import PowerBlendFieldCache, PowerBlendFieldPair
+from moment_images.rectification_strategy import PixelwiseSimilarityResult
 
 
 def test_save_workspace_variables_adds_npz_suffix_when_missing(tmp_path):
@@ -35,6 +40,36 @@ def test_rectification_run_config_defaults_to_intensity_mode():
     assert config.metric_formulation_id == "intensity_default"
     assert config.combined_reference_mode == "global_average"
     assert config.pixel_shift_power == 1.0
+
+
+def test_rectification_run_config_validates_power_blend_contract():
+    config = RectificationRunConfig(
+        strategy="combined",
+        pixel_power_blend_enabled=True,
+        pixel_power_blend_raised_power=2.0,
+        pixel_power_blend_alpha=0.5,
+        pixel_power_blend_delta_cap=1.5,
+    )
+
+    assert config.pixel_power_blend_raised_power == 2.0
+
+    invalid_options = [
+        {"strategy": "pixel"},
+        {"pixel_sigma_pyramid": True},
+        {"pixel_shift_power": 1.5},
+        {"pixel_power_blend_raised_power": 1.0},
+        {"pixel_power_blend_alpha": 1.1},
+        {"pixel_power_blend_delta_cap": -0.1},
+    ]
+    for options in invalid_options:
+        with pytest.raises(ValueError, match="pixel_power_blend"):
+            kwargs = {
+                "strategy": "combined",
+                "pixel_power_blend_enabled": True,
+                "pixel_power_blend_raised_power": 2.0,
+            }
+            kwargs.update(options)
+            RectificationRunConfig(**kwargs)
 
 
 @pytest.mark.parametrize("value", [0.0, -0.5, float("nan"), float("inf"), float("-inf")])
@@ -149,6 +184,147 @@ def test_rectify_views_from_config_forwards_pixel_shift_power(monkeypatch):
 
     assert captured["pixel_shift_power"] == 0.5
     assert result.pixel_similarity == "pixel_similarity"
+
+
+def test_power_blend_combined_run_blends_baseline_and_raised_similarity_fields(monkeypatch):
+    views = np.arange(16, dtype=np.float32).reshape(2, 2, 2, 2)
+    powers: list[float] = []
+    rectification_similarity: list[PixelwiseSimilarityResult] = []
+
+    def fake_global_similarity(self, stage_views, ref_view_idx, **kwargs):
+        return np.zeros((2, 2, 2, 2, 2), dtype=np.int64)
+
+    def fake_global_rectify(self, stage_views, sim_mat=None, ref_view_idx=None):
+        return np.mean(stage_views, axis=(0, 1)), np.asarray(stage_views).copy()
+
+    def fake_pixel_similarity(self, stage_views, ref_view_idx, **kwargs):
+        power = float(kwargs["pixel_shift_power"])
+        powers.append(power)
+        displacement = 0.0 if power == 1.0 else 2.0
+        disps = np.full((2, 2, 2, 2), displacement, dtype=np.float32)
+        return PixelwiseSimilarityResult(
+            coordinates=np.zeros((2, 2, 2, 2, 2), dtype=np.float32),
+            scores=np.full((2, 2, 2, 2), power, dtype=np.float64),
+            disps_y=disps,
+            disps_x=disps,
+        )
+
+    def fake_pixel_rectify(self, stage_views, sim_mat=None, ref_view_idx=None):
+        rectification_similarity.append(sim_mat)
+        return np.mean(stage_views, axis=(0, 1)), np.asarray(stage_views).copy()
+
+    monkeypatch.setattr(im_process.GlobalTranslationRectificationStrategy, "compute_similarity_matrix", fake_global_similarity)
+    monkeypatch.setattr(im_process.GlobalTranslationRectificationStrategy, "rectify", fake_global_rectify)
+    monkeypatch.setattr(im_process.PixelwisePatchRectificationStrategy, "compute_similarity_matrices", fake_pixel_similarity)
+    monkeypatch.setattr(im_process.PixelwisePatchRectificationStrategy, "rectify", fake_pixel_rectify)
+
+    result = im_process.rectify_views_from_config(
+        views,
+        RectificationRunConfig(
+            strategy="combined",
+            refinement_window_size=1,
+            max_displacement=0,
+            gauss_sigma=1.0,
+            gauss_size=5,
+            disp_gauss_sigma=0.0,
+            disp_gauss_size=1,
+            sub_pix_factor=1,
+            pixel_power_blend_enabled=True,
+            pixel_power_blend_raised_power=2.0,
+            pixel_power_blend_alpha=0.5,
+            pixel_power_blend_delta_cap=2.0,
+        ),
+    )
+
+    assert powers == [1.0, 2.0]
+    assert result.pixel_similarity.power_blend_diagnostics["raised_power"] == 2.0
+    np.testing.assert_allclose(rectification_similarity[0].disps_y, np.sqrt(0.5))
+
+
+def test_power_blend_cache_reuses_fields_for_the_same_key(tmp_path):
+    views = np.arange(16, dtype=np.float32).reshape(2, 2, 2, 2)
+    config = RectificationRunConfig(
+        strategy="combined",
+        refinement_window_size=1,
+        correlation_pad_width=1,
+        max_displacement=0,
+        gauss_sigma=1.0,
+        gauss_size=5,
+        disp_gauss_sigma=0.0,
+        disp_gauss_size=1,
+        sub_pix_factor=1,
+        pixel_power_blend_enabled=True,
+        pixel_power_blend_raised_power=2.0,
+        pixel_power_blend_alpha=0.5,
+        pixel_power_blend_delta_cap=1.0,
+    )
+
+    first = im_process.rectify_views_from_config(
+        views, config, power_blend_cache_dir=tmp_path, power_blend_cache_key="same-fields"
+    )
+    second = im_process.rectify_views_from_config(
+        views, config, power_blend_cache_dir=tmp_path, power_blend_cache_key="same-fields"
+    )
+
+    assert (tmp_path / "same-fields.npz").exists()
+    assert first.pixel_similarity.power_blend_diagnostics["cache_hit"] is False
+    assert second.pixel_similarity.power_blend_diagnostics["cache_hit"] is True
+
+
+def test_power_blend_field_cache_preserves_runtime_warnings(tmp_path):
+    calls = 0
+
+    def make_result(warnings):
+        disps = np.zeros((1, 1, 1, 1), dtype=np.float32)
+        return PixelwiseSimilarityResult(
+            coordinates=np.zeros((1, 1, 1, 1, 2), dtype=np.float32),
+            scores=np.zeros((1, 1, 1, 1), dtype=np.float64),
+            disps_y=disps,
+            disps_x=disps,
+            runtime_warnings=warnings,
+        )
+
+    def compute():
+        nonlocal calls
+        calls += 1
+        return PowerBlendFieldPair(
+            anchor=make_result([{"kind": "anchor_nonfinite"}]),
+            challenger=make_result([{"kind": "challenger_nonfinite"}]),
+        )
+
+    cache = PowerBlendFieldCache(tmp_path)
+    first, first_hit = cache.get_or_compute("shared-fields", compute)
+    second, second_hit = cache.get_or_compute("shared-fields", compute)
+
+    assert calls == 1
+    assert first_hit is False
+    assert second_hit is True
+    assert first.anchor.runtime_warnings == second.anchor.runtime_warnings
+    assert first.challenger.runtime_warnings == second.challenger.runtime_warnings
+
+
+def test_power_blend_field_cache_runs_one_concurrent_producer(tmp_path):
+    calls = 0
+
+    def compute():
+        nonlocal calls
+        calls += 1
+        time.sleep(0.1)
+        disps = np.zeros((1, 1, 1, 1), dtype=np.float32)
+        result = PixelwiseSimilarityResult(
+            coordinates=np.zeros((1, 1, 1, 1, 2), dtype=np.float32),
+            scores=np.zeros((1, 1, 1, 1), dtype=np.float64),
+            disps_y=disps,
+            disps_x=disps,
+        )
+        return PowerBlendFieldPair(anchor=result, challenger=result)
+
+    cache = PowerBlendFieldCache(tmp_path)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: cache.get_or_compute("shared-fields", compute), range(2)))
+
+    assert calls == 1
+    assert sorted(cache_hit for _, cache_hit in results) == [False, True]
 
 
 def test_powered_combined_run_preserves_raw_global_and_rectification_inputs(monkeypatch):

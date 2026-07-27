@@ -20,11 +20,13 @@ if __package__ is None or __package__ == "":
         BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         GlobalTranslationRectificationStrategy,
         PixelwisePatchRectificationStrategy,
+        PixelwiseSimilarityResult,
         normalize_pixel_shift_power,
         resolve_displacement_metric_spec,
         resolve_reference_view,
     )
     from reliable_io import write_npz_atomic
+    from power_blend import PowerBlendConfig, PowerBlendFieldCache, PowerBlendFieldPair
 else:
     # Imported as a module within the package
     from .iterative_subtractive_max_rebuild import iterative_subtractive_max_rebuild
@@ -32,11 +34,13 @@ else:
         BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         GlobalTranslationRectificationStrategy,
         PixelwisePatchRectificationStrategy,
+        PixelwiseSimilarityResult,
         normalize_pixel_shift_power,
         resolve_displacement_metric_spec,
         resolve_reference_view,
     )
     from .reliable_io import write_npz_atomic
+    from .power_blend import PowerBlendConfig, PowerBlendFieldCache, PowerBlendFieldPair
 
 # --- Constants ---
 DEFAULT_IMAGE_DIR = 'moment_images/images'
@@ -125,6 +129,10 @@ class RectificationRunConfig:
     global_threshold: float = 0.15
     pixel_threshold: float = 0.05
     pixel_sigma_pyramid: bool = False
+    pixel_power_blend_enabled: bool = False
+    pixel_power_blend_raised_power: Optional[float] = None
+    pixel_power_blend_alpha: float = 0.0
+    pixel_power_blend_delta_cap: float = 0.0
     zero_fill_roll: bool = True
     sub_pix_factor: int = 2
     pixel_shift_power: float = 1.0
@@ -169,6 +177,35 @@ class RectificationRunConfig:
         if not formulation_id:
             raise ValueError("metric_formulation_id must be non-empty.")
         self.metric_formulation_id = formulation_id
+
+        if self.pixel_power_blend_enabled:
+            if str(self.strategy).lower() != "combined":
+                raise ValueError("pixel_power_blend_enabled is only supported for combined strategy.")
+            if self.pixel_sigma_pyramid:
+                raise ValueError("pixel_power_blend_enabled cannot be combined with pixel_sigma_pyramid.")
+            if self.pixel_shift_power != 1.0:
+                raise ValueError("pixel_power_blend_enabled requires pixel_shift_power=1.0.")
+            if self.pixel_power_blend_raised_power is None:
+                raise ValueError("pixel_power_blend_raised_power is required when pixel_power_blend_enabled.")
+            power_blend = PowerBlendConfig(
+                raised_power=float(self.pixel_power_blend_raised_power),
+                alpha=self.pixel_power_blend_alpha,
+                delta_cap=self.pixel_power_blend_delta_cap,
+            )
+            self.pixel_power_blend_raised_power = power_blend.raised_power
+            self.pixel_power_blend_alpha = power_blend.alpha
+            self.pixel_power_blend_delta_cap = power_blend.delta_cap
+
+    @property
+    def power_blend_config(self) -> Optional[PowerBlendConfig]:
+        if not self.pixel_power_blend_enabled:
+            return None
+        assert self.pixel_power_blend_raised_power is not None
+        return PowerBlendConfig(
+            raised_power=self.pixel_power_blend_raised_power,
+            alpha=self.pixel_power_blend_alpha,
+            delta_cap=self.pixel_power_blend_delta_cap,
+        )
 
 
 @dataclass
@@ -268,7 +305,13 @@ def load_image(image_path: str) -> Optional[Image.Image]:
         return None
 
 
-def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig) -> RectificationResult:
+def rectify_views_from_config(
+    views: np.ndarray,
+    config: RectificationRunConfig,
+    *,
+    power_blend_cache_dir: Optional[Path] = None,
+    power_blend_cache_key: Optional[str] = None,
+) -> RectificationResult:
     """Run rectification with injected parameters instead of interactive prompts.
 
     Args:
@@ -441,23 +484,68 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             ).reference_image
         else:
             reference_view = None
-        pixel_similarity = rectification_strategy_pixel.compute_similarity_matrices(
-            pixel_scoring_views,
-            ref_view_idx,
-            max_disp=config.max_displacement,
-            gauss_sigma=config.gauss_sigma,
-            gauss_size=config.gauss_size,
-            disp_gauss_sigma=config.disp_gauss_sigma,
-            disp_gauss_size=config.disp_gauss_size,
-            thresh=config.pixel_threshold,
-            sub_pix_factor=config.sub_pix_factor,
-            reference_view=reference_view,
-            use_sigma_pyramid=config.pixel_sigma_pyramid,
-            metric_family=config.displacement_metric_family,
-            alpha=config.displacement_alpha,
-            component_weights=config.displacement_component_weights,
-            pixel_shift_power=config.pixel_shift_power,
-        )
+        pixel_similarity_kwargs = {
+            "max_disp": config.max_displacement,
+            "gauss_sigma": config.gauss_sigma,
+            "gauss_size": config.gauss_size,
+            "disp_gauss_sigma": config.disp_gauss_sigma,
+            "disp_gauss_size": config.disp_gauss_size,
+            "thresh": config.pixel_threshold,
+            "sub_pix_factor": config.sub_pix_factor,
+            "reference_view": reference_view,
+            "use_sigma_pyramid": config.pixel_sigma_pyramid,
+            "metric_family": config.displacement_metric_family,
+            "alpha": config.displacement_alpha,
+            "component_weights": config.displacement_component_weights,
+        }
+        if config.pixel_power_blend_enabled:
+            power_blend = config.power_blend_config
+            assert power_blend is not None
+
+            def compute_power_blend_fields() -> PowerBlendFieldPair:
+                return PowerBlendFieldPair(
+                    anchor=rectification_strategy_pixel.compute_similarity_matrices(
+                        pixel_scoring_views,
+                        ref_view_idx,
+                        **pixel_similarity_kwargs,
+                        pixel_shift_power=1.0,
+                    ),
+                    challenger=rectification_strategy_pixel.compute_similarity_matrices(
+                        pixel_scoring_views,
+                        ref_view_idx,
+                        **pixel_similarity_kwargs,
+                        pixel_shift_power=power_blend.raised_power,
+                    ),
+                )
+
+            field_pair, cache_hit = PowerBlendFieldCache(power_blend_cache_dir).get_or_compute(
+                power_blend_cache_key, compute_power_blend_fields
+            )
+            pixel_similarity, power_blend_diagnostics = (
+                PixelwisePatchRectificationStrategy.blend_pixelwise_similarity_results(
+                    field_pair.anchor,
+                    field_pair.challenger,
+                    blend_alpha=power_blend.alpha,
+                    delta_cap=power_blend.delta_cap,
+                )
+            )
+            power_blend_diagnostics.update(
+                {
+                    "baseline_power": 1.0,
+                    "raised_power": power_blend.raised_power,
+                    "pixel_power_blend_enabled": True,
+                    "cache_hit": cache_hit,
+                }
+            )
+            assert pixel_similarity.power_blend_artifacts is not None
+            pixel_similarity.power_blend_artifacts.diagnostics = power_blend_diagnostics
+        else:
+            pixel_similarity = rectification_strategy_pixel.compute_similarity_matrices(
+                pixel_scoring_views,
+                ref_view_idx,
+                **pixel_similarity_kwargs,
+                pixel_shift_power=config.pixel_shift_power,
+            )
         runtime_warnings = list(getattr(pixel_similarity, "runtime_warnings", []))
         if global_rectified_view_stack_arr is not None:
             rectified_view_stack = []

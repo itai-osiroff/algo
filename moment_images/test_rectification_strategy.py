@@ -118,6 +118,34 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
         self.assertIsNone(result.component_score_maps_raw)
         self.assertIsNone(result.view_score_summary)
 
+    def test_blend_pixelwise_similarity_results_caps_vector_residual_and_keeps_anchor_scores(self) -> None:
+        anchor = PixelwiseSimilarityResult(
+            coordinates=np.zeros((2, 2, 1, 1, 2), dtype=np.float32),
+            scores=np.full((2, 2, 1, 1), 7.0, dtype=np.float64),
+            disps_y=np.zeros((2, 2, 1, 1), dtype=np.float32),
+            disps_x=np.zeros((2, 2, 1, 1), dtype=np.float32),
+        )
+        challenger = PixelwiseSimilarityResult(
+            coordinates=np.zeros((2, 2, 1, 1, 2), dtype=np.float32),
+            scores=np.full((2, 2, 1, 1), 3.0, dtype=np.float64),
+            disps_y=np.full((2, 2, 1, 1), 3.0, dtype=np.float32),
+            disps_x=np.full((2, 2, 1, 1), 4.0, dtype=np.float32),
+        )
+
+        blended, diagnostics = PixelwisePatchRectificationStrategy.blend_pixelwise_similarity_results(
+            anchor,
+            challenger,
+            blend_alpha=1.0,
+            delta_cap=2.5,
+        )
+
+        np.testing.assert_allclose(blended.disps_y, 1.5)
+        np.testing.assert_allclose(blended.disps_x, 2.0)
+        np.testing.assert_allclose(blended.scores, anchor.scores)
+        np.testing.assert_allclose(blended.coordinates[0, 0, 0, 0], [-1.5, -2.0])
+        self.assertEqual(diagnostics["scores_source"], "anchor_inherited")
+        self.assertEqual(diagnostics["cap_hit_fraction"], 1.0)
+
     def test_pixel_shift_power_sanitizes_signed_nonfinite_inputs_and_reports_diagnostics(self) -> None:
         views = np.array(
             [[[[4.0, -4.0, 0.0], [np.nan, np.inf, -np.inf], [1.0, -1.0, 2.0]]]],

@@ -39,6 +39,7 @@ from matplotlib.figure import Figure
 
 from moment_images import sweep_scheduler
 from moment_images.memory_enforcement import create_memory_enforcer, worker_registration_environment
+from moment_images.power_blend import PowerBlendConfig, PowerBlendSearchSpace
 from moment_images.im_process import (
     COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE,
     RectificationRunConfig,
@@ -314,11 +315,23 @@ class SweepSearchSpace:
     pixel_sigma_pyramid: List[bool] = field(default_factory=lambda: [False, True])
     zero_fill_roll: List[bool] = field(default_factory=lambda: [True])
     pixel_shift_powers: List[float] = field(default_factory=lambda: [1.0])
+    pixel_power_blend_enabled: List[bool] = field(default_factory=lambda: [False])
+    pixel_power_blend_raised_powers: List[float] = field(default_factory=list)
+    pixel_power_blend_alphas: List[float] = field(default_factory=lambda: [0.0])
+    pixel_power_blend_delta_caps: List[float] = field(default_factory=lambda: [0.0])
     correlation_pad_widths: List[int] = field(default_factory=lambda: [RectificationRunConfig().correlation_pad_width])
     combined_use_global_avg_reference: List[bool] = field(default_factory=lambda: [True])
     combined_reference_mode: Optional[str] = None
     gauss_sizes: Optional[List[int]] = None
     disp_gauss_sizes: Optional[List[int]] = None
+
+    def power_blend_search_space(self) -> PowerBlendSearchSpace:
+        return PowerBlendSearchSpace.from_lists(
+            self.pixel_power_blend_enabled,
+            self.pixel_power_blend_raised_powers,
+            self.pixel_power_blend_alphas,
+            self.pixel_power_blend_delta_caps,
+        )
 
     @classmethod
     def from_dict(cls, strategy: str, payload: Optional[Dict[str, object]]) -> "SweepSearchSpace":
@@ -336,6 +349,10 @@ class SweepSearchSpace:
             pixel_sigma_pyramid=[bool(v) for v in raw.get("pixel_sigma_pyramid", [False, True])],  # type: ignore[arg-type]
             zero_fill_roll=[bool(v) for v in raw.get("zero_fill_roll", [True])],  # type: ignore[arg-type]
             pixel_shift_powers=[float(v) for v in raw.get("pixel_shift_powers", [1.0])],  # type: ignore[arg-type]
+            pixel_power_blend_enabled=[bool(v) for v in raw.get("pixel_power_blend_enabled", [False])],  # type: ignore[arg-type]
+            pixel_power_blend_raised_powers=[float(v) for v in raw.get("pixel_power_blend_raised_powers", [])],  # type: ignore[arg-type]
+            pixel_power_blend_alphas=[float(v) for v in raw.get("pixel_power_blend_alphas", [0.0])],  # type: ignore[arg-type]
+            pixel_power_blend_delta_caps=[float(v) for v in raw.get("pixel_power_blend_delta_caps", [0.0])],  # type: ignore[arg-type]
             correlation_pad_widths=[int(v) for v in raw.get("correlation_pad_widths", [RectificationRunConfig().correlation_pad_width])],  # type: ignore[arg-type]
             combined_use_global_avg_reference=[bool(v) for v in raw.get("combined_use_global_avg_reference", [True])],  # type: ignore[arg-type]
             combined_reference_mode=cast(
@@ -1241,6 +1258,7 @@ class PreparedDataset:
     resolved_views_path: Optional[str] = None
     views_file_size_bytes: Optional[int] = None
     views_file_mtime_ns: Optional[int] = None
+    views_content_sha256: Optional[str] = None
 
 
 @dataclass
@@ -1482,6 +1500,10 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             global_threshold=float(params["global_threshold"]),
             pixel_threshold=float(params["pixel_threshold"]),
             pixel_sigma_pyramid=bool(params["pixel_sigma_pyramid"]),
+            pixel_power_blend_enabled=bool(params.get("pixel_power_blend_enabled", False)),
+            pixel_power_blend_raised_power=cast(Optional[float], params.get("pixel_power_blend_raised_power")),
+            pixel_power_blend_alpha=float(params.get("pixel_power_blend_alpha", 0.0)),
+            pixel_power_blend_delta_cap=float(params.get("pixel_power_blend_delta_cap", 0.0)),
             zero_fill_roll=bool(params["zero_fill_roll"]),
             sub_pix_factor=int(params["sub_pix_factor"]),
             pixel_shift_power=float(params.get("pixel_shift_power", defaults.pixel_shift_power)),
@@ -1497,6 +1519,10 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
         normalized_params["gauss_size"] = gauss_size
         normalized_params["disp_gauss_size"] = disp_gauss_size
         normalized_params["pixel_shift_power"] = config.pixel_shift_power
+        normalized_params["pixel_power_blend_enabled"] = config.pixel_power_blend_enabled
+        normalized_params["pixel_power_blend_raised_power"] = config.pixel_power_blend_raised_power
+        normalized_params["pixel_power_blend_alpha"] = config.pixel_power_blend_alpha
+        normalized_params["pixel_power_blend_delta_cap"] = config.pixel_power_blend_delta_cap
         return SweepCandidate(strategy="combined", params=normalized_params, config=config)
 
     if strategy == "global":
@@ -1557,6 +1583,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
         ]
 
     if strategy == "combined":
+        power_blend_options = search_space.power_blend_search_space().coarse_options()
         values = product(
             search_space.correlation_pad_widths,
             search_space.global_thresholds,
@@ -1570,9 +1597,37 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
             search_space.combined_use_global_avg_reference,
             search_space.zero_fill_roll,
             search_space.pixel_shift_powers,
+            power_blend_options,
         )
-        return [
-            {
+        candidates: List[Dict[str, object]] = []
+        for (
+            correlation_pad_width,
+            global_threshold,
+            refinement_window_size,
+            max_disp,
+            gauss_sigma,
+            disp_gauss_sigma,
+            pixel_threshold,
+            sub_pix_factor,
+            pixel_sigma_pyramid,
+            combined_use_global_avg_reference,
+            zero_fill_roll,
+            pixel_shift_power,
+            power_blend,
+        ) in values:
+            if power_blend is not None and (bool(pixel_sigma_pyramid) or float(pixel_shift_power) != 1.0):
+                continue
+            power_blend_params = (
+                power_blend.flat_params()
+                if power_blend is not None
+                else {
+                    "pixel_power_blend_enabled": False,
+                    "pixel_power_blend_raised_power": None,
+                    "pixel_power_blend_alpha": 0.0,
+                    "pixel_power_blend_delta_cap": 0.0,
+                }
+            )
+            candidates.append({
                 "correlation_pad_width": int(correlation_pad_width),
                 "global_threshold": float(global_threshold),
                 "refinement_window_size": int(refinement_window_size),
@@ -1586,22 +1641,10 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
                 "combined_reference_mode": search_space.combined_reference_mode,
                 "zero_fill_roll": bool(zero_fill_roll),
                 "pixel_shift_power": float(pixel_shift_power),
+                **power_blend_params,
             }
-            for (
-                correlation_pad_width,
-                global_threshold,
-                refinement_window_size,
-                max_disp,
-                gauss_sigma,
-                disp_gauss_sigma,
-                pixel_threshold,
-                sub_pix_factor,
-                pixel_sigma_pyramid,
-                combined_use_global_avg_reference,
-                zero_fill_roll,
-                pixel_shift_power,
-            ) in values
-        ]
+            )
+        return candidates
 
     if strategy == "global":
         values = product(
@@ -1662,6 +1705,9 @@ _FLOAT_REFINEMENT_KEYS = {
     "global_threshold",
     "pixel_threshold",
     "pixel_shift_power",
+    "pixel_power_blend_raised_power",
+    "pixel_power_blend_alpha",
+    "pixel_power_blend_delta_cap",
 }
 _NUMERIC_REFINEMENT_KEYS = _INT_REFINEMENT_KEYS | _FLOAT_REFINEMENT_KEYS
 
@@ -1687,6 +1733,8 @@ def _search_space_values_for_key(search_space: SweepSearchSpace, key: str) -> Se
         return list(search_space.zero_fill_roll)
     if key == "pixel_shift_power":
         return list(search_space.pixel_shift_powers)
+    if key == "pixel_power_blend_enabled":
+        return list(search_space.pixel_power_blend_enabled)
     if key == "correlation_pad_width":
         return list(search_space.correlation_pad_widths)
     if key == "global_threshold":
@@ -1701,7 +1749,7 @@ def _clean_refinement_float(value: float) -> float:
 
 
 def _normalize_refinement_axis_value(key: str, value: object) -> object:
-    if key in {"pixel_sigma_pyramid", "zero_fill_roll", "combined_use_global_avg_reference"}:
+    if key in {"pixel_sigma_pyramid", "zero_fill_roll", "combined_use_global_avg_reference", "pixel_power_blend_enabled"}:
         return bool(value)
 
     if key in _INT_REFINEMENT_KEYS:
@@ -1828,6 +1876,27 @@ def _prepare_refinement_variant_params(
     return variant
 
 
+def _power_blend_flat_params(option: Optional[PowerBlendConfig]) -> Dict[str, object]:
+    if option is None:
+        return {
+            "pixel_power_blend_enabled": False,
+            "pixel_power_blend_raised_power": None,
+            "pixel_power_blend_alpha": 0.0,
+            "pixel_power_blend_delta_cap": 0.0,
+        }
+    return option.flat_params()
+
+
+def _refinement_keys_for_candidate(candidate: SweepCandidate) -> List[str]:
+    keys = _strategy_param_keys(candidate.strategy)
+    if candidate.strategy == "combined" and candidate.config.power_blend_config is not None:
+        return [
+            key for key in keys
+            if key not in {"pixel_sigma_pyramid", "pixel_shift_power"}
+        ]
+    return keys
+
+
 def _refinement_sort_key(
     candidate: SweepCandidate,
     seed_params: Dict[str, object],
@@ -1856,7 +1925,13 @@ def _local_auto_fine_candidates_for_seed(
 ) -> List[SweepCandidate]:
     strategy = coarse.strategy
     seed_params = dict(coarse.params)
-    keys = [key for key in _strategy_param_keys(strategy) if key in seed_params]
+    keys = [key for key in _refinement_keys_for_candidate(coarse) if key in seed_params]
+    power_blend_options: List[Optional[PowerBlendConfig]] = [None]
+    if strategy == "combined":
+        power_blend_options = search_space.power_blend_search_space().auto_options(
+            coarse.config.power_blend_config,
+            refinement.extrapolation,
+        )
     axis_items: List[Tuple[str, List[object]]] = []
     axis_steps: Dict[str, float] = {}
 
@@ -1884,13 +1959,16 @@ def _local_auto_fine_candidates_for_seed(
     axis_values = [values for _, values in axis_items]
     for values_combo in product(*axis_values):
         variant_values = dict(zip(axis_keys, values_combo))
-        variant_params = _prepare_refinement_variant_params(seed_params, variant_values)
-        candidate = _build_candidate_from_params(strategy, variant_params)
-        sig = _candidate_signature(candidate)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        candidates.append(candidate)
+        for power_blend in power_blend_options:
+            if strategy == "combined":
+                variant_values.update(_power_blend_flat_params(power_blend))
+            variant_params = _prepare_refinement_variant_params(seed_params, variant_values)
+            candidate = _build_candidate_from_params(strategy, variant_params)
+            sig = _candidate_signature(candidate)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            candidates.append(candidate)
 
     candidates.sort(
         key=lambda candidate: _refinement_sort_key(candidate, seed_params, keys, axis_steps)
@@ -1952,7 +2030,7 @@ def _generate_neighbor_refined_candidates(
             seen.add(base_sig)
             generated.append(base_candidate)
 
-        for key in _strategy_param_keys(strategy):
+        for key in _refinement_keys_for_candidate(coarse):
             if key not in params:
                 continue
             strategy_values = _search_space_values_for_key(search_space, key)
@@ -1961,6 +2039,22 @@ def _generate_neighbor_refined_candidates(
                 if neighbor == params[key]:
                     continue
                 variant = _prepare_refinement_variant_params(params, {key: neighbor})
+                candidate = _build_candidate_from_params(strategy, variant)
+                sig = _candidate_signature(candidate)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                generated.append(candidate)
+
+        if strategy == "combined":
+            for power_blend in search_space.power_blend_search_space().neighbor_options(
+                coarse.config.power_blend_config
+            ):
+                if power_blend == coarse.config.power_blend_config:
+                    continue
+                variant = _prepare_refinement_variant_params(
+                    params, _power_blend_flat_params(power_blend)
+                )
                 candidate = _build_candidate_from_params(strategy, variant)
                 sig = _candidate_signature(candidate)
                 if sig in seen:
@@ -2070,6 +2164,7 @@ def _save_run_artifacts(
     pixel_displacements_y = None
     pixel_blended_scores = None
     pixel_component_scores: Dict[str, np.ndarray] = {}
+    power_blend_workspace: Dict[str, object] = {}
     if result.pixel_similarity is not None:
         pixel_displacements_x = getattr(result.pixel_similarity, "disps_x", None)
         pixel_displacements_y = getattr(result.pixel_similarity, "disps_y", None)
@@ -2078,6 +2173,9 @@ def _save_run_artifacts(
         if isinstance(component_scores, dict):
             for key, value in component_scores.items():
                 pixel_component_scores[str(key)] = np.asarray(value)
+        power_blend_artifacts = getattr(result.pixel_similarity, "power_blend_artifacts", None)
+        if power_blend_artifacts is not None:
+            power_blend_workspace.update(power_blend_artifacts.workspace_values())
 
     config_dict = asdict(config)
     strategy_code = {"global": 1, "pixel": 2, "combined": 3}.get(config.strategy.lower(), 0)
@@ -2111,6 +2209,7 @@ def _save_run_artifacts(
     }
     for component_name, component_values in pixel_component_scores.items():
         workspace_data[f"pixel_component_score_{component_name}"] = component_values
+    workspace_data.update(power_blend_workspace)
     save_workspace_variables(str(run_dir / "workspace.npz"), workspace_data)
 
     write_json_atomic(run_dir / "config.json", config_dict, indent=2, sort_keys=True, create_backup=True)
@@ -2302,6 +2401,7 @@ def _cached_prepared_dataset(
         resolved_views_path=str(cache_path.resolve()),
         views_file_size_bytes=int(stat.st_size),
         views_file_mtime_ns=int(stat.st_mtime_ns),
+        views_content_sha256=_file_content_sha256(cache_path),
     )
     if _dataset_signature(prepared) != _dataset_signature_from_identity_payload(expected_identity):
         return None
@@ -2356,6 +2456,7 @@ def _prepare_dataset(
             resolved_views_path=str(views_path.resolve()),
             views_file_size_bytes=int(stat.st_size),
             views_file_mtime_ns=int(stat.st_mtime_ns),
+            views_content_sha256=_file_content_sha256(views_path),
         )
 
     dataset_dir = output_dir / "datasets" / dataset.dataset_id
@@ -2444,6 +2545,7 @@ def _prepare_dataset(
             resolved_views_path=str(views_path.resolve()),
             views_file_size_bytes=int(stat.st_size),
             views_file_mtime_ns=int(stat.st_mtime_ns),
+            views_content_sha256=_file_content_sha256(views_path),
         )
 
     # source_image_dir branch
@@ -2506,6 +2608,7 @@ def _prepare_dataset(
         resolved_views_path=str(views_path.resolve()),
         views_file_size_bytes=int(stat.st_size),
         views_file_mtime_ns=int(stat.st_mtime_ns),
+        views_content_sha256=_file_content_sha256(views_path),
     )
 
 
@@ -2535,7 +2638,7 @@ def _prepare_datasets(
 
 
 RUN_STATE_FILENAME = "run_state.json"
-RUN_STATE_SCHEMA_VERSION = 2
+RUN_STATE_SCHEMA_VERSION = 3
 CANDIDATE_ID_HASH_LEN = 12
 DATASET_CONFIG_KEYS = {"hdr_enabled", "hdr_exposure_times", "normalize_to_8bit"}
 
@@ -2547,6 +2650,14 @@ def _canonical_json(payload: object) -> str:
 def _hash_payload(payload: object, length: Optional[int] = None) -> str:
     digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
     return digest if length is None else digest[:length]
+
+
+def _file_content_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _utc_now_iso() -> str:
@@ -2565,6 +2676,7 @@ def _dataset_identity_payload(dataset: PreparedDataset) -> Dict[str, object]:
         "views_itemsize": int(dataset.views_itemsize),
         "views_file_size_bytes": dataset.views_file_size_bytes,
         "views_file_mtime_ns": dataset.views_file_mtime_ns,
+        "views_content_sha256": dataset.views_content_sha256,
     }
 
 
@@ -2578,6 +2690,7 @@ def _dataset_signature_payload(identity_payload: Mapping[str, object]) -> Dict[s
         "views_dtype": str(identity_payload.get("views_dtype", "")),
         "views_itemsize": int(identity_payload.get("views_itemsize", 0) or 0),
         "views_file_size_bytes": identity_payload.get("views_file_size_bytes"),
+        "views_content_sha256": identity_payload.get("views_content_sha256"),
     }
 
 
@@ -3856,7 +3969,12 @@ def _evaluate_candidate_task(task: Dict[str, object]) -> Dict[str, object]:
     try:
         views = _load_views(Path(cast(str, task["views_path"])))
         config = RectificationRunConfig(**cast(Dict[str, object], task["config"]))
-        result = rectify_views_from_config(views, config)
+        result = rectify_views_from_config(
+            views,
+            config,
+            power_blend_cache_dir=Path(cast(str, task["power_blend_cache_dir"])),
+            power_blend_cache_key=str(task["power_blend_cache_key"]),
+        )
         output_dir = Path(cast(str, task["run_parent_dir"]))
         run_name = str(task["run_name"])
         metric_record = build_metric_record(run_uid, config, result)
@@ -4304,6 +4422,9 @@ def _evaluate_stage(
             dataset_signature = _dataset_signature(dataset)
             run_signature = _run_signature(stage_name, candidate_signature, dataset_signature)
             run_dir = candidate_root / run_name
+            cache_payload = asdict(config)
+            cache_payload.pop("pixel_power_blend_alpha", None)
+            cache_payload.pop("pixel_power_blend_delta_cap", None)
             tasks.append(
                 {
                     "stage": stage_name,
@@ -4327,6 +4448,14 @@ def _evaluate_stage(
                     "run_signature": run_signature,
                     "generation_id": generation_id,
                     "artifact_paths": _artifact_paths_payload(run_dir),
+                    "power_blend_cache_dir": str(output_dir / ".pixel_power_blend_cache"),
+                    "power_blend_cache_key": _hash_payload(
+                        {
+                            "version": 2,
+                            "dataset_signature": dataset_signature,
+                            "field_config": cache_payload,
+                        }
+                    ),
                 }
             )
     tasks.sort(key=lambda item: (str(item["candidate_id"]), str(item["dataset_id"])))
@@ -8597,6 +8726,10 @@ class SpecGuiState:
     combined_disp_gauss_sigmas: str = "0.0,1.0"
     combined_pixel_thresholds: str = "0.05"
     combined_pixel_shift_powers: str = "1.0"
+    combined_power_blend_enabled: str = "false"
+    combined_power_blend_raised_powers: str = "2.0"
+    combined_power_blend_alphas: str = "0.5"
+    combined_power_blend_delta_caps: str = "1.0"
     combined_global_thresholds: str = "0.1,0.15"
     combined_correlation_pad_widths: str = str(RectificationRunConfig().correlation_pad_width)
     pixel_sub_pix_factors: str = "1,2"
@@ -9002,6 +9135,18 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             "pixel_shift_powers": _parse_pixel_shift_power_list_csv(
                 state.combined_pixel_shift_powers, "combined pixel shift powers"
             ),
+            "pixel_power_blend_enabled": _parse_bool_list_csv(
+                state.combined_power_blend_enabled, "combined power blend enabled"
+            ),
+            "pixel_power_blend_raised_powers": _parse_float_list_csv(
+                state.combined_power_blend_raised_powers, "combined raised powers"
+            ),
+            "pixel_power_blend_alphas": _parse_float_list_csv(
+                state.combined_power_blend_alphas, "combined power blend alphas"
+            ),
+            "pixel_power_blend_delta_caps": _parse_float_list_csv(
+                state.combined_power_blend_delta_caps, "combined power blend delta caps"
+            ),
             "global_thresholds": _parse_float_list_csv(
                 state.combined_global_thresholds, "combined global thresholds"
             ),
@@ -9350,6 +9495,18 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         state.combined_pixel_shift_powers = _list_to_csv(
             cast(List[object], combined_space.get("pixel_shift_powers", []))
         ) or state.combined_pixel_shift_powers
+        state.combined_power_blend_enabled = _list_to_csv(
+            cast(List[object], combined_space.get("pixel_power_blend_enabled", []))
+        ) or state.combined_power_blend_enabled
+        state.combined_power_blend_raised_powers = _list_to_csv(
+            cast(List[object], combined_space.get("pixel_power_blend_raised_powers", []))
+        ) or state.combined_power_blend_raised_powers
+        state.combined_power_blend_alphas = _list_to_csv(
+            cast(List[object], combined_space.get("pixel_power_blend_alphas", []))
+        ) or state.combined_power_blend_alphas
+        state.combined_power_blend_delta_caps = _list_to_csv(
+            cast(List[object], combined_space.get("pixel_power_blend_delta_caps", []))
+        ) or state.combined_power_blend_delta_caps
         state.combined_global_thresholds = _list_to_csv(
             cast(List[object], combined_space.get("global_thresholds", []))
         ) or state.combined_global_thresholds
@@ -10391,9 +10548,13 @@ class SpecGuiApp:
         self.comb_disp_gauss_entry = self._build_labeled_entry(right, 3, "Combined disp gauss sigmas", "0.0,1.0")
         self.comb_thresh_entry = self._build_labeled_entry(right, 4, "Combined pixel thresholds", "0.05")
         self.comb_shift_power_entry = self._build_labeled_entry(right, 5, "Combined pixel shift powers", "1.0")
-        self.comb_global_thresh_entry = self._build_labeled_entry(right, 6, "Combined global thresholds", "0.1,0.15")
+        self.comb_power_blend_enabled_entry = self._build_labeled_entry(right, 6, "Power blend enabled", "false")
+        self.comb_power_blend_raised_entry = self._build_labeled_entry(right, 7, "Power blend raised powers", "2.0")
+        self.comb_power_blend_alpha_entry = self._build_labeled_entry(right, 8, "Power blend alphas", "0.5")
+        self.comb_power_blend_cap_entry = self._build_labeled_entry(right, 9, "Power blend delta caps", "1.0")
+        self.comb_global_thresh_entry = self._build_labeled_entry(right, 10, "Combined global thresholds", "0.1,0.15")
         self.comb_corr_pad_entry = self._build_labeled_entry(
-            right, 7, "Combined correlation pad widths", str(RectificationRunConfig().correlation_pad_width)
+            right, 11, "Combined correlation pad widths", str(RectificationRunConfig().correlation_pad_width)
         )
 
         dataset_frame = self.ttk.LabelFrame(self.content_frame, text="Datasets")
@@ -11180,6 +11341,10 @@ class SpecGuiApp:
             combined_disp_gauss_sigmas=self.comb_disp_gauss_entry.get().strip(),
             combined_pixel_thresholds=self.comb_thresh_entry.get().strip(),
             combined_pixel_shift_powers=self.comb_shift_power_entry.get().strip(),
+            combined_power_blend_enabled=self.comb_power_blend_enabled_entry.get().strip(),
+            combined_power_blend_raised_powers=self.comb_power_blend_raised_entry.get().strip(),
+            combined_power_blend_alphas=self.comb_power_blend_alpha_entry.get().strip(),
+            combined_power_blend_delta_caps=self.comb_power_blend_cap_entry.get().strip(),
             combined_global_thresholds=self.comb_global_thresh_entry.get().strip(),
             combined_correlation_pad_widths=self.comb_corr_pad_entry.get().strip(),
             pixel_sub_pix_factors=self.pixel_subpix_entry.get().strip(),
@@ -11313,6 +11478,10 @@ class SpecGuiApp:
             (self.comb_disp_gauss_entry, state.combined_disp_gauss_sigmas),
             (self.comb_thresh_entry, state.combined_pixel_thresholds),
             (self.comb_shift_power_entry, state.combined_pixel_shift_powers),
+            (self.comb_power_blend_enabled_entry, state.combined_power_blend_enabled),
+            (self.comb_power_blend_raised_entry, state.combined_power_blend_raised_powers),
+            (self.comb_power_blend_alpha_entry, state.combined_power_blend_alphas),
+            (self.comb_power_blend_cap_entry, state.combined_power_blend_delta_caps),
             (self.comb_global_thresh_entry, state.combined_global_thresholds),
             (self.comb_corr_pad_entry, state.combined_correlation_pad_widths),
             (self.pixel_subpix_entry, state.pixel_sub_pix_factors),

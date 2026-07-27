@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import warnings
 
 import cv2 as cv
@@ -396,6 +396,15 @@ class PixelwiseSimilarityResult:
     component_weights_raw: Optional[Dict[str, float]] = None
     component_weights_normalized: Optional[Dict[str, float]] = None
     runtime_warnings: List[Dict[str, object]] = field(default_factory=list)
+    power_blend_artifacts: Optional[Any] = None
+
+    @property
+    def power_blend_diagnostics(self) -> Optional[Dict[str, object]]:
+        """Compatibility accessor for callers that consumed blend diagnostics."""
+
+        if self.power_blend_artifacts is None:
+            return None
+        return self.power_blend_artifacts.diagnostics
 
 
 class RectificationStrategy(ABC):
@@ -628,6 +637,152 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
     def select_reference_view(self, views: np.ndarray) -> Tuple[int, int]:
         _, _, _, center_i, center_j = self._default_reference_view(views)
         return center_i, center_j
+
+    @staticmethod
+    def blend_pixelwise_similarity_results(
+        anchor: PixelwiseSimilarityResult,
+        challenger: PixelwiseSimilarityResult,
+        *,
+        blend_alpha: float,
+        delta_cap: float,
+    ) -> Tuple[PixelwiseSimilarityResult, Dict[str, object]]:
+        """Blend an anchor field toward a challenger using capped vector residuals."""
+
+        alpha_value = float(blend_alpha)
+        cap_value = float(delta_cap)
+        if not np.isfinite(alpha_value) or not 0.0 <= alpha_value <= 1.0:
+            raise ValueError("blend_alpha must be finite and between 0 and 1.")
+        if not np.isfinite(cap_value) or cap_value < 0.0:
+            raise ValueError("delta_cap must be finite and non-negative.")
+
+        anchor_y = np.asarray(anchor.disps_y, dtype=np.float32)
+        anchor_x = np.asarray(anchor.disps_x, dtype=np.float32)
+        challenger_y = np.asarray(challenger.disps_y, dtype=np.float32)
+        challenger_x = np.asarray(challenger.disps_x, dtype=np.float32)
+        expected_coordinate_shape = (*anchor_y.shape, 2)
+        if (
+            anchor_y.ndim != 4
+            or anchor_x.shape != anchor_y.shape
+            or challenger_y.shape != anchor_y.shape
+            or challenger_x.shape != anchor_y.shape
+            or np.asarray(anchor.scores).shape != anchor_y.shape
+            or np.asarray(challenger.scores).shape != anchor_y.shape
+            or np.asarray(anchor.coordinates).shape != expected_coordinate_shape
+            or np.asarray(challenger.coordinates).shape != expected_coordinate_shape
+        ):
+            raise ValueError("anchor and challenger pixelwise result shapes must match.")
+        if int(anchor.sub_pix_factor) != int(challenger.sub_pix_factor):
+            raise ValueError("anchor and challenger sub_pix_factor values must match.")
+        if bool(anchor.reference_is_external) != bool(challenger.reference_is_external):
+            raise ValueError("anchor and challenger reference_is_external values must match.")
+
+        raw_delta_y = challenger_y - anchor_y
+        raw_delta_x = challenger_x - anchor_x
+        finite_mask = np.isfinite(raw_delta_y) & np.isfinite(raw_delta_x)
+        safe_delta_y = np.where(finite_mask, raw_delta_y, 0.0).astype(np.float32)
+        safe_delta_x = np.where(finite_mask, raw_delta_x, 0.0).astype(np.float32)
+        preclip_magnitude = np.hypot(safe_delta_y, safe_delta_x).astype(np.float64)
+        if cap_value == 0.0:
+            cap_scale = np.zeros_like(preclip_magnitude)
+        else:
+            cap_scale = np.minimum(1.0, cap_value / (preclip_magnitude + 1e-12))
+        clipped_delta_y = (safe_delta_y * cap_scale).astype(np.float32)
+        clipped_delta_x = (safe_delta_x * cap_scale).astype(np.float32)
+        final_delta_y = (alpha_value * clipped_delta_y).astype(np.float32)
+        final_delta_x = (alpha_value * clipped_delta_x).astype(np.float32)
+        final_disps_y = (anchor_y + final_delta_y).astype(np.float32)
+        final_disps_x = (anchor_x + final_delta_x).astype(np.float32)
+
+        height, width = anchor_y.shape[:2]
+        base_y, base_x = np.meshgrid(
+            np.arange(height, dtype=np.float32),
+            np.arange(width, dtype=np.float32),
+            indexing="ij",
+        )
+        coordinates = np.zeros(expected_coordinate_shape, dtype=np.float32)
+        coordinates[..., 0] = base_y[..., None, None] - final_disps_y
+        coordinates[..., 1] = base_x[..., None, None] - final_disps_x
+        coordinate_oob = (
+            (coordinates[..., 0] < 0.0)
+            | (coordinates[..., 0] > float(height - 1))
+            | (coordinates[..., 1] < 0.0)
+            | (coordinates[..., 1] > float(width - 1))
+        )
+        final_magnitude = np.hypot(final_delta_y, final_delta_x).astype(np.float64)
+        gradient_terms: List[np.ndarray] = []
+        if height > 1:
+            gradient_terms.extend((
+                np.gradient(final_delta_y, axis=0),
+                np.gradient(final_delta_x, axis=0),
+            ))
+        if width > 1:
+            gradient_terms.extend((
+                np.gradient(final_delta_y, axis=1),
+                np.gradient(final_delta_x, axis=1),
+            ))
+        if gradient_terms:
+            gradient_magnitude = np.sqrt(sum(np.square(term) for term in gradient_terms))
+        else:
+            gradient_magnitude = np.zeros_like(final_delta_y, dtype=np.float32)
+        diagnostics: Dict[str, object] = {
+            "blend_alpha": alpha_value,
+            "delta_cap": cap_value,
+            "preclip_delta_mean": float(np.mean(preclip_magnitude)),
+            "preclip_delta_rms": float(np.sqrt(np.mean(np.square(preclip_magnitude)))),
+            "preclip_delta_max": float(np.max(preclip_magnitude)),
+            "cap_hit_fraction": float(np.mean(preclip_magnitude > cap_value)),
+            "nonfinite_delta_fraction": float(np.mean(~finite_mask)),
+            "final_delta_mean": float(np.mean(final_magnitude)),
+            "final_delta_rms": float(np.sqrt(np.mean(np.square(final_magnitude)))),
+            "final_delta_max": float(np.max(final_magnitude)),
+            "delta_gradient_mean": float(np.mean(gradient_magnitude)),
+            "delta_gradient_p95": float(np.percentile(gradient_magnitude, 95.0)),
+            "delta_gradient_max": float(np.max(gradient_magnitude)),
+            "coordinate_oob_fraction": float(np.mean(coordinate_oob)),
+            "scores_source": "anchor_inherited",
+        }
+        from .power_blend import PowerBlendArtifacts, PowerBlendFieldPair
+
+        artifacts = PowerBlendArtifacts(
+            fields=PowerBlendFieldPair(anchor=anchor, challenger=challenger),
+            diagnostics=diagnostics,
+            delta_y=safe_delta_y.copy(),
+            delta_x=safe_delta_x.copy(),
+            delta_magnitude=preclip_magnitude.astype(np.float32),
+        )
+        return PixelwiseSimilarityResult(
+            coordinates=coordinates,
+            scores=np.asarray(anchor.scores).copy(),
+            disps_y=final_disps_y,
+            disps_x=final_disps_x,
+            sub_pix_factor=int(anchor.sub_pix_factor),
+            reference_is_external=bool(anchor.reference_is_external),
+            blended_score_maps=(
+                None if anchor.blended_score_maps is None else np.asarray(anchor.blended_score_maps).copy()
+            ),
+            component_score_maps=(
+                None if anchor.component_score_maps is None
+                else {key: np.asarray(value).copy() for key, value in anchor.component_score_maps.items()}
+            ),
+            component_score_maps_raw=(
+                None if anchor.component_score_maps_raw is None
+                else {key: np.asarray(value).copy() for key, value in anchor.component_score_maps_raw.items()}
+            ),
+            view_score_summary=(
+                None if anchor.view_score_summary is None else dict(anchor.view_score_summary)
+            ),
+            metric_family=anchor.metric_family,
+            alpha=anchor.alpha,
+            component_weights_raw=(
+                None if anchor.component_weights_raw is None else dict(anchor.component_weights_raw)
+            ),
+            component_weights_normalized=(
+                None if anchor.component_weights_normalized is None
+                else dict(anchor.component_weights_normalized)
+            ),
+            runtime_warnings=list(anchor.runtime_warnings) + list(challenger.runtime_warnings),
+            power_blend_artifacts=artifacts,
+        ), diagnostics
 
     @staticmethod
     def _blend_normalized_components(

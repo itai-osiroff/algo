@@ -82,6 +82,144 @@ def test_pixel_shift_power_is_a_pixel_and_combined_candidate_axis():
     assert {candidate.params["pixel_shift_power"] for candidate in combined_candidates} == {0.5, 1.0}
 
 
+def test_combined_power_blend_candidates_are_explicit_and_exclude_incompatible_axes():
+    candidates = generate_coarse_candidates(
+        SweepSearchSpace(
+            strategy="combined",
+            correlation_pad_widths=[1],
+            global_thresholds=[0.15],
+            refinement_window_sizes=[1],
+            max_displacements=[0],
+            gauss_sigmas=[1.0],
+            disp_gauss_sigmas=[0.0],
+            pixel_thresholds=[0.05],
+            sub_pix_factors=[1],
+            pixel_sigma_pyramid=[False, True],
+            combined_use_global_avg_reference=[True],
+            zero_fill_roll=[True],
+            pixel_shift_powers=[1.0, 1.5],
+            pixel_power_blend_enabled=[True],
+            pixel_power_blend_raised_powers=[2.0],
+            pixel_power_blend_alphas=[0.25, 0.5],
+            pixel_power_blend_delta_caps=[1.0],
+        )
+    )
+
+    assert len(candidates) == 2
+    assert {candidate.config.pixel_power_blend_alpha for candidate in candidates} == {0.25, 0.5}
+    assert all(candidate.config.pixel_shift_power == 1.0 for candidate in candidates)
+    assert all(candidate.config.pixel_sigma_pyramid is False for candidate in candidates)
+    assert all(candidate.config.pixel_power_blend_raised_power == 2.0 for candidate in candidates)
+
+
+def test_combined_refinement_keeps_a_disabled_power_blend_seed_disabled():
+    search_space = SweepSearchSpace(
+        strategy="combined",
+        correlation_pad_widths=[1],
+        global_thresholds=[0.15],
+        refinement_window_sizes=[1],
+        max_displacements=[0],
+        gauss_sigmas=[1.0],
+        disp_gauss_sigmas=[0.0],
+        pixel_thresholds=[0.05],
+        sub_pix_factors=[1],
+        pixel_sigma_pyramid=[False],
+        combined_use_global_avg_reference=[True],
+        zero_fill_roll=[True],
+        pixel_shift_powers=[1.0],
+        pixel_power_blend_enabled=[False, True],
+        pixel_power_blend_raised_powers=[2.0],
+        pixel_power_blend_alphas=[0.5],
+        pixel_power_blend_delta_caps=[1.0],
+    )
+    coarse = generate_coarse_candidates(search_space)
+    for index, candidate in enumerate(coarse):
+        candidate.candidate_id = f"candidate-{index}"
+    seed = next(candidate for candidate in coarse if not candidate.config.pixel_power_blend_enabled)
+
+    refined = generate_refined_candidates(
+        ranked_candidates=[{"candidate_id": seed.candidate_id, "score": 1.0}],
+        candidate_lookup={candidate.candidate_id: candidate for candidate in coarse},
+        search_spaces={"combined": search_space},
+        top_k=1,
+    )
+
+    assert refined
+    assert all(not candidate.config.pixel_power_blend_enabled for candidate in refined)
+
+
+def test_combined_refinement_keeps_an_enabled_power_blend_seed_compatible():
+    search_space = SweepSearchSpace(
+        strategy="combined",
+        correlation_pad_widths=[1],
+        global_thresholds=[0.15],
+        refinement_window_sizes=[1],
+        max_displacements=[0],
+        gauss_sigmas=[1.0],
+        disp_gauss_sigmas=[0.0],
+        pixel_thresholds=[0.05],
+        sub_pix_factors=[1],
+        pixel_sigma_pyramid=[False, True],
+        combined_use_global_avg_reference=[True],
+        zero_fill_roll=[True],
+        pixel_shift_powers=[1.0, 1.5],
+        pixel_power_blend_enabled=[True],
+        pixel_power_blend_raised_powers=[2.0, 3.0],
+        pixel_power_blend_alphas=[0.25, 0.5],
+        pixel_power_blend_delta_caps=[1.0],
+    )
+    coarse = generate_coarse_candidates(search_space)
+    for index, candidate in enumerate(coarse):
+        candidate.candidate_id = f"candidate-{index}"
+    seed = coarse[0]
+
+    refined = generate_refined_candidates(
+        ranked_candidates=[{"candidate_id": seed.candidate_id, "score": 1.0}],
+        candidate_lookup={candidate.candidate_id: candidate for candidate in coarse},
+        search_spaces={"combined": search_space},
+        top_k=1,
+    )
+
+    assert refined
+    assert all(candidate.config.pixel_power_blend_enabled for candidate in refined)
+    assert all(candidate.config.pixel_shift_power == 1.0 for candidate in refined)
+    assert all(candidate.config.pixel_sigma_pyramid is False for candidate in refined)
+
+
+def test_dataset_signature_uses_content_digest_for_same_size_views(tmp_path):
+    views_path = tmp_path / "views.npy"
+    np.save(views_path, np.array([1, 2, 3, 4], dtype=np.uint8))
+    first_digest = parameter_sweep._file_content_sha256(views_path)
+    first = PreparedDataset(
+        dataset_id="sample",
+        views_path=views_path,
+        hdr_enabled=False,
+        hdr_exposure_times=None,
+        normalize_to_8bit=False,
+        views_shape=(1, 1, 2, 2),
+        views_dtype="uint8",
+        views_itemsize=1,
+        views_file_size_bytes=views_path.stat().st_size,
+        views_content_sha256=first_digest,
+    )
+    np.save(views_path, np.array([4, 3, 2, 1], dtype=np.uint8))
+    second = PreparedDataset(
+        dataset_id="sample",
+        views_path=views_path,
+        hdr_enabled=False,
+        hdr_exposure_times=None,
+        normalize_to_8bit=False,
+        views_shape=(1, 1, 2, 2),
+        views_dtype="uint8",
+        views_itemsize=1,
+        views_file_size_bytes=views_path.stat().st_size,
+        views_content_sha256=parameter_sweep._file_content_sha256(views_path),
+    )
+
+    assert first.views_file_size_bytes == second.views_file_size_bytes
+    assert parameter_sweep._dataset_signature(first) != parameter_sweep._dataset_signature(second)
+
+
 def _metric_record(laplacian_variance: float) -> dict:
     return {
         "global_only_metrics": None,
