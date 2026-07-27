@@ -1,7 +1,7 @@
 import os
 import sys
 import PIL
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from PIL import Image
 import numpy as np
@@ -20,6 +20,7 @@ if __package__ is None or __package__ == "":
         BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         GlobalTranslationRectificationStrategy,
         PixelwisePatchRectificationStrategy,
+        normalize_pixel_shift_power,
         resolve_displacement_metric_spec,
         resolve_reference_view,
     )
@@ -31,6 +32,7 @@ else:
         BLURRED_COMPOSITE_CORR_METRIC_FAMILY,
         GlobalTranslationRectificationStrategy,
         PixelwisePatchRectificationStrategy,
+        normalize_pixel_shift_power,
         resolve_displacement_metric_spec,
         resolve_reference_view,
     )
@@ -105,7 +107,10 @@ class RectificationRunConfig:
     ``displacement_metric_family`` and ``displacement_alpha`` control how local
     pixelwise displacement candidates are ranked; ``alpha`` is the local
     displacement score blend weight between the intensity term and any selected
-    auxiliary blurred-correlation components.
+    auxiliary blurred-correlation components. ``pixel_shift_power`` applies a
+    signed power to the shifted moving view for intensity matching only. It
+    sanitizes a scoring copy when necessary; global alignment, rectification,
+    HDR assembly, and returned view stacks retain the raw input data.
     """
 
     strategy: str = "pixel"
@@ -122,6 +127,7 @@ class RectificationRunConfig:
     pixel_sigma_pyramid: bool = False
     zero_fill_roll: bool = True
     sub_pix_factor: int = 2
+    pixel_shift_power: float = 1.0
     combined_use_global_avg_reference: bool = True
     combined_reference_mode: Optional[str] = None
     displacement_metric_family: str = "intensity"
@@ -133,6 +139,8 @@ class RectificationRunConfig:
     normalize_to_8bit: bool = False
 
     def __post_init__(self) -> None:
+        self.pixel_shift_power = normalize_pixel_shift_power(self.pixel_shift_power)
+
         self.combined_reference_mode = normalize_combined_reference_mode(
             self.combined_reference_mode,
             use_global_avg_reference=bool(self.combined_use_global_avg_reference),
@@ -180,6 +188,7 @@ class RectificationResult:
     global_rectified_views: Optional[np.ndarray] = None
     global_avg_image: Optional[np.ndarray] = None
     pixel_similarity: Optional[Any] = None
+    runtime_warnings: List[Dict[str, object]] = field(default_factory=list)
 
 
 def add_colorbar(mappable: Any, ax: Optional[plt.Axes] = None) -> None:
@@ -274,7 +283,12 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         strategy.
     """
 
+    strategy = config.strategy.lower()
+    if strategy not in {"global", "pixel", "combined"}:
+        raise ValueError("strategy must be one of 'global', 'pixel', or 'combined'")
+
     views_input = np.asarray(views)
+    runtime_warnings: List[Dict[str, object]] = []
     exposure_views: Optional[np.ndarray] = None
     if views_input.ndim == 5:
         if not config.hdr_enabled:
@@ -299,11 +313,8 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
     global_similarity = None
     global_rectified_views = None
     global_avg_image = None
+    global_rectified_view_stack_arr: Optional[np.ndarray] = None
     pixel_similarity = None
-
-    strategy = config.strategy.lower()
-    if strategy not in {"global", "pixel", "combined"}:
-        raise ValueError("strategy must be one of 'global', 'pixel', or 'combined'")
 
     if strategy == "global":
         rectification_strategy = GlobalTranslationRectificationStrategy(
@@ -353,7 +364,9 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             metric_family=config.displacement_metric_family,
             alpha=config.displacement_alpha,
             component_weights=config.displacement_component_weights,
+            pixel_shift_power=config.pixel_shift_power,
         )
+        runtime_warnings = list(getattr(pixel_similarity, "runtime_warnings", []))
         if exposure_views is not None:
             rectified_view_stack = []
             for exposure in exposure_views:
@@ -390,11 +403,11 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
                     exposure, global_similarity, ref_view_idx
                 )
                 rectified_view_stack.append(rectified)
-            rectified_view_stack_arr = np.asarray(rectified_view_stack)
+            global_rectified_view_stack_arr = np.asarray(rectified_view_stack)
             hdr_views = assemble_HDR(
                 images=[],
                 exposure_times=np.array(config.hdr_exposure_times),
-                views=rectified_view_stack_arr,
+                views=global_rectified_view_stack_arr,
                 normalize_to_8bit=config.normalize_to_8bit,
             )
             assert isinstance(hdr_views, np.ndarray)
@@ -408,15 +421,20 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         rectification_strategy_pixel = PixelwisePatchRectificationStrategy(
             config.refinement_window_size, zero_fill_roll=config.zero_fill_roll
         )
+        pixel_scoring_views = global_rectified_views
+        pixel_scoring_average = global_avg_image
+        if global_rectified_view_stack_arr is not None:
+            pixel_scoring_views = global_rectified_view_stack_arr[0]
+            pixel_scoring_average = np.mean(pixel_scoring_views, axis=(0, 1))
         if config.combined_reference_mode == COMBINED_REFERENCE_MODE_GLOBAL_AVERAGE:
-            reference_view = global_avg_image
+            reference_view = pixel_scoring_average
         elif (
             config.combined_reference_mode
             == COMBINED_REFERENCE_MODE_ITERATIVE_SUBTRACTIVE_MAX_REBUILD
         ):
             reference_view = iterative_subtractive_max_rebuild(
-                global_rectified_views,
-                global_average=global_avg_image,
+                pixel_scoring_views,
+                global_average=pixel_scoring_average,
                 metric_family=config.displacement_metric_family,
                 alpha=config.displacement_alpha,
                 component_weights=config.displacement_component_weights,
@@ -424,7 +442,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         else:
             reference_view = None
         pixel_similarity = rectification_strategy_pixel.compute_similarity_matrices(
-            global_rectified_views,
+            pixel_scoring_views,
             ref_view_idx,
             max_disp=config.max_displacement,
             gauss_sigma=config.gauss_sigma,
@@ -438,10 +456,30 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
             metric_family=config.displacement_metric_family,
             alpha=config.displacement_alpha,
             component_weights=config.displacement_component_weights,
+            pixel_shift_power=config.pixel_shift_power,
         )
-        avg_image, rectified_views = rectification_strategy_pixel.rectify(
-            global_rectified_views, pixel_similarity, ref_view_idx
-        )
+        runtime_warnings = list(getattr(pixel_similarity, "runtime_warnings", []))
+        if global_rectified_view_stack_arr is not None:
+            rectified_view_stack = []
+            for exposure in global_rectified_view_stack_arr:
+                _, rectified = rectification_strategy_pixel.rectify(
+                    exposure, pixel_similarity, ref_view_idx
+                )
+                rectified_view_stack.append(rectified)
+            rectified_view_stack_arr = np.asarray(rectified_view_stack)
+            hdr_views = assemble_HDR(
+                images=[],
+                exposure_times=np.array(config.hdr_exposure_times),
+                views=rectified_view_stack_arr,
+                normalize_to_8bit=config.normalize_to_8bit,
+            )
+            assert isinstance(hdr_views, np.ndarray)
+            avg_image = np.mean(hdr_views, axis=(0, 1))
+            rectified_views = hdr_views
+        else:
+            avg_image, rectified_views = rectification_strategy_pixel.rectify(
+                global_rectified_views, pixel_similarity, ref_view_idx
+            )
 
     return RectificationResult(
         avg_image=avg_image,
@@ -454,6 +492,7 @@ def rectify_views_from_config(views: np.ndarray, config: RectificationRunConfig)
         global_rectified_views=global_rectified_views,
         global_avg_image=global_avg_image,
         pixel_similarity=pixel_similarity,
+        runtime_warnings=runtime_warnings,
     )
 
 

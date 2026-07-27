@@ -44,7 +44,7 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
         save_figures_flag=False,
     )
 
-    run_dir = output_dir / "win1_disp0_g1.0_dg0.0_pt0.05"
+    run_dir = output_dir / "win1_disp0_g1.0_dg0.0_pt0.05_psp1.0"
     sweep_rectified = np.load(run_dir / "rectified_views.npy")
     with np.load(run_dir / "workspace.npz") as workspace:
         sweep_rectified_workspace = workspace["rectified_views"]
@@ -65,7 +65,7 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
         assert int(np.asarray(workspace["rectification_strategy"]).item()) == 2
         assert (
             str(np.asarray(workspace["run_name"]).item())
-            == "win1_disp0_g1.0_dg0.0_pt0.05"
+            == "win1_disp0_g1.0_dg0.0_pt0.05_psp1.0"
         )
         parsed_config = json.loads(str(np.asarray(workspace["config_json"]).item()))
         assert parsed_config["strategy"] == "pixel"
@@ -96,6 +96,29 @@ def test_parameter_sweep_matches_direct_rectification(tmp_path):
     assert direct_result.pixel_similarity.component_score_maps is None
     assert (run_dir / "workspace.mat").exists()
     assert not (run_dir / "rectified_views.npz").exists()
+
+
+def test_legacy_sweep_generates_distinct_runs_for_each_pixel_shift_power(tmp_path):
+    views = np.arange(16, dtype=np.float32).reshape(2, 2, 2, 2)
+    output_dir = tmp_path / "runs"
+
+    sweep_parameters(
+        views=views,
+        output_dir=output_dir,
+        window_sizes=[1],
+        max_displacements=[0],
+        gauss_sigmas=[1.0],
+        disp_gauss_sigmas=[0.0],
+        pixel_thresholds=[0.05],
+        pixel_shift_powers=[0.5, 1.0],
+        strategy="pixel",
+    )
+
+    for power in (0.5, 1.0):
+        run_dir = output_dir / f"win1_disp0_g1.0_dg0.0_pt0.05_psp{power}"
+        assert run_dir.is_dir()
+        config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        assert config["pixel_shift_power"] == power
 
 
 def test_non_intensity_pixel_run_saves_metric_workspace_artifacts(tmp_path):
@@ -138,6 +161,30 @@ def test_non_intensity_pixel_run_saves_metric_workspace_artifacts(tmp_path):
         parsed_config = json.loads(str(np.asarray(workspace["config_json"]).item()))
         assert parsed_config["displacement_metric_family"] == "blurred_gradient_corr"
         assert parsed_config["displacement_alpha"] == 0.5
+
+
+def test_workspace_persists_powered_run_runtime_warnings(tmp_path):
+    config = RectificationRunConfig(strategy="pixel", pixel_shift_power=0.5)
+    result = RectificationResult(
+        avg_image=np.zeros((2, 2), dtype=np.float32),
+        rectified_views=np.zeros((1, 1, 2, 2), dtype=np.float32),
+        similarity_data=None,
+        config=config,
+        ref_view_index=(0, 0),
+        runtime_warnings=[
+            {
+                "code": "pixel_shift_power_input_sanitized",
+                "pixel_shift_power": 0.5,
+                "views": {"view_0_0": {"negative_finite": 3, "nan": 1}},
+            }
+        ],
+    )
+
+    _save_run_artifacts(tmp_path, "powered_run", result)
+
+    with np.load(tmp_path / "powered_run" / "workspace.npz") as workspace:
+        warnings_payload = json.loads(str(np.asarray(workspace["runtime_warnings_json"]).item()))
+    assert warnings_payload == result.runtime_warnings
 
 
 def test_live_metrics_plotter_tracks_metrics():

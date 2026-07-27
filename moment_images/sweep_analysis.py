@@ -188,6 +188,7 @@ def build_metric_record(
         "displacement_field_metrics": _compute_displacement_field_metrics(result),
         "inter_view_consistency_metrics": _compute_inter_view_consistency_metrics(result),
         "displacement_score_diagnostics": _extract_displacement_score_diagnostics(result),
+        "runtime_warnings": list(result.runtime_warnings),
     }
 
     if result.global_avg_image is not None:

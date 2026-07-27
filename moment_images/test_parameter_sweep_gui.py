@@ -542,6 +542,45 @@ def test_state_to_spec_maps_advanced_search_controls(tmp_path):
     assert combined["combined_use_global_avg_reference"] == [True]
 
 
+def test_state_to_spec_roundtrips_strategy_specific_pixel_shift_powers(tmp_path):
+    state = _build_valid_state(tmp_path)
+    state.pixel_shift_powers = "0.5,1.0,2.0"
+    state.combined_pixel_shift_powers = "1.5,3.0"
+
+    payload = state_to_spec_dict(state)
+    roundtrip = spec_dict_to_state(payload)
+
+    assert payload["search_spaces"]["pixel"]["pixel_shift_powers"] == [0.5, 1.0, 2.0]
+    assert payload["search_spaces"]["combined"]["pixel_shift_powers"] == [1.5, 3.0]
+    assert roundtrip.pixel_shift_powers == "0.5,1.0,2.0"
+    assert roundtrip.combined_pixel_shift_powers == "1.5,3.0"
+
+
+@pytest.mark.parametrize("invalid_power", ["0", "-0.5", "nan", "inf"])
+def test_validate_state_rejects_non_positive_or_non_finite_pixel_shift_powers(
+    tmp_path, invalid_power
+):
+    state = _build_valid_state(tmp_path)
+    state.pixel_shift_powers = invalid_power
+    state.combined_pixel_shift_powers = "1.0"
+
+    issues = validate_state(state)
+
+    assert any("pixel shift powers" in issue.lower() for issue in issues)
+
+
+def test_spec_dict_to_state_defaults_missing_pixel_shift_powers_to_one(tmp_path):
+    state = _build_valid_state(tmp_path)
+    payload = state_to_spec_dict(state)
+    del payload["search_spaces"]["pixel"]["pixel_shift_powers"]
+    del payload["search_spaces"]["combined"]["pixel_shift_powers"]
+
+    restored = spec_dict_to_state(payload)
+
+    assert restored.pixel_shift_powers == "1.0"
+    assert restored.combined_pixel_shift_powers == "1.0"
+
+
 def test_save_and_load_spec_payload(tmp_path):
     payload = {
         "output_dir": str(tmp_path / "out"),
@@ -607,6 +646,28 @@ def _make_root_or_skip():
         return root
     except Exception:
         pytest.skip("Tkinter root unavailable in this environment")
+
+
+def test_spec_gui_captures_and_restores_pixel_shift_power_entries():
+    from moment_images import parameter_sweep as ps
+
+    root = _make_root_or_skip()
+    try:
+        app = ps.SpecGuiApp(root)
+        app.pixel_shift_power_entry.delete(0, app.tk.END)
+        app.pixel_shift_power_entry.insert(0, "0.5,1.0")
+        app.comb_shift_power_entry.delete(0, app.tk.END)
+        app.comb_shift_power_entry.insert(0, "1.5,2.0")
+
+        state = app._get_state()
+        app._set_state(state)
+
+        assert state.pixel_shift_powers == "0.5,1.0"
+        assert state.combined_pixel_shift_powers == "1.5,2.0"
+        assert app.pixel_shift_power_entry.get() == "0.5,1.0"
+        assert app.comb_shift_power_entry.get() == "1.5,2.0"
+    finally:
+        root.destroy()
 
 
 def test_gui_run_lifecycle_success(monkeypatch, tmp_path):

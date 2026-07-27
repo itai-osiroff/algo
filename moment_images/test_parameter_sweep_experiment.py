@@ -46,6 +46,40 @@ def _pixel_space(**overrides: object) -> SweepSearchSpace:
     return SweepSearchSpace(**base)
 
 
+def test_pixel_shift_power_is_a_pixel_and_combined_candidate_axis():
+    pixel_candidates = generate_coarse_candidates(
+        _pixel_space(
+            similarity_window_sizes=[1],
+            max_displacements=[0],
+            sub_pix_factors=[1],
+            pixel_sigma_pyramid=[False],
+            pixel_shift_powers=[0.5, 1.0],
+        )
+    )
+    assert {candidate.config.pixel_shift_power for candidate in pixel_candidates} == {0.5, 1.0}
+    assert {candidate.params["pixel_shift_power"] for candidate in pixel_candidates} == {0.5, 1.0}
+
+    combined_candidates = generate_coarse_candidates(
+        SweepSearchSpace(
+            strategy="combined",
+            correlation_pad_widths=[1],
+            global_thresholds=[0.15],
+            refinement_window_sizes=[1],
+            max_displacements=[0],
+            gauss_sigmas=[1.0],
+            disp_gauss_sigmas=[0.0],
+            pixel_thresholds=[0.05],
+            sub_pix_factors=[1],
+            pixel_sigma_pyramid=[False],
+            combined_use_global_avg_reference=[True],
+            zero_fill_roll=[True],
+            pixel_shift_powers=[0.5, 1.0],
+        )
+    )
+    assert {candidate.config.pixel_shift_power for candidate in combined_candidates} == {0.5, 1.0}
+    assert {candidate.params["pixel_shift_power"] for candidate in combined_candidates} == {0.5, 1.0}
+
+
 def _metric_record(laplacian_variance: float) -> dict:
     return {
         "global_only_metrics": None,

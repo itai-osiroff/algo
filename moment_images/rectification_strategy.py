@@ -12,8 +12,9 @@ results.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+import warnings
 
 import cv2 as cv
 import numpy as np
@@ -241,6 +242,108 @@ def _summarize_view_score_maps(score_maps: Dict[str, np.ndarray]) -> Dict[str, D
     return summary
 
 
+def normalize_pixel_shift_power(pixel_shift_power: object) -> float:
+    """Validate and normalize the optional powered-moving-view scoring setting."""
+
+    try:
+        power = float(pixel_shift_power)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pixel_shift_power must be a finite positive float.") from exc
+    if not np.isfinite(power) or power <= 0.0:
+        raise ValueError("pixel_shift_power must be a finite positive float.")
+    return power
+
+
+def _pixel_value_counts(values: np.ndarray, *, pixel_shift_power: float) -> Dict[str, int]:
+    """Describe signed/non-finite inputs and powered-overflow risk for one view."""
+
+    array = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(array)
+    with np.errstate(over="ignore", invalid="ignore"):
+        powered = np.sign(array) * np.power(np.abs(array), pixel_shift_power)
+    return {
+        "zero": int(np.count_nonzero(finite & (array == 0.0))),
+        "negative_finite": int(np.count_nonzero(finite & (array < 0.0))),
+        "nan": int(np.count_nonzero(np.isnan(array))),
+        "positive_infinity": int(np.count_nonzero(np.isposinf(array))),
+        "negative_infinity": int(np.count_nonzero(np.isneginf(array))),
+        "post_power_nonfinite": int(np.count_nonzero(~np.isfinite(powered))),
+    }
+
+
+def _signed_power_shifted_view(values: np.ndarray, pixel_shift_power: float) -> np.ndarray:
+    """Apply signed power to a finite shifted view and keep scores finite."""
+
+    if pixel_shift_power == 1.0:
+        return values
+    with np.errstate(over="ignore", invalid="ignore"):
+        powered = np.sign(values) * np.power(np.abs(values), pixel_shift_power)
+    return np.nan_to_num(powered, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _sanitize_pixel_shift_power_inputs(
+    views: np.ndarray,
+    reference_view: Optional[np.ndarray],
+    pixel_shift_power: float,
+    *,
+    emit_runtime_warning: bool = True,
+) -> Tuple[np.ndarray, Optional[np.ndarray], List[Dict[str, object]]]:
+    """Prepare finite scoring inputs and one structured diagnostic for powered runs."""
+
+    if pixel_shift_power == 1.0:
+        return views, reference_view, []
+
+    sanitized_views = np.nan_to_num(
+        np.asarray(views, dtype=np.float64, copy=True),
+        copy=False,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    source_views = np.asarray(views, dtype=np.float64)
+    view_counts: Dict[str, Dict[str, int]] = {}
+    for i in range(source_views.shape[0]):
+        for j in range(source_views.shape[1]):
+            view_counts[f"view_{i}_{j}"] = _pixel_value_counts(
+                source_views[i, j], pixel_shift_power=pixel_shift_power
+            )
+
+    sanitized_reference = reference_view
+    if reference_view is not None:
+        reference_array = np.asarray(reference_view, dtype=np.float64)
+        view_counts["external_reference"] = _pixel_value_counts(
+            reference_array, pixel_shift_power=1.0
+        )
+        sanitized_reference = np.nan_to_num(
+            reference_array,
+            copy=True,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+    warning_record: Dict[str, object] = {
+        "code": "pixel_shift_power_input_sanitized",
+        "pixel_shift_power": pixel_shift_power,
+        "views": view_counts,
+    }
+    needs_warning = any(
+        counts["negative_finite"]
+        or counts["nan"]
+        or counts["positive_infinity"]
+        or counts["negative_infinity"]
+        for counts in view_counts.values()
+    )
+    if needs_warning and emit_runtime_warning:
+        warnings.warn(
+            "pixel_shift_power used signed power after sanitizing negative or non-finite "
+            "pixelwise scoring inputs; inspect runtime_warnings for per-view counts.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return sanitized_views, sanitized_reference, [warning_record]
+
+
 def resolve_reference_view(
     views: np.ndarray, ref_view_idx: Optional[Tuple[int, int]] = None
 ) -> Tuple[np.ndarray, Tuple[int, int]]:
@@ -292,6 +395,7 @@ class PixelwiseSimilarityResult:
     alpha: float = DEFAULT_DISPLACEMENT_ALPHA
     component_weights_raw: Optional[Dict[str, float]] = None
     component_weights_normalized: Optional[Dict[str, float]] = None
+    runtime_warnings: List[Dict[str, object]] = field(default_factory=list)
 
 
 class RectificationStrategy(ABC):
@@ -550,6 +654,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         metric_family: str = DEFAULT_DISPLACEMENT_METRIC_FAMILY,
         alpha: float = DEFAULT_DISPLACEMENT_ALPHA,
         component_weights: Optional[Dict[str, float]] = None,
+        pixel_shift_power: float = 1.0,
+        emit_runtime_warning: bool = True,
     ) -> PixelwiseSimilarityResult:
         """
         Perform per-pixel patch matching between each view and the reference.
@@ -581,13 +687,25 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             alpha: Blend weight for local displacement-score ranking. ``alpha``
                 controls the relative importance of the intensity score versus
                 the selected auxiliary blurred-correlation component(s).
+            pixel_shift_power: Positive signed exponent applied only to each
+                shifted moving view for the intensity-correlation score.
+            emit_runtime_warning: Emit a Python warning for signed or
+                non-finite powered-run inputs.
 
         Returns:
             ``PixelwiseSimilarityResult`` containing local displacement scores,
             displacement maps, and target coordinates for each view.
         """
+        resolved_pixel_shift_power = normalize_pixel_shift_power(pixel_shift_power)
+        scoring_views, scoring_reference, runtime_warnings = _sanitize_pixel_shift_power_inputs(
+            views,
+            reference_view,
+            resolved_pixel_shift_power,
+            emit_runtime_warning=emit_runtime_warning,
+        )
+
         if not use_sigma_pyramid:
-            return self._compute_similarity_matrices_single(
+            result = self._compute_similarity_matrices_single(
                 views,
                 ref_view_idx,
                 max_disp=max_disp,
@@ -602,7 +720,12 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 metric_family=metric_family,
                 alpha=alpha,
                 component_weights=component_weights,
+                pixel_shift_power=resolved_pixel_shift_power,
+                intensity_views=scoring_views,
+                intensity_reference_view=scoring_reference,
             )
+            result.runtime_warnings = runtime_warnings
+            return result
 
         base_sigma = 7 if gauss_sigma is None else gauss_sigma
         base_size = int(base_sigma * 5) if gauss_size is None else gauss_size
@@ -621,6 +744,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             metric_family=metric_family,
             alpha=alpha,
             component_weights=component_weights,
+            pixel_shift_power=resolved_pixel_shift_power,
+            intensity_views=scoring_views,
+            intensity_reference_view=scoring_reference,
         )
 
         current_sigma = int(base_sigma)
@@ -646,10 +772,14 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 metric_family=metric_family,
                 alpha=alpha,
                 component_weights=component_weights,
+                pixel_shift_power=resolved_pixel_shift_power,
+                intensity_views=scoring_views,
+                intensity_reference_view=scoring_reference,
             )
 
             current_sigma = next_sigma
 
+        current_result.runtime_warnings = runtime_warnings
         return current_result
 
     def _compute_similarity_matrices_single(
@@ -663,6 +793,9 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         metric_family: str = DEFAULT_DISPLACEMENT_METRIC_FAMILY,
         alpha: float = DEFAULT_DISPLACEMENT_ALPHA,
         component_weights: Optional[Dict[str, float]] = None,
+        pixel_shift_power: float = 1.0,
+        intensity_views: Optional[np.ndarray] = None,
+        intensity_reference_view: Optional[np.ndarray] = None,
     ) -> PixelwiseSimilarityResult:
         """Compute pixelwise similarity matrices for a single Gaussian sigma."""
         if sub_pix_factor < 1:
@@ -670,10 +803,21 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         sub_pix_factor = int(sub_pix_factor)
 
         views_arr = np.asarray(views, dtype=np.float64, copy=True)
+        intensity_views_arr = np.asarray(
+            views if intensity_views is None else intensity_views,
+            dtype=np.float64,
+            copy=True,
+        )
+        if intensity_views_arr.shape != views_arr.shape:
+            raise ValueError("intensity_views must have the same shape as views")
         if thresh is not None:
             for i in range(views_arr.shape[0]):
                 for j in range(views_arr.shape[1]):
                     views_arr[i, j, :, :][views_arr[i, j, :, :] < np.max(views_arr[i, j, :, :]) * thresh] = 0.0
+                    intensity_views_arr[i, j, :, :][
+                        intensity_views_arr[i, j, :, :]
+                        < np.max(intensity_views_arr[i, j, :, :]) * thresh
+                    ] = 0.0
         
         if max_disp is None:
             max_disp = self.window_radius
@@ -714,6 +858,18 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         interpolation=cv.INTER_LINEAR,
                     )
             views_arr = resized_views
+            resized_intensity_views = np.zeros(
+                (grid_rows, grid_cols, height * sub_pix_factor, width * sub_pix_factor),
+                dtype=np.float64,
+            )
+            for i in range(grid_rows):
+                for j in range(grid_cols):
+                    resized_intensity_views[i, j] = cv.resize(
+                        intensity_views_arr[i, j],
+                        (width * sub_pix_factor, height * sub_pix_factor),
+                        interpolation=cv.INTER_LINEAR,
+                    )
+            intensity_views_arr = resized_intensity_views
             height *= sub_pix_factor
             width *= sub_pix_factor
             gauss_sigma *= sub_pix_factor
@@ -736,21 +892,37 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         reference_is_external = reference_view is not None
         if reference_is_external:
             ref_view = np.asarray(reference_view, dtype=np.float32)
+            intensity_ref_view = np.asarray(
+                reference_view if intensity_reference_view is None else intensity_reference_view,
+                dtype=np.float32,
+            )
             if ref_view.ndim != 2:
                 raise ValueError("reference_view must be a 2D array matching a single view")
+            if intensity_ref_view.ndim != 2:
+                raise ValueError("intensity_reference_view must be a 2D array matching a single view")
             if ref_view.shape == (original_height, original_width) and sub_pix_factor > 1:
                 ref_view = cv.resize(
                     ref_view,
                     (width, height),
                     interpolation=cv.INTER_LINEAR,
                 )
+            if intensity_ref_view.shape == (original_height, original_width) and sub_pix_factor > 1:
+                intensity_ref_view = cv.resize(
+                    intensity_ref_view,
+                    (width, height),
+                    interpolation=cv.INTER_LINEAR,
+                )
             if ref_view.shape != (height, width):
                 raise ValueError("reference_view must match the view dimensions")
+            if intensity_ref_view.shape != (height, width):
+                raise ValueError("intensity_reference_view must match the view dimensions")
         else:
             # Setting up and thresholding the reference view according to percentages from maximal value
             ref_view = views_arr[ref_i, ref_j].astype(np.float32, copy=True)
+            intensity_ref_view = intensity_views_arr[ref_i, ref_j].astype(np.float32, copy=True)
         if thresh is not None:
             ref_view[ref_view < np.max(ref_view)*thresh] = 0.0
+            intensity_ref_view[intensity_ref_view < np.max(intensity_ref_view)*thresh] = 0.0
 
         D = max_disp_scaled * 2 + 1
         disp_arr = np.arange(-max_disp_scaled, max_disp_scaled + 1, dtype=np.float32)
@@ -790,8 +962,8 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if "laplacian" in metric_spec.enabled_auxiliary_components:
             ref_laplacian = cv.Laplacian(ref_view, cv.CV_32F)
         if normalized_conv:
-            ref_view_blurred = gaussian_filter(
-                                                ref_view,
+            intensity_ref_view_blurred = gaussian_filter(
+                                                intensity_ref_view,
                                                 sigma=gauss_sigma,
                                                 truncate=(gauss_size/gauss_sigma),
                                                 mode="constant")
@@ -824,6 +996,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                     norm_mat_view = np.zeros((height, width, D, D), dtype=np.float32)
 
                 view = views_arr[i, j].astype(np.float32, copy=False)
+                intensity_view = intensity_views_arr[i, j].astype(np.float32, copy=False)
                 for s_y_ind in range(0, D, effective_step_size):
                     for s_x_ind in range(0, D, effective_step_size):
                         s_y = s_y_ind - max_disp_scaled
@@ -831,8 +1004,15 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         shifted_view = self._roll_with_fill(
                             view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
                         )
+                        intensity_shifted_source = self._roll_with_fill(
+                            intensity_view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
+                        )
+                        intensity_shifted_view = _signed_power_shifted_view(
+                            intensity_shifted_source,
+                            pixel_shift_power,
+                        )
                         intensity_corr = gaussian_filter(
-                            ref_view * shifted_view,
+                            intensity_ref_view * intensity_shifted_view,
                             sigma=gauss_sigma,
                             truncate=(gauss_size/ gauss_sigma),
                             mode="constant",
@@ -869,14 +1049,16 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                                 component_stacks_raw[component_name][:, :, s_y_ind, s_x_ind] = component_slice
 
                         if normalized_conv:
-                            norm_shifted_view = shifted_view.copy()
+                            norm_shifted_view = intensity_shifted_view
                             norm_mat_view[:, :, s_y_ind, s_x_ind] = gaussian_filter(
                                 norm_shifted_view**2,
                                   sigma=gauss_sigma,
                                     truncate=(gauss_size/gauss_sigma),
                                       mode="constant")
                 if normalized_conv:
-                    norm_mat_view = np.sqrt(norm_mat_view * ref_view_blurred[:, :, None, None])
+                    norm_mat_view = np.sqrt(
+                        norm_mat_view * intensity_ref_view_blurred[:, :, None, None]
+                    )
                     norm_mat_view = norm_mat_view + 0.1 * np.max(norm_mat_view)
                     component_stacks_raw["intensity"] = component_stacks_raw["intensity"] / norm_mat_view
 

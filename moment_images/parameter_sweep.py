@@ -56,6 +56,7 @@ from moment_images.rectification_strategy import (
     DEFAULT_DISPLACEMENT_ALPHA,
     DEFAULT_DISPLACEMENT_METRIC_FAMILY,
     normalize_displacement_metric_family,
+    normalize_pixel_shift_power,
 )
 from moment_images.reliable_io import (
     FirstValidReadError,
@@ -301,6 +302,7 @@ class SweepSearchSpace:
     sub_pix_factors: List[int] = field(default_factory=lambda: [1, 2])
     pixel_sigma_pyramid: List[bool] = field(default_factory=lambda: [False, True])
     zero_fill_roll: List[bool] = field(default_factory=lambda: [True])
+    pixel_shift_powers: List[float] = field(default_factory=lambda: [1.0])
     correlation_pad_widths: List[int] = field(default_factory=lambda: [RectificationRunConfig().correlation_pad_width])
     combined_use_global_avg_reference: List[bool] = field(default_factory=lambda: [True])
     combined_reference_mode: Optional[str] = None
@@ -322,6 +324,7 @@ class SweepSearchSpace:
             sub_pix_factors=[int(v) for v in raw.get("sub_pix_factors", [1, 2])],  # type: ignore[arg-type]
             pixel_sigma_pyramid=[bool(v) for v in raw.get("pixel_sigma_pyramid", [False, True])],  # type: ignore[arg-type]
             zero_fill_roll=[bool(v) for v in raw.get("zero_fill_roll", [True])],  # type: ignore[arg-type]
+            pixel_shift_powers=[float(v) for v in raw.get("pixel_shift_powers", [1.0])],  # type: ignore[arg-type]
             correlation_pad_widths=[int(v) for v in raw.get("correlation_pad_widths", [RectificationRunConfig().correlation_pad_width])],  # type: ignore[arg-type]
             combined_use_global_avg_reference=[bool(v) for v in raw.get("combined_use_global_avg_reference", [True])],  # type: ignore[arg-type]
             combined_reference_mode=cast(
@@ -1253,6 +1256,7 @@ def _strategy_param_keys(strategy: str) -> List[str]:
             "sub_pix_factor",
             "pixel_sigma_pyramid",
             "zero_fill_roll",
+            "pixel_shift_power",
         ]
     if strategy == "combined":
         return [
@@ -1267,6 +1271,7 @@ def _strategy_param_keys(strategy: str) -> List[str]:
             "pixel_sigma_pyramid",
             "combined_use_global_avg_reference",
             "zero_fill_roll",
+            "pixel_shift_power",
         ]
     if strategy == "global":
         return [
@@ -1416,6 +1421,7 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             pixel_sigma_pyramid=bool(params["pixel_sigma_pyramid"]),
             zero_fill_roll=bool(params["zero_fill_roll"]),
             sub_pix_factor=int(params["sub_pix_factor"]),
+            pixel_shift_power=float(params.get("pixel_shift_power", defaults.pixel_shift_power)),
             displacement_metric_family=displacement_metric_family,
             displacement_alpha=displacement_alpha,
             displacement_component_weights=displacement_component_weights,
@@ -1425,6 +1431,7 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
         normalized_params["similarity_window_size"] = window
         normalized_params["gauss_size"] = gauss_size
         normalized_params["disp_gauss_size"] = disp_gauss_size
+        normalized_params["pixel_shift_power"] = config.pixel_shift_power
         return SweepCandidate(strategy="pixel", params=normalized_params, config=config)
 
     if strategy == "combined":
@@ -1448,6 +1455,7 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             pixel_sigma_pyramid=bool(params["pixel_sigma_pyramid"]),
             zero_fill_roll=bool(params["zero_fill_roll"]),
             sub_pix_factor=int(params["sub_pix_factor"]),
+            pixel_shift_power=float(params.get("pixel_shift_power", defaults.pixel_shift_power)),
             combined_use_global_avg_reference=bool(params["combined_use_global_avg_reference"]),
             combined_reference_mode=cast(Optional[str], params.get("combined_reference_mode")),
             displacement_metric_family=displacement_metric_family,
@@ -1459,6 +1467,7 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
         normalized_params["refinement_window_size"] = window
         normalized_params["gauss_size"] = gauss_size
         normalized_params["disp_gauss_size"] = disp_gauss_size
+        normalized_params["pixel_shift_power"] = config.pixel_shift_power
         return SweepCandidate(strategy="combined", params=normalized_params, config=config)
 
     if strategy == "global":
@@ -1466,12 +1475,15 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             strategy="global",
             correlation_pad_width=int(params["correlation_pad_width"]),
             global_threshold=float(params["global_threshold"]),
+            pixel_shift_power=defaults.pixel_shift_power,
             displacement_metric_family=displacement_metric_family,
             displacement_alpha=displacement_alpha,
             displacement_component_weights=displacement_component_weights,
             metric_formulation_id=metric_formulation_id,
         )
-        return SweepCandidate(strategy="global", params=dict(params), config=config)
+        normalized_params = dict(params)
+        normalized_params["pixel_shift_power"] = config.pixel_shift_power
+        return SweepCandidate(strategy="global", params=normalized_params, config=config)
 
     raise ValueError(f"Unsupported strategy: {strategy}")
 
@@ -1488,6 +1500,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
             search_space.sub_pix_factors,
             search_space.pixel_sigma_pyramid,
             search_space.zero_fill_roll,
+            search_space.pixel_shift_powers,
         )
         return [
             {
@@ -1499,6 +1512,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
                 "sub_pix_factor": int(sub_pix_factor),
                 "pixel_sigma_pyramid": bool(pixel_sigma_pyramid),
                 "zero_fill_roll": bool(zero_fill_roll),
+                "pixel_shift_power": float(pixel_shift_power),
             }
             for (
                 win,
@@ -1509,6 +1523,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
                 sub_pix_factor,
                 pixel_sigma_pyramid,
                 zero_fill_roll,
+                pixel_shift_power,
             ) in values
         ]
 
@@ -1525,6 +1540,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
             search_space.pixel_sigma_pyramid,
             search_space.combined_use_global_avg_reference,
             search_space.zero_fill_roll,
+            search_space.pixel_shift_powers,
         )
         return [
             {
@@ -1540,6 +1556,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
                 "combined_use_global_avg_reference": bool(combined_use_global_avg_reference),
                 "combined_reference_mode": search_space.combined_reference_mode,
                 "zero_fill_roll": bool(zero_fill_roll),
+                "pixel_shift_power": float(pixel_shift_power),
             }
             for (
                 correlation_pad_width,
@@ -1553,6 +1570,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
                 pixel_sigma_pyramid,
                 combined_use_global_avg_reference,
                 zero_fill_roll,
+                pixel_shift_power,
             ) in values
         ]
 
@@ -1614,6 +1632,7 @@ _FLOAT_REFINEMENT_KEYS = {
     "disp_gauss_sigma",
     "global_threshold",
     "pixel_threshold",
+    "pixel_shift_power",
 }
 _NUMERIC_REFINEMENT_KEYS = _INT_REFINEMENT_KEYS | _FLOAT_REFINEMENT_KEYS
 
@@ -1637,6 +1656,8 @@ def _search_space_values_for_key(search_space: SweepSearchSpace, key: str) -> Se
         return list(search_space.pixel_sigma_pyramid)
     if key == "zero_fill_roll":
         return list(search_space.zero_fill_roll)
+    if key == "pixel_shift_power":
+        return list(search_space.pixel_shift_powers)
     if key == "correlation_pad_width":
         return list(search_space.correlation_pad_widths)
     if key == "global_threshold":
@@ -1670,6 +1691,8 @@ def _normalize_refinement_axis_value(key: str, value: object) -> object:
         numeric = _clean_refinement_float(float(value))
         if key in {"global_threshold", "pixel_threshold"}:
             return _clean_refinement_float(min(1.0, max(0.0, numeric)))
+        if key == "pixel_shift_power":
+            return _clean_refinement_float(max(np.finfo(float).eps, numeric))
         return _clean_refinement_float(max(0.0, numeric))
 
     return value
@@ -2052,6 +2075,7 @@ def _save_run_artifacts(
         "normalize_to_8bit": np.array(config.normalize_to_8bit),
         "run_name": np.array(run_name),
         "config_json": np.array(json.dumps(config_dict, sort_keys=True)),
+        "runtime_warnings_json": np.array(json.dumps(result.runtime_warnings, sort_keys=True)),
         "displacement_metric_family": np.array(config.displacement_metric_family),
         "displacement_alpha": np.array(config.displacement_alpha, dtype=np.float64),
         "metric_formulation_id": np.array(config.metric_formulation_id),
@@ -7370,10 +7394,12 @@ def sweep_parameters(
     combined_use_global_avg_reference: bool = True,
     combined_reference_mode: str | None = None,
     normalize_to_8bit: bool = False,
+    pixel_shift_powers: Sequence[float] | None = None,
 ) -> None:
     default_config = RectificationRunConfig()
     global_thresholds = list(global_thresholds or [default_config.global_threshold])
     pixel_thresholds = list(pixel_thresholds or [default_config.pixel_threshold])
+    pixel_shift_powers = list(pixel_shift_powers or [default_config.pixel_shift_power])
 
     if strategy == "global":
         combos = [
@@ -7386,22 +7412,24 @@ def sweep_parameters(
         ]
     elif strategy == "pixel":
         combos = [
-            (win, max_disp, gauss, disp_gauss, pixel_thresh)
+            (win, max_disp, gauss, disp_gauss, pixel_thresh, pixel_shift_power)
             for win in window_sizes
             for max_disp in max_displacements
             for gauss in gauss_sigmas
             for disp_gauss in disp_gauss_sigmas
             for pixel_thresh in pixel_thresholds
+            for pixel_shift_power in pixel_shift_powers
         ]
     else:
         combos = [
-            (win, max_disp, gauss, disp_gauss, global_thresh, pixel_thresh)
+            (win, max_disp, gauss, disp_gauss, global_thresh, pixel_thresh, pixel_shift_power)
             for win in window_sizes
             for max_disp in max_displacements
             for gauss in gauss_sigmas
             for disp_gauss in disp_gauss_sigmas
             for global_thresh in global_thresholds
             for pixel_thresh in pixel_thresholds
+            for pixel_shift_power in pixel_shift_powers
         ]
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -7412,11 +7440,12 @@ def sweep_parameters(
         if strategy == "global":
             win, max_disp, gauss, disp_gauss, global_thresh = combo  # type: ignore[misc]
             pixel_thresh = default_config.pixel_threshold
+            pixel_shift_power = default_config.pixel_shift_power
         elif strategy == "pixel":
-            win, max_disp, gauss, disp_gauss, pixel_thresh = combo  # type: ignore[misc]
+            win, max_disp, gauss, disp_gauss, pixel_thresh, pixel_shift_power = combo  # type: ignore[misc]
             global_thresh = default_config.global_threshold
         else:
-            win, max_disp, gauss, disp_gauss, global_thresh, pixel_thresh = combo  # type: ignore[misc]
+            win, max_disp, gauss, disp_gauss, global_thresh, pixel_thresh, pixel_shift_power = combo  # type: ignore[misc]
         # Keep max_displacement explicit and independent from the patch window size
         # to match RectificationRunConfig semantics across rectification entrypoints.
         config = RectificationRunConfig(
@@ -7436,6 +7465,7 @@ def sweep_parameters(
             combined_use_global_avg_reference=combined_use_global_avg_reference,
             combined_reference_mode=combined_reference_mode,
             normalize_to_8bit=normalize_to_8bit,
+            pixel_shift_power=float(pixel_shift_power),
         )
 
         result = rectify_views_from_config(views, config)
@@ -7454,6 +7484,7 @@ def sweep_parameters(
             run_name_parts.append(f"gt{global_thresh}")
         if strategy in {"pixel", "combined"}:
             run_name_parts.append(f"pt{pixel_thresh}")
+            run_name_parts.append(f"psp{config.pixel_shift_power}")
         run_name = "_".join(run_name_parts)
         record = build_metric_record(run_name, config, result)
         _save_run_artifacts(output_dir, run_name, result, metric_record=record)
@@ -7621,6 +7652,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pixel-thresh-start", type=float, default=0.05)
     parser.add_argument("--pixel-thresh-stop", type=float, default=0.05)
     parser.add_argument("--pixel-thresh-step", type=float, default=0.05)
+    parser.add_argument(
+        "--pixel-shift-power-start",
+        type=float,
+        default=1.0,
+        help="Shifted moving-view power sweep start for pixel/combined intensity scoring",
+    )
+    parser.add_argument("--pixel-shift-power-stop", type=float, default=1.0)
+    parser.add_argument("--pixel-shift-power-step", type=float, default=1.0)
     parser.add_argument("--zero-fill-roll",
                          action="store_true",
                          help="Use zero-filled rolling window in pixelwise rectification")
@@ -7843,6 +7882,11 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
     pixel_thresholds = _build_float_range(
         args.pixel_thresh_start, args.pixel_thresh_stop, args.pixel_thresh_step
     )
+    pixel_shift_powers = _build_float_range(
+        float(getattr(args, "pixel_shift_power_start", 1.0)),
+        float(getattr(args, "pixel_shift_power_stop", 1.0)),
+        float(getattr(args, "pixel_shift_power_step", 1.0)),
+    )
 
     sweep_parameters(
         views=views,
@@ -7863,6 +7907,7 @@ def _run_from_namespace(args: argparse.Namespace) -> Path:
         combined_use_global_avg_reference=args.use_global_avg_reference,
         combined_reference_mode=args.combined_reference_mode,
         normalize_to_8bit=args.normalize_to_8bit,
+        pixel_shift_powers=pixel_shift_powers,
     )
     return output_dir
 
@@ -7940,11 +7985,13 @@ class SpecGuiState:
     pixel_gauss_sigmas: str = "3.0,5.0"
     pixel_disp_gauss_sigmas: str = "0.0,1.0"
     pixel_thresholds: str = "0.05"
+    pixel_shift_powers: str = "1.0"
     combined_refinement_window_sizes: str = "15,25"
     combined_max_displacements: str = "5,15"
     combined_gauss_sigmas: str = "3.0,5.0"
     combined_disp_gauss_sigmas: str = "0.0,1.0"
     combined_pixel_thresholds: str = "0.05"
+    combined_pixel_shift_powers: str = "1.0"
     combined_global_thresholds: str = "0.1,0.15"
     combined_correlation_pad_widths: str = str(RectificationRunConfig().correlation_pad_width)
     pixel_sub_pix_factors: str = "1,2"
@@ -8019,6 +8066,16 @@ def _parse_float_list_csv(value: str, field_name: str) -> List[float]:
     if not result:
         raise ValueError(f"{field_name} cannot be empty.")
     return result
+
+
+def _parse_pixel_shift_power_list_csv(value: str, field_name: str) -> List[float]:
+    """Parse powers with the same finite-positive contract as rectification."""
+
+    values = _parse_float_list_csv(value, field_name)
+    try:
+        return [normalize_pixel_shift_power(item) for item in values]
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must contain finite positive numbers.") from exc
 
 
 def _parse_bool_list_csv(value: str, field_name: str) -> List[bool]:
@@ -8307,6 +8364,9 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             "pixel_thresholds": _parse_float_list_csv(
                 state.pixel_thresholds, "pixel thresholds"
             ),
+            "pixel_shift_powers": _parse_pixel_shift_power_list_csv(
+                state.pixel_shift_powers, "pixel shift powers"
+            ),
             "sub_pix_factors": _parse_int_list_csv(
                 state.pixel_sub_pix_factors, "pixel sub-pixel factors"
             ),
@@ -8333,6 +8393,9 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             ),
             "pixel_thresholds": _parse_float_list_csv(
                 state.combined_pixel_thresholds, "combined pixel thresholds"
+            ),
+            "pixel_shift_powers": _parse_pixel_shift_power_list_csv(
+                state.combined_pixel_shift_powers, "combined pixel shift powers"
             ),
             "global_thresholds": _parse_float_list_csv(
                 state.combined_global_thresholds, "combined global thresholds"
@@ -8617,6 +8680,9 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         state.pixel_thresholds = _list_to_csv(
             cast(List[object], pixel_space.get("pixel_thresholds", []))
         ) or state.pixel_thresholds
+        state.pixel_shift_powers = _list_to_csv(
+            cast(List[object], pixel_space.get("pixel_shift_powers", []))
+        ) or state.pixel_shift_powers
         state.pixel_sub_pix_factors = _list_to_csv(
             cast(List[object], pixel_space.get("sub_pix_factors", []))
         ) or state.pixel_sub_pix_factors
@@ -8644,6 +8710,9 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         state.combined_pixel_thresholds = _list_to_csv(
             cast(List[object], combined_space.get("pixel_thresholds", []))
         ) or state.combined_pixel_thresholds
+        state.combined_pixel_shift_powers = _list_to_csv(
+            cast(List[object], combined_space.get("pixel_shift_powers", []))
+        ) or state.combined_pixel_shift_powers
         state.combined_global_thresholds = _list_to_csv(
             cast(List[object], combined_space.get("global_thresholds", []))
         ) or state.combined_global_thresholds
@@ -9006,6 +9075,7 @@ def validate_state(state: SpecGuiState) -> List[str]:
                 ("pixel gauss sigmas", state.pixel_gauss_sigmas, "float"),
                 ("pixel disp gauss sigmas", state.pixel_disp_gauss_sigmas, "float"),
                 ("pixel thresholds", state.pixel_thresholds, "float"),
+                ("pixel shift powers", state.pixel_shift_powers, "pixel_shift_power"),
                 ("pixel sub-pixel factors", state.pixel_sub_pix_factors, "int"),
                 ("pixel sigma pyramid", state.pixel_sigma_pyramid, "bool"),
                 ("pixel zero fill roll", state.pixel_zero_fill_roll, "bool"),
@@ -9019,6 +9089,11 @@ def validate_state(state: SpecGuiState) -> List[str]:
                 ("combined gauss sigmas", state.combined_gauss_sigmas, "float"),
                 ("combined disp gauss sigmas", state.combined_disp_gauss_sigmas, "float"),
                 ("combined pixel thresholds", state.combined_pixel_thresholds, "float"),
+                (
+                    "combined pixel shift powers",
+                    state.combined_pixel_shift_powers,
+                    "pixel_shift_power",
+                ),
                 ("combined global thresholds", state.combined_global_thresholds, "float"),
                 ("combined correlation pad widths", state.combined_correlation_pad_widths, "int"),
                 ("combined sub-pixel factors", state.combined_sub_pix_factors, "int"),
@@ -9040,6 +9115,8 @@ def validate_state(state: SpecGuiState) -> List[str]:
                 _parse_int_list_csv(value, field_name)
             elif field_type == "float":
                 _parse_float_list_csv(value, field_name)
+            elif field_type == "pixel_shift_power":
+                _parse_pixel_shift_power_list_csv(value, field_name)
             else:
                 _parse_bool_list_csv(value, field_name)
         except ValueError as exc:
@@ -9612,15 +9689,17 @@ class SpecGuiApp:
         self.pixel_gauss_entry = self._build_labeled_entry(left, 2, "Pixel gauss sigmas", "3.0,5.0")
         self.pixel_disp_gauss_entry = self._build_labeled_entry(left, 3, "Pixel disp gauss sigmas", "0.0,1.0")
         self.pixel_thresh_entry = self._build_labeled_entry(left, 4, "Pixel thresholds", "0.05")
+        self.pixel_shift_power_entry = self._build_labeled_entry(left, 5, "Pixel shift powers", "1.0")
 
         self.comb_window_entry = self._build_labeled_entry(right, 0, "Combined refinement windows", "15,25")
         self.comb_disp_entry = self._build_labeled_entry(right, 1, "Combined max displacements", "5,15")
         self.comb_gauss_entry = self._build_labeled_entry(right, 2, "Combined gauss sigmas", "3.0,5.0")
         self.comb_disp_gauss_entry = self._build_labeled_entry(right, 3, "Combined disp gauss sigmas", "0.0,1.0")
         self.comb_thresh_entry = self._build_labeled_entry(right, 4, "Combined pixel thresholds", "0.05")
-        self.comb_global_thresh_entry = self._build_labeled_entry(right, 5, "Combined global thresholds", "0.1,0.15")
+        self.comb_shift_power_entry = self._build_labeled_entry(right, 5, "Combined pixel shift powers", "1.0")
+        self.comb_global_thresh_entry = self._build_labeled_entry(right, 6, "Combined global thresholds", "0.1,0.15")
         self.comb_corr_pad_entry = self._build_labeled_entry(
-            right, 6, "Combined correlation pad widths", str(RectificationRunConfig().correlation_pad_width)
+            right, 7, "Combined correlation pad widths", str(RectificationRunConfig().correlation_pad_width)
         )
 
         dataset_frame = self.ttk.LabelFrame(self.content_frame, text="Datasets")
@@ -10395,11 +10474,13 @@ class SpecGuiApp:
             pixel_gauss_sigmas=self.pixel_gauss_entry.get().strip(),
             pixel_disp_gauss_sigmas=self.pixel_disp_gauss_entry.get().strip(),
             pixel_thresholds=self.pixel_thresh_entry.get().strip(),
+            pixel_shift_powers=self.pixel_shift_power_entry.get().strip(),
             combined_refinement_window_sizes=self.comb_window_entry.get().strip(),
             combined_max_displacements=self.comb_disp_entry.get().strip(),
             combined_gauss_sigmas=self.comb_gauss_entry.get().strip(),
             combined_disp_gauss_sigmas=self.comb_disp_gauss_entry.get().strip(),
             combined_pixel_thresholds=self.comb_thresh_entry.get().strip(),
+            combined_pixel_shift_powers=self.comb_shift_power_entry.get().strip(),
             combined_global_thresholds=self.comb_global_thresh_entry.get().strip(),
             combined_correlation_pad_widths=self.comb_corr_pad_entry.get().strip(),
             pixel_sub_pix_factors=self.pixel_subpix_entry.get().strip(),
@@ -10519,11 +10600,13 @@ class SpecGuiApp:
             (self.pixel_gauss_entry, state.pixel_gauss_sigmas),
             (self.pixel_disp_gauss_entry, state.pixel_disp_gauss_sigmas),
             (self.pixel_thresh_entry, state.pixel_thresholds),
+            (self.pixel_shift_power_entry, state.pixel_shift_powers),
             (self.comb_window_entry, state.combined_refinement_window_sizes),
             (self.comb_disp_entry, state.combined_max_displacements),
             (self.comb_gauss_entry, state.combined_gauss_sigmas),
             (self.comb_disp_gauss_entry, state.combined_disp_gauss_sigmas),
             (self.comb_thresh_entry, state.combined_pixel_thresholds),
+            (self.comb_shift_power_entry, state.combined_pixel_shift_powers),
             (self.comb_global_thresh_entry, state.combined_global_thresholds),
             (self.comb_corr_pad_entry, state.combined_correlation_pad_widths),
             (self.pixel_subpix_entry, state.pixel_sub_pix_factors),
