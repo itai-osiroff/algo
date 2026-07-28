@@ -82,6 +82,49 @@ def test_pixel_shift_power_is_a_pixel_and_combined_candidate_axis():
     assert {candidate.params["pixel_shift_power"] for candidate in combined_candidates} == {0.5, 1.0}
 
 
+def test_reference_power_mode_is_a_pixel_and_combined_candidate_axis():
+    pixel_candidates = generate_coarse_candidates(
+        _pixel_space(
+            similarity_window_sizes=[1],
+            max_displacements=[0],
+            sub_pix_factors=[1],
+            pixel_sigma_pyramid=[False],
+            pixel_shift_power_apply_to_reference=[False, True],
+        )
+    )
+    assert {candidate.config.pixel_shift_power_apply_to_reference for candidate in pixel_candidates} == {False, True}
+    assert {candidate.params["pixel_shift_power_apply_to_reference"] for candidate in pixel_candidates} == {False, True}
+    assert len({parameter_sweep._candidate_signature(candidate) for candidate in pixel_candidates}) == 2
+
+    combined_candidates = generate_coarse_candidates(
+        SweepSearchSpace(
+            strategy="combined",
+            correlation_pad_widths=[1],
+            global_thresholds=[0.15],
+            refinement_window_sizes=[1],
+            max_displacements=[0],
+            gauss_sigmas=[1.0],
+            disp_gauss_sigmas=[0.0],
+            pixel_thresholds=[0.05],
+            sub_pix_factors=[1],
+            pixel_sigma_pyramid=[False],
+            combined_use_global_avg_reference=[True],
+            zero_fill_roll=[True],
+            pixel_shift_power_apply_to_reference=[False, True],
+        )
+    )
+    assert {candidate.config.pixel_shift_power_apply_to_reference for candidate in combined_candidates} == {False, True}
+
+
+def test_reference_power_mode_search_space_parses_explicit_boolean_text():
+    search_space = SweepSearchSpace.from_dict(
+        "pixel",
+        {"pixel_shift_power_apply_to_reference": ["false", "true", "no", "yes"]},
+    )
+
+    assert search_space.pixel_shift_power_apply_to_reference == [False, True, False, True]
+
+
 def test_combined_power_blend_candidates_are_explicit_and_exclude_incompatible_axes():
     candidates = generate_coarse_candidates(
         SweepSearchSpace(
@@ -2852,7 +2895,7 @@ def test_run_sweep_experiment_single_stage_still_supports_metric_phase(tmp_path)
     assert manifest["baseline_displacement_mode"]["metric_formulation_id"] == "intensity_default"
 
     state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
-    assert state["schema_version"] == 2
+    assert state["schema_version"] == 3
     assert state["active_generation_id"]
     assert state["spec_generations"]
     assert state["runs"]
@@ -3449,7 +3492,7 @@ def test_run_sweep_extend_existing_creates_generation_products_and_reuses_runs(m
     run_sweep_experiment(extended_spec, output_dir=out_dir, extend_existing=True)
 
     state = json.loads((out_dir / "run_state.json").read_text(encoding="utf-8"))
-    assert state["schema_version"] == 2
+    assert state["schema_version"] == 3
     assert state["active_generation_id"] != base_generation
     assert len(state["spec_generations"]) >= 2
     assert base_run_dir.exists()

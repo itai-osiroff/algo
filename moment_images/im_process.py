@@ -22,6 +22,7 @@ if __package__ is None or __package__ == "":
         PixelwisePatchRectificationStrategy,
         PixelwiseSimilarityResult,
         normalize_pixel_shift_power,
+        normalize_pixel_shift_power_apply_to_reference,
         resolve_displacement_metric_spec,
         resolve_reference_view,
     )
@@ -36,6 +37,7 @@ else:
         PixelwisePatchRectificationStrategy,
         PixelwiseSimilarityResult,
         normalize_pixel_shift_power,
+        normalize_pixel_shift_power_apply_to_reference,
         resolve_displacement_metric_spec,
         resolve_reference_view,
     )
@@ -112,9 +114,12 @@ class RectificationRunConfig:
     pixelwise displacement candidates are ranked; ``alpha`` is the local
     displacement score blend weight between the intensity term and any selected
     auxiliary blurred-correlation components. ``pixel_shift_power`` applies a
-    signed power to the shifted moving view for intensity matching only. It
-    sanitizes a scoring copy when necessary; global alignment, rectification,
-    HDR assembly, and returned view stacks retain the raw input data.
+    signed power to intensity matching inputs only. By default, the reference
+    and shifted moving view are both powered; setting
+    ``pixel_shift_power_apply_to_reference`` to ``False`` retains legacy
+    shifted-view-only scoring. Scoring copies are sanitized when necessary;
+    global alignment, rectification, HDR assembly, and returned view stacks
+    retain the raw input data.
     """
 
     strategy: str = "pixel"
@@ -136,6 +141,7 @@ class RectificationRunConfig:
     zero_fill_roll: bool = True
     sub_pix_factor: int = 2
     pixel_shift_power: float = 1.0
+    pixel_shift_power_apply_to_reference: bool = True
     combined_use_global_avg_reference: bool = True
     combined_reference_mode: Optional[str] = None
     displacement_metric_family: str = "intensity"
@@ -148,6 +154,9 @@ class RectificationRunConfig:
 
     def __post_init__(self) -> None:
         self.pixel_shift_power = normalize_pixel_shift_power(self.pixel_shift_power)
+        self.pixel_shift_power_apply_to_reference = normalize_pixel_shift_power_apply_to_reference(
+            self.pixel_shift_power_apply_to_reference
+        )
 
         self.combined_reference_mode = normalize_combined_reference_mode(
             self.combined_reference_mode,
@@ -408,6 +417,7 @@ def rectify_views_from_config(
             alpha=config.displacement_alpha,
             component_weights=config.displacement_component_weights,
             pixel_shift_power=config.pixel_shift_power,
+            pixel_shift_power_apply_to_reference=config.pixel_shift_power_apply_to_reference,
         )
         runtime_warnings = list(getattr(pixel_similarity, "runtime_warnings", []))
         if exposure_views is not None:
@@ -497,6 +507,7 @@ def rectify_views_from_config(
             "metric_family": config.displacement_metric_family,
             "alpha": config.displacement_alpha,
             "component_weights": config.displacement_component_weights,
+            "pixel_shift_power_apply_to_reference": config.pixel_shift_power_apply_to_reference,
         }
         if config.pixel_power_blend_enabled:
             power_blend = config.power_blend_config
@@ -534,6 +545,7 @@ def rectify_views_from_config(
                     "baseline_power": 1.0,
                     "raised_power": power_blend.raised_power,
                     "pixel_power_blend_enabled": True,
+                    "pixel_shift_power_apply_to_reference": config.pixel_shift_power_apply_to_reference,
                     "cache_hit": cache_hit,
                 }
             )

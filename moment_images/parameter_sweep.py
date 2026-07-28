@@ -60,6 +60,7 @@ from moment_images.rectification_strategy import (
     DEFAULT_DISPLACEMENT_METRIC_FAMILY,
     normalize_displacement_metric_family,
     normalize_pixel_shift_power,
+    normalize_pixel_shift_power_apply_to_reference,
 )
 from moment_images.reliable_io import (
     FirstValidReadError,
@@ -315,6 +316,7 @@ class SweepSearchSpace:
     pixel_sigma_pyramid: List[bool] = field(default_factory=lambda: [False, True])
     zero_fill_roll: List[bool] = field(default_factory=lambda: [True])
     pixel_shift_powers: List[float] = field(default_factory=lambda: [1.0])
+    pixel_shift_power_apply_to_reference: List[bool] = field(default_factory=lambda: [True])
     pixel_power_blend_enabled: List[bool] = field(default_factory=lambda: [False])
     pixel_power_blend_raised_powers: List[float] = field(default_factory=list)
     pixel_power_blend_alphas: List[float] = field(default_factory=lambda: [0.0])
@@ -349,6 +351,7 @@ class SweepSearchSpace:
             pixel_sigma_pyramid=[bool(v) for v in raw.get("pixel_sigma_pyramid", [False, True])],  # type: ignore[arg-type]
             zero_fill_roll=[bool(v) for v in raw.get("zero_fill_roll", [True])],  # type: ignore[arg-type]
             pixel_shift_powers=[float(v) for v in raw.get("pixel_shift_powers", [1.0])],  # type: ignore[arg-type]
+            pixel_shift_power_apply_to_reference=[normalize_pixel_shift_power_apply_to_reference(v) for v in raw.get("pixel_shift_power_apply_to_reference", [True])],  # type: ignore[arg-type]
             pixel_power_blend_enabled=[bool(v) for v in raw.get("pixel_power_blend_enabled", [False])],  # type: ignore[arg-type]
             pixel_power_blend_raised_powers=[float(v) for v in raw.get("pixel_power_blend_raised_powers", [])],  # type: ignore[arg-type]
             pixel_power_blend_alphas=[float(v) for v in raw.get("pixel_power_blend_alphas", [0.0])],  # type: ignore[arg-type]
@@ -1304,6 +1307,7 @@ def _strategy_param_keys(strategy: str) -> List[str]:
             "pixel_sigma_pyramid",
             "zero_fill_roll",
             "pixel_shift_power",
+            "pixel_shift_power_apply_to_reference",
         ]
     if strategy == "combined":
         return [
@@ -1319,6 +1323,7 @@ def _strategy_param_keys(strategy: str) -> List[str]:
             "combined_use_global_avg_reference",
             "zero_fill_roll",
             "pixel_shift_power",
+            "pixel_shift_power_apply_to_reference",
         ]
     if strategy == "global":
         return [
@@ -1469,6 +1474,12 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             zero_fill_roll=bool(params["zero_fill_roll"]),
             sub_pix_factor=int(params["sub_pix_factor"]),
             pixel_shift_power=float(params.get("pixel_shift_power", defaults.pixel_shift_power)),
+            pixel_shift_power_apply_to_reference=normalize_pixel_shift_power_apply_to_reference(
+                params.get(
+                    "pixel_shift_power_apply_to_reference",
+                    defaults.pixel_shift_power_apply_to_reference,
+                )
+            ),
             displacement_metric_family=displacement_metric_family,
             displacement_alpha=displacement_alpha,
             displacement_component_weights=displacement_component_weights,
@@ -1479,6 +1490,9 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
         normalized_params["gauss_size"] = gauss_size
         normalized_params["disp_gauss_size"] = disp_gauss_size
         normalized_params["pixel_shift_power"] = config.pixel_shift_power
+        normalized_params["pixel_shift_power_apply_to_reference"] = (
+            config.pixel_shift_power_apply_to_reference
+        )
         return SweepCandidate(strategy="pixel", params=normalized_params, config=config)
 
     if strategy == "combined":
@@ -1507,6 +1521,12 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
             zero_fill_roll=bool(params["zero_fill_roll"]),
             sub_pix_factor=int(params["sub_pix_factor"]),
             pixel_shift_power=float(params.get("pixel_shift_power", defaults.pixel_shift_power)),
+            pixel_shift_power_apply_to_reference=normalize_pixel_shift_power_apply_to_reference(
+                params.get(
+                    "pixel_shift_power_apply_to_reference",
+                    defaults.pixel_shift_power_apply_to_reference,
+                )
+            ),
             combined_use_global_avg_reference=bool(params["combined_use_global_avg_reference"]),
             combined_reference_mode=cast(Optional[str], params.get("combined_reference_mode")),
             displacement_metric_family=displacement_metric_family,
@@ -1519,6 +1539,9 @@ def _build_candidate_from_params(strategy: str, params: Dict[str, object]) -> Sw
         normalized_params["gauss_size"] = gauss_size
         normalized_params["disp_gauss_size"] = disp_gauss_size
         normalized_params["pixel_shift_power"] = config.pixel_shift_power
+        normalized_params["pixel_shift_power_apply_to_reference"] = (
+            config.pixel_shift_power_apply_to_reference
+        )
         normalized_params["pixel_power_blend_enabled"] = config.pixel_power_blend_enabled
         normalized_params["pixel_power_blend_raised_power"] = config.pixel_power_blend_raised_power
         normalized_params["pixel_power_blend_alpha"] = config.pixel_power_blend_alpha
@@ -1556,6 +1579,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
             search_space.pixel_sigma_pyramid,
             search_space.zero_fill_roll,
             search_space.pixel_shift_powers,
+            search_space.pixel_shift_power_apply_to_reference,
         )
         return [
             {
@@ -1568,6 +1592,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
                 "pixel_sigma_pyramid": bool(pixel_sigma_pyramid),
                 "zero_fill_roll": bool(zero_fill_roll),
                 "pixel_shift_power": float(pixel_shift_power),
+                "pixel_shift_power_apply_to_reference": normalize_pixel_shift_power_apply_to_reference(pixel_shift_power_apply_to_reference),
             }
             for (
                 win,
@@ -1579,6 +1604,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
                 pixel_sigma_pyramid,
                 zero_fill_roll,
                 pixel_shift_power,
+                pixel_shift_power_apply_to_reference,
             ) in values
         ]
 
@@ -1597,6 +1623,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
             search_space.combined_use_global_avg_reference,
             search_space.zero_fill_roll,
             search_space.pixel_shift_powers,
+            search_space.pixel_shift_power_apply_to_reference,
             power_blend_options,
         )
         candidates: List[Dict[str, object]] = []
@@ -1613,6 +1640,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
             combined_use_global_avg_reference,
             zero_fill_roll,
             pixel_shift_power,
+            pixel_shift_power_apply_to_reference,
             power_blend,
         ) in values:
             if power_blend is not None and (bool(pixel_sigma_pyramid) or float(pixel_shift_power) != 1.0):
@@ -1641,6 +1669,7 @@ def _coarse_param_grid(search_space: SweepSearchSpace) -> List[Dict[str, object]
                 "combined_reference_mode": search_space.combined_reference_mode,
                 "zero_fill_roll": bool(zero_fill_roll),
                 "pixel_shift_power": float(pixel_shift_power),
+                "pixel_shift_power_apply_to_reference": normalize_pixel_shift_power_apply_to_reference(pixel_shift_power_apply_to_reference),
                 **power_blend_params,
             }
             )
@@ -1733,6 +1762,8 @@ def _search_space_values_for_key(search_space: SweepSearchSpace, key: str) -> Se
         return list(search_space.zero_fill_roll)
     if key == "pixel_shift_power":
         return list(search_space.pixel_shift_powers)
+    if key == "pixel_shift_power_apply_to_reference":
+        return list(search_space.pixel_shift_power_apply_to_reference)
     if key == "pixel_power_blend_enabled":
         return list(search_space.pixel_power_blend_enabled)
     if key == "correlation_pad_width":
@@ -1749,6 +1780,8 @@ def _clean_refinement_float(value: float) -> float:
 
 
 def _normalize_refinement_axis_value(key: str, value: object) -> object:
+    if key == "pixel_shift_power_apply_to_reference":
+        return normalize_pixel_shift_power_apply_to_reference(value)
     if key in {"pixel_sigma_pyramid", "zero_fill_roll", "combined_use_global_avg_reference", "pixel_power_blend_enabled"}:
         return bool(value)
 
@@ -4468,7 +4501,7 @@ def _evaluate_stage(
                     "power_blend_cache_dir": str(output_dir / ".pixel_power_blend_cache"),
                     "power_blend_cache_key": _hash_payload(
                         {
-                            "version": 2,
+                            "version": 3,
                             "dataset_signature": dataset_signature,
                             "field_config": cache_payload,
                         }
@@ -8737,12 +8770,14 @@ class SpecGuiState:
     pixel_disp_gauss_sigmas: str = "0.0,1.0"
     pixel_thresholds: str = "0.05"
     pixel_shift_powers: str = "1.0"
+    pixel_shift_power_apply_to_reference: str = "true"
     combined_refinement_window_sizes: str = "15,25"
     combined_max_displacements: str = "5,15"
     combined_gauss_sigmas: str = "3.0,5.0"
     combined_disp_gauss_sigmas: str = "0.0,1.0"
     combined_pixel_thresholds: str = "0.05"
     combined_pixel_shift_powers: str = "1.0"
+    combined_pixel_shift_power_apply_to_reference: str = "true"
     combined_power_blend_enabled: str = "false"
     combined_power_blend_raised_powers: str = "2.0"
     combined_power_blend_alphas: str = "0.5"
@@ -8906,7 +8941,10 @@ def _parse_state_metric_weights(state: SpecGuiState) -> Dict[str, float]:
 
 
 def _list_to_csv(values: Sequence[object]) -> str:
-    return ",".join(str(value) for value in values)
+    return ",".join(
+        str(value).lower() if isinstance(value, bool) else str(value)
+        for value in values
+    )
 
 
 def _state_metric_row_to_spec(
@@ -9122,6 +9160,10 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             "pixel_shift_powers": _parse_pixel_shift_power_list_csv(
                 state.pixel_shift_powers, "pixel shift powers"
             ),
+            "pixel_shift_power_apply_to_reference": _parse_bool_list_csv(
+                state.pixel_shift_power_apply_to_reference,
+                "pixel shift power apply to reference",
+            ),
             "sub_pix_factors": _parse_int_list_csv(
                 state.pixel_sub_pix_factors, "pixel sub-pixel factors"
             ),
@@ -9151,6 +9193,10 @@ def state_to_spec_dict(state: SpecGuiState) -> Dict[str, object]:
             ),
             "pixel_shift_powers": _parse_pixel_shift_power_list_csv(
                 state.combined_pixel_shift_powers, "combined pixel shift powers"
+            ),
+            "pixel_shift_power_apply_to_reference": _parse_bool_list_csv(
+                state.combined_pixel_shift_power_apply_to_reference,
+                "combined pixel shift power apply to reference",
             ),
             "pixel_power_blend_enabled": _parse_bool_list_csv(
                 state.combined_power_blend_enabled, "combined power blend enabled"
@@ -9482,6 +9528,12 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         state.pixel_shift_powers = _list_to_csv(
             cast(List[object], pixel_space.get("pixel_shift_powers", []))
         ) or state.pixel_shift_powers
+        state.pixel_shift_power_apply_to_reference = _list_to_csv(
+            cast(
+                List[object],
+                pixel_space.get("pixel_shift_power_apply_to_reference", []),
+            )
+        ) or state.pixel_shift_power_apply_to_reference
         state.pixel_sub_pix_factors = _list_to_csv(
             cast(List[object], pixel_space.get("sub_pix_factors", []))
         ) or state.pixel_sub_pix_factors
@@ -9512,6 +9564,12 @@ def spec_dict_to_state(payload: Dict[str, object]) -> SpecGuiState:
         state.combined_pixel_shift_powers = _list_to_csv(
             cast(List[object], combined_space.get("pixel_shift_powers", []))
         ) or state.combined_pixel_shift_powers
+        state.combined_pixel_shift_power_apply_to_reference = _list_to_csv(
+            cast(
+                List[object],
+                combined_space.get("pixel_shift_power_apply_to_reference", []),
+            )
+        ) or state.combined_pixel_shift_power_apply_to_reference
         state.combined_power_blend_enabled = _list_to_csv(
             cast(List[object], combined_space.get("pixel_power_blend_enabled", []))
         ) or state.combined_power_blend_enabled
@@ -9906,6 +9964,11 @@ def validate_state(state: SpecGuiState) -> List[str]:
                 ("pixel disp gauss sigmas", state.pixel_disp_gauss_sigmas, "float"),
                 ("pixel thresholds", state.pixel_thresholds, "float"),
                 ("pixel shift powers", state.pixel_shift_powers, "pixel_shift_power"),
+                (
+                    "pixel shift power apply to reference",
+                    state.pixel_shift_power_apply_to_reference,
+                    "bool",
+                ),
                 ("pixel sub-pixel factors", state.pixel_sub_pix_factors, "int"),
                 ("pixel sigma pyramid", state.pixel_sigma_pyramid, "bool"),
                 ("pixel zero fill roll", state.pixel_zero_fill_roll, "bool"),
@@ -9923,6 +9986,11 @@ def validate_state(state: SpecGuiState) -> List[str]:
                     "combined pixel shift powers",
                     state.combined_pixel_shift_powers,
                     "pixel_shift_power",
+                ),
+                (
+                    "combined pixel shift power apply to reference",
+                    state.combined_pixel_shift_power_apply_to_reference,
+                    "bool",
                 ),
                 ("combined global thresholds", state.combined_global_thresholds, "float"),
                 ("combined correlation pad widths", state.combined_correlation_pad_widths, "int"),
@@ -10558,6 +10626,7 @@ class SpecGuiApp:
         self.pixel_disp_gauss_entry = self._build_labeled_entry(left, 3, "Pixel disp gauss sigmas", "0.0,1.0")
         self.pixel_thresh_entry = self._build_labeled_entry(left, 4, "Pixel thresholds", "0.05")
         self.pixel_shift_power_entry = self._build_labeled_entry(left, 5, "Pixel shift powers", "1.0")
+        self.pixel_power_reference_entry = self._build_labeled_entry(left, 6, "Power reference enabled", "true")
 
         self.comb_window_entry = self._build_labeled_entry(right, 0, "Combined refinement windows", "15,25")
         self.comb_disp_entry = self._build_labeled_entry(right, 1, "Combined max displacements", "5,15")
@@ -10573,6 +10642,7 @@ class SpecGuiApp:
         self.comb_corr_pad_entry = self._build_labeled_entry(
             right, 11, "Combined correlation pad widths", str(RectificationRunConfig().correlation_pad_width)
         )
+        self.comb_power_reference_entry = self._build_labeled_entry(right, 12, "Combined power reference enabled", "true")
 
         dataset_frame = self.ttk.LabelFrame(self.content_frame, text="Datasets")
         dataset_frame.pack(fill="x", pady=6)
@@ -11352,12 +11422,14 @@ class SpecGuiApp:
             pixel_disp_gauss_sigmas=self.pixel_disp_gauss_entry.get().strip(),
             pixel_thresholds=self.pixel_thresh_entry.get().strip(),
             pixel_shift_powers=self.pixel_shift_power_entry.get().strip(),
+            pixel_shift_power_apply_to_reference=self.pixel_power_reference_entry.get().strip(),
             combined_refinement_window_sizes=self.comb_window_entry.get().strip(),
             combined_max_displacements=self.comb_disp_entry.get().strip(),
             combined_gauss_sigmas=self.comb_gauss_entry.get().strip(),
             combined_disp_gauss_sigmas=self.comb_disp_gauss_entry.get().strip(),
             combined_pixel_thresholds=self.comb_thresh_entry.get().strip(),
             combined_pixel_shift_powers=self.comb_shift_power_entry.get().strip(),
+            combined_pixel_shift_power_apply_to_reference=self.comb_power_reference_entry.get().strip(),
             combined_power_blend_enabled=self.comb_power_blend_enabled_entry.get().strip(),
             combined_power_blend_raised_powers=self.comb_power_blend_raised_entry.get().strip(),
             combined_power_blend_alphas=self.comb_power_blend_alpha_entry.get().strip(),
@@ -11489,12 +11561,14 @@ class SpecGuiApp:
             (self.pixel_disp_gauss_entry, state.pixel_disp_gauss_sigmas),
             (self.pixel_thresh_entry, state.pixel_thresholds),
             (self.pixel_shift_power_entry, state.pixel_shift_powers),
+            (self.pixel_power_reference_entry, state.pixel_shift_power_apply_to_reference),
             (self.comb_window_entry, state.combined_refinement_window_sizes),
             (self.comb_disp_entry, state.combined_max_displacements),
             (self.comb_gauss_entry, state.combined_gauss_sigmas),
             (self.comb_disp_gauss_entry, state.combined_disp_gauss_sigmas),
             (self.comb_thresh_entry, state.combined_pixel_thresholds),
             (self.comb_shift_power_entry, state.combined_pixel_shift_powers),
+            (self.comb_power_reference_entry, state.combined_pixel_shift_power_apply_to_reference),
             (self.comb_power_blend_enabled_entry, state.combined_power_blend_enabled),
             (self.comb_power_blend_raised_entry, state.combined_power_blend_raised_powers),
             (self.comb_power_blend_alpha_entry, state.combined_power_blend_alphas),

@@ -49,6 +49,9 @@
       "pixel_shift_powers": [
         1.0
       ],
+      "pixel_shift_power_apply_to_reference": [
+        true
+      ],
       "zero_fill_roll": [
         true
       ]
@@ -90,6 +93,9 @@
       ],
       "pixel_shift_powers": [
         1.0
+      ],
+      "pixel_shift_power_apply_to_reference": [
+        true
       ],
       "combined_use_global_avg_reference": [
         true

@@ -596,14 +596,20 @@ def test_state_to_spec_roundtrips_strategy_specific_pixel_shift_powers(tmp_path)
     state = _build_valid_state(tmp_path)
     state.pixel_shift_powers = "0.5,1.0,2.0"
     state.combined_pixel_shift_powers = "1.5,3.0"
+    state.pixel_shift_power_apply_to_reference = "true,false"
+    state.combined_pixel_shift_power_apply_to_reference = "false,true"
 
     payload = state_to_spec_dict(state)
     roundtrip = spec_dict_to_state(payload)
 
     assert payload["search_spaces"]["pixel"]["pixel_shift_powers"] == [0.5, 1.0, 2.0]
     assert payload["search_spaces"]["combined"]["pixel_shift_powers"] == [1.5, 3.0]
+    assert payload["search_spaces"]["pixel"]["pixel_shift_power_apply_to_reference"] == [True, False]
+    assert payload["search_spaces"]["combined"]["pixel_shift_power_apply_to_reference"] == [False, True]
     assert roundtrip.pixel_shift_powers == "0.5,1.0,2.0"
     assert roundtrip.combined_pixel_shift_powers == "1.5,3.0"
+    assert roundtrip.pixel_shift_power_apply_to_reference == "true,false"
+    assert roundtrip.combined_pixel_shift_power_apply_to_reference == "false,true"
 
 
 @pytest.mark.parametrize("invalid_power", ["0", "-0.5", "nan", "inf"])

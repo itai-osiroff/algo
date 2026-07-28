@@ -193,6 +193,22 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
                         pixel_shift_power=invalid_value,
                     )
 
+    def test_reference_power_mode_normalizes_explicit_boolean_text(self) -> None:
+        normalizer = rectification_strategy.normalize_pixel_shift_power_apply_to_reference
+
+        for value in (True, "true", " 1 ", "yes"):
+            with self.subTest(value=value):
+                self.assertTrue(normalizer(value))
+        for value in (False, "false", " 0 ", "no"):
+            with self.subTest(value=value):
+                self.assertFalse(normalizer(value))
+        for value in ("enabled", 1, 0, None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "pixel_shift_power_apply_to_reference"
+                ):
+                    normalizer(value)
+
     def test_pixel_shift_power_one_matches_legacy_similarity(self) -> None:
         views = np.array(
             [[[[0.0, 1.0, 2.0], [1.0, 2.0, 3.0], [2.0, 3.0, 4.0]]]],
@@ -228,7 +244,7 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
         np.testing.assert_array_equal(explicit_default.disps_x, legacy.disps_x)
         self.assertEqual(explicit_default.runtime_warnings, [])
 
-    def test_pixel_shift_power_is_used_in_intensity_product_and_normalization(self) -> None:
+    def test_pixel_shift_power_can_power_both_reference_and_shifted_intensity_inputs(self) -> None:
         views = np.array([[[[-4.0, 0.0], [9.0, 16.0]]]], dtype=np.float32)
         reference = np.array([[2.0, 3.0], [5.0, 7.0]], dtype=np.float32)
         filtered_inputs: list[np.ndarray] = []
@@ -250,13 +266,47 @@ class PixelwisePatchRectificationStrategyTests(unittest.TestCase):
                     sub_pix_factor=1,
                     reference_view=reference,
                     pixel_shift_power=0.5,
+                    pixel_shift_power_apply_to_reference=True,
                 )
         finally:
             rectification_strategy.gaussian_filter = original_filter
 
         expected_powered = np.array([[-2.0, 0.0], [3.0, 4.0]], dtype=np.float32)
-        np.testing.assert_allclose(filtered_inputs[1], reference * expected_powered)
+        expected_powered_reference = np.sqrt(reference)
+        np.testing.assert_allclose(
+            filtered_inputs[1], expected_powered_reference * expected_powered
+        )
         np.testing.assert_allclose(filtered_inputs[2], expected_powered**2)
+
+    def test_pixel_shift_power_can_preserve_legacy_shifted_only_intensity_scoring(self) -> None:
+        views = np.array([[[[-4.0, 0.0], [9.0, 16.0]]]], dtype=np.float32)
+        reference = np.array([[2.0, 3.0], [5.0, 7.0]], dtype=np.float32)
+        filtered_inputs: list[np.ndarray] = []
+
+        def identity_filter(values: np.ndarray, **kwargs: object) -> np.ndarray:
+            filtered_inputs.append(np.asarray(values).copy())
+            return np.asarray(values)
+
+        original_filter = rectification_strategy.gaussian_filter
+        rectification_strategy.gaussian_filter = identity_filter
+        try:
+            with self.assertWarnsRegex(RuntimeWarning, "pixel_shift_power"):
+                self.strategy.compute_similarity_matrices(
+                    views,
+                    (0, 0),
+                    max_disp=0,
+                    gauss_sigma=1.0,
+                    gauss_size=5,
+                    sub_pix_factor=1,
+                    reference_view=reference,
+                    pixel_shift_power=0.5,
+                    pixel_shift_power_apply_to_reference=False,
+                )
+        finally:
+            rectification_strategy.gaussian_filter = original_filter
+
+        expected_powered_shifted = np.array([[-2.0, 0.0], [3.0, 4.0]], dtype=np.float32)
+        np.testing.assert_allclose(filtered_inputs[1], reference * expected_powered_shifted)
 
     def test_pixel_shift_power_leaves_gradient_component_scores_unpowered(self) -> None:
         views, reference, _, _ = self._make_shifted_blob_case()

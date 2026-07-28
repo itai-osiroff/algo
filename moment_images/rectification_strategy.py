@@ -254,6 +254,29 @@ def normalize_pixel_shift_power(pixel_shift_power: object) -> float:
     return power
 
 
+def normalize_pixel_shift_power_apply_to_reference(value: object) -> bool:
+    """Normalize the reference-power mode without Python truthiness coercion."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        token = value.strip().lower()
+        mapping = {
+            "true": True,
+            "false": False,
+            "1": True,
+            "0": False,
+            "yes": True,
+            "no": False,
+        }
+        if token in mapping:
+            return mapping[token]
+    raise ValueError(
+        "pixel_shift_power_apply_to_reference must be a boolean or one of "
+        "true/false, 1/0, yes/no."
+    )
+
+
 def _pixel_value_counts(values: np.ndarray, *, pixel_shift_power: float) -> Dict[str, int]:
     """Describe signed/non-finite inputs and powered-overflow risk for one view."""
 
@@ -271,8 +294,8 @@ def _pixel_value_counts(values: np.ndarray, *, pixel_shift_power: float) -> Dict
     }
 
 
-def _signed_power_shifted_view(values: np.ndarray, pixel_shift_power: float) -> np.ndarray:
-    """Apply signed power to a finite shifted view and keep scores finite."""
+def _signed_power_intensity_values(values: np.ndarray, pixel_shift_power: float) -> np.ndarray:
+    """Apply signed power to finite intensity scoring values and keep scores finite."""
 
     if pixel_shift_power == 1.0:
         return values
@@ -286,6 +309,7 @@ def _sanitize_pixel_shift_power_inputs(
     reference_view: Optional[np.ndarray],
     pixel_shift_power: float,
     *,
+    pixel_shift_power_apply_to_reference: bool,
     emit_runtime_warning: bool = True,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], List[Dict[str, object]]]:
     """Prepare finite scoring inputs and one structured diagnostic for powered runs."""
@@ -312,7 +336,10 @@ def _sanitize_pixel_shift_power_inputs(
     if reference_view is not None:
         reference_array = np.asarray(reference_view, dtype=np.float64)
         view_counts["external_reference"] = _pixel_value_counts(
-            reference_array, pixel_shift_power=1.0
+            reference_array,
+            pixel_shift_power=(
+                pixel_shift_power if pixel_shift_power_apply_to_reference else 1.0
+            ),
         )
         sanitized_reference = np.nan_to_num(
             reference_array,
@@ -810,6 +837,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         alpha: float = DEFAULT_DISPLACEMENT_ALPHA,
         component_weights: Optional[Dict[str, float]] = None,
         pixel_shift_power: float = 1.0,
+        pixel_shift_power_apply_to_reference: bool = True,
         emit_runtime_warning: bool = True,
     ) -> PixelwiseSimilarityResult:
         """
@@ -842,8 +870,11 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             alpha: Blend weight for local displacement-score ranking. ``alpha``
                 controls the relative importance of the intensity score versus
                 the selected auxiliary blurred-correlation component(s).
-            pixel_shift_power: Positive signed exponent applied only to each
-                shifted moving view for the intensity-correlation score.
+            pixel_shift_power: Positive signed exponent applied to shifted
+                intensity candidates for the intensity-correlation score.
+            pixel_shift_power_apply_to_reference: When ``True``, apply the
+                same signed exponent to the intensity reference. ``False``
+                preserves legacy shifted-candidate-only scoring.
             emit_runtime_warning: Emit a Python warning for signed or
                 non-finite powered-run inputs.
 
@@ -852,10 +883,14 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             displacement maps, and target coordinates for each view.
         """
         resolved_pixel_shift_power = normalize_pixel_shift_power(pixel_shift_power)
+        resolved_reference_power_mode = normalize_pixel_shift_power_apply_to_reference(
+            pixel_shift_power_apply_to_reference
+        )
         scoring_views, scoring_reference, runtime_warnings = _sanitize_pixel_shift_power_inputs(
             views,
             reference_view,
             resolved_pixel_shift_power,
+            pixel_shift_power_apply_to_reference=resolved_reference_power_mode,
             emit_runtime_warning=emit_runtime_warning,
         )
 
@@ -876,6 +911,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 alpha=alpha,
                 component_weights=component_weights,
                 pixel_shift_power=resolved_pixel_shift_power,
+                pixel_shift_power_apply_to_reference=resolved_reference_power_mode,
                 intensity_views=scoring_views,
                 intensity_reference_view=scoring_reference,
             )
@@ -900,6 +936,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
             alpha=alpha,
             component_weights=component_weights,
             pixel_shift_power=resolved_pixel_shift_power,
+            pixel_shift_power_apply_to_reference=resolved_reference_power_mode,
             intensity_views=scoring_views,
             intensity_reference_view=scoring_reference,
         )
@@ -928,6 +965,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                 alpha=alpha,
                 component_weights=component_weights,
                 pixel_shift_power=resolved_pixel_shift_power,
+                pixel_shift_power_apply_to_reference=resolved_reference_power_mode,
                 intensity_views=scoring_views,
                 intensity_reference_view=scoring_reference,
             )
@@ -949,6 +987,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         alpha: float = DEFAULT_DISPLACEMENT_ALPHA,
         component_weights: Optional[Dict[str, float]] = None,
         pixel_shift_power: float = 1.0,
+        pixel_shift_power_apply_to_reference: bool = True,
         intensity_views: Optional[np.ndarray] = None,
         intensity_reference_view: Optional[np.ndarray] = None,
     ) -> PixelwiseSimilarityResult:
@@ -1078,6 +1117,11 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
         if thresh is not None:
             ref_view[ref_view < np.max(ref_view)*thresh] = 0.0
             intensity_ref_view[intensity_ref_view < np.max(intensity_ref_view)*thresh] = 0.0
+        if pixel_shift_power_apply_to_reference:
+            intensity_ref_view = _signed_power_intensity_values(
+                intensity_ref_view,
+                pixel_shift_power,
+            )
 
         D = max_disp_scaled * 2 + 1
         disp_arr = np.arange(-max_disp_scaled, max_disp_scaled + 1, dtype=np.float32)
@@ -1162,7 +1206,7 @@ class PixelwisePatchRectificationStrategy(RectificationStrategy):
                         intensity_shifted_source = self._roll_with_fill(
                             intensity_view, shift_y=s_y, shift_x=s_x, zero_fill=self.zero_fill_roll
                         )
-                        intensity_shifted_view = _signed_power_shifted_view(
+                        intensity_shifted_view = _signed_power_intensity_values(
                             intensity_shifted_source,
                             pixel_shift_power,
                         )

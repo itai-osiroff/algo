@@ -82,6 +82,7 @@ Common pixel/combined search fields:
 - `sub_pix_factors`
 - `pixel_sigma_pyramid`
 - `pixel_shift_powers` (positive signed powers, default `[1.0]`)
+- `pixel_shift_power_apply_to_reference` (booleans, default `[true]`)
 - `zero_fill_roll`
 
 In the spec-based sweep GUI, enter comma-separated values in the **Pixel shift
@@ -89,12 +90,19 @@ powers** and **Combined pixel shift powers** controls. The two strategy lists
 are independent; every value must be finite and greater than zero.
 
 `pixel_shift_powers` applies only to pixelwise intensity matching (including the
-pixelwise stage of `combined`). At values other than `1.0`, the shifted moving
-view is evaluated as `sign(x) * abs(x) ** power`; non-finite inputs are treated
-as zero only in the scoring copy and recorded in each run's diagnostics. This
-does not alter global matching, raw/HDR view stacks, or rectified output. HDR
-diagnostics describe the first exposure used to estimate the pixel displacement
-field, not subsequent exposures that only receive that field.
+pixelwise stage of `combined`). At values other than `1.0`, shifted moving views
+are evaluated as `sign(x) * abs(x) ** power`. By default,
+`pixel_shift_power_apply_to_reference: [true]` applies the same transform to the
+intensity reference. Set it to `[false]` to reproduce the legacy
+shifted-view-only score, or sweep both values for a controlled comparison.
+JSON specs should use booleans; programmatic inputs also accept `true`/`false`,
+`1`/`0`, and `yes`/`no` text (case-insensitive). Other values fail validation
+rather than silently selecting a scoring mode.
+Non-finite inputs are treated as zero only in scoring copies and recorded in
+each run's diagnostics. This does not alter global matching, raw/HDR view
+stacks, or rectified output. HDR diagnostics describe the first exposure used to
+estimate the pixel displacement field, not subsequent exposures that only
+receive that field.
 
 ### Combined power-field blend
 

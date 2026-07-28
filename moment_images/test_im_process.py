@@ -40,6 +40,22 @@ def test_rectification_run_config_defaults_to_intensity_mode():
     assert config.metric_formulation_id == "intensity_default"
     assert config.combined_reference_mode == "global_average"
     assert config.pixel_shift_power == 1.0
+    assert config.pixel_shift_power_apply_to_reference is True
+
+
+def test_rectification_run_config_can_preserve_legacy_directional_power_scoring():
+    config = RectificationRunConfig(
+        pixel_shift_power=2.0,
+        pixel_shift_power_apply_to_reference=False,
+    )
+
+    assert config.pixel_shift_power_apply_to_reference is False
+
+
+def test_rectification_run_config_normalizes_reference_power_boolean_text():
+    config = RectificationRunConfig(pixel_shift_power_apply_to_reference="false")
+
+    assert config.pixel_shift_power_apply_to_reference is False
 
 
 def test_rectification_run_config_validates_power_blend_contract():
@@ -189,6 +205,7 @@ def test_rectify_views_from_config_forwards_pixel_shift_power(monkeypatch):
 def test_power_blend_combined_run_blends_baseline_and_raised_similarity_fields(monkeypatch):
     views = np.arange(16, dtype=np.float32).reshape(2, 2, 2, 2)
     powers: list[float] = []
+    reference_power_modes: list[bool] = []
     rectification_similarity: list[PixelwiseSimilarityResult] = []
 
     def fake_global_similarity(self, stage_views, ref_view_idx, **kwargs):
@@ -200,6 +217,7 @@ def test_power_blend_combined_run_blends_baseline_and_raised_similarity_fields(m
     def fake_pixel_similarity(self, stage_views, ref_view_idx, **kwargs):
         power = float(kwargs["pixel_shift_power"])
         powers.append(power)
+        reference_power_modes.append(bool(kwargs["pixel_shift_power_apply_to_reference"]))
         displacement = 0.0 if power == 1.0 else 2.0
         disps = np.full((2, 2, 2, 2), displacement, dtype=np.float32)
         return PixelwiseSimilarityResult(
@@ -233,10 +251,12 @@ def test_power_blend_combined_run_blends_baseline_and_raised_similarity_fields(m
             pixel_power_blend_raised_power=2.0,
             pixel_power_blend_alpha=0.5,
             pixel_power_blend_delta_cap=2.0,
+            pixel_shift_power_apply_to_reference=False,
         ),
     )
 
     assert powers == [1.0, 2.0]
+    assert reference_power_modes == [False, False]
     assert result.pixel_similarity.power_blend_diagnostics["raised_power"] == 2.0
     np.testing.assert_allclose(rectification_similarity[0].disps_y, np.sqrt(0.5))
 
