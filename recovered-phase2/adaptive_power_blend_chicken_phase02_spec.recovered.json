@@ -1,0 +1,307 @@
+{
+  "search_spaces": {
+    "pixel": {
+      "strategy": "pixel",
+      "similarity_window_sizes": [
+        15,
+        25,
+        35,
+        45
+      ],
+      "refinement_window_sizes": [
+        15,
+        25,
+        35,
+        45
+      ],
+      "max_displacements": [
+        5,
+        15,
+        25
+      ],
+      "gauss_sigmas": [
+        3,
+        5,
+        7
+      ],
+      "disp_gauss_sigmas": [
+        0,
+        1
+      ],
+      "global_thresholds": [
+        0.15
+      ],
+      "pixel_thresholds": [
+        0.05
+      ],
+      "sub_pix_factors": [
+        1,
+        2
+      ],
+      "pixel_sigma_pyramid": [
+        false,
+        true
+      ],
+      "zero_fill_roll": [
+        true
+      ],
+      "pixel_shift_powers": [
+        1
+      ],
+      "pixel_shift_power_apply_to_reference": [
+        true
+      ],
+      "pixel_power_blend_enabled": [
+        false
+      ],
+      "pixel_power_blend_raised_powers": [],
+      "pixel_power_blend_alphas": [
+        0
+      ],
+      "pixel_power_blend_delta_caps": [
+        0
+      ],
+      "correlation_pad_widths": [
+        54
+      ],
+      "combined_use_global_avg_reference": [
+        true
+      ],
+      "combined_reference_mode": null,
+      "gauss_sizes": null,
+      "disp_gauss_sizes": null
+    },
+    "combined": {
+      "strategy": "combined",
+      "similarity_window_sizes": [
+        15,
+        25,
+        35,
+        45
+      ],
+      "refinement_window_sizes": [
+        15,
+        25,
+        35,
+        45
+      ],
+      "max_displacements": [
+        5,
+        15,
+        25
+      ],
+      "gauss_sigmas": [
+        3,
+        5,
+        7
+      ],
+      "disp_gauss_sigmas": [
+        0,
+        1
+      ],
+      "global_thresholds": [
+        0.15
+      ],
+      "pixel_thresholds": [
+        0.05
+      ],
+      "sub_pix_factors": [
+        1,
+        2
+      ],
+      "pixel_sigma_pyramid": [
+        false,
+        true
+      ],
+      "zero_fill_roll": [
+        true
+      ],
+      "pixel_shift_powers": [
+        1
+      ],
+      "pixel_shift_power_apply_to_reference": [
+        true
+      ],
+      "pixel_power_blend_enabled": [
+        false
+      ],
+      "pixel_power_blend_raised_powers": [],
+      "pixel_power_blend_alphas": [
+        0
+      ],
+      "pixel_power_blend_delta_caps": [
+        0
+      ],
+      "correlation_pad_widths": [
+        54
+      ],
+      "combined_use_global_avg_reference": [
+        true
+      ],
+      "combined_reference_mode": null,
+      "gauss_sizes": null,
+      "disp_gauss_sizes": null
+    }
+  },
+  "strategies": [
+    "pixel",
+    "combined"
+  ],
+  "stages": {
+    "mode": "two_stage",
+    "total_budget_per_dataset": 320,
+    "stage1_fraction": 0.6,
+    "top_k": 8,
+    "max_workers": null,
+    "refinement": {
+      "method": "auto_fine",
+      "extrapolation": "half_step_bounded"
+    },
+    "scheduling": {
+      "mode": "adaptive_memory",
+      "memory_safety_fraction": 0.7,
+      "memory_telemetry": true,
+      "worker_recycle_tasks": null,
+      "memory_enforcement": "auto"
+    }
+  },
+  "scoring": {
+    "metric_weights": {
+      "laplacian_variance": 0.25,
+      "dwt_level2_hv_energy": 0.25,
+      "sum_squared_gradient": 0.25,
+      "total_variation": 0.25
+    },
+    "runtime_penalty_weight": 0,
+    "robustness_lambda": 0.5,
+    "missing_dataset_penalty": 1,
+    "metric_scope": "global_and_local_metrics",
+    "profile_name": null,
+    "profile_config_path": null
+  },
+  "experimental_metric_sweep": {
+    "enabled": false,
+    "shortlist_top_k": 8,
+    "formulations": [],
+    "candidate_source": "baseline_shortlist",
+    "search_stages": null
+  },
+  "validation_oracle_sweep": {
+    "enabled": false,
+    "oracle_mode": "trio_validation",
+    "top_k": 8,
+    "budget_per_dataset": null,
+    "skip_image_metric_stage": false,
+    "scenes": [],
+    "defaults": {}
+  },
+  "metric_formulations": [],
+  "reporting": {
+    "primary_metric": "laplacian_variance",
+    "tolerate_partial_outputs": true,
+    "generate_alpha_report": true
+  },
+  "output_dir": "/CPL_data_1/itaio/adaptive_power_blend_experiment_retry2",
+  "save_figures": false,
+  "analyze": true,
+  "keep_all_run_artifacts": true,
+  "random_seed": 0,
+  "adaptive_power_blend_experiment": {
+    "dataset_manifest": "adaptive_power_blend_chicken_dataset_manifest.recovered.json",
+    "design": {
+      "execution_mode": "development_phase0_2",
+      "terminal_phase": 2,
+      "field_production": {
+        "correlation_pad_width": 54,
+        "global_threshold": 0.1,
+        "refinement_window_size": 19,
+        "max_displacement": 8,
+        "gauss_sigma": 10,
+        "disp_gauss_sigma": 0,
+        "pixel_threshold": 0.05,
+        "sub_pix_factor": 1,
+        "zero_fill_roll": true,
+        "combined_reference_mode": "global_average"
+      },
+      "raised_powers": [
+        1.5,
+        2,
+        2.5
+      ],
+      "phase1_budgets": {
+        "trust": 24,
+        "cap": 24,
+        "smoothing": 24
+      },
+      "phase2_budget": 64,
+      "resource": {
+        "max_workers": 5,
+        "max_memory_bytes": 80530636800,
+        "max_disk_bytes": 805306368000,
+        "max_runtime_seconds": 604800
+      },
+      "retention": {
+        "max_cache_bytes": 697932185600,
+        "retain_generations": 3
+      },
+      "reporting": {
+        "progress_interval_seconds": 60,
+        "emit_json": true
+      },
+      "lifecycle": {
+        "lease_seconds": 300
+      },
+      "restart": {
+        "mode": "supervised",
+        "max_attempts": 3
+      },
+      "operational_profile": {
+        "profile_id": "chicken_beads_400px_75gib_1week",
+        "target_resolution_px": 400,
+        "memory_budget_bytes": 80530636800,
+        "runtime_limit_seconds": 604800,
+        "status": "waived"
+      }
+    },
+    "evaluation": {
+      "opportunity_min_residual_px": 0.05,
+      "no_op_update_px": 0.01,
+      "muted_min_opportunity_fraction": 0.1,
+      "muted_max_median_transferred_residual_ratio": 0.25,
+      "objectives": [
+        {
+          "metric_path": "global_and_local_metrics.tamura_gradient_avg",
+          "direction": "maximize",
+          "min_anchor_improvement": 0.005,
+          "normalization_floor": 0.0001,
+          "tie_tolerance": 0.00001,
+          "family": "image_outcome"
+        },
+        {
+          "metric_path": "inter_view_consistency_metrics.mean_view_std",
+          "direction": "minimize",
+          "min_anchor_improvement": 0,
+          "normalization_floor": 0.0001,
+          "tie_tolerance": 0.00001,
+          "family": "inter_view_consistency"
+        },
+        {
+          "metric_path": "adaptive_evaluation.global.update_gradient.p95",
+          "direction": "minimize",
+          "min_anchor_improvement": 0,
+          "normalization_floor": 0.0001,
+          "tie_tolerance": 0.00001,
+          "family": "field_stability"
+        }
+      ],
+      "overreach": {
+        "max_coordinate_oob_fraction": 0.01,
+        "max_boundary_saturation_fraction": 0.25,
+        "max_update_gradient_p95": 1.5,
+        "max_jacobian_fold_fraction": 0.01,
+        "max_nonfinite_fraction": 0,
+        "max_edge_leakage_fraction": 0
+      }
+    }
+  }
+}

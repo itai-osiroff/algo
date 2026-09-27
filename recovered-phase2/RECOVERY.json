@@ -1,0 +1,12 @@
+{
+  "source_run_state": "C:\\Users\\user\\Downloads\\run_state.json",
+  "sealed_manifest_sha256": "1ba6a4f0a4b413812c2d543e2a8887722ba143a295cf880156fa16b990095efd",
+  "sealed_manifest_sha256_expected": "1ba6a4f0a4b413812c2d543e2a8887722ba143a295cf880156fa16b990095efd",
+  "sealed_spec_sha256_expected": "c5a9d7575cc3b2ba610c67b0af7d43bcb120a4d8afde8f09ac57faa1b8fa245d",
+  "original_output_dir": "/CPL_data_1/itaio/adaptive_power_blend_experiment_retry2",
+  "original_manifest_path": "/CPL_data_1/itaio/adaptive_power_blend_experiment/adaptive_power_blend_chicken_dataset_manifest.json",
+  "recovered_files": [
+    "adaptive_power_blend_chicken_dataset_manifest.recovered.json",
+    "adaptive_power_blend_chicken_phase02_spec.recovered.json"
+  ]
+}

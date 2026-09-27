@@ -1,6 +1,16 @@
 Light Field Summary.pdf
 moment_images/images
 __pycache__
+# Local Python environment and test caches.
+/.venv/
+/.hypothesis/
+/.pytest_cache/
+/.pytest_tmp/
+
+# Per-run pytest output directories created at the repository root.
+/.pytest-*/
+/.q*/
+/.t4*/
 Enhancing Image Features via Upscaling and Multi-Image Fusion in Scientific Imaging (1).pdf
 Critique of Proposed Sigma-Pyramid Rectification Strategy.pdf
 Microscopy Image Rectification Fuzzy Output.pdf
