@@ -1458,7 +1458,7 @@ def main():
     views = np.squeeze(views)
 
 # Debug mode
-    # Image relevant for this : C:\Users\user\OneDrive - Technion\office computer files\images_output\17_3_26\algo_run\dense\beads_2um_dense_4d6kus
+    # Image relevant for this : <local output dir>/algo_run/dense/beads_2um_dense_4d6kus
     # roi_i_start = 96
     # roi_i_end = 104
     # roi_j_start = 140

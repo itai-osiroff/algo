@@ -14,3 +14,9 @@ __pycache__
 Enhancing Image Features via Upscaling and Multi-Image Fusion in Scientific Imaging (1).pdf
 Critique of Proposed Sigma-Pyramid Rectification Strategy.pdf
 Microscopy Image Rectification Fuzzy Output.pdf
+
+# Generated outputs and tool state.
+/.pytest_tmp_publish/
+/outputs/
+/.codex/
+/.agents/

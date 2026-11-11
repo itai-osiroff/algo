@@ -7,7 +7,7 @@ Use this prompt after assembling a local five-scene trio benchmark manifest.
 Objective: Improve the moment_images trio benchmark registration/evaluation plumbing until the generated overlays are visually credible across the five-scene validation dataset.
 
 Repository and branch:
-- Work in C:\Users\user\Documents\git_clones\algo.
+- Work in the repository root.
 - Use the branch that contains moment_images/trio_benchmark.py and moment_images/trio_benchmark_batch.py.
 - Do not mutate completed sweep outputs, run_state.json, sweep summaries, candidate workspaces, or validation workspaces.
 

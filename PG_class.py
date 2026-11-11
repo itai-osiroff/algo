@@ -463,7 +463,7 @@ def get_param(text, name):
 
 
 def get_ROI_params():
-    path = r"C:\Users\user\OneDrive - Technion\Research project 4 Confocal Microscope\System_Lenslets\_Parameters\Val_00.txt"
+    path = r"path/to/System_Lenslets/_Parameters/Val_00.txt"  # TODO: set to your local parameters file
     with open(path, "r") as f:
         text = f.read().split()
     r0s_index = text.index("r0s")
